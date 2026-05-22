@@ -1207,6 +1207,20 @@ def get_latest_run_for_digest(digest_id: str) -> dict[str, Any] | None:
     return row_to_dict(row)
 
 
+def get_latest_source_run_for_digest(digest_id: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM digest_runs
+            WHERE digest_id = ? AND COALESCE(trigger, '') != 'controlled_verification'
+            ORDER BY run_at DESC
+            LIMIT 1
+            """,
+            (digest_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
 def list_article_results_for_run(run_id: str) -> list[ArticleFetchResult]:
     with connect() as connection:
         rows = connection.execute(
@@ -1520,6 +1534,70 @@ def agent_decisions_summary(*, limit: int = 500) -> dict[str, Any]:
         "action_counts": action_counts,
         "decision_counts": decision_counts,
     }
+
+
+def list_agent_decisions(*, limit: int = 25) -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, run_id, digest_id, inference_run_id, agent, target, decision,
+                   action, confidence, reason, model_name, metadata, created_at
+            FROM agent_decisions
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 100)),),
+        ).fetchall()
+
+    decisions: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            metadata = json.loads(record.get("metadata") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        record["metadata"] = metadata if isinstance(metadata, dict) else {}
+        decisions.append(record)
+    return decisions
+
+
+def list_latest_agent_decisions_for_run(run_id: str) -> list[dict[str, Any]]:
+    with connect() as connection:
+        latest = connection.execute(
+            """
+            SELECT created_at
+            FROM agent_decisions
+            WHERE run_id = ?
+              AND decision NOT IN ('fallback', 'skipped')
+              AND action NOT IN ('deterministic_ranking', 'deterministic_repairs', 'single_candidate')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if latest is None:
+            return []
+        rows = connection.execute(
+            """
+            SELECT id, run_id, digest_id, inference_run_id, agent, target, decision,
+                   action, confidence, reason, model_name, metadata, created_at
+            FROM agent_decisions
+            WHERE run_id = ? AND created_at = ?
+            ORDER BY id
+            """,
+            (run_id, latest["created_at"]),
+        ).fetchall()
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            metadata = json.loads(record.get("metadata") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        record["metadata"] = metadata if isinstance(metadata, dict) else {}
+        records.append(record)
+    return records
 
 
 def add_agent_decisions_for_run(

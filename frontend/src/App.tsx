@@ -125,6 +125,8 @@ type VerificationRunResult = {
   mode?: string;
   published?: boolean;
   source_run_id?: string;
+  published_run_id?: string | null;
+  published_issue_id?: string | null;
   reviewed_article_count?: number;
   active_before_count?: number;
   active_after_count?: number;
@@ -132,9 +134,22 @@ type VerificationRunResult = {
   lead_title?: string | null;
   decision_count?: number;
   stored_decision_count?: number;
+  reused_verified_decisions?: boolean;
   action_counts?: Record<string, number>;
   agent_counts?: Record<string, number>;
   message?: string;
+};
+
+type AgentDecisionRecord = {
+  id: string;
+  agent: string;
+  decision: string;
+  action: string;
+  reason: string | null;
+  confidence: number | null;
+  target: string;
+  model_name: string | null;
+  created_at: string;
 };
 
 type ModelJob = {
@@ -434,6 +449,7 @@ function AdminApp() {
   const [jobLimit, setJobLimit] = useState(100);
   const [jobIncludeCached, setJobIncludeCached] = useState(false);
   const [verificationResult, setVerificationResult] = useState<VerificationRunResult | null>(null);
+  const [agentDecisions, setAgentDecisions] = useState<AgentDecisionRecord[]>([]);
   const [message, setMessage] = useState("Loading admin status...");
   const [busy, setBusy] = useState(false);
   const modelOptions = pipeline?.model.catalog.models ?? [];
@@ -453,8 +469,18 @@ function AdminApp() {
       setSelectedModel(preferredModel);
       setJobModel((current) => current || preferredModel);
       setMessage(result.gmail.connected ? "Gmail connected" : "Gmail not connected");
+      await loadAgentDecisions();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Admin status unavailable");
+    }
+  }
+
+  async function loadAgentDecisions() {
+    try {
+      const result = await api<{ decisions: AgentDecisionRecord[] }>("/api/admin/agent-decisions");
+      setAgentDecisions(result.decisions);
+    } catch {
+      setAgentDecisions([]);
     }
   }
 
@@ -561,18 +587,24 @@ function AdminApp() {
     }
   }
 
-  async function runControlledVerification() {
+  async function runControlledVerification(publish = false) {
     const digest = pipeline?.digests[0];
     if (!digest) return;
     setBusy(true);
-    setMessage("Running controlled verification...");
+    setMessage(publish ? "Publishing verified brief..." : "Running controlled verification...");
     try {
-      const result = await api<VerificationRunResult>(`/api/admin/digests/${digest.id}/verification-run`, {
+      const result = await api<VerificationRunResult>(`/api/admin/digests/${digest.id}/verification-run${publish ? "?publish=true" : ""}`, {
         method: "POST",
       });
       setVerificationResult(result);
       await loadStatus();
-      setMessage(result.status === "completed" ? "Controlled verification completed" : result.message ?? result.status);
+      setMessage(
+        result.status === "completed"
+          ? result.published
+            ? "Verified brief published"
+            : "Controlled verification completed"
+          : result.message ?? result.status,
+      );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Controlled verification failed");
     } finally {
@@ -668,8 +700,11 @@ function AdminApp() {
             </div>
             {pipeline?.scheduler.last_error ? <p className="error-text">{pipeline.scheduler.last_error}</p> : null}
             <div className="panel-actions">
-              <button onClick={runControlledVerification} disabled={busy || !pipeline?.digests.length}>
-                Run Controlled Verification
+              <button onClick={() => runControlledVerification(false)} disabled={busy || !pipeline?.digests.length}>
+                Verify Only
+              </button>
+              <button onClick={() => runControlledVerification(true)} disabled={busy || !pipeline?.digests.length}>
+                Publish Verified Brief
               </button>
               {verificationResult ? (
                 <p className="muted">
@@ -679,6 +714,18 @@ function AdminApp() {
                 <p className="muted">Exercises the agentic editor and critic without publishing over the live brief.</p>
               )}
             </div>
+            {agentDecisions.length ? (
+              <div className="decision-list">
+                {agentDecisions.slice(0, 6).map((decision) => (
+                  <article key={decision.id}>
+                    <strong>
+                      {decision.agent} · {decision.action || decision.decision}
+                    </strong>
+                    <span>{decision.reason || decision.decision}</span>
+                  </article>
+                ))}
+              </div>
+            ) : null}
           </section>
 
           <section className="panel wide-panel">
@@ -1080,7 +1127,8 @@ function formatVerificationResult(result: VerificationRunResult): string {
   const decisions = result.decision_count ?? 0;
   const dropped = result.dropped_count ?? 0;
   const lead = result.lead_title ? ` · lead: ${result.lead_title}` : "";
-  return `Reviewed ${reviewed} article(s), saved ${decisions} decision(s), dropped ${dropped}${lead}`;
+  const prefix = result.published ? "Published" : "Reviewed";
+  return `${prefix} ${reviewed} article(s), saved ${decisions} decision(s), dropped ${dropped}${lead}`;
 }
 
 function formatSeconds(value: number | null | undefined): string {

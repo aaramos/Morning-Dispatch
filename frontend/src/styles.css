@@ -462,6 +462,37 @@ iframe {
   margin: 0;
 }
 
+.decision-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.decision-list article {
+  min-width: 0;
+  border: 1px solid #e2e7e1;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #f7f9f6;
+}
+
+.decision-list strong,
+.decision-list span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.decision-list strong {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.decision-list span {
+  margin-top: 4px;
+  color: #66756f;
+  line-height: 1.35;
+}
+
 .run-list {
   display: grid;
   gap: 12px;

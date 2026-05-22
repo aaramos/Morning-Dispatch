@@ -36,8 +36,9 @@ def build_issue_snapshot(
     results: list[ArticleFetchResult],
 ) -> str:
     body_count = payload_count
-    fetched = [result for result in results if result.fetched]
-    fallback = [result for result in results if not result.fetched]
+    visible_results = [result for result in results if result.tier != "dropped"]
+    fetched = [result for result in visible_results if result.fetched]
+    fallback = [result for result in visible_results if not result.fetched]
     if configured_source_count == 0:
         return "No Gmail newsletter sources are configured for this digest."
     if not results and not payload_count:
@@ -48,7 +49,7 @@ def build_issue_snapshot(
     sections = _top_sections(fetched)
     lead = fetched[0].title
     theme_text = ", ".join(sections[:3]).lower()
-    lower_count = sum(1 for result in results if result.tier == "lower_confidence")
+    lower_count = sum(1 for result in visible_results if result.tier == "lower_confidence")
     return (
         f"The issue is led by {lead}. "
         f"Top coverage clusters around {theme_text}, with {len(fetched)} ranked article(s) "

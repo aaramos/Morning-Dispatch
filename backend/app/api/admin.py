@@ -147,6 +147,14 @@ def list_model_jobs() -> dict[str, Any]:
     }
 
 
+@router.get("/agent-decisions")
+def list_agent_decisions() -> dict[str, Any]:
+    return {
+        "decisions": database.list_agent_decisions(limit=40),
+        "summary": database.agent_decisions_summary(),
+    }
+
+
 @router.post("/model/jobs")
 async def start_model_job(payload: ModelJobPayload) -> dict[str, Any]:
     job = await model_jobs.start_model_enrichment_job(
@@ -158,8 +166,8 @@ async def start_model_job(payload: ModelJobPayload) -> dict[str, Any]:
 
 
 @router.post("/digests/{digest_id}/verification-run")
-async def run_digest_verification(digest_id: str) -> dict[str, Any]:
-    result = await verification.run_controlled_verification(digest_id)
+async def run_digest_verification(digest_id: str, publish: bool = False) -> dict[str, Any]:
+    result = await verification.run_controlled_verification(digest_id, publish=publish)
     if result is None:
         raise HTTPException(status_code=404, detail="Digest not found")
     return result

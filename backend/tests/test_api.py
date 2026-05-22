@@ -145,6 +145,18 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         verified_status = client.get("/api/admin/status").json()
         assert verified_status["agent_decisions"]["record_count"] >= verification_payload["stored_decision_count"]
 
+        decisions = client.get("/api/admin/agent-decisions")
+        assert decisions.status_code == 200
+        assert decisions.json()["decisions"]
+
+        published = client.post(f"/api/admin/digests/{digest['id']}/verification-run?publish=true")
+        assert published.status_code == 200
+        published_payload = published.json()
+        assert published_payload["status"] == "completed"
+        assert published_payload["published"] is True
+        assert published_payload["published_run_id"]
+        assert published_payload["published_issue_id"]
+
 
 def test_archived_digests_are_hidden_from_default_lists(monkeypatch, tmp_path):
     runtime = tmp_path / "runtime"
