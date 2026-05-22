@@ -44,20 +44,48 @@ async def browse_subreddit(
 async def search_reddit(
     query: str,
     *,
+    subreddits: list[str] | None = None,
     sort: str = "relevance",
     time: str = "week",
     limit: int = 25,
 ) -> list[dict[str, Any]]:
+    arguments: dict[str, Any] = {
+        "query": query,
+        "sort": sort,
+        "time": time,
+        "limit": max(1, min(limit, 100)),
+    }
+    if subreddits:
+        arguments["subreddits"] = subreddits
     payload = await _call_reddit_tool(
         "search_reddit",
-        {
-            "query": query,
-            "sort": sort,
-            "time": time,
-            "limit": max(1, min(limit, 100)),
-        },
+        arguments,
     )
     return _extract_posts(payload, "results")
+
+
+async def get_post_details(
+    *,
+    post_id: str | None = None,
+    subreddit: str | None = None,
+    url: str | None = None,
+    comment_limit: int = 20,
+    max_top_comments: int = 5,
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "comment_limit": max(1, min(comment_limit, 500)),
+        "comment_sort": "best",
+        "comment_depth": 2,
+        "extract_links": False,
+        "max_top_comments": max(1, min(max_top_comments, 20)),
+    }
+    if url:
+        arguments["url"] = url
+    else:
+        arguments["post_id"] = post_id
+        if subreddit:
+            arguments["subreddit"] = subreddit
+    return await _call_reddit_tool("get_post_details", arguments)
 
 
 async def _call_reddit_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:

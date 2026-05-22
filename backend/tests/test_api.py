@@ -103,7 +103,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
 
         html = client.get(f"/api/issues/{issue_id}/html")
         assert html.status_code == 200
-        assert "Gmail Issue" in html.text
+        assert "Morning Dispatch Issue" in html.text
         assert "A useful newsletter body" in html.text
         assert "May 20, 2026" in html.text
         assert "Model update" in html.text
@@ -119,7 +119,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
 
         brief = client.get("/brief")
         assert brief.status_code == 200
-        assert "Gmail Issue" in brief.text
+        assert "Morning Dispatch Issue" in brief.text
         assert "https://example.com/model-release" in brief.text
         assert "05/20/2026" in brief.text
         assert "overflow-x: hidden" in brief.text
@@ -202,6 +202,66 @@ def test_archived_digests_are_hidden_from_default_lists(monkeypatch, tmp_path):
 
         admin_status = client.get("/api/admin/status").json()
         assert [digest["id"] for digest in admin_status["digests"]] == [canonical["id"]]
+
+
+def test_digest_run_can_publish_reddit_threads(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "false")
+
+    async def fake_fetch_reddit_threads(*_args, **_kwargs):
+        return [
+            NormalizedPayload(
+                source_type="reddit_thread",
+                source_name="r/ollama",
+                raw_text=(
+                    "Local coding agents are getting useful. "
+                    "Builders compare small LLM coding agents, MCP tools, and workflow reliability."
+                ),
+                original_url="https://reddit.com/r/ollama/comments/thread-1/local_agents/",
+                published_at="2026-05-22T12:00:00+00:00",
+                metadata={
+                    "reddit_thread_id": "thread-1",
+                    "title": "Local coding agents are getting useful",
+                    "thread_quality_score": 0.72,
+                    "subreddit": "ollama",
+                },
+            )
+        ]
+
+    monkeypatch.setattr(digest_runner, "fetch_reddit_threads", fake_fetch_reddit_threads)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        created = client.post(
+            "/api/digests",
+            json={
+                "name": "AI Morning Brief",
+                "interest": "Local LLM coding agents and AI product workflows",
+                "schedule": "daily",
+                "sources": [],
+            },
+        )
+        assert created.status_code == 201
+        digest = created.json()
+
+        run = client.post(f"/api/digests/{digest['id']}/run")
+        assert run.status_code == 202
+        assert run.json()["status"] == "completed"
+        assert run.json()["fetched_article_count"] == 1
+
+        issue = client.get(f"/api/digests/{digest['id']}/issues/latest")
+        html = client.get(f"/api/issues/{issue.json()['id']}/html")
+        assert html.status_code == 200
+        assert "Local coding agents are getting useful" in html.text
+        assert "reddit.com" in html.text
+        assert "via r/ollama" in html.text
+        assert "05/22/2026" in html.text
 
 
 def test_digest_run_reuses_cached_model_enrichment(monkeypatch, tmp_path):

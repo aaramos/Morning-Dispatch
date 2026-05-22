@@ -5,6 +5,7 @@ from typing import Any
 
 from backend.agents.critic import apply_critic_repairs
 from backend.agents.digestor.gmail_mcp_client import fetch_newsletters
+from backend.agents.digestor.reddit import fetch_reddit_threads
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.librarian.articles import fetch_articles_for_payloads
@@ -38,6 +39,12 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
             lookback_hours=lookback_hours,
             db_path=str(database.database_path()),
         )
+    reddit_payloads = await fetch_reddit_threads(
+        digest_id=digest_id,
+        digest_interest=str(digest.get("interest") or ""),
+        lookback_hours=lookback_hours,
+    )
+    payloads.extend(reddit_payloads)
     fetched_articles = await fetch_articles_for_payloads(payloads)
     enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
     ranked_articles = prepare_issue_articles(digest, enriched_articles)
@@ -66,12 +73,16 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
     if settings.librarian_use_model:
         model_cache_write_count = database.cache_model_enrichments(article_results, model_name=settings.librarian_model)
 
+    configured_source_count = len(sender_allowlist) + len(
+        database.list_reddit_sources(digest_id, include_retired=False)
+    )
+
     return database.create_ingested_run(
         digest=digest,
         payloads=payloads,
         article_results=article_results,
         lookback_hours=lookback_hours,
-        configured_source_count=len(sender_allowlist),
+        configured_source_count=configured_source_count,
         trigger=trigger,
         duration_seconds=round(monotonic() - started_at, 3),
         model_cache_hit_count=model_cache_hit_count,

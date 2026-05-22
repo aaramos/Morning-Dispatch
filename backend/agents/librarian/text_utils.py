@@ -19,6 +19,7 @@ def fallback_text(result: ArticleFetchResult) -> str:
         str(value)
         for value in (
             metadata.get("link_text"),
+            metadata.get("title"),
             metadata.get("parent_subject"),
             metadata.get("subject"),
             result.original_url,

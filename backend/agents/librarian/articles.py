@@ -52,9 +52,11 @@ async def fetch_articles_for_payloads(
     max_articles: int = MAX_ARTICLE_FETCHES,
     concurrency: int = 8,
 ) -> list[ArticleFetchResult]:
-    selected_payloads = select_article_payloads(payloads, max_articles=max_articles)
+    payload_list = list(payloads)
+    direct_results = direct_article_results(payload_list)
+    selected_payloads = select_article_payloads(payload_list, max_articles=max_articles)
     if not selected_payloads:
-        return []
+        return direct_results
 
     semaphore = asyncio.Semaphore(concurrency)
     async with httpx.AsyncClient(
@@ -67,7 +69,7 @@ async def fetch_articles_for_payloads(
 
     deduped: list[ArticleFetchResult] = []
     seen_final_urls: set[str] = set()
-    for result in results:
+    for result in direct_results + list(results):
         key = result.canonical_url or canonicalize_url(result.final_url or result.original_url)
         if result.fetched and key in seen_final_urls:
             continue
@@ -75,6 +77,33 @@ async def fetch_articles_for_payloads(
             seen_final_urls.add(key)
         deduped.append(result)
     return deduped
+
+
+def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[ArticleFetchResult]:
+    results: list[ArticleFetchResult] = []
+    for payload in payloads:
+        if payload.source_type != "reddit_thread" or not payload.original_url:
+            continue
+        canonical_url = canonicalize_url(payload.original_url)
+        title = _payload_title(payload) or payload.source_name or "Reddit thread"
+        text = _clean_text(payload.raw_text)
+        results.append(
+            ArticleFetchResult(
+                payload=payload,
+                original_url=canonical_url,
+                final_url=canonical_url,
+                canonical_url=canonical_url,
+                title=title,
+                text=text,
+                excerpt=_truncate(text, 520),
+                domain=_domain(canonical_url),
+                status="fetched",
+                link_score=float((payload.metadata or {}).get("thread_quality_score") or 0.65),
+                section="Reddit Threads",
+                content_type="reddit_thread",
+            )
+        )
+    return results
 
 
 def select_article_payloads(
@@ -298,7 +327,13 @@ def _useful_chunk(text: str) -> bool:
 
 def _payload_title(payload: NormalizedPayload) -> str:
     metadata = payload.metadata or {}
-    return str(metadata.get("link_text") or metadata.get("parent_subject") or metadata.get("subject") or "")
+    return str(
+        metadata.get("link_text")
+        or metadata.get("title")
+        or metadata.get("parent_subject")
+        or metadata.get("subject")
+        or ""
+    )
 
 
 def _failed(

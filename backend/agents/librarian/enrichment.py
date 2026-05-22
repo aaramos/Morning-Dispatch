@@ -204,6 +204,8 @@ def classify_content_type(result: ArticleFetchResult, text: str, keywords: list[
     haystack = " ".join([result.title, text, " ".join(keywords)]).lower()
     if not result.fetched:
         return "fallback_snippet"
+    if result.payload.source_type == "reddit_thread":
+        return "discussion"
     if any(marker in haystack for marker in ("tutorial", "how to", "guide", "walkthrough")):
         return "tutorial"
     if any(marker in haystack for marker in ("opinion", "column", "i think", "we believe")):
@@ -244,6 +246,7 @@ def fallback_text(result: ArticleFetchResult) -> str:
         str(value)
         for value in (
             metadata.get("link_text"),
+            metadata.get("title"),
             metadata.get("parent_subject"),
             metadata.get("subject"),
             result.original_url,
@@ -262,9 +265,10 @@ def fallback_summary(result: ArticleFetchResult) -> str:
 
 def _librarian_prompt(result: ArticleFetchResult) -> str:
     text = (result.text or result.excerpt or fallback_text(result))[:MAX_MODEL_TEXT_CHARS]
+    source_label = "Source" if result.payload.source_type == "reddit_thread" else "Source newsletter"
     return f"""Title: {result.title}
 URL: {result.final_url or result.original_url}
-Source newsletter: {result.payload.source_name}
+{source_label}: {result.payload.source_name}
 
 Text:
 {text}

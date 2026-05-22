@@ -39,10 +39,10 @@ def build_issue_snapshot(
     visible_results = [result for result in results if result.tier != "dropped"]
     fetched = [result for result in visible_results if result.fetched]
     fallback = [result for result in visible_results if not result.fetched]
-    if configured_source_count == 0:
-        return "No Gmail newsletter sources are configured for this digest."
+    if configured_source_count == 0 and not results and not payload_count:
+        return "No sources are configured for this digest."
     if not results and not payload_count:
-        return f"No matching newsletters found across {configured_source_count} configured Gmail source(s)."
+        return f"No matching items found across {configured_source_count} configured source(s)."
     if not fetched:
         return "No primary article pages were resolved this run. The issue includes lower-confidence newsletter leads only."
 
@@ -64,10 +64,20 @@ def _prepare_result(
 ) -> ArticleFetchResult:
     source_text = result.text or result.excerpt or fallback_text(result)
     keywords = list(result.keywords)
-    section = _section_for(result.title, source_text, keywords)
+    if result.payload.source_type == "reddit_thread":
+        section = "Community Signals"
+    else:
+        section = _section_for(result.title, source_text, keywords)
     relevance = _relevance_score(result, interest_tokens, keywords)
 
-    if result.fetched:
+    if result.payload.source_type == "reddit_thread":
+        if relevance >= max(0.28, threshold - 0.18) and result.link_score >= 0.30:
+            tier = "main"
+        elif relevance >= 0.22 and result.link_score >= 0.35:
+            tier = "lower_confidence"
+        else:
+            tier = "dropped"
+    elif result.fetched:
         if relevance >= threshold:
             tier = "main"
         elif relevance >= max(0.35, threshold - 0.10) and result.link_score >= 0.5:

@@ -559,7 +559,7 @@ def create_ingested_run(
     run_id = new_id()
     issue_id = new_id()
     digest_id = str(digest["id"])
-    title = f"{digest['name']} - Gmail Issue"
+    title = f"{digest['name']} - Morning Dispatch Issue"
     snapshot = ingested_snapshot(payloads, configured_source_count, article_results)
     html = render_ingested_issue(title, snapshot, payloads, article_results, lookback_hours)
     lookback_days = max(1, math.ceil(lookback_hours / 24))
@@ -878,7 +878,7 @@ def render_ingested_issue(
   <main>
     <header>
       <h1>{escape(title)}</h1>
-      <div class="date">Gmail digest · Last {lookback_hours} hours</div>
+      <div class="date">Morning Dispatch · Last {lookback_hours} hours</div>
     </header>
     <p class="snapshot">{escape(snapshot)}</p>
     {empty_state}
@@ -1108,6 +1108,7 @@ def _digest_item_row_to_fetch_result(row: sqlite3.Row) -> ArticleFetchResult:
     metadata = {
         "article_id": str(row["article_id"]),
         "gmail_message_id": row["message_id"],
+        "reddit_thread_id": row["thread_id"],
         "sender_email": row["sender_email"],
         "link_text": row["link_text"],
     }
@@ -1205,7 +1206,7 @@ def _insert_discovery(
           id, article_id, discovery_source_type, discovery_source_name, sender_email,
           message_id, thread_id, issue_date, link_text, newsletter_snippet, discovered_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             discovery_id,
@@ -1214,6 +1215,7 @@ def _insert_discovery(
             payload.source_name,
             metadata.get("sender_email") or metadata.get("sender"),
             metadata.get("gmail_message_id"),
+            metadata.get("reddit_thread_id") or metadata.get("thread_id"),
             payload.published_at,
             _title_for_payload(payload),
             _summary_for_payload(payload),
@@ -1273,7 +1275,7 @@ def _insert_discovery_for_result(
           id, article_id, discovery_source_type, discovery_source_name, sender_email,
           message_id, thread_id, issue_date, link_text, newsletter_snippet, discovered_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             discovery_id,
@@ -1282,6 +1284,7 @@ def _insert_discovery_for_result(
             result.payload.source_name,
             metadata.get("sender_email") or metadata.get("sender"),
             metadata.get("gmail_message_id"),
+            metadata.get("reddit_thread_id") or metadata.get("thread_id"),
             result.payload.published_at,
             metadata.get("link_text") or result.title,
             str(metadata.get("parent_subject") or metadata.get("subject") or ""),
@@ -1381,6 +1384,9 @@ def _editor_note_for_payload(payload: NormalizedPayload) -> str:
 
 
 def _editor_note_for_result(result: ArticleFetchResult) -> str:
+    if result.payload.source_type == "reddit_thread":
+        score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
+        return f"Reddit thread selected from {result.payload.source_name} by Source Scout.{score}"
     if result.fetched:
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         return f"Fetched from a link discovered in an approved Gmail newsletter.{score}"
@@ -1392,6 +1398,9 @@ def _title_for_payload(payload: NormalizedPayload) -> str:
     link_text = metadata.get("link_text")
     if link_text:
         return str(link_text)
+    reddit_title = metadata.get("title")
+    if reddit_title:
+        return str(reddit_title)
     subject = metadata.get("subject") or metadata.get("parent_subject")
     if subject:
         return str(subject)
@@ -1566,7 +1575,7 @@ def list_article_results_for_run(run_id: str) -> list[ArticleFetchResult]:
               a.title, a.cleaned_text, a.summary, a.keywords, a.content_type,
               a.fetch_status, a.quality_flag,
               ad.discovery_source_type, ad.discovery_source_name, ad.sender_email,
-              ad.message_id, ad.link_text
+              ad.message_id, ad.thread_id, ad.link_text
             FROM digest_items di
             JOIN articles a ON a.id = di.article_id
             LEFT JOIN article_discoveries ad ON ad.id = di.discovery_id

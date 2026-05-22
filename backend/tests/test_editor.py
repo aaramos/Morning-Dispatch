@@ -86,6 +86,39 @@ def test_build_issue_snapshot_uses_ranked_articles():
     assert "ranked article" in snapshot
 
 
+def test_prepare_issue_articles_keeps_reddit_community_signals():
+    payload = NormalizedPayload(
+        source_type="reddit_thread",
+        source_name="r/ollama",
+        raw_text="Builders compare local LLM coding agents, MCP tools, and day-to-day workflow reliability.",
+        original_url="https://reddit.com/r/ollama/comments/thread-1/local_agents/",
+        published_at="2026-05-22T12:00:00+00:00",
+        metadata={"title": "What local model are you actually using for coding tasks?"},
+    )
+    reddit_result = ArticleFetchResult(
+        payload=payload,
+        original_url=str(payload.original_url),
+        final_url=str(payload.original_url),
+        canonical_url=str(payload.original_url),
+        title="What local model are you actually using for coding tasks?",
+        text=payload.raw_text,
+        excerpt=payload.raw_text,
+        domain="reddit.com",
+        status="fetched",
+        link_score=0.42,
+        content_type="discussion",
+    )
+
+    prepared = prepare_issue_articles(
+        {"interest": "Local LLM coding agents and product workflows", "threshold": 0.45},
+        [enrich_article(reddit_result)],
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0].section == "Community Signals"
+    assert prepared[0].tier == "lead"
+
+
 def test_prepare_issue_articles_drops_author_bios_after_redirect():
     payload = NormalizedPayload(
         source_type="gmail_link",
