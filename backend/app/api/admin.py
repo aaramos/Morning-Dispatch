@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from backend.agents.digestor.gmail import SCOPES
 from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
 from backend.app.db import database
-from backend.app.services import mcp_status, model_catalog, model_jobs, scheduler
+from backend.app.services import mcp_status, model_catalog, model_jobs, scheduler, verification
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
         "digests": [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()],
         "model_cache": database.model_cache_summary(),
         "inference_metrics": database.inference_metrics_summary(),
+        "agent_decisions": database.agent_decisions_summary(),
         "model_jobs": database.list_model_enrichment_jobs(limit=8),
     }
 
@@ -154,6 +155,14 @@ async def start_model_job(payload: ModelJobPayload) -> dict[str, Any]:
         include_cached=payload.include_cached,
     )
     return job
+
+
+@router.post("/digests/{digest_id}/verification-run")
+async def run_digest_verification(digest_id: str) -> dict[str, Any]:
+    result = await verification.run_controlled_verification(digest_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    return result
 
 
 @router.post("/gmail/client-secret")

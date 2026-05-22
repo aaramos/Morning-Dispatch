@@ -111,6 +111,32 @@ type InferenceMetricsStatus = {
   ttft_available: boolean;
 };
 
+type AgentDecisionsStatus = {
+  record_count: number;
+  latest_created_at: string | null;
+  latest_model_name: string | null;
+  agent_counts: Record<string, number>;
+  action_counts: Record<string, number>;
+  decision_counts: Record<string, number>;
+};
+
+type VerificationRunResult = {
+  status: string;
+  mode?: string;
+  published?: boolean;
+  source_run_id?: string;
+  reviewed_article_count?: number;
+  active_before_count?: number;
+  active_after_count?: number;
+  dropped_count?: number;
+  lead_title?: string | null;
+  decision_count?: number;
+  stored_decision_count?: number;
+  action_counts?: Record<string, number>;
+  agent_counts?: Record<string, number>;
+  message?: string;
+};
+
 type ModelJob = {
   id: string;
   model_name: string;
@@ -184,6 +210,7 @@ type AdminPipelineStatus = {
   digests: DigestOverview[];
   model_cache: ModelCacheStatus;
   inference_metrics: InferenceMetricsStatus;
+  agent_decisions: AgentDecisionsStatus;
   model_jobs: ModelJob[];
 };
 
@@ -406,6 +433,7 @@ function AdminApp() {
   const [jobModel, setJobModel] = useState("");
   const [jobLimit, setJobLimit] = useState(100);
   const [jobIncludeCached, setJobIncludeCached] = useState(false);
+  const [verificationResult, setVerificationResult] = useState<VerificationRunResult | null>(null);
   const [message, setMessage] = useState("Loading admin status...");
   const [busy, setBusy] = useState(false);
   const modelOptions = pipeline?.model.catalog.models ?? [];
@@ -533,6 +561,25 @@ function AdminApp() {
     }
   }
 
+  async function runControlledVerification() {
+    const digest = pipeline?.digests[0];
+    if (!digest) return;
+    setBusy(true);
+    setMessage("Running controlled verification...");
+    try {
+      const result = await api<VerificationRunResult>(`/api/admin/digests/${digest.id}/verification-run`, {
+        method: "POST",
+      });
+      setVerificationResult(result);
+      await loadStatus();
+      setMessage(result.status === "completed" ? "Controlled verification completed" : result.message ?? result.status);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Controlled verification failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function readClientSecretFile(file: File | undefined) {
     if (!file) return;
     setClientSecretJson(await file.text());
@@ -606,6 +653,11 @@ function AdminApp() {
                 <small>{formatDeliveryUrl(pipeline?.delivery.latest_brief_url)}</small>
               </div>
               <div>
+                <span>Agentic Flow</span>
+                <strong>{pipeline?.agent_decisions.record_count ?? 0}</strong>
+                <small>{formatAgentDecisionSummary(pipeline?.agent_decisions)}</small>
+              </div>
+              <div>
                 <span>Cache</span>
                 <strong>{pipeline?.model_cache.record_count ?? 0}</strong>
               </div>
@@ -615,6 +667,18 @@ function AdminApp() {
               </div>
             </div>
             {pipeline?.scheduler.last_error ? <p className="error-text">{pipeline.scheduler.last_error}</p> : null}
+            <div className="panel-actions">
+              <button onClick={runControlledVerification} disabled={busy || !pipeline?.digests.length}>
+                Run Controlled Verification
+              </button>
+              {verificationResult ? (
+                <p className="muted">
+                  {formatVerificationResult(verificationResult)}
+                </p>
+              ) : (
+                <p className="muted">Exercises the agentic editor and critic without publishing over the live brief.</p>
+              )}
+            </div>
           </section>
 
           <section className="panel wide-panel">
@@ -1001,6 +1065,22 @@ function formatDeliveryUrl(value: string | null | undefined): string {
   } catch {
     return value;
   }
+}
+
+function formatAgentDecisionSummary(status: AgentDecisionsStatus | null | undefined): string {
+  if (!status || status.record_count === 0) return "No agent reviews yet";
+  const editorial = status.agent_counts.editorial ?? 0;
+  const critic = status.agent_counts.critic ?? 0;
+  return `${editorial} editorial · ${critic} critic`;
+}
+
+function formatVerificationResult(result: VerificationRunResult): string {
+  if (result.status !== "completed") return result.message ?? result.status;
+  const reviewed = result.reviewed_article_count ?? 0;
+  const decisions = result.decision_count ?? 0;
+  const dropped = result.dropped_count ?? 0;
+  const lead = result.lead_title ? ` · lead: ${result.lead_title}` : "";
+  return `Reviewed ${reviewed} article(s), saved ${decisions} decision(s), dropped ${dropped}${lead}`;
 }
 
 function formatSeconds(value: number | null | undefined): string {

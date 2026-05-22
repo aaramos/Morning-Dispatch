@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
+from backend.agents.agentic import AgentDecision
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.editor import build_issue_snapshot
 from backend.agents.librarian.articles import ArticleFetchResult
@@ -255,6 +256,7 @@ def create_ingested_run(
     model_cache_miss_count: int = 0,
     model_cache_write_count: int = 0,
     inference_run_id: str | None = None,
+    agent_decisions: list[AgentDecision] | None = None,
 ) -> dict[str, Any]:
     article_results = article_results or []
     now = utc_now()
@@ -366,6 +368,14 @@ def create_ingested_run(
             VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
             """,
             (issue_id, run_id, digest_id, title, snapshot, html, now),
+        )
+        _insert_agent_decisions(
+            connection,
+            run_id=run_id,
+            digest_id=digest_id,
+            inference_run_id=inference_run_id,
+            decisions=agent_decisions or [],
+            now=now,
         )
     run = get_run(run_id)
     if run is None:
@@ -796,6 +806,43 @@ def _article_row_to_fetch_result(row: sqlite3.Row) -> ArticleFetchResult:
     )
 
 
+def _digest_item_row_to_fetch_result(row: sqlite3.Row) -> ArticleFetchResult:
+    canonical_url = str(row["canonical_url"] or row["original_url"] or "")
+    status = str(row["fetch_status"] or "fetched")
+    metadata = {
+        "article_id": str(row["article_id"]),
+        "gmail_message_id": row["message_id"],
+        "sender_email": row["sender_email"],
+        "link_text": row["link_text"],
+    }
+    payload = NormalizedPayload(
+        source_type=str(row["discovery_source_type"] or "stored_article"),
+        source_name=str(row["sender_email"] or row["publisher"] or row["discovery_source_name"] or "stored article"),
+        original_url=canonical_url,
+        published_at=row["published_at"],
+        metadata=metadata,
+    )
+    return ArticleFetchResult(
+        payload=payload,
+        original_url=str(row["original_url"] or canonical_url),
+        final_url=canonical_url,
+        canonical_url=canonical_url,
+        title=str(row["title"] or canonical_url or "Stored article"),
+        text=str(row["cleaned_text"] or ""),
+        excerpt=str(row["summary"] or ""),
+        domain=row["domain"],
+        status=status,
+        error=None if status == "fetched" else row["quality_flag"],
+        keywords=tuple(_decode_keywords(row["keywords"])),
+        content_type=str(row["content_type"] or "article"),
+        relevance_score=_nullable_float(row["relevance_score"]),
+        tier=str(row["tier"] or "main"),
+        section=str(row["section"] or "Fetched Articles"),
+        editor_summary=str(row["editor_summary"] or row["summary"] or ""),
+        enrichment_source="stored",
+    )
+
+
 def _nullable_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -878,6 +925,42 @@ def _insert_discovery(
         ),
     )
     return discovery_id
+
+
+def _insert_agent_decisions(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    digest_id: str,
+    inference_run_id: str | None,
+    decisions: list[AgentDecision],
+    now: str,
+) -> None:
+    for decision in decisions:
+        connection.execute(
+            """
+            INSERT INTO agent_decisions (
+              id, run_id, digest_id, inference_run_id, agent, target, decision,
+              action, confidence, reason, model_name, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                run_id,
+                digest_id,
+                inference_run_id,
+                decision.agent,
+                decision.target,
+                decision.decision,
+                decision.action,
+                decision.confidence,
+                decision.reason,
+                decision.model_name,
+                json.dumps(decision.metadata),
+                now,
+            ),
+        )
 
 
 def _insert_discovery_for_result(
@@ -1124,6 +1207,73 @@ def get_latest_run_for_digest(digest_id: str) -> dict[str, Any] | None:
     return row_to_dict(row)
 
 
+def list_article_results_for_run(run_id: str) -> list[ArticleFetchResult]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+              di.relevance_score, di.tier, di.section, di.editor_summary,
+              a.id AS article_id,
+              a.canonical_url, a.original_url, a.domain, a.publisher, a.published_at,
+              a.title, a.cleaned_text, a.summary, a.keywords, a.content_type,
+              a.fetch_status, a.quality_flag,
+              ad.discovery_source_type, ad.discovery_source_name, ad.sender_email,
+              ad.message_id, ad.link_text
+            FROM digest_items di
+            JOIN articles a ON a.id = di.article_id
+            LEFT JOIN article_discoveries ad ON ad.id = di.discovery_id
+            WHERE di.run_id = ? AND COALESCE(di.tier, '') != 'source'
+            ORDER BY
+              CASE di.tier
+                WHEN 'lead' THEN 0
+                WHEN 'main' THEN 1
+                WHEN 'lower_confidence' THEN 2
+                WHEN 'dropped' THEN 4
+                ELSE 3
+              END,
+              COALESCE(di.relevance_score, 0) DESC
+            """,
+            (run_id,),
+        ).fetchall()
+    return [_digest_item_row_to_fetch_result(row) for row in rows]
+
+
+def list_newsletter_payloads_for_run(run_id: str) -> list[NormalizedPayload]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+              a.original_url, a.publisher, a.published_at, a.title, a.cleaned_text, a.summary,
+              ad.discovery_source_type, ad.discovery_source_name, ad.sender_email, ad.message_id, ad.link_text
+            FROM digest_items di
+            JOIN articles a ON a.id = di.article_id
+            LEFT JOIN article_discoveries ad ON ad.id = di.discovery_id
+            WHERE di.run_id = ? AND COALESCE(di.tier, '') = 'source'
+            ORDER BY a.published_at DESC
+            """,
+            (run_id,),
+        ).fetchall()
+
+    payloads: list[NormalizedPayload] = []
+    for row in rows:
+        payloads.append(
+            NormalizedPayload(
+                source_type=str(row["discovery_source_type"] or "gmail"),
+                source_name=str(row["sender_email"] or row["publisher"] or row["discovery_source_name"] or "Gmail"),
+                raw_text=str(row["cleaned_text"] or row["summary"] or ""),
+                original_url=row["original_url"],
+                published_at=row["published_at"],
+                metadata={
+                    "gmail_message_id": row["message_id"],
+                    "sender_email": row["sender_email"],
+                    "subject": row["title"],
+                    "link_text": row["link_text"],
+                },
+            )
+        )
+    return payloads
+
+
 def list_digest_overviews(*, include_archived: bool = False) -> list[dict[str, Any]]:
     with connect() as connection:
         where_clause = "" if include_archived else "WHERE COALESCE(d.status, 'active') != 'archived'"
@@ -1333,6 +1483,65 @@ def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:
         "recent": recent,
         "ttft_available": any(row.get("ttft_ms") is not None for row in records),
     }
+
+
+def agent_decisions_summary(*, limit: int = 500) -> dict[str, Any]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT agent, decision, action, model_name, created_at
+            FROM agent_decisions
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    agent_counts: dict[str, int] = {}
+    action_counts: dict[str, int] = {}
+    decision_counts: dict[str, int] = {}
+    latest_created_at: str | None = None
+    latest_model_name: str | None = None
+    for row in rows:
+        agent = str(row["agent"] or "unknown")
+        action = str(row["action"] or "none")
+        decision = str(row["decision"] or "unknown")
+        agent_counts[agent] = agent_counts.get(agent, 0) + 1
+        action_counts[action] = action_counts.get(action, 0) + 1
+        decision_counts[decision] = decision_counts.get(decision, 0) + 1
+        latest_created_at = latest_created_at or row["created_at"]
+        latest_model_name = latest_model_name or row["model_name"]
+
+    return {
+        "record_count": len(rows),
+        "latest_created_at": latest_created_at,
+        "latest_model_name": latest_model_name,
+        "agent_counts": agent_counts,
+        "action_counts": action_counts,
+        "decision_counts": decision_counts,
+    }
+
+
+def add_agent_decisions_for_run(
+    *,
+    run_id: str,
+    digest_id: str,
+    inference_run_id: str | None,
+    decisions: list[AgentDecision],
+) -> int:
+    if not decisions:
+        return 0
+    now = utc_now()
+    with connect() as connection:
+        _insert_agent_decisions(
+            connection,
+            run_id=run_id,
+            digest_id=digest_id,
+            inference_run_id=inference_run_id,
+            decisions=decisions,
+            now=now,
+        )
+    return len(decisions)
 
 
 def create_model_enrichment_job(*, model_name: str, limit_count: int, include_cached: bool = False) -> dict[str, Any]:

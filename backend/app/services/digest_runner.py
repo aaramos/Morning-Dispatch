@@ -3,7 +3,9 @@ from __future__ import annotations
 from time import monotonic
 from typing import Any
 
+from backend.agents.critic import apply_critic_repairs
 from backend.agents.digestor.gmail_mcp_client import fetch_newsletters
+from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.librarian.articles import fetch_articles_for_payloads
 from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
@@ -57,6 +59,10 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
         inference_run_id=inference_run_id,
         metrics_mode="batch" if trigger == "scheduled" else "single",
     )
+    editorial_decisions = []
+    critic_decisions = []
+    article_results, editorial_decisions = await apply_editorial_decisions(digest, article_results)
+    article_results, critic_decisions = await apply_critic_repairs(digest, payloads, article_results)
     if settings.librarian_use_model:
         model_cache_write_count = database.cache_model_enrichments(article_results, model_name=settings.librarian_model)
 
@@ -72,6 +78,7 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
         model_cache_miss_count=model_cache_miss_count,
         model_cache_write_count=model_cache_write_count,
         inference_run_id=inference_run_id,
+        agent_decisions=editorial_decisions + critic_decisions,
     )
 
 

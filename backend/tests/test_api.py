@@ -134,6 +134,17 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert isinstance(status_payload["model_jobs"], list)
         assert status_payload["digests"][0]["name"] == "AI Morning Brief"
 
+        verification = client.post(f"/api/admin/digests/{digest['id']}/verification-run")
+        assert verification.status_code == 200
+        verification_payload = verification.json()
+        assert verification_payload["status"] == "completed"
+        assert verification_payload["published"] is False
+        assert verification_payload["reviewed_article_count"] == 1
+        assert verification_payload["decision_count"] >= 1
+
+        verified_status = client.get("/api/admin/status").json()
+        assert verified_status["agent_decisions"]["record_count"] >= verification_payload["stored_decision_count"]
+
 
 def test_archived_digests_are_hidden_from_default_lists(monkeypatch, tmp_path):
     runtime = tmp_path / "runtime"

@@ -161,6 +161,22 @@ CREATE TABLE IF NOT EXISTS digest_items (
   created_at      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_decisions (
+  id               TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES digest_runs(id),
+  digest_id        TEXT NOT NULL REFERENCES digests(id),
+  inference_run_id TEXT,
+  agent            TEXT NOT NULL,
+  target           TEXT NOT NULL,
+  decision         TEXT NOT NULL,
+  action           TEXT DEFAULT 'none',
+  confidence       REAL,
+  reason           TEXT,
+  model_name       TEXT,
+  metadata         TEXT NOT NULL DEFAULT '{}',
+  created_at       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS digest_issues (
   id           TEXT PRIMARY KEY,
   run_id       TEXT NOT NULL REFERENCES digest_runs(id),
@@ -205,6 +221,8 @@ CREATE INDEX IF NOT EXISTS idx_inference_metrics_model_ts ON inference_metrics(m
 CREATE INDEX IF NOT EXISTS idx_model_enrichment_jobs_created_at ON model_enrichment_jobs(created_at);
 CREATE INDEX IF NOT EXISTS idx_digest_issues_digest_id ON digest_issues(digest_id);
 CREATE INDEX IF NOT EXISTS idx_digest_items_digest_id ON digest_items(digest_id);
+CREATE INDEX IF NOT EXISTS idx_agent_decisions_run_id ON agent_decisions(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_decisions_digest_id ON agent_decisions(digest_id);
 CREATE INDEX IF NOT EXISTS idx_discoveries_article_id ON article_discoveries(article_id);
 CREATE INDEX IF NOT EXISTS idx_model_enrichment_cache_url ON model_enrichment_cache(canonical_url);
 CREATE INDEX IF NOT EXISTS idx_model_enrichment_cache_model ON model_enrichment_cache(model_name);
