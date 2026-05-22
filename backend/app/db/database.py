@@ -1034,6 +1034,12 @@ def _render_article_card(result: ArticleFetchResult | None, *, variant: str = "c
     url = result.final_url or result.original_url
     domain = result.domain or _domain(url) or "article"
     source = result.payload.source_name or "Gmail"
+    published = _format_article_date(result.payload.published_at)
+    meta_parts = [domain]
+    if published:
+        meta_parts.append(published)
+    meta_parts.append(f"via {source}")
+    meta = " · ".join(escape(part) for part in meta_parts)
     score = f'<span class="score">{int((result.relevance_score or 0) * 100)}%</span>' if result.relevance_score else ""
     keywords = ", ".join(result.keywords[:5])
     keyword_html = f'<div class="keywords">{escape(keywords)}</div>' if keywords else ""
@@ -1042,7 +1048,7 @@ def _render_article_card(result: ArticleFetchResult | None, *, variant: str = "c
     title = _clean_newsletter_text(result.title) or result.title
     return f"""
       <article class="{card_class}">
-        <div class="meta">{escape(domain)} · via {escape(source)}{score}</div>
+        <div class="meta">{meta}{score}</div>
         <h3><a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">{escape(title)}</a></h3>
         <p>{escape(summary)}</p>
         {keyword_html}
@@ -1054,10 +1060,16 @@ def _render_unresolved_link(result: ArticleFetchResult) -> str:
     url = result.final_url or result.original_url
     domain = result.domain or _domain(url) or "link"
     reason = result.error or result.status
+    published = _format_article_date(result.payload.published_at)
+    meta_parts = [domain]
+    if published:
+        meta_parts.append(published)
+    meta_parts.extend([result.status, reason])
+    meta = " · ".join(escape(part) for part in meta_parts)
     return f"""
       <article class="link-item">
         <a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">{escape(result.title)}</a>
-        <span class="meta">{escape(domain)} · {escape(result.status)} · {escape(reason)}</span>
+        <span class="meta">{meta}</span>
       </article>
     """
 
@@ -1162,6 +1174,32 @@ def _format_issue_date(value: str | None) -> str:
         return text
     if " " in text:
         return text.split(" ", 1)[0]
+    return text
+
+
+def _format_article_date(value: str | None) -> str:
+    if not value:
+        return ""
+    text = value.strip()
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            return f"{parsed.month:02d}/{parsed.day:02d}/{parsed.year:04d}"
+        except ValueError:
+            pass
+    for pattern in ("%b %d, %Y", "%B %d, %Y"):
+        try:
+            parsed = datetime.strptime(text, pattern)
+            return f"{parsed.month:02d}/{parsed.day:02d}/{parsed.year:04d}"
+        except ValueError:
+            pass
+    if "T" in text:
+        date_part = text.split("T", 1)[0]
+        try:
+            parsed = datetime.strptime(date_part, "%Y-%m-%d")
+            return f"{parsed.month:02d}/{parsed.day:02d}/{parsed.year:04d}"
+        except ValueError:
+            return date_part
     return text
 
 

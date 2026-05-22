@@ -111,6 +111,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "jwt_token" not in html.text
         assert "media.example.com" not in html.text
         assert "2026-05-20T12:00:00+00:00" not in html.text
+        assert "05/20/2026" in html.text
         assert "https://example.com/model-release" in html.text
         assert "Fetched Articles" in html.text
         assert "overflow-x: hidden" in html.text
@@ -120,6 +121,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert brief.status_code == 200
         assert "Gmail Issue" in brief.text
         assert "https://example.com/model-release" in brief.text
+        assert "05/20/2026" in brief.text
         assert "overflow-x: hidden" in brief.text
 
         admin_status = client.get("/api/admin/status")
