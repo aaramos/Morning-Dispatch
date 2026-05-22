@@ -355,6 +355,70 @@ iframe {
   color: #1d5d29;
 }
 
+.admin-health {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.45fr) minmax(0, 1fr);
+  gap: 14px;
+  margin-bottom: 16px;
+  padding: 14px;
+  border: 1px solid #d8ded8;
+  border-radius: 8px;
+  background: #f7f9f6;
+}
+
+.admin-health.needs-attention {
+  border-color: #e4c78d;
+  background: #fff8e8;
+}
+
+.admin-health span,
+.health-check strong {
+  display: block;
+  color: #66756f;
+  font-size: 0.72rem;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.admin-health strong {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.admin-health small,
+.health-check span {
+  display: block;
+  margin-top: 5px;
+  color: #66756f;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.health-checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.health-check {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #e2e7e1;
+  border-radius: 8px;
+  background: #fffdf8;
+}
+
+.health-check.problem {
+  border-color: #dfb9b9;
+  background: #fff0f0;
+}
+
+.health-check.warning {
+  border-color: #ead7aa;
+  background: #fff8e8;
+}
+
 .model-picker {
   display: grid;
   grid-template-columns: minmax(260px, 1.2fr) minmax(360px, 1.6fr) auto;
@@ -726,6 +790,7 @@ iframe {
   }
 
   .metric-strip,
+  .admin-health,
   .model-picker,
   .compact-status-list,
   .job-form,

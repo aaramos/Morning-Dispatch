@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS inference_metrics (
     'empty_output',
     'truncated',
     'rate_limited',
+    'model_capacity',
     'http_error',
     'model_error'
   )),

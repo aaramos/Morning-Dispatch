@@ -10,6 +10,8 @@ import httpx
 
 from backend.app.core.config import Settings
 
+MODEL_CAPACITY_STATUS = "model_capacity"
+
 
 class ModelClientError(RuntimeError):
     """Raised when the local model backend cannot complete a request."""
@@ -151,7 +153,7 @@ class ModelClient:
             except httpx.HTTPStatusError as exc:
                 status = _status_for_http(exc.response.status_code)
                 raise ModelClientError(
-                    str(exc),
+                    _http_error_message(exc),
                     status=status,
                     queue_wait_ms=queue_wait_ms,
                     total_ms=_elapsed_ms(submitted_at),
@@ -231,9 +233,37 @@ def _elapsed_ms(started_at: float) -> int:
 
 
 def _status_for_http(status_code: int) -> str:
+    if status_code == 507:
+        return MODEL_CAPACITY_STATUS
     if status_code == 429:
         return "rate_limited"
     return "http_error"
+
+
+def _http_error_message(exc: httpx.HTTPStatusError) -> str:
+    status_code = exc.response.status_code
+    detail = _response_detail(exc.response)
+    if status_code == 507:
+        message = "oMLX reported insufficient model capacity"
+        return f"{message}: {detail}" if detail else message
+    return f"{exc}: {detail}" if detail else str(exc)
+
+
+def _response_detail(response: httpx.Response) -> str:
+    text = response.text.strip()
+    if not text:
+        return ""
+    try:
+        payload = response.json()
+    except ValueError:
+        return text[:500]
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("error") or payload.get("message")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("detail")
+        if detail:
+            return str(detail)[:500]
+    return text[:500]
 
 
 def _usage_int(usage: object, key: str) -> int | None:

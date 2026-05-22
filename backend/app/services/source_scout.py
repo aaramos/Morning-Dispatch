@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 MAX_SAMPLED_SOURCES = 18
 MAX_DISCOVERY_QUERIES = 8
+REDDIT_SAMPLE_ATTEMPTS = 2
+RETRY_DELAY_SECONDS = 0.4
 
 
 async def run_source_scout(digest_id: str, *, live_sample: bool = True) -> dict[str, Any] | None:
@@ -33,7 +35,12 @@ async def run_source_scout(digest_id: str, *, live_sample: bool = True) -> dict[
 
     if live_sample:
         try:
-            observations, discovered = await _sample_reddit(str(digest.get("interest") or ""), current_sources)
+            observations, discovered, sample_errors = await _sample_reddit(
+                str(digest.get("interest") or ""),
+                current_sources,
+            )
+            if sample_errors:
+                live_error = "; ".join(sample_errors[:6])
         except Exception as exc:  # pragma: no cover - defensive, individual calls are already guarded.
             live_error = str(exc)
             logger.warning("Source Scout live Reddit sample failed: %s", exc)
@@ -61,7 +68,7 @@ async def run_source_scout(digest_id: str, *, live_sample: bool = True) -> dict[
 async def _sample_reddit(
     digest_interest: str,
     current_sources: list[dict[str, Any]],
-) -> tuple[dict[str, scout_agent.SourceObservation], dict[str, int]]:
+) -> tuple[dict[str, scout_agent.SourceObservation], dict[str, int], list[str]]:
     source_names = _sources_to_sample(current_sources)
     browse_tasks = [_sample_source(source, digest_interest) for source in source_names]
     search_tasks = [_discover_sources(query) for query in scout_agent.discovery_queries()[:MAX_DISCOVERY_QUERIES]]
@@ -71,9 +78,12 @@ async def _sample_reddit(
     )
     observations = {result.subreddit.lower(): result for result in browse_results}
     discovered: Counter[str] = Counter()
-    for names in search_results:
+    errors = [f"r/{result.subreddit}: {result.error}" for result in browse_results if result.error]
+    for names, error in search_results:
         discovered.update(names)
-    return observations, dict(discovered)
+        if error:
+            errors.append(error)
+    return observations, dict(discovered), errors
 
 
 def _sources_to_sample(current_sources: list[dict[str, Any]]) -> list[str]:
@@ -102,20 +112,41 @@ def _sources_to_sample(current_sources: list[dict[str, Any]]) -> list[str]:
 
 
 async def _sample_source(subreddit: str, digest_interest: str) -> scout_agent.SourceObservation:
-    try:
-        posts = await reddit_mcp_client.browse_subreddit(subreddit, sort="top", time="week", limit=15)
-    except Exception as exc:  # pragma: no cover - reddit_mcp_client returns empty on recoverable errors.
-        return scout_agent.SourceObservation(subreddit=subreddit, error=str(exc))
-    if not posts:
-        return scout_agent.SourceObservation(subreddit=subreddit, error="No posts returned from Reddit MCP.")
-    return scout_agent.observation_from_posts(subreddit, posts, digest_interest=digest_interest)
+    last_error = "No posts returned from Reddit MCP."
+    received_empty_response = False
+    for attempt in range(REDDIT_SAMPLE_ATTEMPTS):
+        try:
+            posts = await reddit_mcp_client.browse_subreddit(subreddit, sort="top", time="week", limit=15)
+            received_empty_response = True
+        except Exception as exc:  # pragma: no cover - reddit_mcp_client returns empty on recoverable errors.
+            last_error = str(exc)
+            posts = []
+        if posts:
+            return scout_agent.observation_from_posts(subreddit, posts, digest_interest=digest_interest)
+        if attempt + 1 < REDDIT_SAMPLE_ATTEMPTS:
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
+    if received_empty_response:
+        return scout_agent.SourceObservation(subreddit=subreddit)
+    return scout_agent.SourceObservation(subreddit=subreddit, error=last_error)
 
 
-async def _discover_sources(query: str) -> list[str]:
-    posts = await reddit_mcp_client.search_reddit(query, sort="relevance", time="week", limit=25)
+async def _discover_sources(query: str) -> tuple[list[str], str | None]:
+    last_error: str | None = None
+    posts: list[dict[str, Any]] = []
+    for attempt in range(REDDIT_SAMPLE_ATTEMPTS):
+        try:
+            posts = await reddit_mcp_client.search_reddit(query, sort="relevance", time="week", limit=25)
+            last_error = None
+            break
+        except Exception as exc:  # pragma: no cover - reddit_mcp_client returns empty on recoverable errors.
+            last_error = str(exc)
+            if attempt + 1 < REDDIT_SAMPLE_ATTEMPTS:
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
     names = []
     for post in posts:
         subreddit = str(post.get("subreddit") or "").strip()
         if subreddit:
             names.append(subreddit)
-    return names
+    if last_error:
+        return names, f"search '{query}': {last_error}"
+    return names, None

@@ -10,7 +10,7 @@ from typing import Iterable
 from urllib.parse import urlparse
 
 from backend.agents.librarian.articles import ArticleFetchResult
-from backend.agents.model import ModelClient, ModelClientError
+from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClient, ModelClientError
 from backend.app.core.config import get_settings
 from backend.app.db import database
 
@@ -99,6 +99,7 @@ async def enrich_article_with_model(
             )
     except ModelClientError as exc:
         logger.info("Librarian model enrichment failed for %s: %s", result.original_url, exc)
+        fallback_source = "model_capacity_fallback" if exc.status == MODEL_CAPACITY_STATUS else "deterministic"
         _record_model_metric(
             result=deterministic,
             metrics_context=metrics_context,
@@ -117,7 +118,7 @@ async def enrich_article_with_model(
             summary_word_count=_word_count(deterministic.editor_summary or deterministic.excerpt),
             error_detail=str(exc),
         )
-        return deterministic
+        return replace(deterministic, enrichment_source=fallback_source)
 
     enriched = _apply_model_payload(deterministic, model_payload)
     _record_model_metric(

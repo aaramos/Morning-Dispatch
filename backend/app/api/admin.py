@@ -82,6 +82,13 @@ async def admin_status(request: Request) -> dict[str, Any]:
     settings = _settings()
     catalog = await model_catalog.catalog_status(settings)
     mcp = await mcp_status.status(settings)
+    gmail = gmail_status(request)
+    scheduler_status = scheduler.status()
+    digests = [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()]
+    model_cache = database.model_cache_summary()
+    inference_metrics = database.inference_metrics_summary()
+    agent_decisions = database.agent_decisions_summary()
+    source_scout = database.source_scout_summary()
     return {
         "system": {
             "environment": settings.environment,
@@ -91,7 +98,21 @@ async def admin_status(request: Request) -> dict[str, Any]:
             "public_base_url": settings.public_base_url,
         },
         "delivery": _delivery_status(request, settings),
-        "gmail": gmail_status(request),
+        "health": _admin_health(
+            gmail=gmail,
+            model={
+                "enabled": settings.librarian_use_model,
+                "model": settings.librarian_model,
+                "api_key_configured": bool(settings.model_api_key),
+                "catalog": catalog,
+            },
+            mcp=mcp,
+            scheduler_status=scheduler_status,
+            digests=digests,
+            inference_metrics=inference_metrics,
+            source_scout=source_scout,
+        ),
+        "gmail": gmail,
         "model": {
             "enabled": settings.librarian_use_model,
             "model": settings.librarian_model,
@@ -103,13 +124,112 @@ async def admin_status(request: Request) -> dict[str, Any]:
             "catalog": catalog,
         },
         "mcp": mcp,
-        "scheduler": scheduler.status(),
-        "digests": [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()],
-        "model_cache": database.model_cache_summary(),
-        "inference_metrics": database.inference_metrics_summary(),
-        "agent_decisions": database.agent_decisions_summary(),
-        "source_scout": database.source_scout_summary(),
+        "scheduler": scheduler_status,
+        "digests": digests,
+        "model_cache": model_cache,
+        "inference_metrics": inference_metrics,
+        "agent_decisions": agent_decisions,
+        "source_scout": source_scout,
         "model_jobs": database.list_model_enrichment_jobs(limit=8),
+    }
+
+
+def _admin_health(
+    *,
+    gmail: dict[str, Any],
+    model: dict[str, Any],
+    mcp: dict[str, Any],
+    scheduler_status: dict[str, Any],
+    digests: list[dict[str, Any]],
+    inference_metrics: dict[str, Any],
+    source_scout: dict[str, Any],
+) -> dict[str, Any]:
+    checks: list[dict[str, str]] = []
+
+    def add(name: str, status: str, message: str) -> None:
+        checks.append({"name": name, "status": status, "message": message})
+
+    add(
+        "Gmail",
+        "ok" if gmail.get("configured") and gmail.get("connected") else "problem",
+        "Connected and ready to read newsletters."
+        if gmail.get("configured") and gmail.get("connected")
+        else "Gmail login is not complete.",
+    )
+    add(
+        "Reddit",
+        "ok" if (mcp.get("reddit") or {}).get("connected") else "warning",
+        "Reddit MCP is connected."
+        if (mcp.get("reddit") or {}).get("connected")
+        else "Reddit MCP is not connected; community signals may be skipped.",
+    )
+
+    model_catalog = model.get("catalog") if isinstance(model.get("catalog"), dict) else {}
+    model_ready = bool(model.get("enabled") and model.get("api_key_configured") and model_catalog.get("available"))
+    add(
+        "Local model",
+        "ok" if model_ready else "problem",
+        f"Using {model.get('model')}."
+        if model_ready
+        else "The local model is not fully available for AI enrichment.",
+    )
+
+    scheduler_ready = bool(scheduler_status.get("enabled") and scheduler_status.get("running"))
+    add(
+        "Scheduler",
+        "ok" if scheduler_ready else "warning",
+        "Morning run is scheduled."
+        if scheduler_ready
+        else "Scheduler is not running; manual runs still work.",
+    )
+
+    latest_digest = digests[0] if digests else {}
+    latest_status = latest_digest.get("latest_run_status")
+    latest_failures = int(latest_digest.get("latest_failed_count") or 0)
+    latest_fallbacks = int(latest_digest.get("latest_fallback_count") or 0)
+    if not latest_digest:
+        add("Latest run", "warning", "No digest has run yet.")
+    elif latest_status != "completed":
+        add("Latest run", "problem", "The latest digest did not complete.")
+    elif latest_failures or latest_fallbacks:
+        add(
+            "Latest run",
+            "warning",
+            f"Completed with {latest_failures} fetch failure(s) and {latest_fallbacks} fallback item(s).",
+        )
+    else:
+        add("Latest run", "ok", "Latest digest completed cleanly.")
+
+    recent_capacity_errors = sum(
+        1 for row in inference_metrics.get("recent", []) if row.get("status") == "model_capacity"
+    )
+    if recent_capacity_errors:
+        add(
+            "Model capacity",
+            "problem",
+            f"Recent oMLX capacity errors: {recent_capacity_errors}. Reduce model size or cache pressure before sleeping.",
+        )
+    else:
+        add("Model capacity", "ok", "No recent model-capacity errors recorded.")
+
+    scout_run = source_scout.get("latest_run") if isinstance(source_scout.get("latest_run"), dict) else None
+    if scout_run and scout_run.get("status") == "partial":
+        add("Source Scout", "warning", "Last Reddit source review was partial; some communities were kept conservative.")
+    elif scout_run and scout_run.get("status") == "completed":
+        add("Source Scout", "ok", "Reddit source review completed.")
+    else:
+        add("Source Scout", "warning", "Reddit source review has not completed yet.")
+
+    problem_count = sum(1 for check in checks if check["status"] == "problem")
+    warning_count = sum(1 for check in checks if check["status"] == "warning")
+    safe_for_overnight = problem_count == 0
+    return {
+        "status": "ready" if safe_for_overnight else "needs_attention",
+        "safe_for_overnight": safe_for_overnight,
+        "headline": "Ready for overnight run" if safe_for_overnight else "Needs attention before overnight run",
+        "problem_count": problem_count,
+        "warning_count": warning_count,
+        "checks": checks,
     }
 
 

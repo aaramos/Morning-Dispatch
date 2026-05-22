@@ -6,6 +6,7 @@ from time import monotonic
 from typing import Any
 
 from backend.agents.agentic import AgentDecision
+from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.critic import apply_critic_repairs
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult
@@ -45,13 +46,15 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
         after_editorial, editorial_decisions = await apply_editorial_decisions(digest, source_articles)
         after_critic, critic_decisions = await apply_critic_repairs(digest, source_payloads, after_editorial)
         decisions = editorial_decisions + critic_decisions
+    after_quality, quality_decisions = apply_brief_quality_checks(after_critic)
+    decisions = decisions + quality_decisions
     published_run = None
     published_issue = None
     if publish:
         published_run = database.create_ingested_run(
             digest=digest,
             payloads=source_payloads,
-            article_results=after_critic,
+            article_results=after_quality,
             lookback_hours=max(24, int(latest_run.get("lookback_days") or 1) * 24),
             configured_source_count=len(digest.get("sources", [])),
             trigger="controlled_verification",
@@ -82,9 +85,9 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
         "published_issue_id": published_issue.get("id") if published_issue else None,
         "reviewed_article_count": len(source_articles),
         "active_before_count": _active_count(source_articles),
-        "active_after_count": _active_count(after_critic),
-        "dropped_count": sum(1 for result in after_critic if result.tier == "dropped"),
-        "lead_title": _lead_title(after_critic),
+        "active_after_count": _active_count(after_quality),
+        "dropped_count": sum(1 for result in after_quality if result.tier == "dropped"),
+        "lead_title": _lead_title(after_quality),
         "decision_count": len(decisions),
         "stored_decision_count": stored_count,
         "reused_verified_decisions": bool(reused_decision_records),

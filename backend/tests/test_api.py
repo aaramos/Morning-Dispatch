@@ -131,6 +131,9 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert status_payload["delivery"]["latest_brief_url"].endswith("/brief")
         assert status_payload["gmail"]["network"] == "loopback-or-tailscale"
         assert status_payload["scheduler"]["enabled"] is False
+        assert status_payload["health"]["safe_for_overnight"] is False
+        assert status_payload["health"]["problem_count"] >= 1
+        assert any(check["name"] == "Gmail" for check in status_payload["health"]["checks"])
         assert status_payload["model_cache"]["record_count"] >= 0
         assert status_payload["inference_metrics"]["record_count"] >= 0
         assert isinstance(status_payload["model_jobs"], list)

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
+
 from fastapi.testclient import TestClient
 
 from backend.agents import source_scout
 from backend.app.main import create_app
+from backend.app.services import source_scout as source_scout_service
 
 
 def test_source_scout_promotes_and_retires_sources() -> None:
@@ -120,3 +124,73 @@ def test_admin_source_scout_seeds_sources(monkeypatch, tmp_path) -> None:
         listed = client.get("/api/admin/source-scout")
         assert listed.status_code == 200
         assert listed.json()["sources"]
+
+
+def test_source_scout_retries_reddit_sampling(monkeypatch) -> None:
+    browse_calls = 0
+    search_calls = 0
+
+    async def fake_browse_subreddit(*_args, **_kwargs):
+        nonlocal browse_calls
+        browse_calls += 1
+        if browse_calls == 1:
+            raise RuntimeError("temporary browse failure")
+        return [
+            {
+                "title": "Local AI agent workflow benchmark",
+                "content": "Developers compare local LLM agents, MCP tools, and coding workflows.",
+                "created_utc": datetime.now(UTC).timestamp(),
+                "num_comments": 12,
+                "score": 55,
+            }
+        ]
+
+    async def fake_search_reddit(*_args, **_kwargs):
+        nonlocal search_calls
+        search_calls += 1
+        if search_calls == 1:
+            raise RuntimeError("temporary search failure")
+        return [{"subreddit": "LocalLLaMA"}, {"subreddit": "AIAgents"}]
+
+    monkeypatch.setattr(source_scout_service, "RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(source_scout_service.reddit_mcp_client, "browse_subreddit", fake_browse_subreddit)
+    monkeypatch.setattr(source_scout_service.reddit_mcp_client, "search_reddit", fake_search_reddit)
+    monkeypatch.setattr(source_scout_service.scout_agent, "discovery_queries", lambda: ("agentic AI",))
+
+    observations, discovered, errors = asyncio.run(
+        source_scout_service._sample_reddit(
+            "Local AI infrastructure and agentic coding workflows",
+            [{"subreddit": "LocalLLaMA", "state": "active", "score": 0.8}],
+        )
+    )
+
+    assert browse_calls == 2
+    assert search_calls == 2
+    assert observations["localllama"].error is None
+    assert observations["localllama"].sampled_posts == 1
+    assert discovered["AIAgents"] == 1
+    assert errors == []
+
+
+def test_source_scout_treats_empty_subreddit_as_stale_signal(monkeypatch) -> None:
+    async def fake_browse_subreddit(*_args, **_kwargs):
+        return []
+
+    async def fake_search_reddit(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(source_scout_service, "RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(source_scout_service.scout_agent, "discovery_queries", lambda: ())
+    monkeypatch.setattr(source_scout_service.reddit_mcp_client, "browse_subreddit", fake_browse_subreddit)
+    monkeypatch.setattr(source_scout_service.reddit_mcp_client, "search_reddit", fake_search_reddit)
+
+    observations, _discovered, errors = asyncio.run(
+        source_scout_service._sample_reddit(
+            "Local AI infrastructure and agentic coding workflows",
+            [{"subreddit": "LMStudio", "state": "active", "score": 0.8}],
+        )
+    )
+
+    assert observations["lmstudio"].sampled_posts == 0
+    assert observations["lmstudio"].error is None
+    assert errors == []

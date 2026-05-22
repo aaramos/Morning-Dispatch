@@ -11,7 +11,7 @@ from backend.agents.librarian.enrichment import (
     enrich_articles,
     refine_ranked_articles_with_model,
 )
-from backend.agents.model import ModelClientError, ModelResponse
+from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClientError, ModelResponse
 from backend.app.db import database
 
 
@@ -255,3 +255,43 @@ def test_librarian_records_inference_metric(monkeypatch, tmp_path):
     assert summary["models"][0]["quantization"] == "Q6"
     assert summary["models"][0]["p95_total_ms"] == 2438
     assert summary["models"][0]["avg_queue_wait_ms"] == 12.0
+
+
+def test_librarian_marks_model_capacity_fallback(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    database.init_database()
+
+    class Config:
+        model = "gemma-4-26b-a4b-it-bf16"
+        base_url = "http://127.0.0.1:1234/v1"
+
+    class CapacityModelClient:
+        config = Config()
+
+        async def complete_json_with_metrics(self, **_kwargs):
+            raise ModelClientError(
+                "oMLX reported insufficient model capacity",
+                status=MODEL_CAPACITY_STATUS,
+                total_ms=19,
+                prompt_tokens=550,
+            )
+
+    enriched = asyncio.run(
+        enrich_article_with_model(
+            article_result(),
+            model_client=CapacityModelClient(),
+            metrics_context={"run_id": "run-507", "article_id": "article-507", "mode": "batch"},
+        )
+    )
+    summary = database.inference_metrics_summary()
+
+    assert enriched.enrichment_source == "model_capacity_fallback"
+    assert summary["status_counts"][MODEL_CAPACITY_STATUS] == 1
+    assert summary["models"][0]["failure_count"] == 1

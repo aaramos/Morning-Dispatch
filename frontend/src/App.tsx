@@ -77,6 +77,27 @@ type McpStatus = {
     fetch_tool_present: boolean;
     error: string | null;
   };
+  reddit: {
+    connected: boolean;
+    server_state: string;
+    tools_count: number;
+    browse_tool_present: boolean;
+    search_tool_present: boolean;
+    error: string | null;
+  };
+};
+
+type AdminHealthStatus = {
+  status: "ready" | "needs_attention";
+  safe_for_overnight: boolean;
+  headline: string;
+  problem_count: number;
+  warning_count: number;
+  checks: Array<{
+    name: string;
+    status: "ok" | "warning" | "problem";
+    message: string;
+  }>;
 };
 
 type InferenceModelSummary = {
@@ -264,6 +285,7 @@ type AdminPipelineStatus = {
     latest_brief_path: string;
     latest_brief_url: string;
   };
+  health: AdminHealthStatus;
   gmail: GmailAdminStatus;
   mcp: McpStatus;
   model: {
@@ -749,6 +771,25 @@ function AdminApp() {
                 {pipeline?.scheduler.enabled ? "Scheduled" : "Manual"}
               </span>
             </div>
+            {pipeline?.health ? (
+              <div className={`admin-health ${pipeline.health.safe_for_overnight ? "ready" : "needs-attention"}`}>
+                <div>
+                  <span>{pipeline.health.safe_for_overnight ? "Safe" : "Attention"}</span>
+                  <strong>{pipeline.health.headline}</strong>
+                  <small>
+                    {pipeline.health.problem_count} problem(s) · {pipeline.health.warning_count} warning(s)
+                  </small>
+                </div>
+                <div className="health-checks">
+                  {pipeline.health.checks.map((check) => (
+                    <article className={`health-check ${check.status}`} key={check.name}>
+                      <strong>{check.name}</strong>
+                      <span>{check.message}</span>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <div className="metric-strip">
               <div>
                 <span>Scheduler</span>

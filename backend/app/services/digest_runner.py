@@ -4,6 +4,7 @@ from time import monotonic
 from typing import Any
 
 from backend.agents.critic import apply_critic_repairs
+from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.digestor.gmail_mcp_client import fetch_newsletters
 from backend.agents.digestor.reddit import fetch_reddit_threads
 from backend.agents.editorial_decisions import apply_editorial_decisions
@@ -70,6 +71,7 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
     critic_decisions = []
     article_results, editorial_decisions = await apply_editorial_decisions(digest, article_results)
     article_results, critic_decisions = await apply_critic_repairs(digest, payloads, article_results)
+    article_results, quality_decisions = apply_brief_quality_checks(article_results)
     if settings.librarian_use_model:
         model_cache_write_count = database.cache_model_enrichments(article_results, model_name=settings.librarian_model)
 
@@ -89,7 +91,7 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
         model_cache_miss_count=model_cache_miss_count,
         model_cache_write_count=model_cache_write_count,
         inference_run_id=inference_run_id,
-        agent_decisions=editorial_decisions + critic_decisions,
+        agent_decisions=editorial_decisions + critic_decisions + quality_decisions,
     )
 
 

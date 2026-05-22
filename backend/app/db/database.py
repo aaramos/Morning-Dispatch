@@ -24,6 +24,17 @@ from backend.app.core.config import ensure_runtime_dirs, get_settings
 from backend.app.db.schema import SCHEMA_SQL
 
 MODEL_ENRICHMENT_CACHE_VERSION = "librarian-v1"
+INFERENCE_METRIC_STATUSES = (
+    "success",
+    "timeout",
+    "parse_error",
+    "empty_output",
+    "truncated",
+    "rate_limited",
+    "model_capacity",
+    "http_error",
+    "model_error",
+)
 RAW_URL_RE = re.compile(r"https?://[^\s<>)\"']+", re.IGNORECASE)
 MARKDOWN_LINK_RE = re.compile(r"!?\[([^\]]{1,180})\]\((https?://[^)\s]+)[^)]*\)", re.IGNORECASE)
 IMAGE_PLACEHOLDER_RE = re.compile(r"(?:[-–—]{2,}\s*)?View image:\s*\([^)]*(?:\)|$)\s*(?:Caption:\s*)?", re.IGNORECASE)
@@ -63,6 +74,7 @@ def init_database() -> None:
     with connect() as connection:
         connection.executescript(SCHEMA_SQL)
         _ensure_digest_run_metric_columns(connection)
+        _ensure_inference_metric_status_values(connection)
         _ensure_default_profile(connection)
 
 
@@ -103,6 +115,83 @@ def _ensure_digest_run_metric_columns(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_digest_runs_inference_run_id ON digest_runs(inference_run_id)"
     )
+
+
+def _ensure_inference_metric_status_values(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inference_metrics'"
+    ).fetchone()
+    table_sql = str(row["sql"] if row else "")
+    if "model_capacity" in table_sql:
+        return
+
+    columns = [
+        "id",
+        "run_id",
+        "article_id",
+        "ts",
+        "model",
+        "model_tag",
+        "quantization",
+        "backend",
+        "mode",
+        "queue_wait_ms",
+        "ttft_ms",
+        "generation_ms",
+        "total_ms",
+        "prompt_tokens",
+        "completion_tokens",
+        "tokens_per_sec",
+        "classification_label",
+        "classification_confidence",
+        "schema_valid",
+        "summary_word_count",
+        "fallback_triggered",
+        "status",
+        "error_detail",
+    ]
+    column_list = ", ".join(columns)
+    status_values = ",\n    ".join(f"'{status}'" for status in INFERENCE_METRIC_STATUSES)
+    connection.execute("ALTER TABLE inference_metrics RENAME TO inference_metrics_legacy")
+    connection.execute(
+        f"""
+        CREATE TABLE inference_metrics (
+          id                    TEXT PRIMARY KEY,
+          run_id                TEXT NOT NULL,
+          article_id            TEXT NOT NULL,
+          ts                    TEXT NOT NULL,
+          model                 TEXT NOT NULL,
+          model_tag             TEXT,
+          quantization          TEXT,
+          backend               TEXT,
+          mode                  TEXT NOT NULL,
+          queue_wait_ms         INTEGER,
+          ttft_ms               INTEGER,
+          generation_ms         INTEGER,
+          total_ms              INTEGER NOT NULL,
+          prompt_tokens         INTEGER,
+          completion_tokens     INTEGER,
+          tokens_per_sec        REAL,
+          classification_label  TEXT,
+          classification_confidence REAL,
+          schema_valid          INTEGER NOT NULL DEFAULT 0,
+          summary_word_count    INTEGER,
+          fallback_triggered    INTEGER NOT NULL DEFAULT 0,
+          status                TEXT NOT NULL CHECK(status IN (
+            {status_values}
+          )),
+          error_detail          TEXT
+        ) STRICT
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO inference_metrics ({column_list})
+        SELECT {column_list}
+        FROM inference_metrics_legacy
+        """
+    )
+    connection.execute("DROP TABLE inference_metrics_legacy")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -689,12 +778,21 @@ def ingested_snapshot(
     link_count = sum(1 for payload in payloads if payload.source_type == "gmail_link")
     fetched_article_count = sum(1 for result in article_results if result.fetched)
     attempted_count = len(article_results)
+    model_capacity_count = sum(
+        1 for result in article_results if result.enrichment_source == "model_capacity_fallback"
+    )
     if configured_source_count == 0:
         return "No Gmail newsletter sources are configured for this digest."
     if not payloads:
         return f"No matching newsletters found across {configured_source_count} configured Gmail source(s)."
     if attempted_count:
-        return build_issue_snapshot(body_count, configured_source_count, article_results)
+        snapshot = build_issue_snapshot(body_count, configured_source_count, article_results)
+        if model_capacity_count:
+            snapshot += (
+                f" Model capacity limited AI enrichment for {model_capacity_count} article(s); "
+                "deterministic summaries were used for those items."
+            )
+        return snapshot
     return (
         f"Fetched {body_count} newsletter body/bodies and {link_count} linked item(s) "
         f"from {configured_source_count} configured Gmail source(s)."
@@ -1730,6 +1828,9 @@ INFERENCE_METRIC_COLUMNS = {
 
 def record_inference_metric(metric: dict[str, Any]) -> str:
     metric_id = str(metric.get("id") or new_id())
+    status = str(metric.get("status") or "model_error")
+    if status not in INFERENCE_METRIC_STATUSES:
+        status = "model_error"
     row = {
         "id": metric_id,
         "run_id": str(metric.get("run_id") or "manual"),
@@ -1752,7 +1853,7 @@ def record_inference_metric(metric: dict[str, Any]) -> str:
         "schema_valid": int(bool(metric.get("schema_valid"))),
         "summary_word_count": _nullable_int(metric.get("summary_word_count")),
         "fallback_triggered": int(bool(metric.get("fallback_triggered"))),
-        "status": str(metric.get("status") or "model_error"),
+        "status": status,
         "error_detail": _nullable_str(metric.get("error_detail")),
     }
     placeholders = ", ".join("?" for _column in row)
