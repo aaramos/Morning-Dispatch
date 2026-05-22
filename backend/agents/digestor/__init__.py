@@ -1,0 +1,1 @@
+"""Digestor data-source adapters."""

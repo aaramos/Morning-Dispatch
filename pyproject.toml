@@ -1,0 +1,25 @@
+[project]
+name = "morning-dispatch"
+version = "0.1.0"
+description = "Local-first AI newspaper digests from approved Gmail newsletters."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "beautifulsoup4>=4.12.0",
+    "fastapi>=0.124.0",
+    "google-api-python-client>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-auth>=2.0.0",
+    "httpx>=0.28.0",
+    "mcp>=1.23.0",
+    "uvicorn[standard]>=0.38.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["."]

@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+from time import monotonic
+from typing import Any
+
+from backend.agents.digestor.gmail_mcp_client import fetch_newsletters
+from backend.agents.editor import prepare_issue_articles
+from backend.agents.librarian.articles import fetch_articles_for_payloads
+from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
+from backend.app.core.config import get_settings
+from backend.app.db import database
+
+LOOKBACK_HOURS_BY_SCHEDULE = {
+    "hourly": 1,
+    "daily": 24,
+    "weekly": 168,
+    "monthly": 720,
+}
+
+
+async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, Any] | None:
+    started_at = monotonic()
+    digest = database.get_digest(digest_id)
+    if digest is None:
+        return None
+    inference_run_id = database.new_id()
+
+    sender_allowlist = gmail_sender_allowlist(digest.get("sources", []))
+    lookback_hours = LOOKBACK_HOURS_BY_SCHEDULE.get(str(digest.get("schedule", "daily")), 24)
+
+    payloads = []
+    if sender_allowlist:
+        payloads = await fetch_newsletters(
+            digest_id=digest_id,
+            sender_allowlist=sender_allowlist,
+            lookback_hours=lookback_hours,
+            db_path=str(database.database_path()),
+        )
+    fetched_articles = await fetch_articles_for_payloads(payloads)
+    enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
+    ranked_articles = prepare_issue_articles(digest, enriched_articles)
+    settings = get_settings()
+    model_cache_hit_count = 0
+    model_cache_miss_count = 0
+    model_cache_write_count = 0
+    if settings.librarian_use_model:
+        model_cache_candidate_count = _model_cache_candidate_count(ranked_articles, settings.librarian_model_max_items)
+        ranked_articles = database.apply_cached_model_enrichments(
+            ranked_articles,
+            model_name=settings.librarian_model,
+            limit=settings.librarian_model_max_items,
+        )
+        model_cache_hit_count = sum(1 for result in ranked_articles if result.enrichment_source == "model_cache")
+        model_cache_miss_count = max(0, model_cache_candidate_count - model_cache_hit_count)
+    article_results = await refine_ranked_articles_with_model(
+        ranked_articles,
+        inference_run_id=inference_run_id,
+        metrics_mode="batch" if trigger == "scheduled" else "single",
+    )
+    if settings.librarian_use_model:
+        model_cache_write_count = database.cache_model_enrichments(article_results, model_name=settings.librarian_model)
+
+    return database.create_ingested_run(
+        digest=digest,
+        payloads=payloads,
+        article_results=article_results,
+        lookback_hours=lookback_hours,
+        configured_source_count=len(sender_allowlist),
+        trigger=trigger,
+        duration_seconds=round(monotonic() - started_at, 3),
+        model_cache_hit_count=model_cache_hit_count,
+        model_cache_miss_count=model_cache_miss_count,
+        model_cache_write_count=model_cache_write_count,
+        inference_run_id=inference_run_id,
+    )
+
+
+def _model_cache_candidate_count(results: list[Any], limit: int) -> int:
+    if limit <= 0:
+        return 0
+    return sum(
+        1
+        for result in results[:limit]
+        if getattr(result, "fetched", False) and getattr(result, "tier", None) != "dropped"
+    )
+
+
+def gmail_sender_allowlist(sources: list[dict[str, Any]]) -> list[str]:
+    senders: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        if source.get("type") not in {"gmail", "gmail_newsletter"}:
+            continue
+        sender = str(source.get("sender", "")).strip().lower()
+        if not sender or sender in seen:
+            continue
+        senders.append(sender)
+        seen.add(sender)
+    return senders

@@ -1,0 +1,20 @@
+# Safe example config. Do not put real tokens or OAuth credentials here.
+app:
+  host: "127.0.0.1"
+  port: 8000
+
+paths:
+  home: "/Users/macstudio/.morning-dispatch"
+  data_dir: "/Users/macstudio/.morning-dispatch/data"
+  secrets_dir: "/Users/macstudio/.morning-dispatch/secrets"
+  database_path: "/Users/macstudio/.morning-dispatch/data/db/morning_dispatch.sqlite3"
+  gmail_client_secret_path: "/Users/macstudio/.morning-dispatch/secrets/gmail/gmail_client_secret.json"
+  gmail_credentials_path: "/Users/macstudio/.morning-dispatch/secrets/gmail/gmail_credentials.json"
+
+network:
+  public_base_url: "http://127.0.0.1:8000"
+  tailscale_example: "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000"
+
+defaults:
+  profile_name: "Adrian"
+  digest_threshold: 0.45
