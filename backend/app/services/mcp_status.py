@@ -8,6 +8,8 @@ import httpx
 from backend.app.core.config import Settings
 
 GMAIL_FETCH_TOOL = "gmail__gmail_fetch_newsletters"
+REDDIT_BROWSE_TOOL = "reddit__browse_subreddit"
+REDDIT_SEARCH_TOOL = "reddit__search_reddit"
 
 
 async def status(settings: Settings) -> dict[str, Any]:
@@ -46,6 +48,14 @@ async def status(settings: Settings) -> dict[str, Any]:
         and gmail_server["state"] == "connected"
         and fetch_tool_present
     )
+    reddit_server = next((server for server in servers if server["name"] == "reddit"), None)
+    reddit_tool_count = sum(1 for tool in tools if tool.startswith("reddit__"))
+    reddit_connected = bool(
+        reddit_server
+        and reddit_server["state"] == "connected"
+        and REDDIT_BROWSE_TOOL in tools
+        and REDDIT_SEARCH_TOOL in tools
+    )
 
     return {
         "available": True,
@@ -60,6 +70,14 @@ async def status(settings: Settings) -> dict[str, Any]:
             "tools_count": gmail_tool_count,
             "fetch_tool_present": fetch_tool_present,
             "error": gmail_server["error"] if gmail_server else "Gmail MCP server is not registered.",
+        },
+        "reddit": {
+            "connected": reddit_connected,
+            "server_state": reddit_server["state"] if reddit_server else "missing",
+            "tools_count": reddit_tool_count,
+            "browse_tool_present": REDDIT_BROWSE_TOOL in tools,
+            "search_tool_present": REDDIT_SEARCH_TOOL in tools,
+            "error": reddit_server["error"] if reddit_server else "Reddit MCP server is not registered.",
         },
     }
 
@@ -120,6 +138,14 @@ def _unavailable(error: str) -> dict[str, Any]:
             "server_state": "unavailable",
             "tools_count": 0,
             "fetch_tool_present": False,
+            "error": error,
+        },
+        "reddit": {
+            "connected": False,
+            "server_state": "unavailable",
+            "tools_count": 0,
+            "browse_tool_present": False,
+            "search_tool_present": False,
             "error": error,
         },
     }

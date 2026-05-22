@@ -120,6 +120,61 @@ type AgentDecisionsStatus = {
   decision_counts: Record<string, number>;
 };
 
+type SourceScoutRun = {
+  id: string;
+  digest_id: string;
+  run_at: string;
+  status: "completed" | "partial" | "failed";
+  sampled_count: number;
+  active_count: number;
+  candidate_count: number;
+  retired_count: number;
+  summary: string | null;
+  error_detail: string | null;
+};
+
+type SourceScoutStatus = {
+  source_count: number;
+  active_count: number;
+  search_only_count: number;
+  candidate_count: number;
+  retired_count: number;
+  latest_run: SourceScoutRun | null;
+};
+
+type RedditSource = {
+  id: string;
+  digest_id: string;
+  subreddit: string;
+  state: "active" | "search_only" | "candidate" | "retired";
+  category: string | null;
+  score: number;
+  reason: string | null;
+  last_reviewed_at: string | null;
+  last_seen_post_at: string | null;
+  consecutive_stale_runs: number;
+  metadata: Record<string, unknown>;
+};
+
+type SourceScoutDecision = {
+  id: string;
+  scout_run_id: string;
+  digest_id: string;
+  agent: string;
+  subreddit: string;
+  decision: string;
+  action: string;
+  confidence: number | null;
+  reason: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+type SourceScoutResponse = SourceScoutRun & {
+  sources: RedditSource[];
+  decisions: SourceScoutDecision[];
+};
+
 type VerificationRunResult = {
   status: string;
   mode?: string;
@@ -226,6 +281,7 @@ type AdminPipelineStatus = {
   model_cache: ModelCacheStatus;
   inference_metrics: InferenceMetricsStatus;
   agent_decisions: AgentDecisionsStatus;
+  source_scout: SourceScoutStatus;
   model_jobs: ModelJob[];
 };
 
@@ -450,6 +506,8 @@ function AdminApp() {
   const [jobIncludeCached, setJobIncludeCached] = useState(false);
   const [verificationResult, setVerificationResult] = useState<VerificationRunResult | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecisionRecord[]>([]);
+  const [sourceScoutSources, setSourceScoutSources] = useState<RedditSource[]>([]);
+  const [sourceScoutDecisions, setSourceScoutDecisions] = useState<SourceScoutDecision[]>([]);
   const [message, setMessage] = useState("Loading admin status...");
   const [busy, setBusy] = useState(false);
   const modelOptions = pipeline?.model.catalog.models ?? [];
@@ -469,7 +527,7 @@ function AdminApp() {
       setSelectedModel(preferredModel);
       setJobModel((current) => current || preferredModel);
       setMessage(result.gmail.connected ? "Gmail connected" : "Gmail not connected");
-      await loadAgentDecisions();
+      await Promise.all([loadAgentDecisions(), loadSourceScout()]);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Admin status unavailable");
     }
@@ -481,6 +539,17 @@ function AdminApp() {
       setAgentDecisions(result.decisions);
     } catch {
       setAgentDecisions([]);
+    }
+  }
+
+  async function loadSourceScout() {
+    try {
+      const result = await api<{ sources: RedditSource[]; decisions: SourceScoutDecision[] }>("/api/admin/source-scout");
+      setSourceScoutSources(result.sources);
+      setSourceScoutDecisions(result.decisions);
+    } catch {
+      setSourceScoutSources([]);
+      setSourceScoutDecisions([]);
     }
   }
 
@@ -612,6 +681,27 @@ function AdminApp() {
     }
   }
 
+  async function runSourceScout(liveSample = true) {
+    const digest = pipeline?.digests[0];
+    if (!digest) return;
+    setBusy(true);
+    setMessage(liveSample ? "Running Reddit Source Scout..." : "Seeding Reddit Source Scout...");
+    try {
+      const result = await api<SourceScoutResponse>(
+        `/api/admin/digests/${digest.id}/source-scout?live_sample=${liveSample ? "true" : "false"}`,
+        { method: "POST" },
+      );
+      setSourceScoutSources(result.sources);
+      setSourceScoutDecisions(result.decisions);
+      await loadStatus();
+      setMessage(result.summary ?? "Reddit Source Scout completed");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Source Scout failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function readClientSecretFile(file: File | undefined) {
     if (!file) return;
     setClientSecretJson(await file.text());
@@ -690,6 +780,11 @@ function AdminApp() {
                 <small>{formatAgentDecisionSummary(pipeline?.agent_decisions)}</small>
               </div>
               <div>
+                <span>Reddit Scout</span>
+                <strong>{pipeline?.source_scout.active_count ?? 0} active</strong>
+                <small>{formatSourceScoutSummary(pipeline?.source_scout)}</small>
+              </div>
+              <div>
                 <span>Cache</span>
                 <strong>{pipeline?.model_cache.record_count ?? 0}</strong>
               </div>
@@ -725,6 +820,87 @@ function AdminApp() {
                   </article>
                 ))}
               </div>
+            ) : null}
+          </section>
+
+          <section className="panel wide-panel">
+            <div className="panel-heading">
+              <div>
+                <h3>Reddit Source Scout</h3>
+                <p className="muted">
+                  Keeps Reddit communities aligned with the digest interest by promoting fresh sources and retiring stale ones.
+                </p>
+              </div>
+              <span className={pipeline?.source_scout.latest_run?.status === "completed" ? "status-pill good" : "status-pill"}>
+                {pipeline?.source_scout.latest_run?.status ?? "Not run"}
+              </span>
+            </div>
+            <div className="metric-strip">
+              <div>
+                <span>Tracked</span>
+                <strong>{pipeline?.source_scout.source_count ?? sourceScoutSources.length}</strong>
+                <small>{formatDateTime(pipeline?.source_scout.latest_run?.run_at)}</small>
+              </div>
+              <div>
+                <span>Active</span>
+                <strong>{pipeline?.source_scout.active_count ?? 0}</strong>
+                <small>Browsed every run</small>
+              </div>
+              <div>
+                <span>Search-only</span>
+                <strong>{pipeline?.source_scout.search_only_count ?? 0}</strong>
+                <small>Queried when keywords match</small>
+              </div>
+              <div>
+                <span>Candidate</span>
+                <strong>{pipeline?.source_scout.candidate_count ?? 0}</strong>
+                <small>Proving signal</small>
+              </div>
+              <div>
+                <span>Retired</span>
+                <strong>{pipeline?.source_scout.retired_count ?? 0}</strong>
+                <small>Kept for audit</small>
+              </div>
+            </div>
+            <div className="panel-actions">
+              <button onClick={() => runSourceScout(true)} disabled={busy || !pipeline?.digests.length}>
+                Run Scout
+              </button>
+              <button onClick={() => runSourceScout(false)} disabled={busy || !pipeline?.digests.length}>
+                Seed Only
+              </button>
+              <p className="muted">{pipeline?.source_scout.latest_run?.summary ?? "No Reddit source review has run yet."}</p>
+            </div>
+            {sourceScoutSources.length ? (
+              <div className="source-list">
+                {sourceScoutSources.slice(0, 18).map((source) => (
+                  <article key={source.id}>
+                    <div>
+                      <strong>r/{source.subreddit}</strong>
+                      <small>{source.category ?? "Uncategorized"} · score {formatPercent(source.score)}</small>
+                    </div>
+                    <span className={`source-state ${source.state}`}>{formatSourceState(source.state)}</span>
+                    <p>{source.reason ?? "No review note yet."}</p>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="muted">Run the scout to seed Reddit communities.</p>
+            )}
+            {sourceScoutDecisions.length ? (
+              <>
+                <p className="section-label">Recent scout decisions</p>
+                <div className="decision-list">
+                  {sourceScoutDecisions.slice(0, 5).map((decision) => (
+                    <article key={decision.id}>
+                      <strong>
+                        r/{decision.subreddit} · {decision.action || decision.decision}
+                      </strong>
+                      <span>{decision.reason || decision.decision}</span>
+                    </article>
+                  ))}
+                </div>
+              </>
             ) : null}
           </section>
 
@@ -1119,6 +1295,16 @@ function formatAgentDecisionSummary(status: AgentDecisionsStatus | null | undefi
   const editorial = status.agent_counts.editorial ?? 0;
   const critic = status.agent_counts.critic ?? 0;
   return `${editorial} editorial · ${critic} critic`;
+}
+
+function formatSourceScoutSummary(status: SourceScoutStatus | null | undefined): string {
+  if (!status || status.source_count === 0) return "Not seeded yet";
+  return `${status.search_only_count} search-only · ${status.candidate_count} candidate`;
+}
+
+function formatSourceState(value: RedditSource["state"]): string {
+  if (value === "search_only") return "Search-only";
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function formatVerificationResult(result: VerificationRunResult): string {

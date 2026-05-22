@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from backend.agents.digestor.gmail import SCOPES
 from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
 from backend.app.db import database
-from backend.app.services import mcp_status, model_catalog, model_jobs, scheduler, verification
+from backend.app.services import mcp_status, model_catalog, model_jobs, scheduler, source_scout, verification
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
         "model_cache": database.model_cache_summary(),
         "inference_metrics": database.inference_metrics_summary(),
         "agent_decisions": database.agent_decisions_summary(),
+        "source_scout": database.source_scout_summary(),
         "model_jobs": database.list_model_enrichment_jobs(limit=8),
     }
 
@@ -153,6 +154,23 @@ def list_agent_decisions() -> dict[str, Any]:
         "decisions": database.list_agent_decisions(limit=40),
         "summary": database.agent_decisions_summary(),
     }
+
+
+@router.get("/source-scout")
+def list_source_scout() -> dict[str, Any]:
+    return {
+        "summary": database.source_scout_summary(),
+        "sources": database.list_reddit_sources(include_retired=True),
+        "decisions": database.list_source_scout_decisions(limit=60),
+    }
+
+
+@router.post("/digests/{digest_id}/source-scout")
+async def run_source_scout(digest_id: str, live_sample: bool = True) -> dict[str, Any]:
+    result = await source_scout.run_source_scout(digest_id, live_sample=live_sample)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    return result
 
 
 @router.post("/model/jobs")
