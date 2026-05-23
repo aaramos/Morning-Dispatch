@@ -24,6 +24,9 @@ class Settings:
     model_settings_path: Path
     public_base_url: str | None = None
     environment: str = "development"
+    podcastindex_api_key: str | None = None
+    podcastindex_api_secret: str | None = None
+    podcast_transcribe_command: str | None = None
     model_base_url: str | None = None
     model_api_key: str | None = None
     librarian_model: str | None = DEFAULT_LIBRARIAN_MODEL
@@ -42,6 +45,14 @@ def _path_from_env(name: str, default: Path) -> Path:
     if not raw_value:
         return default
     return Path(raw_value).expanduser()
+
+
+def _secret_text(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
 
 
 def _float_from_env(name: str, default: float) -> float:
@@ -127,6 +138,12 @@ def get_settings() -> Settings:
         _librarian_model_from_runtime(model_settings_path)
         or os.environ.get("MORNING_DISPATCH_LIBRARIAN_MODEL", DEFAULT_LIBRARIAN_MODEL)
     )
+    podcastindex_api_key = os.environ.get("MORNING_DISPATCH_PODCASTINDEX_API_KEY") or _secret_text(
+        secrets_dir / "podcastindex" / "api_key"
+    )
+    podcastindex_api_secret = os.environ.get("MORNING_DISPATCH_PODCASTINDEX_API_SECRET") or _secret_text(
+        secrets_dir / "podcastindex" / "api_secret"
+    )
     return Settings(
         home_dir=home_dir,
         data_dir=data_dir,
@@ -138,6 +155,9 @@ def get_settings() -> Settings:
         model_settings_path=model_settings_path,
         public_base_url=os.environ.get("MORNING_DISPATCH_PUBLIC_BASE_URL"),
         environment=os.environ.get("MORNING_DISPATCH_ENV", "development"),
+        podcastindex_api_key=podcastindex_api_key,
+        podcastindex_api_secret=podcastindex_api_secret,
+        podcast_transcribe_command=os.environ.get("MORNING_DISPATCH_PODCAST_TRANSCRIBE_COMMAND"),
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
         librarian_model=librarian_model,
@@ -169,6 +189,7 @@ def ensure_runtime_dirs(settings: Settings) -> None:
         settings.data_dir / "article-cache",
         settings.data_dir / "digest-output",
         settings.data_dir / "podcast-audio",
+        settings.data_dir / "podcast-transcripts",
         settings.secrets_dir,
         settings.secrets_dir / "gmail",
         settings.secrets_dir / "reddit",

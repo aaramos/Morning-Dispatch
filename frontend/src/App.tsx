@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 type Digest = {
   id: string;
@@ -132,6 +132,19 @@ type InferenceMetricsStatus = {
   ttft_available: boolean;
 };
 
+type PodcastMetricsStatus = {
+  record_count: number;
+  latest_ts: string | null;
+  status_counts: Record<string, number>;
+  transcript_source_counts: Record<string, number>;
+  cache_hit_count: number;
+  audio_bytes: number;
+  transcript_words: number;
+  avg_download_ms: number | null;
+  avg_transcription_ms: number | null;
+  avg_total_ms: number | null;
+};
+
 type AgentDecisionsStatus = {
   record_count: number;
   latest_created_at: string | null;
@@ -186,6 +199,7 @@ type DigestStats = {
   source_count: number;
   newsletter_count: number;
   link_count: number;
+  podcast_episode_count: number;
   article_candidate_count: number;
   included_article_count: number;
   unresolved_count: number;
@@ -196,6 +210,36 @@ type DigestStats = {
   model_call_count: number;
   processing_seconds: number | null;
   stage_seconds: Record<string, number>;
+};
+
+type PodcastSource = {
+  key?: string;
+  digest_id?: string;
+  digest_name?: string;
+  type: "podcast_rss" | "podcast_search";
+  title?: string | null;
+  feed_url?: string | null;
+  site_url?: string | null;
+  author?: string | null;
+  query?: string | null;
+  aggregator?: string | null;
+  itunes_id?: string | null;
+  apple_podcasts_url?: string | null;
+  transcription?: string | null;
+};
+
+type PodcastStatus = {
+  aggregator_configured: boolean;
+  transcription_configured: boolean;
+  sources: PodcastSource[];
+  audio_cache_dir: string;
+  transcript_cache_dir: string;
+};
+
+type PodcastDiscoveryResponse = {
+  configured: boolean;
+  results: PodcastSource[];
+  message: string | null;
 };
 
 type EmailDeliveryStatus = {
@@ -378,6 +422,7 @@ type AdminPipelineStatus = {
     latest_brief_url: string;
     email: EmailDeliveryStatus;
   };
+  podcasts: PodcastStatus;
   health: AdminHealthStatus;
   gmail: GmailAdminStatus;
   mcp: McpStatus;
@@ -395,6 +440,7 @@ type AdminPipelineStatus = {
   digests: DigestOverview[];
   model_cache: ModelCacheStatus;
   inference_metrics: InferenceMetricsStatus;
+  podcast_metrics: PodcastMetricsStatus;
   agent_decisions: AgentDecisionsStatus;
   source_scout: SourceScoutStatus;
   fetch_failures: FetchFailureBreakdown;
@@ -421,6 +467,11 @@ export default function App() {
     return <AdminApp />;
   }
 
+  return <MorningDispatchApp />;
+}
+
+function MorningDispatchApp() {
+
   const [health, setHealth] = useState<Health | null>(null);
   const [digests, setDigests] = useState<Digest[]>([]);
   const [selectedDigestId, setSelectedDigestId] = useState<string | null>(null);
@@ -435,21 +486,9 @@ export default function App() {
     () => digests.find((digest) => digest.id === selectedDigestId) ?? digests[0],
     [digests, selectedDigestId],
   );
+  const selectedDigestIssueId = selectedDigest?.id ?? null;
 
-  useEffect(() => {
-    void refresh();
-  }, []);
-
-  useEffect(() => {
-    if (!selectedDigest) {
-      setIssue(null);
-      setIssueHtml("");
-      return;
-    }
-    void loadLatestIssue(selectedDigest.id);
-  }, [selectedDigest?.id]);
-
-  async function refresh() {
+  const refresh = useCallback(async () => {
     const [healthResult, digestResult] = await Promise.all([
       api<Health>("/api/health"),
       api<Digest[]>("/api/digests"),
@@ -458,9 +497,9 @@ export default function App() {
     setDigests(digestResult);
     setSelectedDigestId((current) => current ?? digestResult[0]?.id ?? null);
     setStatus("Ready");
-  }
+  }, []);
 
-  async function loadLatestIssue(digestId: string) {
+  const loadLatestIssue = useCallback(async (digestId: string) => {
     try {
       const latest = await api<Issue>(`/api/digests/${digestId}/issues/latest`);
       const html = await fetch(`/api/issues/${latest.id}/html`).then((response) => response.text());
@@ -470,7 +509,16 @@ export default function App() {
       setIssue(null);
       setIssueHtml("");
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!selectedDigestIssueId) return;
+    void loadLatestIssue(selectedDigestIssueId);
+  }, [loadLatestIssue, selectedDigestIssueId]);
 
   async function createDigest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -624,6 +672,12 @@ function AdminApp() {
   const [jobIncludeCached, setJobIncludeCached] = useState(false);
   const [deliveryEmail, setDeliveryEmail] = useState("");
   const [deliveryEnabled, setDeliveryEnabled] = useState(false);
+  const [podcastQuery, setPodcastQuery] = useState("AI daily brief");
+  const [podcastFeedUrl, setPodcastFeedUrl] = useState("");
+  const [podcastTitle, setPodcastTitle] = useState("");
+  const [podcastApiKey, setPodcastApiKey] = useState("");
+  const [podcastApiSecret, setPodcastApiSecret] = useState("");
+  const [podcastResults, setPodcastResults] = useState<PodcastSource[]>([]);
   const [verificationResult, setVerificationResult] = useState<VerificationRunResult | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecisionRecord[]>([]);
   const [sourceScoutSources, setSourceScoutSources] = useState<RedditSource[]>([]);
@@ -634,11 +688,27 @@ function AdminApp() {
   const modelCatalogReady = Boolean(pipeline?.model.catalog.available && modelOptions.length > 0);
   const modelSelectionChanged = Boolean(selectedModel && selectedModel !== pipeline?.model.model);
 
-  useEffect(() => {
-    void loadStatus();
+  const loadAgentDecisions = useCallback(async () => {
+    try {
+      const result = await api<{ decisions: AgentDecisionRecord[] }>("/api/admin/agent-decisions");
+      setAgentDecisions(result.decisions);
+    } catch {
+      setAgentDecisions([]);
+    }
   }, []);
 
-  async function loadStatus() {
+  const loadSourceScout = useCallback(async () => {
+    try {
+      const result = await api<{ sources: RedditSource[]; decisions: SourceScoutDecision[] }>("/api/admin/source-scout");
+      setSourceScoutSources(result.sources);
+      setSourceScoutDecisions(result.decisions);
+    } catch {
+      setSourceScoutSources([]);
+      setSourceScoutDecisions([]);
+    }
+  }, []);
+
+  const loadStatus = useCallback(async () => {
     try {
       const result = await api<AdminPipelineStatus>("/api/admin/status");
       setPipeline(result);
@@ -653,27 +723,11 @@ function AdminApp() {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Admin status unavailable");
     }
-  }
+  }, [loadAgentDecisions, loadSourceScout]);
 
-  async function loadAgentDecisions() {
-    try {
-      const result = await api<{ decisions: AgentDecisionRecord[] }>("/api/admin/agent-decisions");
-      setAgentDecisions(result.decisions);
-    } catch {
-      setAgentDecisions([]);
-    }
-  }
-
-  async function loadSourceScout() {
-    try {
-      const result = await api<{ sources: RedditSource[]; decisions: SourceScoutDecision[] }>("/api/admin/source-scout");
-      setSourceScoutSources(result.sources);
-      setSourceScoutDecisions(result.decisions);
-    } catch {
-      setSourceScoutSources([]);
-      setSourceScoutDecisions([]);
-    }
-  }
+  useEffect(() => {
+    void loadStatus();
+  }, [loadStatus]);
 
   async function saveClientSecret() {
     setBusy(true);
@@ -846,6 +900,105 @@ function AdminApp() {
     }
   }
 
+  async function discoverPodcasts() {
+    if (!podcastQuery.trim()) return;
+    setBusy(true);
+    setMessage("Searching podcast directory...");
+    try {
+      const result = await api<PodcastDiscoveryResponse>(
+        `/api/admin/podcasts/discover?query=${encodeURIComponent(podcastQuery.trim())}&limit=8`,
+      );
+      setPodcastResults(result.results);
+      setMessage(result.message ?? `Found ${result.results.length} podcast candidate(s)`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Podcast search failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function savePodcastCredentials() {
+    setBusy(true);
+    setMessage("Saving Podcast Index credentials...");
+    try {
+      await api<PodcastStatus>("/api/admin/podcasts/credentials", {
+        method: "POST",
+        body: JSON.stringify({
+          api_key: podcastApiKey.trim(),
+          api_secret: podcastApiSecret.trim(),
+        }),
+      });
+      setPodcastApiKey("");
+      setPodcastApiSecret("");
+      await loadStatus();
+      setMessage("Podcast Index credentials saved");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not save podcast credentials");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addPodcastSource(source: Partial<PodcastSource>) {
+    const digest = pipeline?.digests[0];
+    if (!digest) return;
+    setBusy(true);
+    setMessage("Adding podcast source...");
+    try {
+      await api(`/api/admin/digests/${digest.id}/podcast-sources`, {
+        method: "POST",
+        body: JSON.stringify(source),
+      });
+      setPodcastFeedUrl("");
+      setPodcastTitle("");
+      await loadStatus();
+      setMessage("Podcast source added");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not add podcast source");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addManualPodcastFeed() {
+    if (!podcastFeedUrl.trim()) return;
+    await addPodcastSource({
+      type: "podcast_rss",
+      title: podcastTitle.trim() || undefined,
+      feed_url: podcastFeedUrl.trim(),
+      transcription: "auto",
+    });
+  }
+
+  async function addPodcastSearch() {
+    if (!podcastQuery.trim()) return;
+    await addPodcastSource({
+      type: "podcast_search",
+      title: `Search: ${podcastQuery.trim()}`,
+      query: podcastQuery.trim(),
+      aggregator: "podcastindex",
+      transcription: "auto",
+    });
+  }
+
+  async function removePodcastSource(source: PodcastSource) {
+    const digest = pipeline?.digests[0];
+    if (!digest || !source.key) return;
+    setBusy(true);
+    setMessage("Removing podcast source...");
+    try {
+      await api(`/api/admin/digests/${digest.id}/podcast-sources/${encodeURIComponent(source.key)}`, {
+        method: "DELETE",
+      });
+      await loadStatus();
+      setMessage("Podcast source removed");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not remove podcast source");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function sendLatestDigestEmail() {
     const digest = pipeline?.digests[0];
     if (!digest) return;
@@ -966,6 +1119,11 @@ function AdminApp() {
                 <small>{formatSourceScoutSummary(pipeline?.source_scout)}</small>
               </div>
               <div>
+                <span>Podcasts</span>
+                <strong>{pipeline?.podcasts.sources.length ?? 0}</strong>
+                <small>{pipeline?.podcasts.transcription_configured ? "Transcript cache on" : "Show notes fallback"}</small>
+              </div>
+              <div>
                 <span>Cache</span>
                 <strong>{pipeline?.model_cache.record_count ?? 0}</strong>
               </div>
@@ -1024,6 +1182,11 @@ function AdminApp() {
                 <small>{formatNumber(pipeline?.digest_stats.link_count)} links extracted</small>
               </div>
               <div>
+                <span>Podcasts</span>
+                <strong>{formatNumber(pipeline?.digest_stats.podcast_episode_count)}</strong>
+                <small>Episodes added</small>
+              </div>
+              <div>
                 <span>Included</span>
                 <strong>{formatNumber(pipeline?.digest_stats.included_article_count)}</strong>
                 <small>{formatNumber(pipeline?.digest_stats.article_candidate_count)} candidates reviewed</small>
@@ -1054,6 +1217,171 @@ function AdminApp() {
                   {formatStageLabel(stage)}: <strong>{formatSeconds(seconds)}</strong>
                 </span>
               ))}
+            </div>
+          </section>
+
+          <section className="panel wide-panel">
+            <div className="panel-heading">
+              <div>
+                <h3>Podcast Sources</h3>
+                <p className="muted">Episodes are summarized into the digest with a link back to the original episode.</p>
+              </div>
+              <span className={pipeline?.podcasts.aggregator_configured ? "status-pill good" : "status-pill"}>
+                {pipeline?.podcasts.aggregator_configured ? "Directory ready" : "RSS only"}
+              </span>
+            </div>
+            <div className="podcast-credentials">
+              <label>
+                Podcast Index API key
+                <input
+                  type="password"
+                  value={podcastApiKey}
+                  onChange={(event) => setPodcastApiKey(event.target.value)}
+                  placeholder={pipeline?.podcasts.aggregator_configured ? "Saved" : "Paste API key"}
+                  autoComplete="off"
+                />
+              </label>
+              <label>
+                Podcast Index API secret
+                <input
+                  type="password"
+                  value={podcastApiSecret}
+                  onChange={(event) => setPodcastApiSecret(event.target.value)}
+                  placeholder={pipeline?.podcasts.aggregator_configured ? "Saved" : "Paste API secret"}
+                  autoComplete="off"
+                />
+              </label>
+              <button
+                onClick={savePodcastCredentials}
+                disabled={busy || !podcastApiKey.trim() || !podcastApiSecret.trim()}
+              >
+                Save Directory Access
+              </button>
+            </div>
+            <div className="podcast-tools">
+              <label>
+                Search topic
+                <input
+                  value={podcastQuery}
+                  onChange={(event) => setPodcastQuery(event.target.value)}
+                  placeholder="AI daily brief"
+                />
+              </label>
+              <div className="button-row podcast-buttons">
+                <button onClick={discoverPodcasts} disabled={busy || !podcastQuery.trim() || !pipeline?.podcasts.aggregator_configured}>
+                  Search Directory
+                </button>
+                <button
+                  className="secondary-button"
+                  onClick={addPodcastSearch}
+                  disabled={busy || !podcastQuery.trim() || !pipeline?.podcasts.aggregator_configured}
+                >
+                  Watch Search
+                </button>
+              </div>
+              <label>
+                RSS feed
+                <input
+                  value={podcastFeedUrl}
+                  onChange={(event) => setPodcastFeedUrl(event.target.value)}
+                  placeholder="https://example.com/feed.xml"
+                />
+              </label>
+              <label>
+                Feed name
+                <input
+                  value={podcastTitle}
+                  onChange={(event) => setPodcastTitle(event.target.value)}
+                  placeholder="Optional"
+                />
+              </label>
+              <button onClick={addManualPodcastFeed} disabled={busy || !podcastFeedUrl.trim()}>
+                Add RSS
+              </button>
+            </div>
+            <div className="metric-strip">
+              <div>
+                <span>Tracked</span>
+                <strong>{pipeline?.podcasts.sources.length ?? 0}</strong>
+                <small>{pipeline?.podcasts.aggregator_configured ? "Podcast Index enabled" : "Manual feeds enabled"}</small>
+              </div>
+              <div>
+                <span>Transcription</span>
+                <strong>{pipeline?.podcasts.transcription_configured ? "Configured" : "Show notes"}</strong>
+                <small>Cached once available</small>
+              </div>
+              <div>
+                <span>Transcript cache</span>
+                <strong>{formatPathTail(pipeline?.podcasts.transcript_cache_dir)}</strong>
+                <small>{formatPathTail(pipeline?.podcasts.audio_cache_dir)}</small>
+              </div>
+            </div>
+            <div className="metric-strip">
+              <div>
+                <span>Telemetry rows</span>
+                <strong>{formatNumber(pipeline?.podcast_metrics.record_count)}</strong>
+                <small>{formatNumber(pipeline?.podcast_metrics.cache_hit_count)} cache hit(s)</small>
+              </div>
+              <div>
+                <span>Avg transcript</span>
+                <strong>{formatMs(pipeline?.podcast_metrics.avg_transcription_ms)}</strong>
+                <small>{formatNumber(pipeline?.podcast_metrics.transcript_words)} transcript words</small>
+              </div>
+              <div>
+                <span>Avg download</span>
+                <strong>{formatMs(pipeline?.podcast_metrics.avg_download_ms)}</strong>
+                <small>{formatBytes(pipeline?.podcast_metrics.audio_bytes)} cached audio</small>
+              </div>
+              <div>
+                <span>Latest</span>
+                <strong>{formatDateTime(pipeline?.podcast_metrics.latest_ts)}</strong>
+                <small>{formatPodcastMetricCounts(pipeline?.podcast_metrics)}</small>
+              </div>
+            </div>
+            {podcastResults.length ? (
+              <>
+                <p className="section-label">Directory results</p>
+                <div className="source-list">
+                  {podcastResults.map((source) => (
+                    <article key={source.feed_url ?? source.key}>
+                      <div>
+                        <strong>{source.title ?? "Podcast"}</strong>
+                        <small>{source.author ?? source.site_url ?? source.feed_url}</small>
+                      </div>
+                      <button className="source-action" onClick={() => addPodcastSource(source)} disabled={busy}>
+                        Add
+                      </button>
+                      <p>{source.feed_url}</p>
+                    </article>
+                  ))}
+                </div>
+              </>
+            ) : null}
+            <p className="section-label">Tracked sources</p>
+            <div className="source-list">
+              {(pipeline?.podcasts.sources ?? []).map((source) => (
+                <article key={source.key ?? source.feed_url ?? source.query}>
+                  <div>
+                    <strong>{source.title ?? source.query ?? source.feed_url ?? "Podcast source"}</strong>
+                    <small>
+                      {source.type === "podcast_search" ? `Search: ${source.query}` : source.feed_url}
+                    </small>
+                  </div>
+                  <button className="source-action" onClick={() => removePodcastSource(source)} disabled={busy}>
+                    Remove
+                  </button>
+                  <p>{source.aggregator ?? "rss"} · {source.transcription ?? "auto"}</p>
+                </article>
+              ))}
+              {(pipeline?.podcasts.sources.length ?? 0) === 0 ? (
+                <article>
+                  <div>
+                    <strong>No podcast sources yet</strong>
+                    <small>Add a directory search or RSS feed.</small>
+                  </div>
+                  <span className="source-state candidate">New</span>
+                </article>
+              ) : null}
             </div>
           </section>
 
@@ -1696,7 +2024,8 @@ function formatAgentDecisionSummary(status: AgentDecisionsStatus | null | undefi
   if (!status || status.record_count === 0) return "No agent reviews yet";
   const editorial = status.agent_counts.editorial ?? 0;
   const critic = status.agent_counts.critic ?? 0;
-  return `${editorial} editorial · ${critic} critic`;
+  const podcast = status.agent_counts.podcast_scout ?? 0;
+  return `${editorial} editorial · ${critic} critic · ${podcast} podcast`;
 }
 
 function formatSourceScoutSummary(status: SourceScoutStatus | null | undefined): string {
@@ -1743,7 +2072,30 @@ function formatMs(value: number | null | undefined): string {
   return formatSeconds(value / 1000);
 }
 
+function formatBytes(value: number | null | undefined): string {
+  const bytes = value ?? 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function formatPodcastMetricCounts(status: PodcastMetricsStatus | null | undefined): string {
+  if (!status || status.record_count === 0) return "No podcast telemetry yet";
+  const success = status.status_counts.success ?? 0;
+  const failed = Object.entries(status.status_counts)
+    .filter(([key]) => key !== "success")
+    .reduce((total, [, count]) => total + count, 0);
+  return `${success} success · ${failed} issue(s)`;
+}
+
 function formatPercent(value: number | null | undefined): string {
   if (value === null || value === undefined) return "Unknown";
   return `${Math.round(value * 100)}%`;
+}
+
+function formatPathTail(value: string | null | undefined): string {
+  if (!value) return "Not set";
+  const parts = value.split("/").filter(Boolean);
+  return parts.slice(-2).join("/") || value;
 }

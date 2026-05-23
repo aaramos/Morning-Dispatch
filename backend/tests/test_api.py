@@ -4,9 +4,11 @@ import re
 
 from fastapi.testclient import TestClient
 
+from backend.agents.agentic import AgentDecision
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.librarian import enrichment
+from backend.app.db import database
 from backend.app.main import create_app
 from backend.app.services import email_delivery
 from backend.app.services import digest_runner
@@ -63,8 +65,8 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
                 original_url="https://newsletter.example.com/redirect",
                 final_url="https://example.com/model-release",
                 title="Model release article",
-                text="This article has enough extracted text to stand in for a fetched article body.",
-                excerpt="This article has enough extracted text to stand in for a fetched article body.",
+                text="This article covers local AI infrastructure and model releases in enough detail.",
+                excerpt="This article covers local AI infrastructure and model releases in enough detail.",
                 domain="example.com",
                 status="fetched",
             )
@@ -110,7 +112,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "A useful newsletter body" in html.text
         assert "May 20, 2026" in html.text
         assert "Model update" in html.text
-        assert "Read Online" in html.text
+        assert "Read Online" not in html.text
         assert "jwt_token" not in html.text
         assert "media.example.com" not in html.text
         assert "2026-05-20T12:00:00+00:00" not in html.text
@@ -161,6 +163,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert status_payload["digest_stats"]["newsletter_count"] == 1
         assert status_payload["digest_stats"]["included_article_count"] == 1
         assert status_payload["digest_stats"]["source_count"] == 1
+        assert status_payload["podcast_metrics"]["record_count"] >= 0
         assert status_payload["delivery"]["email"]["enabled"] is False
         assert isinstance(status_payload["model_jobs"], list)
         assert status_payload["digests"][0]["name"] == "AI Morning Brief"
@@ -204,6 +207,50 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert published_payload["published"] is True
         assert published_payload["published_run_id"]
         assert published_payload["published_issue_id"]
+
+
+def test_newsletter_cleanup_removes_boilerplate_without_losing_content():
+    cleaned = database._clean_newsletter_text(
+        "AlphaSignal Stay updated with today's top AI news, papers, and repos. "
+        "Signup | Work With Us | Follow on X | Archive "
+        "Hey, Google I/O just handed developers the keys to a fully managed AI stack. "
+        "Together with · Today's Author Lior Alexander. Founder of AlphaSignal."
+    )
+
+    assert "Hey, Google I/O" in cleaned
+    assert "Signup" not in cleaned
+    assert "Work With Us" not in cleaned
+    assert "Follow on X" not in cleaned
+    assert "Today's Author" not in cleaned
+
+
+def test_newsletter_cleanup_drops_scrambled_email_boilerplate():
+    cleaned = database._clean_newsletter_text(
+        "Oops! Looks like your email provider is scrambling the email:( "
+        "Click here to read it in full online: "
+        "We'd hate to see you go, but if you want to unsubscribe, please click here:"
+    )
+
+    assert cleaned == ""
+    assert database._weak_newsletter_snippet(cleaned) is True
+
+
+def test_newsletter_cleanup_removes_utility_clusters_and_sponsor_blocks():
+    rundown = database._clean_newsletter_text(
+        "Read Online | Sign Up | Advertise Follow image link: ( ) Caption: "
+        "Good morning, AI enthusiasts. Google’s announcements at I/O gave us a clear picture."
+    )
+    tldr = database._clean_newsletter_text(
+        "Microsoft plans to supply its Maia AI chips to Anthropic. "
+        "Sign Up | Advertise | View Online TLDR TOGETHER WITH [Cato Networks] "
+        "TLDR AI 2026-05-22 DEFENDING AGAINST ATTACKS. (SPONSOR) Join us."
+    )
+
+    assert rundown.startswith("Good morning, AI enthusiasts.")
+    assert "Read Online" not in rundown
+    assert "Follow image link" not in rundown
+    assert tldr == "Microsoft plans to supply its Maia AI chips to Anthropic."
+    assert "SPONSOR" not in tldr
 
 
 def test_admin_reports_fetch_failures_and_review_counts(monkeypatch, tmp_path):
@@ -384,6 +431,88 @@ def test_digest_run_can_publish_reddit_threads(monkeypatch, tmp_path):
         assert "reddit.com" in html.text
         assert "via r/ollama" in html.text
         assert "05/22/2026" in html.text
+
+
+def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "false")
+
+    async def fake_fetch_reddit_threads(*_args, **_kwargs):
+        return []
+
+    async def fake_fetch_podcast_episodes(*_args, **_kwargs):
+        return [
+            NormalizedPayload(
+                source_type="podcast_episode",
+                source_name="AI Daily Brief",
+                raw_text=(
+                    "Agentic AI workflows for product teams. Podcast: AI Daily Brief. "
+                    "Show notes: OpenAI agents, local LLM infrastructure, and product strategy."
+                ),
+                original_url="https://podcasts.example.com/agentic-ai-workflows",
+                published_at="2026-05-22T12:00:00+00:00",
+                metadata={
+                    "podcast_episode_id": "episode-1",
+                    "podcast_title": "AI Daily Brief",
+                    "title": "Agentic AI workflows for product teams",
+                    "episode_url": "https://podcasts.example.com/agentic-ai-workflows",
+                    "audio_url": "https://cdn.example.com/audio.mp3",
+                    "episode_quality_score": 0.76,
+                    "transcript_source": "show_notes",
+                },
+            )
+        ], [
+            AgentDecision(
+                agent="podcast_scout",
+                target="Agentic AI workflows for product teams",
+                decision="show_notes_summary",
+                action="summarize_show_notes",
+                confidence=0.7,
+                reason="Podcast Triage found a relevant episode.",
+                metadata={},
+            )
+        ]
+
+    monkeypatch.setattr(digest_runner, "fetch_reddit_threads", fake_fetch_reddit_threads)
+    monkeypatch.setattr(digest_runner, "fetch_podcast_episodes", fake_fetch_podcast_episodes)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        created = client.post(
+            "/api/digests",
+            json={
+                "name": "AI Morning Brief",
+                "interest": "Agentic AI product workflows local LLM infrastructure",
+                "schedule": "daily",
+                "sources": [{"type": "podcast_search", "query": "AI daily brief"}],
+            },
+        )
+        assert created.status_code == 201
+        digest = created.json()
+
+        run = client.post(f"/api/digests/{digest['id']}/run")
+        assert run.status_code == 202
+        assert run.json()["status"] == "completed"
+        assert run.json()["fetched_article_count"] == 1
+
+        issue = client.get(f"/api/digests/{digest['id']}/issues/latest")
+        html = client.get(f"/api/issues/{issue.json()['id']}/html")
+        assert html.status_code == 200
+        assert "Agentic AI workflows for product teams" in html.text
+        assert "https://podcasts.example.com/agentic-ai-workflows" in html.text
+        assert "via AI Daily Brief" in html.text
+        assert "05/22/2026" in html.text
+        assert "Podcast episodes" in html.text
+
+        admin_status = client.get("/api/admin/status").json()
+        assert admin_status["digest_stats"]["podcast_episode_count"] == 1
+        assert admin_status["podcasts"]["sources"][0]["type"] == "podcast_search"
 
 
 def test_digest_run_reuses_cached_model_enrichment(monkeypatch, tmp_path):

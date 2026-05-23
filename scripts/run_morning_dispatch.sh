@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_DIR="/Users/macstudio/Apps/personal_intel"
 RUNTIME_HOME="/private/tmp/morning-dispatch-dev"
 
-mkdir -p "$RUNTIME_HOME/data/db" "$RUNTIME_HOME/secrets" "$RUNTIME_HOME/logs"
+mkdir -p "$RUNTIME_HOME/data/db" "$RUNTIME_HOME/secrets/podcastindex" "$RUNTIME_HOME/secrets/podcasts" "$RUNTIME_HOME/logs"
 cd "$PROJECT_DIR"
 
 export MORNING_DISPATCH_HOME="$RUNTIME_HOME"
@@ -22,6 +22,18 @@ export MORNING_DISPATCH_SCHEDULER_ENABLED="true"
 export MORNING_DISPATCH_SCHEDULER_INTERVAL_SECONDS="300"
 export MORNING_DISPATCH_SCHEDULER_DAILY_RUN_TIME="05:00"
 export MORNING_DISPATCH_SCHEDULER_TIMEZONE="America/Los_Angeles"
+
+if [[ -f "$RUNTIME_HOME/secrets/podcastindex/api_key" ]]; then
+  export MORNING_DISPATCH_PODCASTINDEX_API_KEY="$(< "$RUNTIME_HOME/secrets/podcastindex/api_key")"
+fi
+
+if [[ -f "$RUNTIME_HOME/secrets/podcastindex/api_secret" ]]; then
+  export MORNING_DISPATCH_PODCASTINDEX_API_SECRET="$(< "$RUNTIME_HOME/secrets/podcastindex/api_secret")"
+fi
+
+if [[ -f "$RUNTIME_HOME/secrets/podcasts/transcribe_command" ]]; then
+  export MORNING_DISPATCH_PODCAST_TRANSCRIBE_COMMAND="$(< "$RUNTIME_HOME/secrets/podcasts/transcribe_command")"
+fi
 
 if [[ -f "/Users/macstudio/.omlx/settings.json" ]]; then
   export MORNING_DISPATCH_MODEL_API_KEY="$("$PROJECT_DIR/.venv/bin/python" -c 'import json; print(json.load(open("/Users/macstudio/.omlx/settings.json"))["auth"]["api_key"])')"

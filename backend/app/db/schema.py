@@ -179,6 +179,33 @@ CREATE TABLE IF NOT EXISTS agent_decisions (
   created_at       TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS podcast_metrics (
+  id                    TEXT PRIMARY KEY,
+  digest_id             TEXT NOT NULL REFERENCES digests(id),
+  inference_run_id      TEXT,
+  ts                    TEXT NOT NULL,
+  show_name             TEXT,
+  episode_id            TEXT,
+  episode_title         TEXT,
+  feed_url              TEXT,
+  audio_url             TEXT,
+  episode_url           TEXT,
+  apple_podcasts_url    TEXT,
+  published_at          TEXT,
+  duration_seconds      INTEGER,
+  quality_score         REAL,
+  transcript_source     TEXT,
+  status                TEXT NOT NULL,
+  error_detail          TEXT,
+  feed_fetch_ms         INTEGER,
+  audio_download_ms     INTEGER,
+  transcription_ms      INTEGER,
+  total_ms              INTEGER,
+  audio_bytes           INTEGER,
+  transcript_words      INTEGER,
+  cache_hit             INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS digest_issues (
   id           TEXT PRIMARY KEY,
   run_id       TEXT NOT NULL REFERENCES digest_runs(id),
@@ -279,6 +306,9 @@ CREATE INDEX IF NOT EXISTS idx_digest_issues_digest_id ON digest_issues(digest_i
 CREATE INDEX IF NOT EXISTS idx_digest_items_digest_id ON digest_items(digest_id);
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_run_id ON agent_decisions(run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_digest_id ON agent_decisions(digest_id);
+CREATE INDEX IF NOT EXISTS idx_podcast_metrics_digest_ts ON podcast_metrics(digest_id, ts);
+CREATE INDEX IF NOT EXISTS idx_podcast_metrics_inference_run_id ON podcast_metrics(inference_run_id);
+CREATE INDEX IF NOT EXISTS idx_podcast_metrics_status ON podcast_metrics(status);
 CREATE INDEX IF NOT EXISTS idx_discoveries_article_id ON article_discoveries(article_id);
 CREATE INDEX IF NOT EXISTS idx_model_enrichment_cache_url ON model_enrichment_cache(canonical_url);
 CREATE INDEX IF NOT EXISTS idx_model_enrichment_cache_model ON model_enrichment_cache(model_name);

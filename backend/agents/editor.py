@@ -66,6 +66,8 @@ def _prepare_result(
     keywords = list(result.keywords)
     if result.payload.source_type == "reddit_thread":
         section = "Community Signals"
+    elif result.payload.source_type == "podcast_episode":
+        section = "Podcast Signals"
     else:
         section = _section_for(result.title, source_text, keywords)
     relevance = _relevance_score(result, interest_tokens, keywords)
@@ -74,6 +76,13 @@ def _prepare_result(
         if relevance >= max(0.28, threshold - 0.18) and result.link_score >= 0.30:
             tier = "main"
         elif relevance >= 0.22 and result.link_score >= 0.35:
+            tier = "lower_confidence"
+        else:
+            tier = "dropped"
+    elif result.payload.source_type == "podcast_episode":
+        if relevance >= max(0.30, threshold - 0.16) and result.link_score >= 0.30:
+            tier = "main"
+        elif relevance >= 0.24 and result.link_score >= 0.34:
             tier = "lower_confidence"
         else:
             tier = "dropped"

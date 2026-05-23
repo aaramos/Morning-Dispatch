@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from backend.agents.digestor.gmail import SCOPES
+from backend.agents.digestor.podcast import discover_podcasts
 from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
 from backend.app.db import database
 from backend.app.services import email_delivery, mcp_status, model_catalog, model_jobs, scheduler, source_scout, verification
@@ -48,6 +49,22 @@ class ModelSelectionPayload(BaseModel):
 class DeliverySettingsPayload(BaseModel):
     recipient_email: str = Field(default="", max_length=254)
     enabled: bool = False
+
+
+class PodcastSourcePayload(BaseModel):
+    type: str = Field(default="podcast_rss")
+    title: str | None = Field(default=None, max_length=180)
+    feed_url: str | None = Field(default=None, max_length=1200)
+    site_url: str | None = Field(default=None, max_length=1200)
+    author: str | None = Field(default=None, max_length=180)
+    query: str | None = Field(default=None, max_length=220)
+    aggregator: str | None = Field(default=None, max_length=80)
+    transcription: str = Field(default="auto", max_length=40)
+
+
+class PodcastCredentialsPayload(BaseModel):
+    api_key: str = Field(min_length=1, max_length=1000)
+    api_secret: str = Field(min_length=1, max_length=1000)
 
 
 def require_admin_network(request: Request) -> None:
@@ -92,8 +109,10 @@ async def admin_status(request: Request) -> dict[str, Any]:
     scheduler_status = scheduler.status()
     digests = [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()]
     delivery_status = _delivery_status(request, settings, digests)
+    podcast_status = _podcast_status(settings, digests)
     model_cache = database.model_cache_summary()
     inference_metrics = database.inference_metrics_summary()
+    podcast_metrics = database.podcast_metrics_summary()
     agent_decisions = database.agent_decisions_summary()
     source_scout = database.source_scout_summary()
     fetch_failures = database.fetch_failure_breakdown(limit=5)
@@ -108,6 +127,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
             "public_base_url": settings.public_base_url,
         },
         "delivery": delivery_status,
+        "podcasts": podcast_status,
         "health": _admin_health(
             gmail=gmail,
             model={
@@ -139,6 +159,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
         "digests": digests,
         "model_cache": model_cache,
         "inference_metrics": inference_metrics,
+        "podcast_metrics": podcast_metrics,
         "agent_decisions": agent_decisions,
         "source_scout": source_scout,
         "fetch_failures": fetch_failures,
@@ -312,6 +333,53 @@ def get_brief_review() -> dict[str, Any]:
 @router.get("/digest-stats")
 def get_digest_stats() -> dict[str, Any]:
     return database.latest_digest_stats()
+
+
+@router.get("/podcasts/discover")
+async def discover_podcast_sources(query: str = "", limit: int = 8) -> dict[str, Any]:
+    settings = _settings()
+    configured = bool(settings.podcastindex_api_key and settings.podcastindex_api_secret)
+    if not configured:
+        return {
+            "configured": False,
+            "results": [],
+            "message": "Podcast Index credentials are not configured. Manual RSS feeds still work.",
+        }
+    results = await discover_podcasts(query, limit=limit)
+    return {"configured": True, "results": results, "message": None}
+
+
+@router.post("/podcasts/credentials")
+def save_podcast_credentials(payload: PodcastCredentialsPayload) -> dict[str, Any]:
+    api_key = payload.api_key.strip()
+    api_secret = payload.api_secret.strip()
+    if not api_key or not api_secret:
+        raise HTTPException(status_code=400, detail="Podcast Index API key and secret are required")
+    settings = _settings()
+    _write_secret_text(settings.secrets_dir / "podcastindex" / "api_key", api_key)
+    _write_secret_text(settings.secrets_dir / "podcastindex" / "api_secret", api_secret)
+    refreshed_settings = _settings()
+    digests = [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()]
+    return _podcast_status(refreshed_settings, digests)
+
+
+@router.post("/digests/{digest_id}/podcast-sources")
+def add_podcast_source(digest_id: str, payload: PodcastSourcePayload) -> dict[str, Any]:
+    try:
+        digest = database.add_podcast_source(digest_id, payload.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    return {"digest": digest, "sources": database.list_podcast_sources(digest_id)}
+
+
+@router.delete("/digests/{digest_id}/podcast-sources/{source_key}")
+def remove_podcast_source(digest_id: str, source_key: str) -> dict[str, Any]:
+    digest = database.remove_podcast_source(digest_id, source_key)
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    return {"digest": digest, "sources": database.list_podcast_sources(digest_id)}
 
 
 @router.patch("/digests/{digest_id}/delivery")
@@ -493,6 +561,17 @@ def _delivery_status(request: Request, settings: Settings, digests: list[dict[st
     }
 
 
+def _podcast_status(settings: Settings, digests: list[dict[str, Any]]) -> dict[str, Any]:
+    digest_id = str(digests[0]["id"]) if digests else None
+    return {
+        "aggregator_configured": bool(settings.podcastindex_api_key and settings.podcastindex_api_secret),
+        "transcription_configured": bool(settings.podcast_transcribe_command),
+        "sources": database.list_podcast_sources(digest_id) if digest_id else [],
+        "audio_cache_dir": str(settings.data_dir / "podcast-audio"),
+        "transcript_cache_dir": str(settings.data_dir / "podcast-transcripts"),
+    }
+
+
 def _looks_like_email(value: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value))
 
@@ -517,6 +596,15 @@ def _oauth_flow(
 def _write_secret_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path)
+
+
+def _write_secret_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value.strip() + "\n", encoding="utf-8")
     try:
         path.chmod(0o600)
     except OSError:

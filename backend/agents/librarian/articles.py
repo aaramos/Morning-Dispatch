@@ -82,11 +82,12 @@ async def fetch_articles_for_payloads(
 def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[ArticleFetchResult]:
     results: list[ArticleFetchResult] = []
     for payload in payloads:
-        if payload.source_type != "reddit_thread" or not payload.original_url:
+        if payload.source_type not in {"reddit_thread", "podcast_episode"} or not payload.original_url:
             continue
         canonical_url = canonicalize_url(payload.original_url)
-        title = _payload_title(payload) or payload.source_name or "Reddit thread"
+        title = _payload_title(payload) or payload.source_name or "Direct source"
         text = _clean_text(payload.raw_text)
+        is_podcast = payload.source_type == "podcast_episode"
         results.append(
             ArticleFetchResult(
                 payload=payload,
@@ -98,9 +99,13 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                 excerpt=_truncate(text, 520),
                 domain=_domain(canonical_url),
                 status="fetched",
-                link_score=float((payload.metadata or {}).get("thread_quality_score") or 0.65),
-                section="Reddit Threads",
-                content_type="reddit_thread",
+                link_score=float(
+                    (payload.metadata or {}).get("episode_quality_score")
+                    or (payload.metadata or {}).get("thread_quality_score")
+                    or 0.65
+                ),
+                section="Podcast Signals" if is_podcast else "Reddit Threads",
+                content_type="podcast" if is_podcast else "reddit_thread",
             )
         )
     return results

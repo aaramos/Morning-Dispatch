@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import replace
 from time import monotonic
@@ -51,6 +52,7 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
     published_run = None
     published_issue = None
     if publish:
+        source_stats = _run_digest_stats(latest_run)
         stage_seconds = {
             "editorial": round(monotonic() - started_at, 3),
             "publishing": 0.0,
@@ -69,9 +71,10 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
             inference_run_id=str(latest_run.get("inference_run_id") or database.new_id()),
             stage_seconds=stage_seconds,
             stats_overrides={
-                "source_count": len(digest.get("sources", [])),
-                "newsletter_count": int(latest_run.get("newsletter_count") or len(source_payloads)),
-                "link_count": int(latest_run.get("link_count") or 0),
+                "source_count": int(source_stats.get("source_count") or len(digest.get("sources", []))),
+                "newsletter_count": int(source_stats.get("newsletter_count") or latest_run.get("newsletter_count") or len(source_payloads)),
+                "link_count": int(source_stats.get("link_count") or latest_run.get("link_count") or 0),
+                "podcast_episode_count": int(source_stats.get("podcast_episode_count") or _podcast_count(source_articles)),
                 "processing_seconds": latest_run.get("duration_seconds"),
             },
             agent_decisions=decisions,
@@ -109,6 +112,19 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
 
 def _active_count(results: list[ArticleFetchResult]) -> int:
     return sum(1 for result in results if result.tier != "dropped")
+
+
+def _podcast_count(results: list[ArticleFetchResult]) -> int:
+    return sum(1 for result in results if result.payload.source_type == "podcast_episode")
+
+
+def _run_digest_stats(run: dict[str, Any]) -> dict[str, Any]:
+    try:
+        metadata = json.loads(str(run.get("run_metadata") or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    stats = metadata.get("digest_stats") if isinstance(metadata, dict) else {}
+    return stats if isinstance(stats, dict) else {}
 
 
 def _lead_title(results: list[ArticleFetchResult]) -> str | None:

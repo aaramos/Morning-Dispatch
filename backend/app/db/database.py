@@ -25,6 +25,7 @@ from backend.app.core.config import ensure_runtime_dirs, get_settings
 from backend.app.db.schema import SCHEMA_SQL
 
 MODEL_ENRICHMENT_CACHE_VERSION = "librarian-v1"
+PODCAST_SOURCE_TYPES = {"podcast_rss", "podcast_search"}
 INFERENCE_METRIC_STATUSES = (
     "success",
     "timeout",
@@ -43,6 +44,46 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\ufeff\u00ad]+")
 REFERENCE_MARK_RE = re.compile(r"\[\d+\]")
 SEPARATOR_RE = re.compile(r"(?:[-–—]\s*){3,}")
+NEWSLETTER_UTILITY_LABELS = {
+    "advertise",
+    "archive",
+    "click here",
+    "follow on x",
+    "manage preferences",
+    "read online",
+    "read it in full online",
+    "sign up",
+    "signup",
+    "subscribe",
+    "unsubscribe",
+    "view in browser",
+    "view online",
+    "work with us",
+}
+NEWSLETTER_BOILERPLATE_PATTERNS = (
+    re.compile(r"\bOops!\s*Looks like your email provider is scrambling the email.*?(?=(?:[A-Z][a-z]+[,.:;!?]|\Z))", re.IGNORECASE),
+    re.compile(r"\bClick here to read it in full online:?", re.IGNORECASE),
+    re.compile(r"\bWe'd hate to see you go,\s*but if you want to unsubscribe.*$", re.IGNORECASE),
+    re.compile(r"\bIf you want to unsubscribe,\s*please click here:?.*$", re.IGNORECASE),
+    re.compile(r"\bTogether with\s*·?\s*Today's Author\b.*$", re.IGNORECASE),
+    re.compile(r"\bToday's Author\b.*$", re.IGNORECASE),
+    re.compile(r"\bView Online\s+TLDR\s+TOGETHER WITH\b.*$", re.IGNORECASE),
+    re.compile(r"\bTLDR\s+TOGETHER WITH\b.*$", re.IGNORECASE),
+    re.compile(r"\bSignup\s*\|\s*Work With Us\s*\|\s*Follow on X\s*\|\s*Archive\b", re.IGNORECASE),
+    re.compile(r"\bSign up\s*\|\s*Work With Us\s*\|\s*Follow on X\s*\|\s*Archive\b", re.IGNORECASE),
+)
+FOLLOW_IMAGE_RE = re.compile(r"Follow image link:\s*(?:\([^)]*\)|\S*)\s*(?:Caption:\s*)?", re.IGNORECASE)
+NEWSLETTER_LOW_VALUE_RE = re.compile(
+    r"\b(?:"
+    r"email provider is scrambling|"
+    r"read it in full online|"
+    r"unsubscribe|"
+    r"manage preferences|"
+    r"view in browser|"
+    r"view online"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def utc_now() -> str:
@@ -76,6 +117,7 @@ def init_database() -> None:
         connection.executescript(SCHEMA_SQL)
         _ensure_digest_run_metric_columns(connection)
         _ensure_digest_delivery_settings_table(connection)
+        _ensure_podcast_metrics_table(connection)
         _ensure_inference_metric_status_values(connection)
         _ensure_default_profile(connection)
 
@@ -133,6 +175,48 @@ def _ensure_digest_delivery_settings_table(connection: sqlite3.Connection) -> No
           updated_at            TEXT NOT NULL
         ) STRICT
         """
+    )
+
+
+def _ensure_podcast_metrics_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS podcast_metrics (
+          id                    TEXT PRIMARY KEY,
+          digest_id             TEXT NOT NULL REFERENCES digests(id),
+          inference_run_id      TEXT,
+          ts                    TEXT NOT NULL,
+          show_name             TEXT,
+          episode_id            TEXT,
+          episode_title         TEXT,
+          feed_url              TEXT,
+          audio_url             TEXT,
+          episode_url           TEXT,
+          apple_podcasts_url    TEXT,
+          published_at          TEXT,
+          duration_seconds      INTEGER,
+          quality_score         REAL,
+          transcript_source     TEXT,
+          status                TEXT NOT NULL,
+          error_detail          TEXT,
+          feed_fetch_ms         INTEGER,
+          audio_download_ms     INTEGER,
+          transcription_ms      INTEGER,
+          total_ms              INTEGER,
+          audio_bytes           INTEGER,
+          transcript_words      INTEGER,
+          cache_hit             INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_podcast_metrics_digest_ts ON podcast_metrics(digest_id, ts)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_podcast_metrics_inference_run_id ON podcast_metrics(inference_run_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_podcast_metrics_status ON podcast_metrics(status)"
     )
 
 
@@ -333,6 +417,97 @@ def update_digest(digest_id: str, payload: dict[str, Any]) -> dict[str, Any] | N
             ),
         )
     return get_digest(digest_id)
+
+
+def list_podcast_sources(digest_id: str | None = None) -> list[dict[str, Any]]:
+    digests = list_digests(include_archived=True)
+    records: list[dict[str, Any]] = []
+    for digest in digests:
+        if digest_id and str(digest["id"]) != digest_id:
+            continue
+        sources = digest.get("sources") if isinstance(digest.get("sources"), list) else []
+        for source in sources:
+            if not isinstance(source, dict) or source.get("type") not in PODCAST_SOURCE_TYPES:
+                continue
+            record = {**source}
+            record["key"] = _podcast_source_key(source)
+            record["digest_id"] = digest["id"]
+            record["digest_name"] = digest["name"]
+            records.append(record)
+    return records
+
+
+def add_podcast_source(digest_id: str, source: dict[str, Any]) -> dict[str, Any] | None:
+    digest = get_digest(digest_id)
+    if digest is None:
+        return None
+    normalized = _normalize_podcast_source(source)
+    if normalized is None:
+        raise ValueError("Podcast source needs either a feed URL or a search query")
+
+    existing_sources = list(digest.get("sources") if isinstance(digest.get("sources"), list) else [])
+    source_key = _podcast_source_key(normalized)
+    updated_sources = [
+        item
+        for item in existing_sources
+        if not (isinstance(item, dict) and item.get("type") in PODCAST_SOURCE_TYPES and _podcast_source_key(item) == source_key)
+    ]
+    updated_sources.append(normalized)
+    return update_digest(digest_id, {"sources": updated_sources})
+
+
+def remove_podcast_source(digest_id: str, source_key: str) -> dict[str, Any] | None:
+    digest = get_digest(digest_id)
+    if digest is None:
+        return None
+    existing_sources = list(digest.get("sources") if isinstance(digest.get("sources"), list) else [])
+    updated_sources = [
+        item
+        for item in existing_sources
+        if not (isinstance(item, dict) and item.get("type") in PODCAST_SOURCE_TYPES and _podcast_source_key(item) == source_key)
+    ]
+    return update_digest(digest_id, {"sources": updated_sources})
+
+
+def _normalize_podcast_source(source: dict[str, Any]) -> dict[str, Any] | None:
+    feed_url = str(source.get("feed_url") or source.get("url") or "").strip()
+    query = str(source.get("query") or "").strip()
+    source_type = str(source.get("type") or "").strip()
+    if feed_url:
+        parsed = urlparse(feed_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        title = str(source.get("title") or parsed.netloc.removeprefix("www.") or "Podcast").strip()
+        return {
+            "type": "podcast_rss",
+            "title": title[:180],
+            "feed_url": feed_url,
+            "site_url": _nullable_str(source.get("site_url")),
+            "author": _nullable_str(source.get("author")),
+            "aggregator": _nullable_str(source.get("aggregator")),
+            "itunes_id": _nullable_str(source.get("itunes_id") or source.get("itunesId")),
+            "apple_podcasts_url": _nullable_str(source.get("apple_podcasts_url")),
+            "transcription": str(source.get("transcription") or "auto"),
+        }
+    if source_type == "podcast_search" or query:
+        if not query:
+            return None
+        return {
+            "type": "podcast_search",
+            "title": str(source.get("title") or f"Search: {query}").strip()[:180],
+            "query": query[:220],
+            "aggregator": _nullable_str(source.get("aggregator") or "podcastindex"),
+            "transcription": str(source.get("transcription") or "auto"),
+        }
+    return None
+
+
+def _podcast_source_key(source: dict[str, Any]) -> str:
+    if source.get("type") == "podcast_search":
+        value = str(source.get("query") or "").strip().lower()
+        return "search:" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+    value = str(source.get("feed_url") or source.get("url") or "").strip().lower()
+    return "feed:" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
 
 
 def seed_reddit_sources(digest_id: str, seed_sources: list[dict[str, Any]]) -> int:
@@ -674,6 +849,7 @@ def create_ingested_run(
     lookback_days = max(1, math.ceil(lookback_hours / 24))
     body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
     link_payload_count = sum(1 for payload in payloads if payload.source_type == "gmail_link")
+    podcast_payload_count = sum(1 for payload in payloads if payload.source_type == "podcast_episode")
     item_count = len(body_payloads) + len(article_results)
     failed_count = sum(1 for result in article_results if not result.fetched)
     fallback_count = sum(1 for result in article_results if result.content_type == "fallback_snippet")
@@ -682,6 +858,7 @@ def create_ingested_run(
         configured_source_count=configured_source_count,
         newsletter_count=len(body_payloads),
         link_count=link_payload_count,
+        podcast_episode_count=podcast_payload_count,
         article_results=article_results,
         duration_seconds=duration_seconds,
         inference_run_id=inference_run_id,
@@ -692,6 +869,7 @@ def create_ingested_run(
             "source_count",
             "newsletter_count",
             "link_count",
+            "podcast_episode_count",
             "processing_seconds",
             "stage_seconds",
         ):
@@ -827,15 +1005,16 @@ def ingested_snapshot(
     article_results = article_results or []
     body_count = sum(1 for payload in payloads if payload.source_type == "gmail")
     link_count = sum(1 for payload in payloads if payload.source_type == "gmail_link")
+    podcast_count = sum(1 for payload in payloads if payload.source_type == "podcast_episode")
     fetched_article_count = sum(1 for result in article_results if result.fetched)
     attempted_count = len(article_results)
     model_capacity_count = sum(
         1 for result in article_results if result.enrichment_source == "model_capacity_fallback"
     )
     if configured_source_count == 0:
-        return "No Gmail newsletter sources are configured for this digest."
+        return "No sources are configured for this digest."
     if not payloads:
-        return f"No matching newsletters found across {configured_source_count} configured Gmail source(s)."
+        return f"No matching items found across {configured_source_count} configured source(s)."
     if attempted_count:
         snapshot = build_issue_snapshot(body_count, configured_source_count, article_results)
         if model_capacity_count:
@@ -845,8 +1024,8 @@ def ingested_snapshot(
             )
         return snapshot
     return (
-        f"Fetched {body_count} newsletter body/bodies and {link_count} linked item(s) "
-        f"from {configured_source_count} configured Gmail source(s)."
+        f"Fetched {body_count} newsletter body/bodies, {link_count} linked item(s), "
+        f"and {podcast_count} podcast episode(s) from {configured_source_count} configured source(s)."
     )
 
 
@@ -936,6 +1115,7 @@ def _build_digest_stats(
     configured_source_count: int,
     newsletter_count: int,
     link_count: int,
+    podcast_episode_count: int = 0,
     article_results: list[ArticleFetchResult],
     duration_seconds: float | None,
     inference_run_id: str | None,
@@ -950,6 +1130,7 @@ def _build_digest_stats(
         "source_count": max(0, int(configured_source_count or 0)),
         "newsletter_count": max(0, int(newsletter_count or 0)),
         "link_count": max(0, int(link_count or 0)),
+        "podcast_episode_count": max(0, int(podcast_episode_count or 0)),
         "article_candidate_count": len(article_results),
         "included_article_count": included_count,
         "unresolved_count": unresolved_count,
@@ -1027,7 +1208,8 @@ def render_ingested_issue(
     lower_confidence_articles = [result for result in fetched_articles if result.tier == "lower_confidence"]
     hidden_article_count = max(0, len(fetched_articles) - len(main_articles) - len(lower_confidence_articles) - (1 if lead_article else 0))
 
-    newsletter_html = "\n".join(_render_newsletter_item(payload) for payload in body_payloads[:8])
+    newsletter_items = [_render_newsletter_item(payload) for payload in body_payloads[:8]]
+    newsletter_html = "\n".join(item for item in newsletter_items if item)
     lead_html = _render_article_card(lead_article, variant="lead", issue_id=issue_id) if lead_article else ""
     section_html = _render_article_sections(main_articles, issue_id=issue_id)
     lower_html = "\n".join(
@@ -1040,6 +1222,7 @@ def render_ingested_issue(
             configured_source_count=0,
             newsletter_count=len(body_payloads),
             link_count=sum(1 for payload in payloads if payload.source_type == "gmail_link"),
+            podcast_episode_count=sum(1 for payload in payloads if payload.source_type == "podcast_episode"),
             article_results=article_results,
             duration_seconds=None,
             inference_run_id=None,
@@ -1148,7 +1331,7 @@ def render_ingested_issue(
       <section class="section">
         <h2>Digest Stats</h2>
         {stats_html}
-        <details class="source-notes">
+        <details class="source-notes" open>
           <summary>Newsletter Briefs</summary>
           {newsletter_html or '<p class="meta">No newsletter bodies were available.</p>'}
         </details>
@@ -1373,16 +1556,19 @@ def _article_row_to_fetch_result(row: sqlite3.Row) -> ArticleFetchResult:
 
 def _digest_item_row_to_fetch_result(row: sqlite3.Row) -> ArticleFetchResult:
     canonical_url = str(row["canonical_url"] or row["original_url"] or "")
+    source_type = str(row["discovery_source_type"] or "stored_article")
+    thread_id = row["thread_id"]
     status = str(row["fetch_status"] or "fetched")
     metadata = {
         "article_id": str(row["article_id"]),
         "gmail_message_id": row["message_id"],
-        "reddit_thread_id": row["thread_id"],
+        "reddit_thread_id": thread_id if source_type == "reddit_thread" else None,
+        "podcast_episode_id": thread_id if source_type == "podcast_episode" else None,
         "sender_email": row["sender_email"],
         "link_text": row["link_text"],
     }
     payload = NormalizedPayload(
-        source_type=str(row["discovery_source_type"] or "stored_article"),
+        source_type=source_type,
         source_name=str(row["sender_email"] or row["publisher"] or row["discovery_source_name"] or "stored article"),
         original_url=canonical_url,
         published_at=row["published_at"],
@@ -1484,7 +1670,7 @@ def _insert_discovery(
             payload.source_name,
             metadata.get("sender_email") or metadata.get("sender"),
             metadata.get("gmail_message_id"),
-            metadata.get("reddit_thread_id") or metadata.get("thread_id"),
+            metadata.get("reddit_thread_id") or metadata.get("podcast_episode_id") or metadata.get("thread_id"),
             payload.published_at,
             _title_for_payload(payload),
             _summary_for_payload(payload),
@@ -1553,7 +1739,7 @@ def _insert_discovery_for_result(
             result.payload.source_name,
             metadata.get("sender_email") or metadata.get("sender"),
             metadata.get("gmail_message_id"),
-            metadata.get("reddit_thread_id") or metadata.get("thread_id"),
+            metadata.get("reddit_thread_id") or metadata.get("podcast_episode_id") or metadata.get("thread_id"),
             result.payload.published_at,
             metadata.get("link_text") or result.title,
             _discovery_snippet_for_result(result),
@@ -1582,6 +1768,8 @@ def _render_newsletter_item(payload: NormalizedPayload) -> str:
     subject = _title_for_payload(payload)
     sender = payload.source_name or "Gmail"
     snippet = _summary_for_payload(payload, max_chars=700)
+    if _weak_newsletter_snippet(snippet):
+        return ""
     published = _format_issue_date(payload.published_at)
     return f"""
       <article class="newsletter">
@@ -1720,6 +1908,7 @@ def _render_digest_stats(stats: dict[str, Any]) -> str:
         ("Sources", _format_int(stats.get("source_count"))),
         ("Newsletters", _format_int(stats.get("newsletter_count"))),
         ("Links extracted", _format_int(stats.get("link_count"))),
+        ("Podcast episodes", _format_int(stats.get("podcast_episode_count"))),
         ("Articles included", _format_int(stats.get("included_article_count"))),
         ("Items filtered", _format_int(int(stats.get("dropped_count") or 0) + int(stats.get("unresolved_count") or 0))),
         ("Model tokens", _format_int(stats.get("total_tokens"))),
@@ -1766,10 +1955,14 @@ def _format_duration(value: Any) -> str:
 
 
 def _section_for_payload(payload: NormalizedPayload) -> str:
+    if payload.source_type == "podcast_episode":
+        return "Podcast Signals"
     return "Newsletter" if payload.source_type == "gmail" else "Discovered Link"
 
 
 def _editor_note_for_payload(payload: NormalizedPayload) -> str:
+    if payload.source_type == "podcast_episode":
+        return "Podcast episode ingested from a configured feed or aggregator search."
     if payload.source_type == "gmail_link":
         return "Extracted from an approved Gmail newsletter. Article fetch and enrichment are pending."
     return "Newsletter body ingested from an approved Gmail sender."
@@ -1779,6 +1972,10 @@ def _editor_note_for_result(result: ArticleFetchResult) -> str:
     if result.payload.source_type == "reddit_thread":
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         return f"Reddit thread selected from {result.payload.source_name} by Source Scout.{score}"
+    if result.payload.source_type == "podcast_episode":
+        score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
+        source = str((result.payload.metadata or {}).get("transcript_source") or "show notes").replace("_", " ")
+        return f"Podcast episode summarized from {source}.{score}"
     if result.fetched:
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         return f"Fetched from a link discovered in an approved Gmail newsletter.{score}"
@@ -1831,7 +2028,15 @@ def clean_issue_html_for_display(html: str) -> str:
         paragraph = article.find("p")
         if paragraph is not None:
             cleaned = _truncate_text(_clean_newsletter_text(paragraph.get_text(" ", strip=True)), 700)
+            if _weak_newsletter_snippet(cleaned):
+                article.decompose()
+                changed = True
+                continue
             paragraph.string = cleaned
+            changed = True
+    for details in soup.select("details.source-notes"):
+        if not details.has_attr("open"):
+            details["open"] = ""
             changed = True
     for paragraph in soup.select("article.article-card p"):
         cleaned = _clean_newsletter_text(paragraph.get_text(" ", strip=True))
@@ -1880,7 +2085,17 @@ def _clean_newsletter_text(value: str | None) -> str:
     text = unescape(value or "")
     text = ZERO_WIDTH_RE.sub(" ", text)
     text = IMAGE_PLACEHOLDER_RE.sub(" ", text)
-    text = MARKDOWN_LINK_RE.sub(lambda match: f" {match.group(1)} ", text)
+    text = FOLLOW_IMAGE_RE.sub(" ", text)
+    text = MARKDOWN_LINK_RE.sub(_newsletter_markdown_label, text)
+    for pattern in NEWSLETTER_BOILERPLATE_PATTERNS:
+        text = pattern.sub(" ", text)
+    text = re.sub(
+        r"\b(?:read online|sign\s*up|signup|work with us|advertise|follow on x|archive|subscribe|unsubscribe|view online|view in browser)\b"
+        r"(?:\s*\|\s*\b(?:read online|sign\s*up|signup|work with us|advertise|follow on x|archive|subscribe|unsubscribe|view online|view in browser)\b)+",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = RAW_URL_RE.sub(" ", text)
     text = HTML_TAG_RE.sub(" ", text)
     text = REFERENCE_MARK_RE.sub(" ", text)
@@ -1888,7 +2103,42 @@ def _clean_newsletter_text(value: str | None) -> str:
     text = text.replace("**", " ").replace("__", " ").replace("^^", " ").replace("^", " ").replace("`", " ")
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     text = re.sub(r"\s+", " ", text)
+    text = text.strip(" -|")
+    if re.fullmatch(r"(?:online|read online|click here)[:.!?]?", text, flags=re.IGNORECASE):
+        return ""
+    return text
+
+
+def _newsletter_markdown_label(match: re.Match[str]) -> str:
+    label = _clean_markdown_label(match.group(1))
+    if _is_newsletter_utility_label(label):
+        return " "
+    return f" {label} "
+
+
+def _clean_markdown_label(label: str) -> str:
+    text = ZERO_WIDTH_RE.sub(" ", unescape(label or ""))
+    text = HTML_TAG_RE.sub(" ", text)
+    text = text.replace("**", " ").replace("__", " ").replace("`", " ")
+    text = re.sub(r"\s+", " ", text)
     return text.strip(" -|")
+
+
+def _is_newsletter_utility_label(label: str) -> bool:
+    normalized = re.sub(r"\s+", " ", label.lower()).strip(" -|")
+    return normalized in NEWSLETTER_UTILITY_LABELS
+
+
+def _weak_newsletter_snippet(snippet: str) -> bool:
+    text = re.sub(r"\s+", " ", snippet or "").strip()
+    if not text:
+        return True
+    words = re.findall(r"[A-Za-z0-9]+", text)
+    if len(words) <= 3 and re.fullmatch(r"(?:online|read online|click here)[:.!?]?", text, flags=re.IGNORECASE):
+        return True
+    if len(words) < 8 and NEWSLETTER_LOW_VALUE_RE.search(text):
+        return True
+    return not words
 
 
 def _format_issue_date(value: str | None) -> str:
@@ -2142,6 +2392,7 @@ def latest_digest_stats() -> dict[str, Any]:
             "source_count": 0,
             "newsletter_count": 0,
             "link_count": 0,
+            "podcast_episode_count": 0,
             "article_candidate_count": 0,
             "included_article_count": 0,
             "unresolved_count": 0,
@@ -2168,6 +2419,7 @@ def _digest_stats_from_run_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, A
             "source_count": int(stats.get("source_count") or 0),
             "newsletter_count": int(stats.get("newsletter_count") or 0),
             "link_count": int(stats.get("link_count") or 0),
+            "podcast_episode_count": int(stats.get("podcast_episode_count") or 0),
             "article_candidate_count": int(stats.get("article_candidate_count") or 0),
             "included_article_count": int(stats.get("included_article_count") or 0),
             "unresolved_count": int(stats.get("unresolved_count") or 0),
@@ -2188,6 +2440,7 @@ def _digest_stats_from_run_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, A
         "source_count": 0,
         "newsletter_count": int(record.get("newsletter_count") or 0),
         "link_count": int(record.get("link_count") or 0),
+        "podcast_episode_count": 0,
         "article_candidate_count": included + unresolved,
         "included_article_count": included,
         "unresolved_count": unresolved,
@@ -2501,6 +2754,103 @@ def agent_decisions_summary(*, limit: int = 500) -> dict[str, Any]:
         "agent_counts": agent_counts,
         "action_counts": action_counts,
         "decision_counts": decision_counts,
+    }
+
+
+def record_podcast_metric(metric: dict[str, Any]) -> str:
+    metric_id = str(metric.get("id") or new_id())
+    record = {
+        "id": metric_id,
+        "digest_id": str(metric.get("digest_id") or ""),
+        "inference_run_id": _nullable_str(metric.get("inference_run_id")),
+        "ts": str(metric.get("ts") or utc_now()),
+        "show_name": _nullable_str(metric.get("show_name")),
+        "episode_id": _nullable_str(metric.get("episode_id")),
+        "episode_title": _nullable_str(metric.get("episode_title")),
+        "feed_url": _nullable_str(metric.get("feed_url")),
+        "audio_url": _nullable_str(metric.get("audio_url")),
+        "episode_url": _nullable_str(metric.get("episode_url")),
+        "apple_podcasts_url": _nullable_str(metric.get("apple_podcasts_url")),
+        "published_at": _nullable_str(metric.get("published_at")),
+        "duration_seconds": _nullable_int(metric.get("duration_seconds")),
+        "quality_score": _nullable_float(metric.get("quality_score")),
+        "transcript_source": _nullable_str(metric.get("transcript_source")),
+        "status": str(metric.get("status") or "unknown"),
+        "error_detail": _nullable_str(metric.get("error_detail")),
+        "feed_fetch_ms": _nullable_int(metric.get("feed_fetch_ms")),
+        "audio_download_ms": _nullable_int(metric.get("audio_download_ms")),
+        "transcription_ms": _nullable_int(metric.get("transcription_ms")),
+        "total_ms": _nullable_int(metric.get("total_ms")),
+        "audio_bytes": _nullable_int(metric.get("audio_bytes")),
+        "transcript_words": _nullable_int(metric.get("transcript_words")),
+        "cache_hit": int(bool(metric.get("cache_hit"))),
+    }
+    columns = ", ".join(record.keys())
+    placeholders = ", ".join("?" for _ in record)
+    with connect() as connection:
+        connection.execute(
+            f"INSERT INTO podcast_metrics ({columns}) VALUES ({placeholders})",
+            tuple(record.values()),
+        )
+    return metric_id
+
+
+def podcast_metrics_summary(*, limit: int = 500) -> dict[str, Any]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM podcast_metrics
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 5000)),),
+        ).fetchall()
+
+    records = [dict(row) for row in rows]
+    status_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    total_download_ms = 0
+    total_transcription_ms = 0
+    total_ms = 0
+    download_count = 0
+    transcription_count = 0
+    total_counted = 0
+    cache_hits = 0
+    audio_bytes = 0
+    transcript_words = 0
+    latest_ts: str | None = None
+    for record in records:
+        status = str(record.get("status") or "unknown")
+        source = str(record.get("transcript_source") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        source_counts[source] = source_counts.get(source, 0) + 1
+        latest_ts = latest_ts or record.get("ts")
+        cache_hits += int(record.get("cache_hit") or 0)
+        audio_bytes += int(record.get("audio_bytes") or 0)
+        transcript_words += int(record.get("transcript_words") or 0)
+        if record.get("audio_download_ms") is not None:
+            total_download_ms += int(record["audio_download_ms"])
+            download_count += 1
+        if record.get("transcription_ms") is not None:
+            total_transcription_ms += int(record["transcription_ms"])
+            transcription_count += 1
+        if record.get("total_ms") is not None:
+            total_ms += int(record["total_ms"])
+            total_counted += 1
+
+    return {
+        "record_count": len(records),
+        "latest_ts": latest_ts,
+        "status_counts": status_counts,
+        "transcript_source_counts": source_counts,
+        "cache_hit_count": cache_hits,
+        "audio_bytes": audio_bytes,
+        "transcript_words": transcript_words,
+        "avg_download_ms": round(total_download_ms / download_count) if download_count else None,
+        "avg_transcription_ms": round(total_transcription_ms / transcription_count) if transcription_count else None,
+        "avg_total_ms": round(total_ms / total_counted) if total_counted else None,
+        "recent": records[:20],
     }
 
 

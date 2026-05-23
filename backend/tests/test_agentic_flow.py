@@ -6,6 +6,7 @@ from backend.agents.critic import apply_critic_repairs
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult
+from backend.app.services import digest_runner
 
 
 class FakeModelClient:
@@ -114,3 +115,16 @@ def test_critic_agent_applies_safe_repairs_only():
     assert updated[2].tier == "lead"
     assert any(decision.agent == "critic" and decision.action == "drop_article" for decision in decisions)
     assert any(decision.agent == "critic" and decision.action == "replace_lead" for decision in decisions)
+
+
+def test_digest_runner_uses_langgraph_orchestration():
+    graph = digest_runner._digest_graph().get_graph()
+
+    assert {
+        "ingest_sources",
+        "fetch_articles",
+        "rank_articles",
+        "refine_with_model",
+        "review_quality",
+        "publish_run",
+    }.issubset(set(graph.nodes))
