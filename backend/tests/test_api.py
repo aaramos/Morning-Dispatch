@@ -5,6 +5,7 @@ import re
 from fastapi.testclient import TestClient
 
 from backend.agents.agentic import AgentDecision
+from backend.agents.digestor import podcast
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.librarian import enrichment
@@ -13,6 +14,7 @@ from backend.app.main import create_app
 from backend.app.services import email_delivery
 from backend.app.services import digest_runner
 from backend.app.services import verification
+from backend.db.queries import get_watermark
 
 
 def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
@@ -469,6 +471,7 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
                     "podcast_episode_id": "episode-1",
                     "podcast_title": "AI Daily Brief",
                     "title": "Agentic AI workflows for product teams",
+                    "feed_url": "https://feeds.example.com/ai-daily.xml",
                     "episode_url": "https://podcasts.example.com/agentic-ai-workflows",
                     "audio_url": "https://cdn.example.com/audio.mp3",
                     "episode_quality_score": 0.76,
@@ -508,6 +511,12 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
         assert run.status_code == 202
         assert run.json()["status"] == "completed"
         assert run.json()["fetched_article_count"] == 1
+        watermark = get_watermark(
+            str(database.database_path()),
+            digest["id"],
+            podcast._source_key("https://feeds.example.com/ai-daily.xml"),
+        )
+        assert watermark == {"last_fetched": "2026-05-22T12:00:00+00:00", "last_id": "episode-1"}
 
         refresh = client.post(f"/api/admin/digests/{digest['id']}/verification-run?force_podcast_refresh=true")
         assert refresh.status_code == 200

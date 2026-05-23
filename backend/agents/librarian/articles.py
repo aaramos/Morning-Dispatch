@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 MAX_ARTICLE_FETCHES = 120
 MIN_ARTICLE_TEXT_CHARS = 450
+MIN_CONTEXT_FALLBACK_CHARS = 180
 REQUEST_TIMEOUT_SECONDS = 12
 USER_AGENT = "MorningDispatch/0.1 (+https://tailnet.local)"
 
@@ -244,6 +245,20 @@ async def _fetch_one(
             article = extract_article(response.text, final_url, fallback_title=_payload_title(payload))
             if len(article.text) < MIN_ARTICLE_TEXT_CHARS:
                 context = _newsletter_context(payload)
+                if _substantial_newsletter_context(context):
+                    return ArticleFetchResult(
+                        payload=payload,
+                        original_url=original_url,
+                        final_url=final_url,
+                        canonical_url=canonicalize_url(final_url),
+                        title=_contextual_title(article.title, payload, context),
+                        text=context,
+                        excerpt=_truncate(context, 520),
+                        domain=_domain(final_url),
+                        status="fetched",
+                        link_score=link_score,
+                        enrichment_source="newsletter_context",
+                    )
                 text = article.text or context
                 excerpt = _truncate(context or article.excerpt or article.text, 520)
                 return ArticleFetchResult(
@@ -423,6 +438,35 @@ def _newsletter_context(payload: NormalizedPayload) -> str:
     text = re.sub(r"https?://[^\s<>)\"']+", " ", text)
     text = _clean_text(text)
     return _truncate(text, 900)
+
+
+def _substantial_newsletter_context(context: str) -> bool:
+    if len(context) < MIN_CONTEXT_FALLBACK_CHARS:
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'-]+", context)
+    if len(words) < 18:
+        return False
+    lowered = context.lower()
+    low_value = (
+        "unsubscribe",
+        "manage preferences",
+        "privacy policy",
+        "sign up",
+        "sponsor",
+        "terms of service",
+        "view in browser",
+    )
+    return not any(phrase in lowered for phrase in low_value)
+
+
+def _contextual_title(article_title: str, payload: NormalizedPayload, context: str) -> str:
+    payload_title = _payload_title(payload)
+    if payload_title and len(payload_title) >= max(16, len(article_title) + 8):
+        return payload_title
+    first_sentence = re.split(r"(?<=[.!?])\s+", context, maxsplit=1)[0].strip()
+    if 20 <= len(first_sentence) <= 140 and len(first_sentence) >= len(article_title) + 8:
+        return first_sentence
+    return article_title or payload_title or _domain(str(payload.original_url or "")) or "Article"
 
 
 def _clean_text(value: str) -> str:

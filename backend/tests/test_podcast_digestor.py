@@ -135,6 +135,45 @@ def test_fetch_podcast_episode_payload_uses_show_notes(monkeypatch, tmp_path):
     assert updated_summary["record_count"] == 2
     assert updated_summary["status_counts"]["already_seen"] == 1
 
+    included_seen_payloads, included_seen_decisions = asyncio.run(
+        podcast.fetch_podcast_episodes(
+            digest_id=digest["id"],
+            digest_interest="agentic AI product strategy OpenAI local LLM infrastructure",
+            sources=[
+                {
+                    "type": "podcast_rss",
+                    "title": "AI Daily Brief",
+                    "feed_url": "https://podcasts.example.com/feed.xml",
+                }
+            ],
+            lookback_hours=24,
+            inference_run_id="inference-2a",
+            include_seen=True,
+        )
+    )
+
+    assert len(included_seen_payloads) == 1
+    assert any(decision.action == "reuse_cached_episode" for decision in included_seen_decisions)
+
+    unpublished_retry_payloads, _unpublished_retry_decisions = asyncio.run(
+        podcast.fetch_podcast_episodes(
+            digest_id=digest["id"],
+            digest_interest="agentic AI product strategy OpenAI local LLM infrastructure",
+            sources=[
+                {
+                    "type": "podcast_rss",
+                    "title": "AI Daily Brief",
+                    "feed_url": "https://podcasts.example.com/feed.xml",
+                }
+            ],
+            lookback_hours=24,
+            inference_run_id="inference-2b",
+            seen_requires_published=True,
+        )
+    )
+
+    assert len(unpublished_retry_payloads) == 1
+
     refreshed_payloads, _refreshed_decisions = asyncio.run(
         podcast.fetch_podcast_episodes(
             digest_id=digest["id"],
@@ -154,8 +193,8 @@ def test_fetch_podcast_episode_payload_uses_show_notes(monkeypatch, tmp_path):
 
     assert len(refreshed_payloads) == 1
     refreshed_summary = database.podcast_metrics_summary()
-    assert refreshed_summary["record_count"] == 3
-    assert refreshed_summary["status_counts"]["success"] == 2
+    assert refreshed_summary["record_count"] == 5
+    assert refreshed_summary["status_counts"]["success"] == 4
     assert refreshed_summary["status_counts"]["already_seen"] == 1
 
 

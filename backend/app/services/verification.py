@@ -9,7 +9,7 @@ from typing import Any
 from backend.agents.agentic import AgentDecision
 from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.critic import apply_critic_repairs
-from backend.agents.digestor.podcast import fetch_podcast_episodes
+from backend.agents.digestor.podcast import fetch_podcast_episodes, mark_podcast_payloads_seen
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
@@ -90,6 +90,14 @@ async def run_controlled_verification(
             agent_decisions=decisions,
         )
         published_issue = database.get_latest_issue(digest_id)
+        mark_podcast_payloads_seen(
+            digest_id,
+            [
+                result.payload
+                for result in after_quality
+                if result.payload.source_type == "podcast_episode" and result.tier != "dropped"
+            ],
+        )
         stored_count = len(decisions)
     else:
         stored_count = database.add_agent_decisions_for_run(

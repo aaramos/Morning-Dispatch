@@ -10,7 +10,7 @@ from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.agentic import AgentDecision
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.digestor.gmail_mcp_client import fetch_newsletters
-from backend.agents.digestor.podcast import fetch_podcast_episodes
+from backend.agents.digestor.podcast import fetch_podcast_episodes, mark_podcast_payloads_seen
 from backend.agents.digestor.reddit import fetch_reddit_threads
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.editor import prepare_issue_articles
@@ -155,6 +155,9 @@ async def _ingest_podcast(state: DigestGraphState) -> DigestGraphState:
         sources=digest.get("sources", []),
         lookback_hours=state["lookback_hours"],
         inference_run_id=state["inference_run_id"],
+        mark_seen=False,
+        seen_requires_published=True,
+        include_seen=True,
     )
     return {"podcast_payloads": payloads, "podcast_decisions": decisions}
 
@@ -266,6 +269,14 @@ async def _publish_run(state: DigestGraphState) -> DigestGraphState:
             + state.get("critic_decisions", [])
             + state.get("quality_decisions", [])
         ),
+    )
+    mark_podcast_payloads_seen(
+        state["digest_id"],
+        [
+            result.payload
+            for result in state.get("article_results", [])
+            if result.payload.source_type == "podcast_episode" and result.tier != "dropped"
+        ],
     )
     return {"run": run, "stage_seconds": stage_seconds}
 

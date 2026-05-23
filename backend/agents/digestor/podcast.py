@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 from xml.etree import ElementTree
 
@@ -57,6 +57,9 @@ async def fetch_podcast_episodes(
     max_episodes: int = MAX_PODCAST_EPISODES,
     inference_run_id: str | None = None,
     force_refresh: bool = False,
+    mark_seen: bool = True,
+    seen_requires_published: bool = False,
+    include_seen: bool = False,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     decisions: list[AgentDecision] = []
     try:
@@ -68,6 +71,9 @@ async def fetch_podcast_episodes(
             max_episodes=max_episodes,
             inference_run_id=inference_run_id,
             force_refresh=force_refresh,
+            mark_seen=mark_seen,
+            seen_requires_published=seen_requires_published,
+            include_seen=include_seen,
             decisions=decisions,
         )
     except Exception as exc:
@@ -94,6 +100,9 @@ async def _fetch_podcast_episodes(
     max_episodes: int,
     inference_run_id: str | None,
     force_refresh: bool,
+    mark_seen: bool,
+    seen_requires_published: bool,
+    include_seen: bool,
     decisions: list[AgentDecision],
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     podcast_sources = _podcast_sources(sources)
@@ -148,7 +157,8 @@ async def _fetch_podcast_episodes(
         for episode in feed_episodes:
             if not _inside_lookback(episode.published_at, lookback_hours):
                 continue
-            if _already_seen(digest_id, episode) and not force_refresh:
+            already_seen = _already_seen(digest_id, episode, require_published=seen_requires_published)
+            if already_seen and not force_refresh and not include_seen:
                 _record_skipped_podcast_metric(
                     digest_id=digest_id,
                     inference_run_id=inference_run_id,
@@ -178,6 +188,17 @@ async def _fetch_podcast_episodes(
                     )
                 )
                 continue
+            if already_seen:
+                decisions.append(
+                    _decision(
+                        target=episode.title,
+                        decision="recent_episode_reused",
+                        action="reuse_cached_episode",
+                        confidence=0.82,
+                        reason="Podcast Scout reused a recent episode so the regenerated digest keeps podcast coverage without re-discovery.",
+                        metadata={"score": score, "show": episode.show_name},
+                    )
+                )
             candidates.append((score, episode, source))
 
     ranked = sorted(candidates, key=lambda item: item[0], reverse=True)[:max(1, max_episodes)]
@@ -238,7 +259,7 @@ async def _fetch_podcast_episodes(
         )
         if pii_filter(payload):
             payloads.append(payload)
-            if not force_refresh:
+            if mark_seen and not force_refresh:
                 _mark_seen(digest_id, episode)
             metric["status"] = "success"
         else:
@@ -246,6 +267,32 @@ async def _fetch_podcast_episodes(
         database.record_podcast_metric(metric)
 
     return payloads, decisions
+
+
+def mark_podcast_payloads_seen(digest_id: str, payloads: Iterable[NormalizedPayload]) -> int:
+    marked_count = 0
+    seen: set[tuple[str, str]] = set()
+    for payload in payloads:
+        if payload.source_type != "podcast_episode":
+            continue
+        metadata = payload.metadata or {}
+        feed_url = str(metadata.get("feed_url") or "").strip()
+        episode_id = str(metadata.get("podcast_episode_id") or "").strip()
+        if not feed_url or not episode_id:
+            continue
+        key = (feed_url, episode_id)
+        if key in seen:
+            continue
+        upsert_watermark(
+            str(database.database_path()),
+            digest_id,
+            _source_key(feed_url),
+            payload.published_at or database.utc_now(),
+            episode_id,
+        )
+        marked_count += 1
+        seen.add(key)
+    return marked_count
 
 
 def _record_skipped_podcast_metric(
@@ -607,12 +654,12 @@ def _episode_payload_text(episode: PodcastEpisode, text: str, transcript_source:
     return "\n\n".join(part for part in parts if part)
 
 
-def _already_seen(digest_id: str, episode: PodcastEpisode) -> bool:
+def _already_seen(digest_id: str, episode: PodcastEpisode, *, require_published: bool = False) -> bool:
     watermark = get_watermark(str(database.database_path()), digest_id, _source_key(episode.feed_url))
     if not watermark:
         return False
     if watermark.get("last_id") == episode.episode_id:
-        return True
+        return _seen_watermark_counts(digest_id, episode, require_published=require_published)
     last_fetched = watermark.get("last_fetched")
     if not last_fetched or not episode.published_at:
         return False
@@ -625,7 +672,15 @@ def _already_seen(digest_id: str, episode: PodcastEpisode) -> bool:
         last_at = last_at.replace(tzinfo=UTC)
     if episode_at.tzinfo is None:
         episode_at = episode_at.replace(tzinfo=UTC)
-    return episode_at <= last_at
+    if episode_at <= last_at:
+        return _seen_watermark_counts(digest_id, episode, require_published=require_published)
+    return False
+
+
+def _seen_watermark_counts(digest_id: str, episode: PodcastEpisode, *, require_published: bool) -> bool:
+    if not require_published:
+        return True
+    return database.podcast_episode_was_published(digest_id, episode.episode_id)
 
 
 def _mark_seen(digest_id: str, episode: PodcastEpisode) -> None:

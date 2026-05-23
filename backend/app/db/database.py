@@ -469,6 +469,26 @@ def remove_podcast_source(digest_id: str, source_key: str) -> dict[str, Any] | N
     return update_digest(digest_id, {"sources": updated_sources})
 
 
+def podcast_episode_was_published(digest_id: str, episode_id: str) -> bool:
+    if not episode_id:
+        return False
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM digest_items di
+            JOIN article_discoveries ad ON ad.id = di.discovery_id
+            WHERE di.digest_id = ?
+              AND ad.discovery_source_type = 'podcast_episode'
+              AND ad.thread_id = ?
+              AND COALESCE(di.tier, '') != 'dropped'
+            LIMIT 1
+            """,
+            (digest_id, episode_id),
+        ).fetchone()
+    return row is not None
+
+
 def _normalize_podcast_source(source: dict[str, Any]) -> dict[str, Any] | None:
     feed_url = str(source.get("feed_url") or source.get("url") or "").strip()
     query = str(source.get("query") or "").strip()

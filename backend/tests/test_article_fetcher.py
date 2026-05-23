@@ -176,6 +176,30 @@ def test_fetch_articles_uses_newsletter_context_for_short_pages(monkeypatch):
     assert "short" in results[0].error
 
 
+def test_fetch_articles_promotes_short_pages_with_substantial_newsletter_context(monkeypatch):
+    class ShortClient(FakeAsyncClient):
+        response = ShortResponse()
+
+    monkeypatch.setattr(articles.httpx, "AsyncClient", ShortClient)
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="newsletter@example.com",
+        original_url="https://example.com/short",
+        raw_text=(
+            "Google launches managed agents with Linux environments for developers building AI workflows. "
+            "The newsletter explains that teams can deploy an agent with one API call, skip sandbox setup, "
+            "and move from mobile prototyping to production infrastructure faster."
+        ),
+        metadata={"link_text": "Google managed agents", "parent_subject": "Agent infrastructure"},
+    )
+
+    results = asyncio.run(articles.fetch_articles_for_payloads([payload]))
+
+    assert results[0].status == "fetched"
+    assert results[0].enrichment_source == "newsletter_context"
+    assert "managed agents with Linux environments" in results[0].excerpt
+
+
 def test_select_article_payloads_unwraps_redirect_links():
     payloads = [
         NormalizedPayload(
