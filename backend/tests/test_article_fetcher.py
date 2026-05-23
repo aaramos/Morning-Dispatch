@@ -117,6 +117,16 @@ def test_select_article_payloads_filters_junk_and_deduplicates():
             original_url="https://jobs.ashbyhq.com/openai/example",
             metadata={"link_text": "Researcher, Models"},
         ),
+        NormalizedPayload(
+            source_type="gmail_link",
+            original_url="https://link.mail.beehiiv.com/ss/c/u001.example",
+            metadata={"link_text": "Trending AI Tools"},
+        ),
+        NormalizedPayload(
+            source_type="gmail_link",
+            original_url="https://link.mail.beehiiv.com/ss/c/u002.example",
+            metadata={"link_text": "Community AI workflows"},
+        ),
     ]
 
     selected = articles.select_article_payloads(payloads)

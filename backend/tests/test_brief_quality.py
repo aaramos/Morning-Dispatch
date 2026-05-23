@@ -13,6 +13,7 @@ def article_result(
     published_at: str | None = "2026-05-22T12:00:00+00:00",
     fetched_at: str = "2026-05-22T13:00:00+00:00",
     status: str = "fetched",
+    domain: str = "example.com",
 ) -> ArticleFetchResult:
     payload = NormalizedPayload(
         source_type="gmail_link",
@@ -31,7 +32,7 @@ def article_result(
         text=summary,
         excerpt=summary,
         editor_summary=summary,
-        domain="example.com",
+        domain=domain,
         status=status,
         link_score=0.9,
     )
@@ -71,6 +72,20 @@ def test_brief_quality_drops_broken_fetched_link() -> None:
 
     assert cleaned == []
     assert decisions[0].decision == "broken_link"
+
+
+def test_brief_quality_drops_low_value_blocked_newsletter_sections() -> None:
+    blocked = article_result(
+        title="Trending AI Tools",
+        url="https://link.mail.beehiiv.com/ss/c/u001.example",
+        status="blocked",
+        domain="link.mail.beehiiv.com",
+    )
+
+    cleaned, decisions = apply_brief_quality_checks([blocked])
+
+    assert cleaned == []
+    assert decisions[0].decision == "low_value_fallback"
 
 
 def test_clean_display_text_removes_html_and_raw_links() -> None:

@@ -28,6 +28,16 @@ def apply_brief_quality_checks(
     for result in results:
         url = result.final_url or result.original_url
         target = url or result.title
+        if not result.fetched and _low_value_unresolved_link(result):
+            decisions.append(
+                _decision(
+                    target=target,
+                    decision="low_value_fallback",
+                    action="drop_article",
+                    reason="Dropped a blocked newsletter section or utility link before rendering the brief.",
+                )
+            )
+            continue
         if result.fetched and not _is_http_url(url):
             decisions.append(
                 _decision(
@@ -162,6 +172,15 @@ def _weak_summary(summary: str) -> bool:
     return False
 
 
+def _low_value_unresolved_link(result: ArticleFetchResult) -> bool:
+    url = result.final_url or result.original_url
+    domain = (result.domain or urlparse(url or "").netloc).lower().removeprefix("www.")
+    title = clean_display_text(result.title).lower()
+    return domain == "link.mail.beehiiv.com" and any(
+        phrase in title for phrase in LOW_VALUE_NEWSLETTER_LINK_TEXT
+    )
+
+
 def _decision(*, target: str, decision: str, action: str, reason: str) -> AgentDecision:
     return AgentDecision(
         agent="brief_quality",
@@ -171,3 +190,11 @@ def _decision(*, target: str, decision: str, action: str, reason: str) -> AgentD
         confidence=0.92,
         reason=reason,
     )
+
+
+LOW_VALUE_NEWSLETTER_LINK_TEXT = (
+    "community ai workflows",
+    "highlights: news, guides & events",
+    "join the ai university",
+    "trending ai tools",
+)

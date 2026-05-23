@@ -159,6 +159,7 @@ def test_utility_links_are_filtered(monkeypatch, tmp_path):
     <a href="https://example.com/unsubscribe">Unsubscribe</a>
     <a href="https://example.com/advertise">Advertise</a>
     <a href="https://example.com/tracker.gif">Pixel</a>
+    <a href="https://link.mail.beehiiv.com/ss/c/u001.example">Trending AI Tools</a>
     """
     monkeypatch.setattr(
         gmail,
