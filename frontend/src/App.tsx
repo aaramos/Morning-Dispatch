@@ -143,6 +143,34 @@ type PodcastMetricsStatus = {
   avg_download_ms: number | null;
   avg_transcription_ms: number | null;
   avg_total_ms: number | null;
+  recent: PodcastMetricRecord[];
+};
+
+type PodcastMetricRecord = {
+  id: string;
+  digest_id: string;
+  inference_run_id: string | null;
+  ts: string;
+  show_name: string | null;
+  episode_id: string | null;
+  episode_title: string | null;
+  feed_url: string | null;
+  audio_url: string | null;
+  episode_url: string | null;
+  apple_podcasts_url: string | null;
+  published_at: string | null;
+  duration_seconds: number | null;
+  quality_score: number | null;
+  transcript_source: string | null;
+  status: string;
+  error_detail: string | null;
+  feed_fetch_ms: number | null;
+  audio_download_ms: number | null;
+  transcription_ms: number | null;
+  total_ms: number | null;
+  audio_bytes: number | null;
+  transcript_words: number | null;
+  cache_hit: number;
 };
 
 type AgentDecisionsStatus = {
@@ -1338,6 +1366,30 @@ function AdminApp() {
                 <small>{formatPodcastMetricCounts(pipeline?.podcast_metrics)}</small>
               </div>
             </div>
+            <p className="section-label">Podcast run details</p>
+            <div className="source-list podcast-run-list">
+              {(pipeline?.podcast_metrics.recent ?? []).slice(0, 8).map((metric) => (
+                <article key={metric.id}>
+                  <div>
+                    <strong>{metric.episode_title ?? "Podcast episode"}</strong>
+                    <small>{metric.show_name ?? metric.feed_url ?? "Unknown show"}</small>
+                  </div>
+                  <span className={`source-state ${podcastMetricStateClass(metric.status)}`}>
+                    {formatStatusLabel(metric.status)}
+                  </span>
+                  <p>{formatPodcastMetricDetail(metric)}</p>
+                </article>
+              ))}
+              {(pipeline?.podcast_metrics.recent.length ?? 0) === 0 ? (
+                <article>
+                  <div>
+                    <strong>No podcast run details yet</strong>
+                    <small>The next podcast-enabled run will populate episode-level telemetry.</small>
+                  </div>
+                  <span className="source-state candidate">Waiting</span>
+                </article>
+              ) : null}
+            </div>
             {podcastResults.length ? (
               <>
                 <p className="section-label">Directory results</p>
@@ -2087,6 +2139,25 @@ function formatPodcastMetricCounts(status: PodcastMetricsStatus | null | undefin
     .filter(([key]) => key !== "success")
     .reduce((total, [, count]) => total + count, 0);
   return `${success} success · ${failed} issue(s)`;
+}
+
+function formatPodcastMetricDetail(metric: PodcastMetricRecord): string {
+  const parts = [
+    `Source: ${formatStatusLabel(metric.transcript_source ?? "not_processed")}`,
+    metric.feed_fetch_ms !== null ? `Feed ${formatMs(metric.feed_fetch_ms)}` : null,
+    metric.audio_download_ms !== null ? `Download ${formatMs(metric.audio_download_ms)}` : null,
+    metric.transcription_ms !== null ? `Transcript ${formatMs(metric.transcription_ms)}` : null,
+    metric.transcript_words ? `${formatNumber(metric.transcript_words)} words` : null,
+    metric.cache_hit ? "Cache hit" : null,
+    metric.error_detail ? `Error: ${metric.error_detail}` : null,
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function podcastMetricStateClass(status: string): string {
+  if (status === "success") return "active";
+  if (status === "already_seen" || status === "low_score") return "candidate";
+  return "retired";
 }
 
 function formatPercent(value: number | null | undefined): string {
