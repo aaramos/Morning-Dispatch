@@ -89,6 +89,8 @@ async def admin_status(request: Request) -> dict[str, Any]:
     inference_metrics = database.inference_metrics_summary()
     agent_decisions = database.agent_decisions_summary()
     source_scout = database.source_scout_summary()
+    fetch_failures = database.fetch_failure_breakdown(limit=5)
+    brief_review = database.brief_review(limit=8)
     return {
         "system": {
             "environment": settings.environment,
@@ -130,6 +132,8 @@ async def admin_status(request: Request) -> dict[str, Any]:
         "inference_metrics": inference_metrics,
         "agent_decisions": agent_decisions,
         "source_scout": source_scout,
+        "fetch_failures": fetch_failures,
+        "brief_review": brief_review,
         "model_jobs": database.list_model_enrichment_jobs(limit=8),
     }
 
@@ -274,6 +278,16 @@ def list_agent_decisions() -> dict[str, Any]:
         "decisions": database.list_agent_decisions(limit=40),
         "summary": database.agent_decisions_summary(),
     }
+
+
+@router.get("/fetch-failures")
+def list_fetch_failures() -> dict[str, Any]:
+    return database.fetch_failure_breakdown(limit=25)
+
+
+@router.get("/brief-review")
+def get_brief_review() -> dict[str, Any]:
+    return database.brief_review(limit=25)
 
 
 @router.get("/source-scout")

@@ -32,6 +32,12 @@ class DigestUpdate(BaseModel):
     status: Literal["active", "paused", "archived"] | None = None
 
 
+class FeedbackCreate(BaseModel):
+    issue_id: str = Field(min_length=1)
+    url: str = Field(min_length=8)
+    signal: Literal["up", "down"]
+
+
 @router.get("/health")
 def health() -> dict[str, Any]:
     settings = get_settings()
@@ -113,7 +119,19 @@ def issue_html(issue_id: str) -> HTMLResponse:
     record = database.get_issue(issue_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Issue not found")
-    return HTMLResponse(_issue_html_for_display(record.get("html_content") or ""))
+    return HTMLResponse(_issue_html_for_display(record.get("html_content") or "", record.get("created_at")))
+
+
+@router.post("/feedback", status_code=201)
+def create_feedback(payload: FeedbackCreate) -> dict[str, Any]:
+    record = database.record_feedback(
+        issue_id=payload.issue_id,
+        url=payload.url,
+        signal=payload.signal,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Article was not found for this brief")
+    return record
 
 
 @delivery_router.get("/brief", response_class=HTMLResponse, include_in_schema=False)
@@ -126,7 +144,7 @@ def latest_brief_html() -> HTMLResponse:
     if issue is None:
         return HTMLResponse(_empty_brief_html("No completed brief is available yet."), status_code=404)
 
-    return HTMLResponse(_issue_html_for_display(issue.get("html_content") or ""))
+    return HTMLResponse(_issue_html_for_display(issue.get("html_content") or "", issue.get("created_at")))
 
 
 def _canonical_digest() -> dict[str, Any] | None:
@@ -174,8 +192,10 @@ def _empty_brief_html(message: str) -> str:
 """
 
 
-def _issue_html_for_display(html: str) -> str:
-    return _with_issue_overflow_guards(database.clean_issue_html_for_display(html))
+def _issue_html_for_display(html: str, generated_at: str | None = None) -> str:
+    cleaned = database.clean_issue_html_for_display(html)
+    with_footer = database.ensure_generated_footer(cleaned, generated_at)
+    return _with_issue_overflow_guards(with_footer)
 
 
 def _with_issue_overflow_guards(html: str) -> str:

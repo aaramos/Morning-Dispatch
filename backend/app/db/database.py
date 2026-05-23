@@ -12,7 +12,8 @@ from datetime import UTC, datetime
 from html import escape, unescape
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bs4 import BeautifulSoup
 
@@ -603,7 +604,7 @@ def create_placeholder_run(digest_id: str) -> dict[str, Any] | None:
     issue_id = new_id()
     title = f"{digest['name']} - Preview Issue"
     snapshot = "Pipeline scaffold is running. Gmail ingestion and article fetching are the next build slices."
-    html = render_placeholder_issue(title, snapshot)
+    html = render_placeholder_issue(title, snapshot, generated_at=now)
 
     with connect() as connection:
         connection.execute(
@@ -650,7 +651,15 @@ def create_ingested_run(
     digest_id = str(digest["id"])
     title = f"{digest['name']} - Morning Dispatch Issue"
     snapshot = ingested_snapshot(payloads, configured_source_count, article_results)
-    html = render_ingested_issue(title, snapshot, payloads, article_results, lookback_hours)
+    html = render_ingested_issue(
+        title,
+        snapshot,
+        payloads,
+        article_results,
+        lookback_hours,
+        generated_at=now,
+        issue_id=issue_id,
+    )
     lookback_days = max(1, math.ceil(lookback_hours / 24))
     body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
     link_payload_count = sum(1 for payload in payloads if payload.source_type == "gmail_link")
@@ -886,6 +895,8 @@ def render_ingested_issue(
     payloads: list[NormalizedPayload],
     article_results: list[ArticleFetchResult] | None,
     lookback_hours: int,
+    generated_at: str | None = None,
+    issue_id: str | None = None,
 ) -> str:
     article_results = article_results or []
     body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
@@ -898,9 +909,12 @@ def render_ingested_issue(
     hidden_article_count = max(0, len(fetched_articles) - len(main_articles) - len(lower_confidence_articles) - (1 if lead_article else 0))
 
     newsletter_html = "\n".join(_render_newsletter_item(payload) for payload in body_payloads[:8])
-    lead_html = _render_article_card(lead_article, variant="lead") if lead_article else ""
-    section_html = _render_article_sections(main_articles)
-    lower_html = "\n".join(_render_article_card(result, variant="compact") for result in lower_confidence_articles[:8])
+    lead_html = _render_article_card(lead_article, variant="lead", issue_id=issue_id) if lead_article else ""
+    section_html = _render_article_sections(main_articles, issue_id=issue_id)
+    lower_html = "\n".join(
+        _render_article_card(result, variant="compact", issue_id=issue_id)
+        for result in lower_confidence_articles[:8]
+    )
     unresolved_html = "\n".join(_render_unresolved_link(result) for result in displayed_unresolved)
     empty_state = ""
     if not payloads:
@@ -924,6 +938,8 @@ def render_ingested_issue(
           <div class="article-list">{lower_html}</div>
         </section>
         """
+    generated_footer = _render_generated_footer(generated_at or utc_now())
+    feedback_script = _render_feedback_script(issue_id)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -962,6 +978,11 @@ def render_ingested_issue(
     .article-list .article-card:last-child, .article-grid .article-card:last-child {{ margin-bottom: 0; }}
     .score {{ display: inline-block; margin-left: 8px; color: #7a4f16; }}
     .keywords {{ margin-top: 10px; font: 700 .72rem Arial, sans-serif; color: #6a746e; text-transform: uppercase; }}
+    .feedback-controls {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-family: Arial, sans-serif; }}
+    .feedback-controls button {{ border: 1px solid #d4cbbd; border-radius: 8px; background: #fffaf0; color: #173f63; padding: 6px 10px; font: 800 .72rem Arial, sans-serif; cursor: pointer; }}
+    .feedback-controls button:hover {{ background: #efe7d8; }}
+    .feedback-controls[data-feedback='sent'] button {{ opacity: .55; }}
+    .feedback-state {{ color: #5f675f; font: 700 .72rem Arial, sans-serif; text-transform: uppercase; }}
     .newsletter {{ padding: 0 0 20px; margin-bottom: 20px; border-bottom: 1px solid #d4cbbd; }}
     .newsletter p {{ font-size: 1rem; line-height: 1.55; margin: 10px 0 0; }}
     .link-item {{ display: grid; gap: 5px; padding: 12px 0; border-bottom: 1px solid #d4cbbd; }}
@@ -969,6 +990,7 @@ def render_ingested_issue(
     details.source-notes summary {{ cursor: pointer; font: 800 .9rem Arial, sans-serif; text-transform: uppercase; }}
     .empty {{ margin-top: 32px; padding: 24px; border: 1px dashed #b9ae9d; font: 1rem Arial, sans-serif; background: #fffaf0; }}
     .more-count {{ font: 700 .9rem Arial, sans-serif; color: #5f675f; margin-top: 16px; }}
+    .issue-footer {{ margin-top: 36px; padding-top: 16px; border-top: 1px solid #d4cbbd; font: 700 .76rem Arial, sans-serif; color: #5f675f; text-transform: uppercase; }}
     @media (max-width: 820px) {{ .grid, .article-grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -997,12 +1019,15 @@ def render_ingested_issue(
         </details>
       </section>
     </div>
+    {generated_footer}
   </main>
+  {feedback_script}
 </body>
 </html>"""
 
 
-def render_placeholder_issue(title: str, snapshot: str) -> str:
+def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None = None) -> str:
+    generated_footer = _render_generated_footer(generated_at or utc_now())
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1020,6 +1045,7 @@ def render_placeholder_issue(title: str, snapshot: str) -> str:
     .date {{ margin-top: 12px; font: 600 0.8rem Arial, sans-serif; text-transform: uppercase; }}
     .snapshot {{ font-size: 1.3rem; line-height: 1.5; max-width: 720px; }}
     .empty {{ margin-top: 32px; padding-top: 24px; border-top: 1px solid #c8bfae; font: 1rem Arial, sans-serif; }}
+    .issue-footer {{ margin-top: 36px; padding-top: 16px; border-top: 1px solid #d4cbbd; font: 700 .76rem Arial, sans-serif; color: #5f675f; text-transform: uppercase; }}
   </style>
 </head>
 <body>
@@ -1033,6 +1059,7 @@ def render_placeholder_issue(title: str, snapshot: str) -> str:
       <strong>No article items yet.</strong>
       The next slice will connect approved Gmail newsletters, filter links, and fetch primary articles.
     </section>
+    {generated_footer}
   </main>
 </body>
 </html>"""
@@ -1103,7 +1130,7 @@ def _upsert_article_result(connection: sqlite3.Connection, result: ArticleFetchR
                 result.content_type,
                 json.dumps(list(result.keywords)),
                 result.status,
-                "ok" if result.fetched else "needs_review",
+                _quality_flag_for_result(result),
                 now,
                 article_id,
             ),
@@ -1133,12 +1160,21 @@ def _upsert_article_result(connection: sqlite3.Connection, result: ArticleFetchR
             json.dumps(list(result.keywords)),
             result.content_type,
             result.status,
-            "ok" if result.fetched else "needs_review",
+            _quality_flag_for_result(result),
             now,
             now,
         ),
     )
     return article_id
+
+
+def _quality_flag_for_result(result: ArticleFetchResult) -> str:
+    if result.fetched:
+        return "ok"
+    reason = _truncate_text(str(result.error or result.status or "needs review"), 180)
+    if reason.lower().startswith(str(result.status).lower()):
+        return reason
+    return _truncate_text(f"{result.status}: {reason}", 180)
 
 
 def _model_cache_identity(result: ArticleFetchResult, model_name: str) -> tuple[str, str, str] | None:
@@ -1385,11 +1421,26 @@ def _insert_discovery_for_result(
             metadata.get("reddit_thread_id") or metadata.get("thread_id"),
             result.payload.published_at,
             metadata.get("link_text") or result.title,
-            str(metadata.get("parent_subject") or metadata.get("subject") or ""),
+            _discovery_snippet_for_result(result),
             now,
         ),
     )
     return discovery_id
+
+
+def _discovery_snippet_for_result(result: ArticleFetchResult) -> str:
+    metadata = result.payload.metadata or {}
+    context = " ".join(
+        str(value)
+        for value in (
+            metadata.get("parent_subject"),
+            metadata.get("subject"),
+            result.payload.raw_text,
+            result.excerpt if not result.fetched else "",
+        )
+        if value
+    )
+    return _truncate_text(_clean_newsletter_text(context), 700)
 
 
 def _render_newsletter_item(payload: NormalizedPayload) -> str:
@@ -1406,14 +1457,17 @@ def _render_newsletter_item(payload: NormalizedPayload) -> str:
     """
 
 
-def _render_article_sections(results: list[ArticleFetchResult]) -> str:
+def _render_article_sections(results: list[ArticleFetchResult], *, issue_id: str | None = None) -> str:
     grouped: dict[str, list[ArticleFetchResult]] = {}
     for result in results:
         grouped.setdefault(result.section or "Noteworthy", []).append(result)
 
     sections: list[str] = []
     for section, section_results in grouped.items():
-        cards = "\n".join(_render_article_card(result, variant="compact") for result in section_results[:6])
+        cards = "\n".join(
+            _render_article_card(result, variant="compact", issue_id=issue_id)
+            for result in section_results[:6]
+        )
         sections.append(
             f"""
             <section class="article-section">
@@ -1425,7 +1479,12 @@ def _render_article_sections(results: list[ArticleFetchResult]) -> str:
     return "\n".join(sections)
 
 
-def _render_article_card(result: ArticleFetchResult | None, *, variant: str = "compact") -> str:
+def _render_article_card(
+    result: ArticleFetchResult | None,
+    *,
+    variant: str = "compact",
+    issue_id: str | None = None,
+) -> str:
     if result is None:
         return ""
     url = result.final_url or result.original_url
@@ -1443,13 +1502,64 @@ def _render_article_card(result: ArticleFetchResult | None, *, variant: str = "c
     card_class = "article-card lead" if variant == "lead" else "article-card"
     summary = _clean_newsletter_text(result.editor_summary or result.excerpt)
     title = _clean_newsletter_text(result.title) or result.title
+    feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
     return f"""
       <article class="{card_class}">
         <div class="meta">{meta}{score}</div>
         <h3><a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">{escape(title)}</a></h3>
         <p>{escape(summary)}</p>
         {keyword_html}
+        {feedback_html}
       </article>
+    """
+
+
+def _render_feedback_controls(issue_id: str | None, url: str | None) -> str:
+    if not issue_id or not url:
+        return ""
+    return f"""
+        <div class="feedback-controls" data-feedback-url="{escape(url, quote=True)}">
+          <button type="button" data-feedback-signal="up">Useful</button>
+          <button type="button" data-feedback-signal="down">Not useful</button>
+          <span class="feedback-state" aria-live="polite"></span>
+        </div>
+    """
+
+
+def _render_feedback_script(issue_id: str | None) -> str:
+    if not issue_id:
+        return ""
+    return f"""
+  <script>
+    (() => {{
+      const issueId = {json.dumps(issue_id)};
+      document.addEventListener("click", async (event) => {{
+        const button = event.target.closest("[data-feedback-signal]");
+        if (!button) return;
+        const controls = button.closest(".feedback-controls");
+        const state = controls ? controls.querySelector(".feedback-state") : null;
+        if (!controls) return;
+        const url = controls.getAttribute("data-feedback-url");
+        const signal = button.getAttribute("data-feedback-signal");
+        if (!url || !signal) return;
+        controls.querySelectorAll("button").forEach((item) => item.disabled = true);
+        if (state) state.textContent = "Saving";
+        try {{
+          const response = await fetch("/api/feedback", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ issue_id: issueId, url, signal }}),
+          }});
+          if (!response.ok) throw new Error("Feedback failed");
+          controls.setAttribute("data-feedback", "sent");
+          if (state) state.textContent = "Saved";
+        }} catch (_error) {{
+          controls.querySelectorAll("button").forEach((item) => item.disabled = false);
+          if (state) state.textContent = "Try again";
+        }}
+      }});
+    }})();
+  </script>
     """
 
 
@@ -1547,6 +1657,41 @@ def clean_issue_html_for_display(html: str) -> str:
     return str(soup) if changed else html
 
 
+def ensure_generated_footer(html: str, generated_at: str | None) -> str:
+    if not html:
+        return html
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.select_one("footer.issue-footer"):
+        return html
+
+    target = soup.find("main") or soup.body
+    if target is None:
+        return html
+
+    _ensure_generated_footer_style(soup)
+    footer = soup.new_tag("footer", attrs={"class": "issue-footer"})
+    footer.string = f"Generated {_format_generated_timestamp(generated_at)}"
+    target.append(footer)
+    return str(soup)
+
+
+def _ensure_generated_footer_style(soup: BeautifulSoup) -> None:
+    if ".issue-footer" in soup.get_text(" ", strip=True):
+        return
+    head = soup.find("head")
+    if head is None:
+        return
+    existing_style = "".join(style.get_text() for style in soup.find_all("style"))
+    if ".issue-footer" in existing_style:
+        return
+    style = soup.new_tag("style", id="morning-dispatch-generated-footer-style")
+    style.string = (
+        ".issue-footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #d4cbbd; "
+        "font: 700 .76rem Arial, sans-serif; color: #5f675f; text-transform: uppercase; }"
+    )
+    head.append(style)
+
+
 def _clean_newsletter_text(value: str | None) -> str:
     text = unescape(value or "")
     text = ZERO_WIDTH_RE.sub(" ", text)
@@ -1604,6 +1749,30 @@ def _format_article_date(value: str | None) -> str:
         except ValueError:
             return date_part
     return text
+
+
+def _render_generated_footer(generated_at: str | None) -> str:
+    return f'<footer class="issue-footer">Generated {escape(_format_generated_timestamp(generated_at))}</footer>'
+
+
+def _format_generated_timestamp(value: str | None) -> str:
+    if not value:
+        value = utc_now()
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    try:
+        local_zone = ZoneInfo(get_settings().scheduler_timezone)
+    except ZoneInfoNotFoundError:
+        local_zone = UTC
+    parsed = parsed.astimezone(local_zone)
+    hour = parsed.strftime("%I").lstrip("0") or "0"
+    zone_label = parsed.tzname() or "UTC"
+    return f"{parsed:%m/%d/%Y} {hour}:{parsed:%M} {parsed:%p} {zone_label}"
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -2167,6 +2336,346 @@ def list_model_enrichment_candidates(
             if len(candidates) >= limit_count:
                 break
     return candidates
+
+
+def apply_feedback_to_candidates(digest_id: str, article_results: list[ArticleFetchResult]) -> list[ArticleFetchResult]:
+    if not article_results:
+        return article_results
+    with connect() as connection:
+        weights = {
+            str(row["source_name"]): float(row["weight"])
+            for row in connection.execute(
+                "SELECT source_name, weight FROM source_weights WHERE digest_id = ?",
+                (digest_id,),
+            ).fetchall()
+        }
+        rows = connection.execute(
+            """
+            SELECT a.canonical_url, a.original_url, a.domain, f.signal, COUNT(*) AS signal_count
+            FROM feedback f
+            JOIN articles a ON a.id = f.article_id
+            WHERE f.digest_id = ?
+            GROUP BY a.canonical_url, a.original_url, a.domain, f.signal
+            """,
+            (digest_id,),
+        ).fetchall()
+
+    exact_signals: dict[str, int] = {}
+    domain_signals: dict[str, int] = {}
+    for row in rows:
+        value = int(row["signal_count"] or 0)
+        delta = value if row["signal"] == "up" else -value
+        for url in (row["canonical_url"], row["original_url"]):
+            key = _url_match_key(url)
+            if key:
+                exact_signals[key] = exact_signals.get(key, 0) + delta
+        domain = str(row["domain"] or "")
+        if domain:
+            domain_signals[domain] = domain_signals.get(domain, 0) + delta
+
+    adjusted: list[ArticleFetchResult] = []
+    for result in article_results:
+        url_key = _url_match_key(result.canonical_url or result.final_url or result.original_url)
+        domain = result.domain or _domain(result.final_url or result.original_url) or result.payload.source_name
+        source_weight = weights.get(domain, 1.0)
+        exact_delta = max(-0.25, min(0.25, exact_signals.get(url_key, 0) * 0.08)) if url_key else 0.0
+        domain_delta = max(-0.12, min(0.12, domain_signals.get(domain, 0) * 0.02)) if domain else 0.0
+        adjusted_score = max(0.0, min(1.0, (result.link_score * source_weight) + exact_delta + domain_delta))
+        adjusted.append(replace(result, link_score=round(adjusted_score, 3)))
+    return adjusted
+
+
+def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] | None:
+    if signal not in {"up", "down"}:
+        raise ValueError("Feedback signal must be up or down")
+
+    url_key = _url_match_key(url)
+    if not url_key:
+        return None
+    now = utc_now()
+    with connect() as connection:
+        issue = connection.execute(
+            "SELECT id, run_id, digest_id FROM digest_issues WHERE id = ?",
+            (issue_id,),
+        ).fetchone()
+        if issue is None:
+            return None
+
+        rows = connection.execute(
+            """
+            SELECT di.id AS digest_item_id, di.digest_id, a.id AS article_id,
+                   a.canonical_url, a.original_url, a.domain, a.publisher
+            FROM digest_items di
+            JOIN articles a ON a.id = di.article_id
+            WHERE di.run_id = ? AND COALESCE(di.tier, '') != 'source'
+            """,
+            (issue["run_id"],),
+        ).fetchall()
+        matched = next(
+            (
+                row
+                for row in rows
+                if url_key in {_url_match_key(row["canonical_url"]), _url_match_key(row["original_url"])}
+            ),
+            None,
+        )
+        if matched is None:
+            return None
+
+        feedback_id = new_id()
+        connection.execute(
+            """
+            INSERT INTO feedback (id, digest_item_id, article_id, digest_id, signal, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                feedback_id,
+                matched["digest_item_id"],
+                matched["article_id"],
+                issue["digest_id"],
+                signal,
+                now,
+            ),
+        )
+        source_name = str(matched["domain"] or matched["publisher"] or "")
+        if source_name:
+            _update_source_weight(connection, str(issue["digest_id"]), source_name, signal, now)
+
+    return {
+        "id": feedback_id,
+        "issue_id": issue_id,
+        "signal": signal,
+        "url": url,
+        "source_name": source_name,
+        "created_at": now,
+    }
+
+
+def fetch_failure_breakdown(*, limit: int = 5) -> dict[str, Any]:
+    latest = _latest_run_row()
+    if latest is None:
+        return {"run_id": None, "total_count": 0, "groups": [], "examples": []}
+
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT di.id AS digest_item_id, a.id AS article_id, a.title, a.canonical_url,
+                   a.original_url, a.domain, a.fetch_status, a.quality_flag,
+                   di.editor_summary, di.editor_note, ad.newsletter_snippet, ad.link_text
+            FROM digest_items di
+            JOIN articles a ON a.id = di.article_id
+            LEFT JOIN article_discoveries ad ON ad.id = di.discovery_id
+            WHERE di.run_id = ?
+              AND COALESCE(di.tier, '') != 'source'
+              AND COALESCE(a.fetch_status, 'fetched') != 'fetched'
+            ORDER BY COALESCE(di.relevance_score, 0) DESC, di.created_at DESC
+            """,
+            (latest["id"],),
+        ).fetchall()
+
+    groups: dict[str, dict[str, Any]] = {}
+    examples: list[dict[str, Any]] = []
+    for row in rows:
+        status = str(row["fetch_status"] or "unknown")
+        group = groups.setdefault(
+            status,
+            {
+                "status": status,
+                "count": 0,
+                "fixability": _fetch_fixability(status),
+            },
+        )
+        group["count"] += 1
+        if len(examples) < limit:
+            examples.append(_failure_example(row))
+
+    return {
+        "run_id": latest["id"],
+        "run_at": latest["run_at"],
+        "digest_id": latest["digest_id"],
+        "total_count": len(rows),
+        "groups": sorted(groups.values(), key=lambda item: item["count"], reverse=True),
+        "examples": examples,
+    }
+
+
+def brief_review(*, limit: int = 8) -> dict[str, Any]:
+    latest = _latest_run_row()
+    if latest is None:
+        return {
+            "run_id": None,
+            "issue_id": None,
+            "generated_at": None,
+            "counts": {"included": 0, "unresolved": 0, "dropped": 0, "duplicate": 0, "repaired": 0},
+            "included": [],
+            "unresolved": [],
+            "dropped": [],
+            "duplicates": [],
+            "repaired": [],
+        }
+
+    with connect() as connection:
+        issue = connection.execute(
+            "SELECT id, created_at FROM digest_issues WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+            (latest["id"],),
+        ).fetchone()
+        item_rows = connection.execute(
+            """
+            SELECT di.tier, di.section, di.relevance_score, di.editor_summary,
+                   a.title, a.canonical_url, a.original_url, a.domain, a.fetch_status,
+                   a.quality_flag
+            FROM digest_items di
+            JOIN articles a ON a.id = di.article_id
+            WHERE di.run_id = ? AND COALESCE(di.tier, '') != 'source'
+            ORDER BY
+              CASE di.tier WHEN 'lead' THEN 0 WHEN 'main' THEN 1 WHEN 'lower_confidence' THEN 2 ELSE 3 END,
+              COALESCE(di.relevance_score, 0) DESC
+            """,
+            (latest["id"],),
+        ).fetchall()
+        decision_rows = connection.execute(
+            """
+            SELECT agent, target, decision, action, reason, confidence, created_at
+            FROM agent_decisions
+            WHERE run_id = ?
+            ORDER BY created_at DESC
+            """,
+            (latest["id"],),
+        ).fetchall()
+
+    included = [_review_item(row) for row in item_rows if row["fetch_status"] == "fetched" and row["tier"] != "dropped"]
+    unresolved = [_review_item(row) for row in item_rows if row["fetch_status"] != "fetched" and row["tier"] != "dropped"]
+    dropped_rows = [
+        row for row in decision_rows
+        if str(row["action"] or "") in {"drop", "drop_article"} or str(row["decision"] or "") in {"exclude", "weak_fallback"}
+    ]
+    duplicate_rows = [row for row in decision_rows if str(row["decision"] or "") == "duplicate"]
+    repaired_rows = [row for row in decision_rows if str(row["action"] or "") == "repair_article"]
+    return {
+        "run_id": latest["id"],
+        "issue_id": issue["id"] if issue else None,
+        "generated_at": issue["created_at"] if issue else latest["completed_at"],
+        "counts": {
+            "included": len(included),
+            "unresolved": len(unresolved),
+            "dropped": len(dropped_rows),
+            "duplicate": len(duplicate_rows),
+            "repaired": len(repaired_rows),
+        },
+        "included": included[:limit],
+        "unresolved": unresolved[:limit],
+        "dropped": [_review_decision(row) for row in dropped_rows[:limit]],
+        "duplicates": [_review_decision(row) for row in duplicate_rows[:limit]],
+        "repaired": [_review_decision(row) for row in repaired_rows[:limit]],
+    }
+
+
+def _latest_run_row() -> sqlite3.Row | None:
+    with connect() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM digest_runs
+            WHERE status = 'completed'
+            ORDER BY completed_at DESC, run_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+def _failure_example(row: sqlite3.Row) -> dict[str, Any]:
+    status = str(row["fetch_status"] or "unknown")
+    reason = str(row["quality_flag"] or status)
+    return {
+        "title": row["title"] or row["link_text"] or "Untitled link",
+        "url": row["canonical_url"] or row["original_url"],
+        "domain": row["domain"],
+        "status": status,
+        "reason": reason,
+        "fixability": _fetch_fixability(status),
+        "context": row["newsletter_snippet"] or row["editor_summary"] or row["editor_note"],
+    }
+
+
+def _review_item(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "title": row["title"] or "Untitled article",
+        "url": row["canonical_url"] or row["original_url"],
+        "domain": row["domain"],
+        "tier": row["tier"],
+        "section": row["section"],
+        "status": row["fetch_status"],
+        "reason": row["quality_flag"],
+        "score": _nullable_float(row["relevance_score"]),
+        "summary": _truncate_text(str(row["editor_summary"] or ""), 220),
+    }
+
+
+def _review_decision(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "agent": row["agent"],
+        "target": row["target"],
+        "decision": row["decision"],
+        "action": row["action"],
+        "reason": row["reason"],
+        "confidence": _nullable_float(row["confidence"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _fetch_fixability(status: str) -> str:
+    if status in {"blocked", "rate_limited"}:
+        return "Usually fixable with retry, reader mode, or a different fetch path."
+    if status in {"site_error", "fetch_error", "http_error"}:
+        return "Worth retrying; may be temporary."
+    if status == "no_content":
+        return "Use newsletter context unless reader extraction improves."
+    if status in {"not_found", "non_html"}:
+        return "Usually safe to ignore unless the title looks important."
+    return "Needs review."
+
+
+def _update_source_weight(
+    connection: sqlite3.Connection,
+    digest_id: str,
+    source_name: str,
+    signal: str,
+    now: str,
+) -> None:
+    row = connection.execute(
+        "SELECT weight FROM source_weights WHERE digest_id = ? AND source_name = ?",
+        (digest_id, source_name),
+    ).fetchone()
+    current = float(row["weight"]) if row else 1.0
+    delta = 0.04 if signal == "up" else -0.06
+    updated = max(0.55, min(1.45, round(current + delta, 3)))
+    connection.execute(
+        """
+        INSERT INTO source_weights (digest_id, source_name, weight, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(digest_id, source_name) DO UPDATE SET
+          weight = excluded.weight,
+          updated_at = excluded.updated_at
+        """,
+        (digest_id, source_name, updated, now),
+    )
+
+
+def _url_match_key(url: Any) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(str(url).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    query_items = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+        if not key.lower().startswith("utm_")
+    ]
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", urlencode(query_items), ""))
 
 
 def get_latest_issue(digest_id: str) -> dict[str, Any] | None:

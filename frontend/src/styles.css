@@ -565,6 +565,57 @@ iframe {
   line-height: 1.35;
 }
 
+.review-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.review-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.review-list.compact {
+  margin-top: 8px;
+}
+
+.review-list article {
+  min-width: 0;
+  border: 1px solid #e2e7e1;
+  border-radius: 8px;
+  padding: 12px;
+  background: #f7f9f6;
+}
+
+.review-list strong,
+.review-list small,
+.review-list p,
+.review-list span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.review-list strong {
+  font-size: 0.9rem;
+}
+
+.review-list small,
+.review-list span {
+  margin-top: 4px;
+  color: #66756f;
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.review-list p {
+  margin: 6px 0 0;
+  color: #4f5f59;
+  font-size: 0.88rem;
+  line-height: 1.4;
+}
+
 .source-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -793,6 +844,7 @@ iframe {
   .admin-health,
   .model-picker,
   .compact-status-list,
+  .review-columns,
   .job-form,
   .run-row,
   .run-row dl {

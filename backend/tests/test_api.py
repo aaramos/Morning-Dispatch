@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from fastapi.testclient import TestClient
 
 from backend.agents.digestor.base import NormalizedPayload
@@ -112,16 +114,30 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "media.example.com" not in html.text
         assert "2026-05-20T12:00:00+00:00" not in html.text
         assert "05/20/2026" in html.text
+        assert re.search(r"Generated \d{2}/\d{2}/\d{4} ", html.text)
         assert "https://example.com/model-release" in html.text
         assert "Fetched Articles" in html.text
+        assert "data-feedback-signal" in html.text
         assert "overflow-x: hidden" in html.text
         assert "overflow-wrap: anywhere" in html.text
+
+        feedback = client.post(
+            "/api/feedback",
+            json={
+                "issue_id": issue_id,
+                "url": "https://example.com/model-release",
+                "signal": "up",
+            },
+        )
+        assert feedback.status_code == 201
+        assert feedback.json()["signal"] == "up"
 
         brief = client.get("/brief")
         assert brief.status_code == 200
         assert "Morning Dispatch Issue" in brief.text
         assert "https://example.com/model-release" in brief.text
         assert "05/20/2026" in brief.text
+        assert re.search(r"Generated \d{2}/\d{2}/\d{4} ", brief.text)
         assert "overflow-x: hidden" in brief.text
 
         admin_status = client.get("/api/admin/status")
@@ -136,6 +152,8 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert any(check["name"] == "Gmail" for check in status_payload["health"]["checks"])
         assert status_payload["model_cache"]["record_count"] >= 0
         assert status_payload["inference_metrics"]["record_count"] >= 0
+        assert status_payload["fetch_failures"]["total_count"] == 0
+        assert status_payload["brief_review"]["counts"]["included"] == 1
         assert isinstance(status_payload["model_jobs"], list)
         assert status_payload["digests"][0]["name"] == "AI Morning Brief"
 
@@ -161,6 +179,76 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert published_payload["published"] is True
         assert published_payload["published_run_id"]
         assert published_payload["published_issue_id"]
+
+
+def test_admin_reports_fetch_failures_and_review_counts(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "false")
+
+    async def fake_fetch_newsletters(*_args, **_kwargs):
+        return [
+            NormalizedPayload(
+                source_type="gmail_link",
+                source_name="example@example.com",
+                raw_text="Newsletter context says this blocked article matters for local model workflows.",
+                original_url="https://example.com/blocked",
+                published_at="2026-05-20T12:00:00+00:00",
+                metadata={
+                    "gmail_message_id": "msg-2",
+                    "sender_email": "example@example.com",
+                    "parent_subject": "Local model workflows",
+                    "link_text": "Blocked local model article",
+                },
+            )
+        ]
+
+    async def fake_fetch_articles(payloads, **_kwargs):
+        link_payload = next(payload for payload in payloads if payload.source_type == "gmail_link")
+        return [
+            ArticleFetchResult(
+                payload=link_payload,
+                original_url="https://example.com/blocked",
+                final_url="https://example.com/blocked",
+                canonical_url="https://example.com/blocked",
+                title="Blocked local model article",
+                text="Newsletter context says this blocked article matters for local model workflows.",
+                excerpt="Newsletter context says this blocked article matters for local model workflows.",
+                domain="example.com",
+                status="blocked",
+                error="HTTP 403",
+                link_score=0.9,
+            )
+        ]
+
+    monkeypatch.setattr(digest_runner, "fetch_newsletters", fake_fetch_newsletters)
+    monkeypatch.setattr(digest_runner, "fetch_articles_for_payloads", fake_fetch_articles)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        digest = client.post(
+            "/api/digests",
+            json={
+                "name": "AI Morning Brief",
+                "interest": "Local model workflows",
+                "schedule": "daily",
+                "sources": [{"type": "gmail_newsletter", "sender": "example@example.com"}],
+            },
+        ).json()
+
+        run = client.post(f"/api/digests/{digest['id']}/run")
+        assert run.status_code == 202
+
+        status_payload = client.get("/api/admin/status").json()
+        assert status_payload["fetch_failures"]["total_count"] == 1
+        assert status_payload["fetch_failures"]["groups"][0]["status"] == "blocked"
+        assert "HTTP 403" in status_payload["fetch_failures"]["examples"][0]["reason"]
+        assert status_payload["brief_review"]["counts"]["unresolved"] == 1
 
 
 def test_archived_digests_are_hidden_from_default_lists(monkeypatch, tmp_path):

@@ -43,7 +43,15 @@ def test_gmail_mcp_lists_tools_and_extracts_links():
     tool_names, structured_content = asyncio.run(run_check())
 
     assert {"gmail_search", "gmail_get_message", "gmail_extract_links", "gmail_fetch_newsletters"} <= tool_names
-    assert structured_content == {"links": [{"url": "https://example.com/article", "text": "Useful article"}]}
+    assert structured_content == {
+        "links": [
+            {
+                "url": "https://example.com/article",
+                "text": "Useful article",
+                "context": "Useful article",
+            }
+        ]
+    }
 
 
 def test_gmail_mcp_client_hydrates_payloads():

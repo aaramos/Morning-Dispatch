@@ -87,9 +87,10 @@ async def _run_model_enrichment_job(job_id: str) -> None:
         for task in asyncio.as_completed(tasks):
             enriched = await task
             processed += 1
-            if enriched.enrichment_source == "model":
+            if enriched.enrichment_source in {"model", "model_fallback"}:
                 success += 1
-                database.cache_model_enrichments([enriched], model_name=str(job["model_name"]))
+                if enriched.enrichment_source == "model":
+                    database.cache_model_enrichments([enriched], model_name=str(job["model_name"]))
             else:
                 failure += 1
             average_ms = round(((monotonic() - batch_started_at) * 1000) / processed, 2)

@@ -11,6 +11,7 @@ from backend.agents.librarian.enrichment import (
     enrich_articles,
     refine_ranked_articles_with_model,
 )
+import backend.agents.librarian.enrichment as enrichment_module
 from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClientError, ModelResponse
 from backend.app.db import database
 
@@ -283,6 +284,8 @@ def test_librarian_marks_model_capacity_fallback(monkeypatch, tmp_path):
                 prompt_tokens=550,
             )
 
+    monkeypatch.setattr(enrichment_module, "_fallback_model_client", lambda _client: None)
+
     enriched = asyncio.run(
         enrich_article_with_model(
             article_result(),
@@ -295,3 +298,69 @@ def test_librarian_marks_model_capacity_fallback(monkeypatch, tmp_path):
     assert enriched.enrichment_source == "model_capacity_fallback"
     assert summary["status_counts"][MODEL_CAPACITY_STATUS] == 1
     assert summary["models"][0]["failure_count"] == 1
+
+
+def test_librarian_retries_capacity_errors_with_fallback_model(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    database.init_database()
+
+    class PrimaryConfig:
+        model = "gemma-4-26b-a4b-it-bf16"
+        base_url = "http://127.0.0.1:1234/v1"
+
+    class FallbackConfig:
+        model = "Gemma-4 MTP 6Bit"
+        base_url = "http://127.0.0.1:1234/v1"
+
+    class CapacityModelClient:
+        config = PrimaryConfig()
+
+        async def complete_json_with_metrics(self, **_kwargs):
+            raise ModelClientError("capacity", status=MODEL_CAPACITY_STATUS, total_ms=11)
+
+    class FallbackModelClient:
+        config = FallbackConfig()
+
+        async def complete_json_with_metrics(self, **_kwargs):
+            return (
+                ModelResponse(
+                    content="{}",
+                    queue_wait_ms=0,
+                    ttft_ms=None,
+                    generation_ms=None,
+                    total_ms=1200,
+                    prompt_tokens=400,
+                    completion_tokens=70,
+                    tokens_per_sec=None,
+                ),
+                {
+                    "title": "Fallback model summary",
+                    "summary": "The fallback model handled the article after the larger model hit capacity.",
+                    "keywords": ["fallback", "capacity"],
+                    "content_type": "article",
+                },
+            )
+
+    monkeypatch.setattr(enrichment_module, "_fallback_model_client", lambda _client: FallbackModelClient())
+
+    enriched = asyncio.run(
+        enrich_article_with_model(
+            article_result(),
+            model_client=CapacityModelClient(),
+            metrics_context={"run_id": "run-fallback", "article_id": "article-fallback", "mode": "batch"},
+        )
+    )
+    summary = database.inference_metrics_summary()
+
+    assert enriched.enrichment_source == "model_fallback"
+    assert enriched.title == "Fallback model summary"
+    assert summary["record_count"] == 2
+    assert summary["status_counts"][MODEL_CAPACITY_STATUS] == 1
+    assert summary["success_count"] == 1

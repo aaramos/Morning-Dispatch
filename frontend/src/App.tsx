@@ -141,6 +141,67 @@ type AgentDecisionsStatus = {
   decision_counts: Record<string, number>;
 };
 
+type FetchFailureBreakdown = {
+  run_id: string | null;
+  run_at?: string | null;
+  digest_id?: string | null;
+  total_count: number;
+  groups: Array<{
+    status: string;
+    count: number;
+    fixability: string;
+  }>;
+  examples: Array<{
+    title: string;
+    url: string | null;
+    domain: string | null;
+    status: string;
+    reason: string;
+    fixability: string;
+    context: string | null;
+  }>;
+};
+
+type BriefReview = {
+  run_id: string | null;
+  issue_id: string | null;
+  generated_at: string | null;
+  counts: {
+    included: number;
+    unresolved: number;
+    dropped: number;
+    duplicate: number;
+    repaired: number;
+  };
+  included: ReviewItem[];
+  unresolved: ReviewItem[];
+  dropped: ReviewDecision[];
+  duplicates: ReviewDecision[];
+  repaired: ReviewDecision[];
+};
+
+type ReviewItem = {
+  title: string;
+  url: string | null;
+  domain: string | null;
+  tier: string | null;
+  section: string | null;
+  status: string | null;
+  reason: string | null;
+  score: number | null;
+  summary: string | null;
+};
+
+type ReviewDecision = {
+  agent: string;
+  target: string;
+  decision: string;
+  action: string;
+  reason: string | null;
+  confidence: number | null;
+  created_at: string;
+};
+
 type SourceScoutRun = {
   id: string;
   digest_id: string;
@@ -304,6 +365,8 @@ type AdminPipelineStatus = {
   inference_metrics: InferenceMetricsStatus;
   agent_decisions: AgentDecisionsStatus;
   source_scout: SourceScoutStatus;
+  fetch_failures: FetchFailureBreakdown;
+  brief_review: BriefReview;
   model_jobs: ModelJob[];
 };
 
@@ -867,6 +930,105 @@ function AdminApp() {
           <section className="panel wide-panel">
             <div className="panel-heading">
               <div>
+                <h3>Fetch Quality</h3>
+                <p className="muted">Shows why links failed so we can tell retries from links worth ignoring.</p>
+              </div>
+              <span className={pipeline?.fetch_failures.total_count ? "status-pill" : "status-pill good"}>
+                {pipeline?.fetch_failures.total_count ?? 0} unresolved
+              </span>
+            </div>
+            <div className="metric-strip">
+              {(pipeline?.fetch_failures.groups ?? []).slice(0, 5).map((group) => (
+                <div key={group.status}>
+                  <span>{formatStatusLabel(group.status)}</span>
+                  <strong>{group.count}</strong>
+                  <small>{group.fixability}</small>
+                </div>
+              ))}
+              {(pipeline?.fetch_failures.groups.length ?? 0) === 0 ? (
+                <div>
+                  <span>Failures</span>
+                  <strong>0</strong>
+                  <small>No failed article fetches in the latest run.</small>
+                </div>
+              ) : null}
+            </div>
+            <div className="review-list">
+              {(pipeline?.fetch_failures.examples ?? []).map((item) => (
+                <article key={`${item.url ?? item.title}-${item.status}`}>
+                  <div>
+                    <strong>{item.title}</strong>
+                    <small>{item.domain ?? "unknown source"} · {formatStatusLabel(item.status)}</small>
+                  </div>
+                  <p>{item.reason}</p>
+                  {item.context ? <span>{item.context}</span> : null}
+                </article>
+              ))}
+            </div>
+          </section>
+
+          <section className="panel wide-panel">
+            <div className="panel-heading">
+              <div>
+                <h3>Brief Review</h3>
+                <p className="muted">A compact audit of what the agents included, dropped, repaired, or deduplicated.</p>
+              </div>
+              <span className="status-pill">{formatDateTime(pipeline?.brief_review.generated_at)}</span>
+            </div>
+            <div className="metric-strip">
+              <div>
+                <span>Included</span>
+                <strong>{pipeline?.brief_review.counts.included ?? 0}</strong>
+              </div>
+              <div>
+                <span>Unresolved</span>
+                <strong>{pipeline?.brief_review.counts.unresolved ?? 0}</strong>
+              </div>
+              <div>
+                <span>Dropped</span>
+                <strong>{pipeline?.brief_review.counts.dropped ?? 0}</strong>
+              </div>
+              <div>
+                <span>Duplicate</span>
+                <strong>{pipeline?.brief_review.counts.duplicate ?? 0}</strong>
+              </div>
+              <div>
+                <span>Repaired</span>
+                <strong>{pipeline?.brief_review.counts.repaired ?? 0}</strong>
+              </div>
+            </div>
+            <div className="review-columns">
+              <div>
+                <p className="section-label">Included</p>
+                <div className="review-list compact">
+                  {(pipeline?.brief_review.included ?? []).slice(0, 5).map((item) => (
+                    <article key={`${item.url ?? item.title}-included`}>
+                      <strong>{item.title}</strong>
+                      <small>{item.section ?? item.tier ?? "included"} · {formatPercent(item.score)}</small>
+                    </article>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="section-label">Dropped / Repaired</p>
+                <div className="review-list compact">
+                  {[...(pipeline?.brief_review.dropped ?? []), ...(pipeline?.brief_review.repaired ?? [])]
+                    .slice(0, 5)
+                    .map((item) => (
+                      <article key={`${item.target}-${item.action}-${item.created_at}`}>
+                        <strong>{item.action || item.decision}</strong>
+                        <small>{item.target}</small>
+                        <p>{item.reason ?? item.decision}</p>
+                      </article>
+                    ))}
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section className="panel wide-panel">
+            <div className="panel-heading">
+              <div>
                 <h3>Reddit Source Scout</h3>
                 <p className="muted">
                   Keeps Reddit communities aligned with the digest interest by promoting fresh sources and retiring stale ones.
@@ -1319,6 +1481,15 @@ function formatMcpStatus(status: McpStatus | null | undefined): string {
   if (!status.available) return status.error ?? "oMLX MCP unavailable";
   const gmailTools = `${status.gmail.tools_count} Gmail tool${status.gmail.tools_count === 1 ? "" : "s"}`;
   return `${gmailTools} · ${status.tool_count} total`;
+}
+
+function formatStatusLabel(value: string | null | undefined): string {
+  if (!value) return "Unknown";
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
 }
 
 function formatDeliveryUrl(value: string | null | undefined): string {

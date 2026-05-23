@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 class ExtractedLink:
     url: str
     text: str
+    context: str = ""
 
 
 async def fetch_newsletters(
@@ -94,7 +95,7 @@ async def fetch_newsletters(
                         link_payload = NormalizedPayload(
                             source_type="gmail_link",
                             source_name=sender,
-                            raw_text="",
+                            raw_text=link.context,
                             original_url=link.url,
                             published_at=published_at,
                             metadata={
@@ -184,6 +185,7 @@ def extract_link_items_from_html(payload: dict[str, Any]) -> list[ExtractedLink]
         for anchor in soup.find_all("a", href=True):
             url = str(anchor["href"]).strip()
             text = _clean_text(anchor.get_text(" ", strip=True))
+            context = _link_context(anchor)
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 continue
@@ -191,7 +193,7 @@ def extract_link_items_from_html(payload: dict[str, Any]) -> list[ExtractedLink]
                 continue
             if url in seen:
                 continue
-            links.append(ExtractedLink(url=url, text=text))
+            links.append(ExtractedLink(url=url, text=text, context=context))
             seen.add(url)
     return links
 
@@ -295,6 +297,16 @@ def _clean_text(value: str) -> str:
     stripped = re.sub(r"[ \t]+", " ", value)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped)
     return stripped.strip()
+
+
+def _link_context(anchor: Any) -> str:
+    parent = anchor.find_parent(["p", "li", "td", "div", "section", "article"]) or anchor.parent
+    if parent is None or getattr(parent, "name", "") in {"[document]", "body", "html"}:
+        return _clean_text(anchor.get_text(" ", strip=True))
+    context = _clean_text(parent.get_text(" ", strip=True))
+    if len(context) <= 700:
+        return context
+    return f"{context[:699].rstrip()}..."
 
 
 def _keep_newsletter_link(url: str, text: str) -> bool:

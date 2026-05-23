@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Iterable
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -115,7 +115,7 @@ def select_article_payloads(
     for payload in payloads:
         if payload.source_type != "gmail_link" or not payload.original_url:
             continue
-        canonical_url = canonicalize_url(payload.original_url)
+        canonical_url = canonicalize_url(unwrap_redirect_url(payload.original_url))
         score = score_link_candidate(canonical_url, _payload_title(payload))
         if score <= 0:
             continue
@@ -151,6 +151,29 @@ def canonicalize_url(url: str) -> str:
     if path != "/":
         path = path.rstrip("/")
     return urlunparse((parsed.scheme.lower(), netloc, path, "", urlencode(query_items, doseq=True), ""))
+
+
+def unwrap_redirect_url(url: str) -> str:
+    current = str(url or "").strip()
+    for _attempt in range(3):
+        parsed = urlparse(current)
+        if parsed.scheme not in {"http", "https"}:
+            return current
+        query = dict(parse_qsl(parsed.query, keep_blank_values=False))
+        next_url = ""
+        for key in REDIRECT_QUERY_KEYS:
+            raw_value = query.get(key)
+            if not raw_value:
+                continue
+            candidate = unquote(str(raw_value)).strip()
+            parsed_candidate = urlparse(candidate)
+            if parsed_candidate.scheme in {"http", "https"} and parsed_candidate.netloc:
+                next_url = candidate
+                break
+        if not next_url or next_url == current:
+            return current
+        current = next_url
+    return current
 
 
 def score_link_candidate(url: str, link_text: str = "") -> float:
@@ -194,7 +217,7 @@ async def _fetch_one(
     semaphore: asyncio.Semaphore,
     payload: NormalizedPayload,
 ) -> ArticleFetchResult:
-    original_url = canonicalize_url(str(payload.original_url))
+    original_url = canonicalize_url(unwrap_redirect_url(str(payload.original_url)))
     link_score = float((payload.metadata or {}).get("link_quality_score") or score_link_candidate(original_url, _payload_title(payload)))
     async with semaphore:
         try:
@@ -202,23 +225,33 @@ async def _fetch_one(
             content_type = response.headers.get("content-type", "")
             final_url = canonicalize_url(str(response.url))
             if response.status_code >= 400:
-                return _failed(payload, original_url, final_url, "http_error", f"HTTP {response.status_code}", link_score)
+                return _failed(
+                    payload,
+                    original_url,
+                    final_url,
+                    _http_failure_status(response.status_code),
+                    f"HTTP {response.status_code}",
+                    link_score,
+                )
             if "html" not in content_type.lower():
                 return _failed(payload, original_url, final_url, "non_html", content_type, link_score)
 
             article = extract_article(response.text, final_url, fallback_title=_payload_title(payload))
             if len(article.text) < MIN_ARTICLE_TEXT_CHARS:
+                context = _newsletter_context(payload)
+                text = article.text or context
+                excerpt = _truncate(context or article.excerpt or article.text, 520)
                 return ArticleFetchResult(
                     payload=payload,
                     original_url=original_url,
                     final_url=final_url,
                     canonical_url=canonicalize_url(final_url),
                     title=article.title,
-                    text=article.text,
-                    excerpt=article.excerpt,
+                    text=text,
+                    excerpt=excerpt,
                     domain=_domain(final_url),
                     status="no_content",
-                    error="Readable article text was too short",
+                    error=f"Readable article text was too short ({len(article.text)} chars)",
                     link_score=link_score,
                 )
             return ArticleFetchResult(
@@ -344,19 +377,47 @@ def _failed(
     error: str,
     link_score: float = 0.0,
 ) -> ArticleFetchResult:
+    context = _newsletter_context(payload)
     return ArticleFetchResult(
         payload=payload,
         original_url=original_url,
         final_url=final_url,
         canonical_url=canonicalize_url(final_url or original_url),
         title=_payload_title(payload) or _domain(original_url) or "Article",
-        text="",
-        excerpt="",
+        text=context,
+        excerpt=_truncate(context, 520),
         domain=_domain(final_url or original_url),
         status=status,
         error=error,
         link_score=link_score,
     )
+
+
+def _http_failure_status(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return "blocked"
+    if status_code in {404, 410}:
+        return "not_found"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code >= 500:
+        return "site_error"
+    return "http_error"
+
+
+def _newsletter_context(payload: NormalizedPayload) -> str:
+    metadata = payload.metadata or {}
+    parts = [
+        metadata.get("link_text"),
+        metadata.get("title"),
+        metadata.get("parent_subject"),
+        metadata.get("subject"),
+        payload.raw_text,
+    ]
+    text = " ".join(str(part) for part in parts if part)
+    text = re.sub(r"https?://[^\s<>)\"']+", " ", text)
+    text = _clean_text(text)
+    return _truncate(text, 900)
 
 
 def _clean_text(value: str) -> str:
@@ -394,6 +455,17 @@ TRACKING_QUERY_KEYS = {
     "s",
     "spm",
 }
+
+REDIRECT_QUERY_KEYS = (
+    "url",
+    "u",
+    "target",
+    "redirect",
+    "redirect_url",
+    "destination",
+    "dest",
+    "link",
+)
 
 NON_ARTICLE_EXTENSIONS = (
     ".avif",

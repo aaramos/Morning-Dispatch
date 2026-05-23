@@ -10,15 +10,15 @@ from typing import Iterable
 from urllib.parse import urlparse
 
 from backend.agents.librarian.articles import ArticleFetchResult
-from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClient, ModelClientError
-from backend.app.core.config import get_settings
+from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClient, ModelClientConfig, ModelClientError
+from backend.app.core.config import DEFAULT_LIBRARIAN_MODEL, get_settings
 from backend.app.db import database
 
 
 MAX_SUMMARY_CHARS = 620
 MAX_MODEL_TEXT_CHARS = 2500
 logger = logging.getLogger(__name__)
-MODEL_ENRICHED_SOURCES = {"model", "model_cache"}
+MODEL_ENRICHED_SOURCES = {"model", "model_cache", "model_fallback"}
 
 
 async def enrich_articles(
@@ -99,7 +99,6 @@ async def enrich_article_with_model(
             )
     except ModelClientError as exc:
         logger.info("Librarian model enrichment failed for %s: %s", result.original_url, exc)
-        fallback_source = "model_capacity_fallback" if exc.status == MODEL_CAPACITY_STATUS else "deterministic"
         _record_model_metric(
             result=deterministic,
             metrics_context=metrics_context,
@@ -118,7 +117,17 @@ async def enrich_article_with_model(
             summary_word_count=_word_count(deterministic.editor_summary or deterministic.excerpt),
             error_detail=str(exc),
         )
-        return replace(deterministic, enrichment_source=fallback_source)
+        if exc.status == MODEL_CAPACITY_STATUS:
+            fallback = _fallback_model_client(model_client)
+            if fallback is not None:
+                return await _retry_with_fallback_model(
+                    deterministic,
+                    prompt=prompt,
+                    fallback_client=fallback,
+                    metrics_context=metrics_context,
+                )
+            return replace(deterministic, enrichment_source="model_capacity_fallback")
+        return replace(deterministic, enrichment_source="deterministic")
 
     enriched = _apply_model_payload(deterministic, model_payload)
     _record_model_metric(
@@ -141,6 +150,94 @@ async def enrich_article_with_model(
         summary_word_count=_word_count(enriched.editor_summary or enriched.excerpt),
     )
     return enriched
+
+
+async def _retry_with_fallback_model(
+    result: ArticleFetchResult,
+    *,
+    prompt: str,
+    fallback_client: ModelClient,
+    metrics_context: dict[str, object] | None,
+) -> ArticleFetchResult:
+    started_at = perf_counter()
+    model_response = None
+    try:
+        if hasattr(fallback_client, "complete_json_with_metrics"):
+            model_response, model_payload = await fallback_client.complete_json_with_metrics(
+                system=LIBRARIAN_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=220,
+            )
+        else:
+            model_payload = await fallback_client.complete_json(
+                system=LIBRARIAN_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=220,
+            )
+    except ModelClientError as exc:
+        _record_model_metric(
+            result=result,
+            metrics_context=metrics_context,
+            model_client=fallback_client,
+            prompt=prompt,
+            status=exc.status,
+            schema_valid=False,
+            fallback_triggered=True,
+            total_ms=exc.total_ms if exc.total_ms is not None else _elapsed_ms(started_at),
+            queue_wait_ms=exc.queue_wait_ms,
+            ttft_ms=exc.ttft_ms,
+            generation_ms=exc.generation_ms,
+            prompt_tokens=exc.prompt_tokens,
+            completion_tokens=exc.completion_tokens,
+            tokens_per_sec=exc.tokens_per_sec,
+            summary_word_count=_word_count(result.editor_summary or result.excerpt),
+            error_detail=str(exc),
+        )
+        return replace(result, enrichment_source="model_capacity_fallback")
+
+    enriched = _apply_model_payload(result, model_payload)
+    enriched = replace(enriched, enrichment_source="model_fallback")
+    _record_model_metric(
+        result=enriched,
+        metrics_context=metrics_context,
+        model_client=fallback_client,
+        prompt=prompt,
+        status="success",
+        schema_valid=True,
+        fallback_triggered=True,
+        total_ms=getattr(model_response, "total_ms", None) or _elapsed_ms(started_at),
+        queue_wait_ms=getattr(model_response, "queue_wait_ms", None),
+        ttft_ms=getattr(model_response, "ttft_ms", None),
+        generation_ms=getattr(model_response, "generation_ms", None),
+        prompt_tokens=getattr(model_response, "prompt_tokens", None),
+        completion_tokens=getattr(model_response, "completion_tokens", None),
+        tokens_per_sec=getattr(model_response, "tokens_per_sec", None),
+        classification_label=enriched.content_type,
+        classification_confidence=_classification_confidence(model_payload),
+        summary_word_count=_word_count(enriched.editor_summary or enriched.excerpt),
+    )
+    return enriched
+
+
+def _fallback_model_client(model_client: object) -> ModelClient | None:
+    settings = get_settings()
+    config = getattr(model_client, "config", None)
+    current_model = str(getattr(config, "model", "") or settings.librarian_model or "")
+    fallback_model = DEFAULT_LIBRARIAN_MODEL
+    if not fallback_model or current_model == fallback_model:
+        return None
+    base_url = str(getattr(config, "base_url", None) or settings.model_base_url or "")
+    if not base_url:
+        return None
+    return ModelClient(
+        ModelClientConfig(
+            base_url=base_url,
+            model=fallback_model,
+            api_key=getattr(config, "api_key", None) or settings.model_api_key,
+            timeout_seconds=float(getattr(config, "timeout_seconds", None) or settings.model_timeout_seconds),
+            concurrency=int(getattr(config, "concurrency", None) or settings.model_concurrency),
+        )
+    )
 
 
 async def refine_ranked_articles_with_model(

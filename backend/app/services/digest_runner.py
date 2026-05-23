@@ -48,6 +48,7 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
     payloads.extend(reddit_payloads)
     fetched_articles = await fetch_articles_for_payloads(payloads)
     enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
+    enriched_articles = database.apply_feedback_to_candidates(digest_id, enriched_articles)
     ranked_articles = prepare_issue_articles(digest, enriched_articles)
     settings = get_settings()
     model_cache_hit_count = 0

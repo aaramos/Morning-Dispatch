@@ -34,7 +34,23 @@ class FakeResponse:
     url = "https://example.com/final-article"
 
 
+class ForbiddenResponse:
+    status_code = 403
+    headers = {"content-type": "text/html; charset=utf-8"}
+    text = "<html><body>Forbidden</body></html>"
+    url = "https://example.com/paywalled"
+
+
+class ShortResponse:
+    status_code = 200
+    headers = {"content-type": "text/html; charset=utf-8"}
+    text = "<html><body><article><h1>Short AI item</h1><p>Too short to be considered a readable article.</p></article></body></html>"
+    url = "https://example.com/short"
+
+
 class FakeAsyncClient:
+    response = FakeResponse()
+
     def __init__(self, **_kwargs):
         pass
 
@@ -45,7 +61,7 @@ class FakeAsyncClient:
         return None
 
     async def get(self, _url):
-        return FakeResponse()
+        return self.response
 
 
 def test_extract_article_prefers_article_content():
@@ -108,3 +124,60 @@ def test_select_article_payloads_filters_junk_and_deduplicates():
     assert len(selected) == 1
     assert selected[0].original_url == "https://example.com/articles/useful-ai"
     assert selected[0].metadata["canonical_url"] == "https://example.com/articles/useful-ai"
+
+
+def test_fetch_articles_classifies_blocked_and_keeps_newsletter_context(monkeypatch):
+    class BlockedClient(FakeAsyncClient):
+        response = ForbiddenResponse()
+
+    monkeypatch.setattr(articles.httpx, "AsyncClient", BlockedClient)
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="newsletter@example.com",
+        original_url="https://example.com/paywalled",
+        raw_text="Newsletter context says this paywalled story covers agentic AI product workflows.",
+        metadata={"link_text": "Paywalled agent story", "parent_subject": "Agentic AI updates"},
+    )
+
+    results = asyncio.run(articles.fetch_articles_for_payloads([payload]))
+
+    assert results[0].status == "blocked"
+    assert results[0].error == "HTTP 403"
+    assert "paywalled story covers agentic AI" in results[0].excerpt
+
+
+def test_fetch_articles_uses_newsletter_context_for_short_pages(monkeypatch):
+    class ShortClient(FakeAsyncClient):
+        response = ShortResponse()
+
+    monkeypatch.setattr(articles.httpx, "AsyncClient", ShortClient)
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="newsletter@example.com",
+        original_url="https://example.com/short",
+        raw_text="Newsletter context explains that this link is about local model benchmarks and faster agent workflows.",
+        metadata={"link_text": "Short AI item", "parent_subject": "Local model benchmarks"},
+    )
+
+    results = asyncio.run(articles.fetch_articles_for_payloads([payload]))
+
+    assert results[0].status == "no_content"
+    assert "local model benchmarks" in results[0].excerpt
+    assert "short" in results[0].error
+
+
+def test_select_article_payloads_unwraps_redirect_links():
+    payloads = [
+        NormalizedPayload(
+            source_type="gmail_link",
+            original_url=(
+                "https://newsletter.example.com/redirect?"
+                "url=https%3A%2F%2Fexample.com%2Farticles%2Fuseful-ai%3Futm_source%3Dmail"
+            ),
+            metadata={"link_text": "Useful AI article"},
+        )
+    ]
+
+    selected = articles.select_article_payloads(payloads)
+
+    assert selected[0].original_url == "https://example.com/articles/useful-ai"
