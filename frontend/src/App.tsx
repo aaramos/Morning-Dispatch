@@ -367,6 +367,7 @@ type VerificationRunResult = {
   source_run_id?: string;
   published_run_id?: string | null;
   published_issue_id?: string | null;
+  podcast_episode_count?: number;
   reviewed_article_count?: number;
   active_before_count?: number;
   active_after_count?: number;
@@ -860,20 +861,32 @@ function AdminApp() {
     }
   }
 
-  async function runControlledVerification(publish = false) {
+  async function runControlledVerification(publish = false, forcePodcastRefresh = false) {
     const digest = pipeline?.digests[0];
     if (!digest) return;
     setBusy(true);
-    setMessage(publish ? "Publishing verified brief..." : "Running controlled verification...");
+    setMessage(
+      forcePodcastRefresh
+        ? "Refreshing podcasts for verification..."
+        : publish
+          ? "Publishing verified brief..."
+          : "Running controlled verification...",
+    );
     try {
-      const result = await api<VerificationRunResult>(`/api/admin/digests/${digest.id}/verification-run${publish ? "?publish=true" : ""}`, {
+      const params = new URLSearchParams();
+      if (publish) params.set("publish", "true");
+      if (forcePodcastRefresh) params.set("force_podcast_refresh", "true");
+      const query = params.toString() ? `?${params.toString()}` : "";
+      const result = await api<VerificationRunResult>(`/api/admin/digests/${digest.id}/verification-run${query}`, {
         method: "POST",
       });
       setVerificationResult(result);
       await loadStatus();
       setMessage(
         result.status === "completed"
-          ? result.published
+          ? forcePodcastRefresh
+            ? "Podcast refresh verification completed"
+            : result.published
             ? "Verified brief published"
             : "Controlled verification completed"
           : result.message ?? result.status,
@@ -1167,6 +1180,9 @@ function AdminApp() {
               </button>
               <button onClick={() => runControlledVerification(true)} disabled={busy || !pipeline?.digests.length}>
                 Publish Verified Brief
+              </button>
+              <button onClick={() => runControlledVerification(false, true)} disabled={busy || !pipeline?.digests.length}>
+                Refresh Podcasts
               </button>
               {verificationResult ? (
                 <p className="muted">
@@ -2093,11 +2109,16 @@ function formatSourceState(value: RedditSource["state"]): string {
 function formatVerificationResult(result: VerificationRunResult): string {
   if (result.status !== "completed") return result.message ?? result.status;
   const reviewed = result.reviewed_article_count ?? 0;
+  const podcasts = result.podcast_episode_count ?? 0;
   const decisions = result.decision_count ?? 0;
+  const decisionVerb = result.stored_decision_count === 0 && decisions > 0 ? "made" : "saved";
   const dropped = result.dropped_count ?? 0;
   const lead = result.lead_title ? ` · lead: ${result.lead_title}` : "";
   const prefix = result.published ? "Published" : "Reviewed";
-  return `${prefix} ${reviewed} article(s), saved ${decisions} decision(s), dropped ${dropped}${lead}`;
+  if (result.mode === "podcast_refresh") {
+    return `${prefix} ${podcasts} podcast episode(s), reviewed ${reviewed}, ${decisionVerb} ${decisions} decision(s), dropped ${dropped}${lead}`;
+  }
+  return `${prefix} ${reviewed} article(s), ${decisionVerb} ${decisions} decision(s), dropped ${dropped}${lead}`;
 }
 
 function formatSeconds(value: number | null | undefined): string {

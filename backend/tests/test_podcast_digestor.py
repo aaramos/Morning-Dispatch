@@ -135,6 +135,29 @@ def test_fetch_podcast_episode_payload_uses_show_notes(monkeypatch, tmp_path):
     assert updated_summary["record_count"] == 2
     assert updated_summary["status_counts"]["already_seen"] == 1
 
+    refreshed_payloads, _refreshed_decisions = asyncio.run(
+        podcast.fetch_podcast_episodes(
+            digest_id=digest["id"],
+            digest_interest="agentic AI product strategy OpenAI local LLM infrastructure",
+            sources=[
+                {
+                    "type": "podcast_rss",
+                    "title": "AI Daily Brief",
+                    "feed_url": "https://podcasts.example.com/feed.xml",
+                }
+            ],
+            lookback_hours=24,
+            inference_run_id="inference-3",
+            force_refresh=True,
+        )
+    )
+
+    assert len(refreshed_payloads) == 1
+    refreshed_summary = database.podcast_metrics_summary()
+    assert refreshed_summary["record_count"] == 3
+    assert refreshed_summary["status_counts"]["success"] == 2
+    assert refreshed_summary["status_counts"]["already_seen"] == 1
+
 
 def test_apple_url_from_itunes_id():
     assert podcast._apple_url_from_itunes_id(123456789) == "https://podcasts.apple.com/podcast/id123456789"

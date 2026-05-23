@@ -56,6 +56,7 @@ async def fetch_podcast_episodes(
     lookback_hours: int,
     max_episodes: int = MAX_PODCAST_EPISODES,
     inference_run_id: str | None = None,
+    force_refresh: bool = False,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     decisions: list[AgentDecision] = []
     try:
@@ -66,6 +67,7 @@ async def fetch_podcast_episodes(
             lookback_hours=lookback_hours,
             max_episodes=max_episodes,
             inference_run_id=inference_run_id,
+            force_refresh=force_refresh,
             decisions=decisions,
         )
     except Exception as exc:
@@ -91,6 +93,7 @@ async def _fetch_podcast_episodes(
     lookback_hours: int,
     max_episodes: int,
     inference_run_id: str | None,
+    force_refresh: bool,
     decisions: list[AgentDecision],
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     podcast_sources = _podcast_sources(sources)
@@ -145,7 +148,7 @@ async def _fetch_podcast_episodes(
         for episode in feed_episodes:
             if not _inside_lookback(episode.published_at, lookback_hours):
                 continue
-            if _already_seen(digest_id, episode):
+            if _already_seen(digest_id, episode) and not force_refresh:
                 _record_skipped_podcast_metric(
                     digest_id=digest_id,
                     inference_run_id=inference_run_id,
@@ -235,7 +238,8 @@ async def _fetch_podcast_episodes(
         )
         if pii_filter(payload):
             payloads.append(payload)
-            _mark_seen(digest_id, episode)
+            if not force_refresh:
+                _mark_seen(digest_id, episode)
             metric["status"] = "success"
         else:
             metric["status"] = "pii_filtered"

@@ -2256,7 +2256,8 @@ def get_latest_source_run_for_digest(digest_id: str) -> dict[str, Any] | None:
         row = connection.execute(
             """
             SELECT * FROM digest_runs
-            WHERE digest_id = ? AND COALESCE(trigger, '') != 'controlled_verification'
+            WHERE digest_id = ?
+              AND COALESCE(trigger, '') NOT IN ('controlled_verification', 'controlled_podcast_refresh')
             ORDER BY run_at DESC
             LIMIT 1
             """,

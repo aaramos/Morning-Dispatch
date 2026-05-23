@@ -9,16 +9,26 @@ from typing import Any
 from backend.agents.agentic import AgentDecision
 from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.critic import apply_critic_repairs
+from backend.agents.digestor.podcast import fetch_podcast_episodes
+from backend.agents.editor import prepare_issue_articles
 from backend.agents.editorial_decisions import apply_editorial_decisions
-from backend.agents.librarian.articles import ArticleFetchResult
+from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
+from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
 from backend.app.db import database
 
 
-async def run_controlled_verification(digest_id: str, *, publish: bool = False) -> dict[str, Any] | None:
+async def run_controlled_verification(
+    digest_id: str,
+    *,
+    publish: bool = False,
+    force_podcast_refresh: bool = False,
+) -> dict[str, Any] | None:
     started_at = monotonic()
     digest = database.get_digest(digest_id)
     if digest is None:
         return None
+    if force_podcast_refresh:
+        return await _run_controlled_podcast_refresh(digest, publish=publish, started_at=started_at)
 
     latest_run = database.get_latest_source_run_for_digest(digest_id) if publish else database.get_latest_run_for_digest(digest_id)
     if latest_run is None:
@@ -110,12 +120,139 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
     }
 
 
+async def _run_controlled_podcast_refresh(
+    digest: dict[str, Any],
+    *,
+    publish: bool,
+    started_at: float,
+) -> dict[str, Any]:
+    digest_id = str(digest["id"])
+    podcast_sources = _podcast_sources(digest.get("sources", []))
+    if not podcast_sources:
+        return {
+            "status": "no_podcast_sources",
+            "mode": "podcast_refresh",
+            "published": False,
+            "digest_id": digest_id,
+            "message": "No podcast sources are configured for this digest yet.",
+        }
+
+    latest_run = database.get_latest_source_run_for_digest(digest_id)
+    lookback_hours = max(24, int(latest_run.get("lookback_days") or 1) * 24) if latest_run else 24
+    inference_run_id = database.new_id()
+    stage_seconds: dict[str, float] = {}
+    stage_started = started_at
+
+    podcast_payloads, podcast_decisions = await fetch_podcast_episodes(
+        digest_id=digest_id,
+        digest_interest=str(digest.get("interest") or ""),
+        sources=digest.get("sources", []),
+        lookback_hours=lookback_hours,
+        inference_run_id=inference_run_id,
+        force_refresh=True,
+    )
+    stage_started = _mark_stage(stage_seconds, "podcast_refresh", stage_started)
+
+    if not podcast_payloads:
+        return {
+            "status": "no_podcast_episodes",
+            "mode": "podcast_refresh",
+            "published": False,
+            "digest_id": digest_id,
+            "source_run_id": latest_run.get("id") if latest_run else None,
+            "podcast_episode_count": 0,
+            "decision_count": len(podcast_decisions),
+            "stored_decision_count": 0,
+            "action_counts": dict(Counter(decision.action for decision in podcast_decisions)),
+            "agent_counts": dict(Counter(decision.agent for decision in podcast_decisions)),
+            "message": "Podcast refresh ran, but no matching episodes were selected.",
+        }
+
+    fetched_articles = await fetch_articles_for_payloads(podcast_payloads)
+    stage_started = _mark_stage(stage_seconds, "fetching", stage_started)
+    enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
+    ranked_articles = prepare_issue_articles(digest, enriched_articles)
+    article_results = await refine_ranked_articles_with_model(
+        ranked_articles,
+        inference_run_id=inference_run_id,
+        metrics_mode="single",
+    )
+    stage_started = _mark_stage(stage_seconds, "classification", stage_started)
+
+    after_editorial, editorial_decisions = await apply_editorial_decisions(digest, article_results)
+    after_critic, critic_decisions = await apply_critic_repairs(digest, podcast_payloads, after_editorial)
+    after_quality, quality_decisions = apply_brief_quality_checks(after_critic)
+    _mark_stage(stage_seconds, "editorial", stage_started)
+    decisions = podcast_decisions + editorial_decisions + critic_decisions + quality_decisions
+
+    published_run = None
+    published_issue = None
+    if publish:
+        stage_seconds["publishing"] = 0.0
+        published_run = database.create_ingested_run(
+            digest=digest,
+            payloads=podcast_payloads,
+            article_results=after_quality,
+            lookback_hours=lookback_hours,
+            configured_source_count=len(podcast_sources),
+            trigger="controlled_podcast_refresh",
+            duration_seconds=round(monotonic() - started_at, 3),
+            inference_run_id=inference_run_id,
+            stage_seconds=stage_seconds,
+            stats_overrides={
+                "source_count": len(podcast_sources),
+                "newsletter_count": 0,
+                "link_count": 0,
+                "podcast_episode_count": len(podcast_payloads),
+                "processing_seconds": round(monotonic() - started_at, 3),
+                "stage_seconds": stage_seconds,
+            },
+            agent_decisions=decisions,
+        )
+        published_issue = database.get_latest_issue(digest_id)
+
+    return {
+        "status": "completed",
+        "mode": "podcast_refresh",
+        "published": publish,
+        "digest_id": digest_id,
+        "source_run_id": latest_run.get("id") if latest_run else None,
+        "published_run_id": published_run.get("id") if published_run else None,
+        "published_issue_id": published_issue.get("id") if published_issue else None,
+        "podcast_episode_count": len(podcast_payloads),
+        "reviewed_article_count": len(fetched_articles),
+        "active_before_count": _active_count(article_results),
+        "active_after_count": _active_count(after_quality),
+        "dropped_count": sum(1 for result in after_quality if result.tier == "dropped"),
+        "lead_title": _lead_title(after_quality),
+        "decision_count": len(decisions),
+        "stored_decision_count": len(decisions) if publish else 0,
+        "reused_verified_decisions": False,
+        "action_counts": dict(Counter(decision.action for decision in decisions)),
+        "agent_counts": dict(Counter(decision.agent for decision in decisions)),
+    }
+
+
 def _active_count(results: list[ArticleFetchResult]) -> int:
     return sum(1 for result in results if result.tier != "dropped")
 
 
 def _podcast_count(results: list[ArticleFetchResult]) -> int:
     return sum(1 for result in results if result.payload.source_type == "podcast_episode")
+
+
+def _podcast_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        source
+        for source in sources
+        if isinstance(source, dict) and source.get("type") in {"podcast_rss", "podcast_search"}
+    ]
+
+
+def _mark_stage(stage_seconds: dict[str, float], name: str, started_at: float) -> float:
+    now = monotonic()
+    stage_seconds[name] = round(now - started_at, 3)
+    return now
 
 
 def _run_digest_stats(run: dict[str, Any]) -> dict[str, Any]:

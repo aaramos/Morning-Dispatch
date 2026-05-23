@@ -12,6 +12,7 @@ from backend.app.db import database
 from backend.app.main import create_app
 from backend.app.services import email_delivery
 from backend.app.services import digest_runner
+from backend.app.services import verification
 
 
 def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
@@ -192,6 +193,12 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert verification_payload["published"] is False
         assert verification_payload["reviewed_article_count"] == 1
         assert verification_payload["decision_count"] >= 1
+
+        podcast_refresh = client.post(f"/api/admin/digests/{digest['id']}/verification-run?force_podcast_refresh=true")
+        assert podcast_refresh.status_code == 200
+        podcast_refresh_payload = podcast_refresh.json()
+        assert podcast_refresh_payload["status"] == "no_podcast_sources"
+        assert podcast_refresh_payload["mode"] == "podcast_refresh"
 
         verified_status = client.get("/api/admin/status").json()
         assert verified_status["agent_decisions"]["record_count"] >= verification_payload["stored_decision_count"]
@@ -482,6 +489,7 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
 
     monkeypatch.setattr(digest_runner, "fetch_reddit_threads", fake_fetch_reddit_threads)
     monkeypatch.setattr(digest_runner, "fetch_podcast_episodes", fake_fetch_podcast_episodes)
+    monkeypatch.setattr(verification, "fetch_podcast_episodes", fake_fetch_podcast_episodes)
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         created = client.post(
@@ -500,6 +508,15 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
         assert run.status_code == 202
         assert run.json()["status"] == "completed"
         assert run.json()["fetched_article_count"] == 1
+
+        refresh = client.post(f"/api/admin/digests/{digest['id']}/verification-run?force_podcast_refresh=true")
+        assert refresh.status_code == 200
+        refresh_payload = refresh.json()
+        assert refresh_payload["status"] == "completed"
+        assert refresh_payload["mode"] == "podcast_refresh"
+        assert refresh_payload["published"] is False
+        assert refresh_payload["podcast_episode_count"] == 1
+        assert refresh_payload["reviewed_article_count"] == 1
 
         issue = client.get(f"/api/digests/{digest['id']}/issues/latest")
         html = client.get(f"/api/issues/{issue.json()['id']}/html")

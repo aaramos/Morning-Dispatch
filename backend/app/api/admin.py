@@ -438,8 +438,16 @@ async def start_model_job(payload: ModelJobPayload) -> dict[str, Any]:
 
 
 @router.post("/digests/{digest_id}/verification-run")
-async def run_digest_verification(digest_id: str, publish: bool = False) -> dict[str, Any]:
-    result = await verification.run_controlled_verification(digest_id, publish=publish)
+async def run_digest_verification(
+    digest_id: str,
+    publish: bool = False,
+    force_podcast_refresh: bool = False,
+) -> dict[str, Any]:
+    result = await verification.run_controlled_verification(
+        digest_id,
+        publish=publish,
+        force_podcast_refresh=force_podcast_refresh,
+    )
     if result is None:
         raise HTTPException(status_code=404, detail="Digest not found")
     return result
