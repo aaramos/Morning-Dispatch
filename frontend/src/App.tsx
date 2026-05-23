@@ -180,6 +180,37 @@ type BriefReview = {
   repaired: ReviewDecision[];
 };
 
+type DigestStats = {
+  run_id: string | null;
+  generated_at: string | null;
+  source_count: number;
+  newsletter_count: number;
+  link_count: number;
+  article_candidate_count: number;
+  included_article_count: number;
+  unresolved_count: number;
+  dropped_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  model_call_count: number;
+  processing_seconds: number | null;
+  stage_seconds: Record<string, number>;
+};
+
+type EmailDeliveryStatus = {
+  digest_id: string | null;
+  recipient_email: string;
+  enabled: boolean;
+  last_delivery_status: string | null;
+  last_delivered_at: string | null;
+  last_error: string | null;
+  updated_at: string | null;
+  gmail_send_ready: boolean;
+  requires_gmail_reconnect: boolean;
+  token_scopes: string[];
+};
+
 type ReviewItem = {
   title: string;
   url: string | null;
@@ -345,6 +376,7 @@ type AdminPipelineStatus = {
   delivery: {
     latest_brief_path: string;
     latest_brief_url: string;
+    email: EmailDeliveryStatus;
   };
   health: AdminHealthStatus;
   gmail: GmailAdminStatus;
@@ -367,6 +399,7 @@ type AdminPipelineStatus = {
   source_scout: SourceScoutStatus;
   fetch_failures: FetchFailureBreakdown;
   brief_review: BriefReview;
+  digest_stats: DigestStats;
   model_jobs: ModelJob[];
 };
 
@@ -589,6 +622,8 @@ function AdminApp() {
   const [jobModel, setJobModel] = useState("");
   const [jobLimit, setJobLimit] = useState(100);
   const [jobIncludeCached, setJobIncludeCached] = useState(false);
+  const [deliveryEmail, setDeliveryEmail] = useState("");
+  const [deliveryEnabled, setDeliveryEnabled] = useState(false);
   const [verificationResult, setVerificationResult] = useState<VerificationRunResult | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecisionRecord[]>([]);
   const [sourceScoutSources, setSourceScoutSources] = useState<RedditSource[]>([]);
@@ -611,6 +646,8 @@ function AdminApp() {
       const preferredModel = result.model.model || result.model.catalog.models[0]?.id || "";
       setSelectedModel(preferredModel);
       setJobModel((current) => current || preferredModel);
+      setDeliveryEmail(result.delivery.email.recipient_email ?? "");
+      setDeliveryEnabled(Boolean(result.delivery.email.enabled));
       setMessage(result.gmail.connected ? "Gmail connected" : "Gmail not connected");
       await Promise.all([loadAgentDecisions(), loadSourceScout()]);
     } catch (error) {
@@ -787,6 +824,46 @@ function AdminApp() {
     }
   }
 
+  async function saveDeliverySettings() {
+    const digest = pipeline?.digests[0];
+    if (!digest) return;
+    setBusy(true);
+    setMessage("Saving delivery settings...");
+    try {
+      await api(`/api/admin/digests/${digest.id}/delivery`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          recipient_email: deliveryEmail.trim(),
+          enabled: deliveryEnabled,
+        }),
+      });
+      await loadStatus();
+      setMessage("Delivery settings saved");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not save delivery settings");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendLatestDigestEmail() {
+    const digest = pipeline?.digests[0];
+    if (!digest) return;
+    setBusy(true);
+    setMessage("Sending latest digest...");
+    try {
+      await api(`/api/admin/digests/${digest.id}/delivery/send-test`, {
+        method: "POST",
+      });
+      await loadStatus();
+      setMessage("Latest digest sent");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not send latest digest");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function readClientSecretFile(file: File | undefined) {
     if (!file) return;
     setClientSecretJson(await file.text());
@@ -930,8 +1007,121 @@ function AdminApp() {
           <section className="panel wide-panel">
             <div className="panel-heading">
               <div>
-                <h3>Fetch Quality</h3>
-                <p className="muted">Shows why links failed so we can tell retries from links worth ignoring.</p>
+                <h3>Digest Stats</h3>
+                <p className="muted">Clean run summary shown in the digest; unresolved details stay in Admin.</p>
+              </div>
+              <span className="status-pill">{formatDateTime(pipeline?.digest_stats.generated_at)}</span>
+            </div>
+            <div className="metric-strip">
+              <div>
+                <span>Sources</span>
+                <strong>{formatNumber(pipeline?.digest_stats.source_count)}</strong>
+                <small>Configured inputs</small>
+              </div>
+              <div>
+                <span>Newsletters</span>
+                <strong>{formatNumber(pipeline?.digest_stats.newsletter_count)}</strong>
+                <small>{formatNumber(pipeline?.digest_stats.link_count)} links extracted</small>
+              </div>
+              <div>
+                <span>Included</span>
+                <strong>{formatNumber(pipeline?.digest_stats.included_article_count)}</strong>
+                <small>{formatNumber(pipeline?.digest_stats.article_candidate_count)} candidates reviewed</small>
+              </div>
+              <div>
+                <span>Filtered</span>
+                <strong>
+                  {formatNumber((pipeline?.digest_stats.dropped_count ?? 0) + (pipeline?.digest_stats.unresolved_count ?? 0))}
+                </strong>
+                <small>{formatNumber(pipeline?.digest_stats.unresolved_count)} unresolved, admin-only</small>
+              </div>
+              <div>
+                <span>Model tokens</span>
+                <strong>{formatNumber(pipeline?.digest_stats.total_tokens)}</strong>
+                <small>
+                  {formatNumber(pipeline?.digest_stats.prompt_tokens)} prompt · {formatNumber(pipeline?.digest_stats.completion_tokens)} output
+                </small>
+              </div>
+              <div>
+                <span>Processing</span>
+                <strong>{formatSeconds(pipeline?.digest_stats.processing_seconds)}</strong>
+                <small>{formatNumber(pipeline?.digest_stats.model_call_count)} model call(s)</small>
+              </div>
+            </div>
+            <div className="stage-strip">
+              {Object.entries(pipeline?.digest_stats.stage_seconds ?? {}).map(([stage, seconds]) => (
+                <span key={stage}>
+                  {formatStageLabel(stage)}: <strong>{formatSeconds(seconds)}</strong>
+                </span>
+              ))}
+            </div>
+          </section>
+
+          <section className="panel wide-panel">
+            <div className="panel-heading">
+              <div>
+                <h3>Digest Delivery</h3>
+                <p className="muted">Sends the finished morning brief to your inbox after the scheduled run completes.</p>
+              </div>
+              <span className={pipeline?.delivery.email.enabled ? "status-pill good" : "status-pill"}>
+                {pipeline?.delivery.email.enabled ? "Enabled" : "Off"}
+              </span>
+            </div>
+            <div className="delivery-form">
+              <label>
+                Recipient email
+                <input
+                  value={deliveryEmail}
+                  onChange={(event) => setDeliveryEmail(event.target.value)}
+                  placeholder="you@example.com"
+                />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={deliveryEnabled}
+                  onChange={(event) => setDeliveryEnabled(event.target.checked)}
+                />
+                Send each morning
+              </label>
+              <div className="button-row">
+                <button onClick={saveDeliverySettings} disabled={busy || !pipeline?.digests.length}>
+                  Save Delivery
+                </button>
+                <button
+                  className="secondary-button"
+                  onClick={sendLatestDigestEmail}
+                  disabled={busy || !pipeline?.delivery.email.enabled || !pipeline.delivery.email.recipient_email}
+                >
+                  Send Latest Now
+                </button>
+              </div>
+            </div>
+            <dl className="status-list inline">
+              <div>
+                <dt>Gmail send</dt>
+                <dd>{pipeline?.delivery.email.gmail_send_ready ? "Ready" : "Reconnect Gmail"}</dd>
+              </div>
+              <div>
+                <dt>Last sent</dt>
+                <dd>{formatDateTime(pipeline?.delivery.email.last_delivered_at)}</dd>
+              </div>
+              <div>
+                <dt>Last status</dt>
+                <dd>{pipeline?.delivery.email.last_delivery_status ?? "Never"}</dd>
+              </div>
+            </dl>
+            {pipeline?.delivery.email.requires_gmail_reconnect ? (
+              <p className="error-text">Reconnect Gmail once so Morning Dispatch can send the brief, not just read newsletters.</p>
+            ) : null}
+            {pipeline?.delivery.email.last_error ? <p className="error-text">{pipeline.delivery.email.last_error}</p> : null}
+          </section>
+
+          <section className="panel wide-panel">
+            <div className="panel-heading">
+              <div>
+                <h3>Unresolved Links</h3>
+                <p className="muted">Admin-only detail. These no longer appear in the digest itself.</p>
               </div>
               <span className={pipeline?.fetch_failures.total_count ? "status-pill" : "status-pill good"}>
                 {pipeline?.fetch_failures.total_count ?? 0} unresolved
@@ -1533,6 +1723,18 @@ function formatSeconds(value: number | null | undefined): string {
   if (value === null || value === undefined) return "0s";
   if (value < 60) return `${Math.round(value)}s`;
   return `${Math.floor(value / 60)}m ${Math.round(value % 60)}s`;
+}
+
+function formatNumber(value: number | null | undefined): string {
+  return new Intl.NumberFormat().format(value ?? 0);
+}
+
+function formatStageLabel(value: string): string {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
 }
 
 function formatMs(value: number | null | undefined): string {

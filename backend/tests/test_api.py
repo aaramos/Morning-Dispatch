@@ -8,6 +8,7 @@ from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.librarian import enrichment
 from backend.app.main import create_app
+from backend.app.services import email_delivery
 from backend.app.services import digest_runner
 
 
@@ -117,6 +118,9 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert re.search(r"Generated \d{2}/\d{2}/\d{4} ", html.text)
         assert "https://example.com/model-release" in html.text
         assert "Fetched Articles" in html.text
+        assert "Digest Stats" in html.text
+        assert "Model tokens" in html.text
+        assert "Unresolved Links" not in html.text
         assert "data-feedback-signal" in html.text
         assert "overflow-x: hidden" in html.text
         assert "overflow-wrap: anywhere" in html.text
@@ -154,8 +158,29 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert status_payload["inference_metrics"]["record_count"] >= 0
         assert status_payload["fetch_failures"]["total_count"] == 0
         assert status_payload["brief_review"]["counts"]["included"] == 1
+        assert status_payload["digest_stats"]["newsletter_count"] == 1
+        assert status_payload["digest_stats"]["included_article_count"] == 1
+        assert status_payload["digest_stats"]["source_count"] == 1
+        assert status_payload["delivery"]["email"]["enabled"] is False
         assert isinstance(status_payload["model_jobs"], list)
         assert status_payload["digests"][0]["name"] == "AI Morning Brief"
+
+        delivery = client.patch(
+            f"/api/admin/digests/{digest['id']}/delivery",
+            json={"recipient_email": "adrian@example.com", "enabled": True},
+        )
+        assert delivery.status_code == 200
+        assert delivery.json()["recipient_email"] == "adrian@example.com"
+        assert delivery.json()["enabled"] is True
+
+        monkeypatch.setattr(
+            email_delivery,
+            "send_latest_digest",
+            lambda digest_id: {"status": "sent", "digest_id": digest_id, "recipient_email": "adrian@example.com"},
+        )
+        sent = client.post(f"/api/admin/digests/{digest['id']}/delivery/send-test")
+        assert sent.status_code == 200
+        assert sent.json()["status"] == "sent"
 
         verification = client.post(f"/api/admin/digests/{digest['id']}/verification-run")
         assert verification.status_code == 200
@@ -249,6 +274,12 @@ def test_admin_reports_fetch_failures_and_review_counts(monkeypatch, tmp_path):
         assert status_payload["fetch_failures"]["groups"][0]["status"] == "blocked"
         assert "HTTP 403" in status_payload["fetch_failures"]["examples"][0]["reason"]
         assert status_payload["brief_review"]["counts"]["unresolved"] == 1
+
+        issue = client.get(f"/api/digests/{digest['id']}/issues/latest")
+        html = client.get(f"/api/issues/{issue.json()['id']}/html")
+        assert "Unresolved Links" not in html.text
+        assert "Blocked local model article" not in html.text
+        assert "Digest Stats" in html.text
 
 
 def test_archived_digests_are_hidden_from_default_lists(monkeypatch, tmp_path):

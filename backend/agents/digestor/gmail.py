@@ -16,7 +16,10 @@ from bs4 import BeautifulSoup
 from backend.agents.digestor.base import NormalizedPayload, pii_filter, utc_now
 from backend.db.queries import get_watermark, upsert_watermark
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 CREDENTIALS_PATH = "/secrets/gmail_credentials.json"
 
 logger = logging.getLogger(__name__)

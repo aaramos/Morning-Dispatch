@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS digest_runs (
   partial         INTEGER DEFAULT 0,
   status          TEXT DEFAULT 'pending',
   snapshot        TEXT,
+  run_metadata    TEXT NOT NULL DEFAULT '{}',
   completed_at    TEXT
 );
 
@@ -188,6 +189,16 @@ CREATE TABLE IF NOT EXISTS digest_issues (
   html_content TEXT,
   created_at   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS digest_delivery_settings (
+  digest_id             TEXT PRIMARY KEY REFERENCES digests(id),
+  recipient_email       TEXT,
+  enabled               INTEGER NOT NULL DEFAULT 0,
+  last_delivery_status  TEXT,
+  last_delivered_at     TEXT,
+  last_error            TEXT,
+  updated_at            TEXT NOT NULL
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS feedback (
   id             TEXT PRIMARY KEY,

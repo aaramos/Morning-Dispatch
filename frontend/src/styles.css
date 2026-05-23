@@ -505,6 +505,54 @@ iframe {
   line-height: 1.3;
 }
 
+.stage-strip {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  color: #66756f;
+  font-size: 0.82rem;
+}
+
+.stage-strip span {
+  border: 1px solid #e2e7e1;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #ffffff;
+}
+
+.delivery-form {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 14px;
+  align-items: end;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  color: #52635d;
+}
+
+.checkbox-row input {
+  width: auto;
+}
+
+.status-list.inline {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.status-list.inline div {
+  border: 1px solid #e2e7e1;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f7f9f6;
+}
+
 .panel-actions {
   display: flex;
   gap: 12px;
@@ -825,7 +873,9 @@ iframe {
   .app-shell,
   .content-grid,
   .admin-shell,
-  .admin-grid {
+  .admin-grid,
+  .delivery-form,
+  .status-list.inline {
     grid-template-columns: 1fr;
   }
 

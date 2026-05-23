@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backend.app.core.config import get_settings
 from backend.app.db import database
-from backend.app.services import digest_runner
+from backend.app.services import digest_runner, email_delivery
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,8 @@ async def run_due_digests_once(now: datetime | None = None) -> int:
         _running_digest_ids.add(digest_id)
         started_count += 1
         try:
-            await digest_runner.run_digest(digest_id, trigger="scheduled")
+            run = await digest_runner.run_digest(digest_id, trigger="scheduled")
+            await email_delivery.deliver_scheduled_digest(run)
         except Exception as exc:  # pragma: no cover - scheduler must keep running.
             _last_error = f"{digest.get('name') or digest_id}: {exc}"
             logger.exception("Scheduled digest run failed for %s", digest_id)

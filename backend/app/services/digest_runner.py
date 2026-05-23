@@ -24,6 +24,8 @@ LOOKBACK_HOURS_BY_SCHEDULE = {
 
 async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, Any] | None:
     started_at = monotonic()
+    stage_started = started_at
+    stage_seconds: dict[str, float] = {}
     digest = database.get_digest(digest_id)
     if digest is None:
         return None
@@ -46,7 +48,9 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
         lookback_hours=lookback_hours,
     )
     payloads.extend(reddit_payloads)
+    stage_started = _mark_stage(stage_seconds, "ingestion", stage_started)
     fetched_articles = await fetch_articles_for_payloads(payloads)
+    stage_started = _mark_stage(stage_seconds, "fetching", stage_started)
     enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
     enriched_articles = database.apply_feedback_to_candidates(digest_id, enriched_articles)
     ranked_articles = prepare_issue_articles(digest, enriched_articles)
@@ -68,11 +72,13 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
         inference_run_id=inference_run_id,
         metrics_mode="batch" if trigger == "scheduled" else "single",
     )
+    stage_started = _mark_stage(stage_seconds, "classification", stage_started)
     editorial_decisions = []
     critic_decisions = []
     article_results, editorial_decisions = await apply_editorial_decisions(digest, article_results)
     article_results, critic_decisions = await apply_critic_repairs(digest, payloads, article_results)
     article_results, quality_decisions = apply_brief_quality_checks(article_results)
+    stage_started = _mark_stage(stage_seconds, "editorial", stage_started)
     if settings.librarian_use_model:
         model_cache_write_count = database.cache_model_enrichments(article_results, model_name=settings.librarian_model)
 
@@ -80,6 +86,7 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
         database.list_reddit_sources(digest_id, include_retired=False)
     )
 
+    stage_seconds["publishing"] = 0.0
     return database.create_ingested_run(
         digest=digest,
         payloads=payloads,
@@ -92,6 +99,7 @@ async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, An
         model_cache_miss_count=model_cache_miss_count,
         model_cache_write_count=model_cache_write_count,
         inference_run_id=inference_run_id,
+        stage_seconds=stage_seconds,
         agent_decisions=editorial_decisions + critic_decisions + quality_decisions,
     )
 
@@ -104,6 +112,12 @@ def _model_cache_candidate_count(results: list[Any], limit: int) -> int:
         for result in results[:limit]
         if getattr(result, "fetched", False) and getattr(result, "tier", None) != "dropped"
     )
+
+
+def _mark_stage(stage_seconds: dict[str, float], name: str, started_at: float) -> float:
+    now = monotonic()
+    stage_seconds[name] = round(now - started_at, 3)
+    return now
 
 
 def gmail_sender_allowlist(sources: list[dict[str, Any]]) -> list[str]:

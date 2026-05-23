@@ -51,6 +51,10 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
     published_run = None
     published_issue = None
     if publish:
+        stage_seconds = {
+            "editorial": round(monotonic() - started_at, 3),
+            "publishing": 0.0,
+        }
         published_run = database.create_ingested_run(
             digest=digest,
             payloads=source_payloads,
@@ -63,6 +67,13 @@ async def run_controlled_verification(digest_id: str, *, publish: bool = False) 
             model_cache_miss_count=int(latest_run.get("model_cache_miss_count") or 0),
             model_cache_write_count=0,
             inference_run_id=str(latest_run.get("inference_run_id") or database.new_id()),
+            stage_seconds=stage_seconds,
+            stats_overrides={
+                "source_count": len(digest.get("sources", [])),
+                "newsletter_count": int(latest_run.get("newsletter_count") or len(source_payloads)),
+                "link_count": int(latest_run.get("link_count") or 0),
+                "processing_seconds": latest_run.get("duration_seconds"),
+            },
             agent_decisions=decisions,
         )
         published_issue = database.get_latest_issue(digest_id)

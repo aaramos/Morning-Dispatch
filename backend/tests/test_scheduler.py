@@ -33,17 +33,23 @@ def test_scheduler_runs_due_active_digest(monkeypatch, tmp_path):
         }
     )
     started: list[str] = []
+    delivered: list[str] = []
 
     async def fake_run_digest(digest_id: str, *, trigger: str = "manual"):
         started.append(f"{trigger}:{digest_id}")
-        return {"id": "run-1"}
+        return {"id": "run-1", "digest_id": digest_id}
+
+    async def fake_delivery(run):
+        delivered.append(str(run["digest_id"]))
 
     monkeypatch.setattr(scheduler.digest_runner, "run_digest", fake_run_digest)
+    monkeypatch.setattr(scheduler.email_delivery, "deliver_scheduled_digest", fake_delivery)
 
     count = asyncio.run(scheduler.run_due_digests_once(datetime(2026, 5, 21, tzinfo=UTC)))
 
     assert count == 1
     assert started == [f"scheduled:{digest['id']}"]
+    assert delivered == [digest["id"]]
 
 
 def test_scheduler_skips_recent_digest(monkeypatch, tmp_path):

@@ -75,6 +75,7 @@ def init_database() -> None:
     with connect() as connection:
         connection.executescript(SCHEMA_SQL)
         _ensure_digest_run_metric_columns(connection)
+        _ensure_digest_delivery_settings_table(connection)
         _ensure_inference_metric_status_values(connection)
         _ensure_default_profile(connection)
 
@@ -109,12 +110,29 @@ def _ensure_digest_run_metric_columns(connection: sqlite3.Connection) -> None:
         "model_cache_write_count": "INTEGER DEFAULT 0",
         "duration_seconds": "REAL",
         "trigger": "TEXT DEFAULT 'manual'",
+        "run_metadata": "TEXT NOT NULL DEFAULT '{}'",
     }
     for column, definition in columns.items():
         if column not in existing_columns:
             connection.execute(f"ALTER TABLE digest_runs ADD COLUMN {column} {definition}")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_digest_runs_inference_run_id ON digest_runs(inference_run_id)"
+    )
+
+
+def _ensure_digest_delivery_settings_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS digest_delivery_settings (
+          digest_id             TEXT PRIMARY KEY REFERENCES digests(id),
+          recipient_email       TEXT,
+          enabled               INTEGER NOT NULL DEFAULT 0,
+          last_delivery_status  TEXT,
+          last_delivered_at     TEXT,
+          last_error            TEXT,
+          updated_at            TEXT NOT NULL
+        ) STRICT
+        """
     )
 
 
@@ -642,6 +660,8 @@ def create_ingested_run(
     model_cache_miss_count: int = 0,
     model_cache_write_count: int = 0,
     inference_run_id: str | None = None,
+    stage_seconds: dict[str, float] | None = None,
+    stats_overrides: dict[str, Any] | None = None,
     agent_decisions: list[AgentDecision] | None = None,
 ) -> dict[str, Any]:
     article_results = article_results or []
@@ -651,6 +671,33 @@ def create_ingested_run(
     digest_id = str(digest["id"])
     title = f"{digest['name']} - Morning Dispatch Issue"
     snapshot = ingested_snapshot(payloads, configured_source_count, article_results)
+    lookback_days = max(1, math.ceil(lookback_hours / 24))
+    body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
+    link_payload_count = sum(1 for payload in payloads if payload.source_type == "gmail_link")
+    item_count = len(body_payloads) + len(article_results)
+    failed_count = sum(1 for result in article_results if not result.fetched)
+    fallback_count = sum(1 for result in article_results if result.content_type == "fallback_snippet")
+    fetched_article_count = sum(1 for result in article_results if result.fetched)
+    digest_stats = _build_digest_stats(
+        configured_source_count=configured_source_count,
+        newsletter_count=len(body_payloads),
+        link_count=link_payload_count,
+        article_results=article_results,
+        duration_seconds=duration_seconds,
+        inference_run_id=inference_run_id,
+        stage_seconds=stage_seconds,
+    )
+    if isinstance(stats_overrides, dict):
+        for key in (
+            "source_count",
+            "newsletter_count",
+            "link_count",
+            "processing_seconds",
+            "stage_seconds",
+        ):
+            if key in stats_overrides:
+                digest_stats[key] = stats_overrides[key]
+    run_metadata = {"digest_stats": digest_stats}
     html = render_ingested_issue(
         title,
         snapshot,
@@ -659,14 +706,8 @@ def create_ingested_run(
         lookback_hours,
         generated_at=now,
         issue_id=issue_id,
+        digest_stats=digest_stats,
     )
-    lookback_days = max(1, math.ceil(lookback_hours / 24))
-    body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
-    link_payload_count = sum(1 for payload in payloads if payload.source_type == "gmail_link")
-    item_count = len(body_payloads) + len(article_results)
-    failed_count = sum(1 for result in article_results if not result.fetched)
-    fallback_count = sum(1 for result in article_results if result.content_type == "fallback_snippet")
-    fetched_article_count = sum(1 for result in article_results if result.fetched)
 
     with connect() as connection:
         connection.execute(
@@ -675,9 +716,9 @@ def create_ingested_run(
               id, digest_id, inference_run_id, run_at, lookback_days, item_count, failed_count,
               fallback_count, newsletter_count, link_count, fetched_article_count,
               model_cache_hit_count, model_cache_miss_count, model_cache_write_count,
-              duration_seconds, trigger, cold_start, partial, status, snapshot, completed_at
+              duration_seconds, trigger, cold_start, partial, status, snapshot, run_metadata, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'completed', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'completed', ?, ?, ?)
             """,
             (
                 run_id,
@@ -698,6 +739,7 @@ def create_ingested_run(
                 trigger,
                 int(failed_count > 0),
                 snapshot,
+                json.dumps(run_metadata),
                 now,
             ),
         )
@@ -889,6 +931,84 @@ def cache_model_enrichments(article_results: list[ArticleFetchResult], *, model_
     return cached_count
 
 
+def _build_digest_stats(
+    *,
+    configured_source_count: int,
+    newsletter_count: int,
+    link_count: int,
+    article_results: list[ArticleFetchResult],
+    duration_seconds: float | None,
+    inference_run_id: str | None,
+    stage_seconds: dict[str, float] | None,
+) -> dict[str, Any]:
+    active_results = [result for result in article_results if result.tier != "dropped"]
+    included_count = sum(1 for result in active_results if result.fetched)
+    unresolved_count = sum(1 for result in active_results if not result.fetched)
+    dropped_count = sum(1 for result in article_results if result.tier == "dropped")
+    token_summary = inference_token_summary(inference_run_id) if inference_run_id else _empty_token_summary()
+    return {
+        "source_count": max(0, int(configured_source_count or 0)),
+        "newsletter_count": max(0, int(newsletter_count or 0)),
+        "link_count": max(0, int(link_count or 0)),
+        "article_candidate_count": len(article_results),
+        "included_article_count": included_count,
+        "unresolved_count": unresolved_count,
+        "dropped_count": dropped_count,
+        "prompt_tokens": token_summary["prompt_tokens"],
+        "completion_tokens": token_summary["completion_tokens"],
+        "total_tokens": token_summary["total_tokens"],
+        "model_call_count": token_summary["model_call_count"],
+        "processing_seconds": _nullable_float(duration_seconds),
+        "stage_seconds": _normalize_stage_seconds(stage_seconds),
+    }
+
+
+def _empty_token_summary() -> dict[str, int]:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "model_call_count": 0,
+    }
+
+
+def _normalize_stage_seconds(stage_seconds: dict[str, float] | None) -> dict[str, float]:
+    if not isinstance(stage_seconds, dict):
+        return {}
+    normalized: dict[str, float] = {}
+    for key, value in stage_seconds.items():
+        try:
+            normalized[str(key)] = round(max(0.0, float(value)), 3)
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def inference_token_summary(inference_run_id: str | None) -> dict[str, int]:
+    if not inference_run_id:
+        return _empty_token_summary()
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT
+              COUNT(*) AS model_call_count,
+              COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+              COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+            FROM inference_metrics
+            WHERE run_id = ?
+            """,
+            (inference_run_id,),
+        ).fetchone()
+    prompt_tokens = int(row["prompt_tokens"] or 0) if row else 0
+    completion_tokens = int(row["completion_tokens"] or 0) if row else 0
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "model_call_count": int(row["model_call_count"] or 0) if row else 0,
+    }
+
+
 def render_ingested_issue(
     title: str,
     snapshot: str,
@@ -897,6 +1017,7 @@ def render_ingested_issue(
     lookback_hours: int,
     generated_at: str | None = None,
     issue_id: str | None = None,
+    digest_stats: dict[str, Any] | None = None,
 ) -> str:
     article_results = article_results or []
     body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
@@ -904,8 +1025,6 @@ def render_ingested_issue(
     lead_article = next((result for result in fetched_articles if result.tier == "lead"), None)
     main_articles = [result for result in fetched_articles if result is not lead_article and result.tier == "main"]
     lower_confidence_articles = [result for result in fetched_articles if result.tier == "lower_confidence"]
-    unresolved_articles = [result for result in article_results if not result.fetched and result.tier != "dropped"]
-    displayed_unresolved = unresolved_articles[:8]
     hidden_article_count = max(0, len(fetched_articles) - len(main_articles) - len(lower_confidence_articles) - (1 if lead_article else 0))
 
     newsletter_html = "\n".join(_render_newsletter_item(payload) for payload in body_payloads[:8])
@@ -915,7 +1034,18 @@ def render_ingested_issue(
         _render_article_card(result, variant="compact", issue_id=issue_id)
         for result in lower_confidence_articles[:8]
     )
-    unresolved_html = "\n".join(_render_unresolved_link(result) for result in displayed_unresolved)
+    stats_html = _render_digest_stats(
+        digest_stats
+        or _build_digest_stats(
+            configured_source_count=0,
+            newsletter_count=len(body_payloads),
+            link_count=sum(1 for payload in payloads if payload.source_type == "gmail_link"),
+            article_results=article_results,
+            duration_seconds=None,
+            inference_run_id=None,
+            stage_seconds=None,
+        )
+    )
     empty_state = ""
     if not payloads:
         empty_state = """
@@ -983,6 +1113,11 @@ def render_ingested_issue(
     .feedback-controls button:hover {{ background: #efe7d8; }}
     .feedback-controls[data-feedback='sent'] button {{ opacity: .55; }}
     .feedback-state {{ color: #5f675f; font: 700 .72rem Arial, sans-serif; text-transform: uppercase; }}
+    .digest-stats {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }}
+    .digest-stat {{ border-top: 1px solid #d4cbbd; padding-top: 10px; min-width: 0; }}
+    .digest-stat span {{ display: block; font: 800 .68rem Arial, sans-serif; color: #6a746e; text-transform: uppercase; }}
+    .digest-stat strong {{ display: block; margin-top: 4px; font: 900 1.25rem Arial, sans-serif; color: #171717; overflow-wrap: anywhere; }}
+    .stage-list {{ margin-top: 4px; padding-left: 18px; color: #5f675f; font: 700 .74rem Arial, sans-serif; line-height: 1.6; }}
     .newsletter {{ padding: 0 0 20px; margin-bottom: 20px; border-bottom: 1px solid #d4cbbd; }}
     .newsletter p {{ font-size: 1rem; line-height: 1.55; margin: 10px 0 0; }}
     .link-item {{ display: grid; gap: 5px; padding: 12px 0; border-bottom: 1px solid #d4cbbd; }}
@@ -1011,8 +1146,8 @@ def render_ingested_issue(
         {hidden_html}
       </section>
       <section class="section">
-        <h2>Unresolved Links</h2>
-        {unresolved_html or '<p class="meta">No attempted links failed.</p>'}
+        <h2>Digest Stats</h2>
+        {stats_html}
         <details class="source-notes">
           <summary>Newsletter Briefs</summary>
           {newsletter_html or '<p class="meta">No newsletter bodies were available.</p>'}
@@ -1563,22 +1698,71 @@ def _render_feedback_script(issue_id: str | None) -> str:
     """
 
 
-def _render_unresolved_link(result: ArticleFetchResult) -> str:
-    url = result.final_url or result.original_url
-    domain = result.domain or _domain(url) or "link"
-    reason = result.error or result.status
-    published = _format_article_date(result.payload.published_at)
-    meta_parts = [domain]
-    if published:
-        meta_parts.append(published)
-    meta_parts.extend([result.status, reason])
-    meta = " · ".join(escape(part) for part in meta_parts)
+def _render_digest_stats(stats: dict[str, Any]) -> str:
+    stage_seconds = stats.get("stage_seconds") if isinstance(stats.get("stage_seconds"), dict) else {}
+    stage_html = ""
+    if stage_seconds:
+        stage_labels = {
+            "ingestion": "Ingestion",
+            "fetching": "Article fetching",
+            "classification": "AI classification",
+            "editorial": "Editor review",
+            "publishing": "Publishing",
+        }
+        stage_items = "\n".join(
+            f"<li>{escape(stage_labels.get(str(key), str(key).replace('_', ' ').title()))}: "
+            f"{escape(_format_duration(value))}</li>"
+            for key, value in stage_seconds.items()
+        )
+        stage_html = f'<div class="digest-stat"><span>Stage timing</span><ul class="stage-list">{stage_items}</ul></div>'
+
+    stat_items = [
+        ("Sources", _format_int(stats.get("source_count"))),
+        ("Newsletters", _format_int(stats.get("newsletter_count"))),
+        ("Links extracted", _format_int(stats.get("link_count"))),
+        ("Articles included", _format_int(stats.get("included_article_count"))),
+        ("Items filtered", _format_int(int(stats.get("dropped_count") or 0) + int(stats.get("unresolved_count") or 0))),
+        ("Model tokens", _format_int(stats.get("total_tokens"))),
+        ("Model calls", _format_int(stats.get("model_call_count"))),
+        ("Processing time", _format_duration(stats.get("processing_seconds"))),
+    ]
+    stat_html = "\n".join(
+        f'<div class="digest-stat"><span>{escape(label)}</span><strong>{escape(value)}</strong></div>'
+        for label, value in stat_items
+    )
+    token_detail = ""
+    if int(stats.get("total_tokens") or 0):
+        token_detail = (
+            f"<p class=\"meta\">Token detail: {_format_int(stats.get('prompt_tokens'))} prompt + "
+            f"{_format_int(stats.get('completion_tokens'))} completion.</p>"
+        )
     return f"""
-      <article class="link-item">
-        <a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">{escape(result.title)}</a>
-        <span class="meta">{meta}</span>
-      </article>
+      <div class="digest-stats">
+        {stat_html}
+        {stage_html}
+      </div>
+      {token_detail}
     """
+
+
+def _format_int(value: Any) -> str:
+    try:
+        return f"{int(value or 0):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _format_duration(value: Any) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if seconds < 1:
+        return f"{round(seconds * 1000):,} ms"
+    minutes, remaining = divmod(round(seconds), 60)
+    if minutes:
+        return f"{minutes}m {remaining:02d}s"
+    return f"{remaining}s"
 
 
 def _section_for_payload(payload: NormalizedPayload) -> str:
@@ -1947,6 +2131,177 @@ def list_digest_overviews(*, include_archived: bool = False) -> list[dict[str, A
         record["source_count"] = len(sources) if isinstance(sources, list) else 0
         overviews.append(record)
     return overviews
+
+
+def latest_digest_stats() -> dict[str, Any]:
+    latest = _latest_run_row()
+    if latest is None:
+        return {
+            "run_id": None,
+            "generated_at": None,
+            "source_count": 0,
+            "newsletter_count": 0,
+            "link_count": 0,
+            "article_candidate_count": 0,
+            "included_article_count": 0,
+            "unresolved_count": 0,
+            "dropped_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "model_call_count": 0,
+            "processing_seconds": None,
+            "stage_seconds": {},
+        }
+    stats = _digest_stats_from_run_row(latest)
+    stats["run_id"] = latest["id"]
+    stats["generated_at"] = latest["completed_at"] or latest["run_at"]
+    return stats
+
+
+def _digest_stats_from_run_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    record = dict(row)
+    metadata = _json_dict(record.get("run_metadata"))
+    stats = metadata.get("digest_stats") if isinstance(metadata.get("digest_stats"), dict) else {}
+    if stats:
+        normalized = {
+            "source_count": int(stats.get("source_count") or 0),
+            "newsletter_count": int(stats.get("newsletter_count") or 0),
+            "link_count": int(stats.get("link_count") or 0),
+            "article_candidate_count": int(stats.get("article_candidate_count") or 0),
+            "included_article_count": int(stats.get("included_article_count") or 0),
+            "unresolved_count": int(stats.get("unresolved_count") or 0),
+            "dropped_count": int(stats.get("dropped_count") or 0),
+            "prompt_tokens": int(stats.get("prompt_tokens") or 0),
+            "completion_tokens": int(stats.get("completion_tokens") or 0),
+            "total_tokens": int(stats.get("total_tokens") or 0),
+            "model_call_count": int(stats.get("model_call_count") or 0),
+            "processing_seconds": _nullable_float(stats.get("processing_seconds")),
+            "stage_seconds": _normalize_stage_seconds(stats.get("stage_seconds")),
+        }
+        return normalized
+
+    token_summary = inference_token_summary(record.get("inference_run_id"))
+    included = int(record.get("fetched_article_count") or 0)
+    unresolved = int(record.get("failed_count") or 0)
+    return {
+        "source_count": 0,
+        "newsletter_count": int(record.get("newsletter_count") or 0),
+        "link_count": int(record.get("link_count") or 0),
+        "article_candidate_count": included + unresolved,
+        "included_article_count": included,
+        "unresolved_count": unresolved,
+        "dropped_count": 0,
+        "prompt_tokens": token_summary["prompt_tokens"],
+        "completion_tokens": token_summary["completion_tokens"],
+        "total_tokens": token_summary["total_tokens"],
+        "model_call_count": token_summary["model_call_count"],
+        "processing_seconds": _nullable_float(record.get("duration_seconds")),
+        "stage_seconds": {},
+    }
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def get_delivery_settings(digest_id: str) -> dict[str, Any]:
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT digest_id, recipient_email, enabled, last_delivery_status,
+                   last_delivered_at, last_error, updated_at
+            FROM digest_delivery_settings
+            WHERE digest_id = ?
+            """,
+            (digest_id,),
+        ).fetchone()
+    if row is None:
+        return {
+            "digest_id": digest_id,
+            "recipient_email": "",
+            "enabled": False,
+            "last_delivery_status": None,
+            "last_delivered_at": None,
+            "last_error": None,
+            "updated_at": None,
+        }
+    record = dict(row)
+    record["enabled"] = bool(record.get("enabled"))
+    return record
+
+
+def update_delivery_settings(*, digest_id: str, recipient_email: str, enabled: bool) -> dict[str, Any] | None:
+    if get_digest(digest_id) is None:
+        return None
+    now = utc_now()
+    email = recipient_email.strip()
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO digest_delivery_settings (
+              digest_id, recipient_email, enabled, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(digest_id) DO UPDATE SET
+              recipient_email = excluded.recipient_email,
+              enabled = excluded.enabled,
+              updated_at = excluded.updated_at
+            """,
+            (digest_id, email, int(bool(enabled and email)), now),
+        )
+    return get_delivery_settings(digest_id)
+
+
+def record_delivery_result(
+    *,
+    digest_id: str,
+    status: str,
+    error: str | None = None,
+    delivered_at: str | None = None,
+) -> dict[str, Any]:
+    now = utc_now()
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO digest_delivery_settings (
+              digest_id, recipient_email, enabled, last_delivery_status,
+              last_delivered_at, last_error, updated_at
+            )
+            VALUES (?, '', 0, ?, ?, ?, ?)
+            ON CONFLICT(digest_id) DO UPDATE SET
+              last_delivery_status = excluded.last_delivery_status,
+              last_delivered_at = excluded.last_delivered_at,
+              last_error = excluded.last_error,
+              updated_at = excluded.updated_at
+            """,
+            (digest_id, status, delivered_at, error, now),
+        )
+    return get_delivery_settings(digest_id)
+
+
+def enabled_delivery_settings() -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT digest_id, recipient_email, enabled, last_delivery_status,
+                   last_delivered_at, last_error, updated_at
+            FROM digest_delivery_settings
+            WHERE enabled = 1 AND COALESCE(recipient_email, '') != ''
+            """
+        ).fetchall()
+    records = []
+    for row in rows:
+        record = dict(row)
+        record["enabled"] = bool(record.get("enabled"))
+        records.append(record)
+    return records
 
 
 def model_cache_summary() -> dict[str, Any]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime
 from ipaddress import ip_address, ip_network
 from pathlib import Path
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field
 from backend.agents.digestor.gmail import SCOPES
 from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
 from backend.app.db import database
-from backend.app.services import mcp_status, model_catalog, model_jobs, scheduler, source_scout, verification
+from backend.app.services import email_delivery, mcp_status, model_catalog, model_jobs, scheduler, source_scout, verification
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,11 @@ class ModelJobPayload(BaseModel):
 
 class ModelSelectionPayload(BaseModel):
     model_name: str = Field(min_length=1, max_length=180)
+
+
+class DeliverySettingsPayload(BaseModel):
+    recipient_email: str = Field(default="", max_length=254)
+    enabled: bool = False
 
 
 def require_admin_network(request: Request) -> None:
@@ -85,12 +91,14 @@ async def admin_status(request: Request) -> dict[str, Any]:
     gmail = gmail_status(request)
     scheduler_status = scheduler.status()
     digests = [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()]
+    delivery_status = _delivery_status(request, settings, digests)
     model_cache = database.model_cache_summary()
     inference_metrics = database.inference_metrics_summary()
     agent_decisions = database.agent_decisions_summary()
     source_scout = database.source_scout_summary()
     fetch_failures = database.fetch_failure_breakdown(limit=5)
     brief_review = database.brief_review(limit=8)
+    digest_stats = database.latest_digest_stats()
     return {
         "system": {
             "environment": settings.environment,
@@ -99,7 +107,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
             "secrets_dir": str(settings.secrets_dir),
             "public_base_url": settings.public_base_url,
         },
-        "delivery": _delivery_status(request, settings),
+        "delivery": delivery_status,
         "health": _admin_health(
             gmail=gmail,
             model={
@@ -113,6 +121,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
             digests=digests,
             inference_metrics=inference_metrics,
             source_scout=source_scout,
+            delivery=delivery_status,
         ),
         "gmail": gmail,
         "model": {
@@ -134,6 +143,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
         "source_scout": source_scout,
         "fetch_failures": fetch_failures,
         "brief_review": brief_review,
+        "digest_stats": digest_stats,
         "model_jobs": database.list_model_enrichment_jobs(limit=8),
     }
 
@@ -147,6 +157,7 @@ def _admin_health(
     digests: list[dict[str, Any]],
     inference_metrics: dict[str, Any],
     source_scout: dict[str, Any],
+    delivery: dict[str, Any],
 ) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
 
@@ -224,6 +235,14 @@ def _admin_health(
     else:
         add("Source Scout", "warning", "Reddit source review has not completed yet.")
 
+    email_status = delivery.get("email") if isinstance(delivery.get("email"), dict) else {}
+    if email_status.get("enabled") and email_status.get("gmail_send_ready"):
+        add("Email delivery", "ok", "Morning digest email delivery is enabled.")
+    elif email_status.get("enabled"):
+        add("Email delivery", "warning", "Reconnect Gmail to grant send permission before email delivery works.")
+    else:
+        add("Email delivery", "warning", "Digest email delivery is not enabled yet.")
+
     problem_count = sum(1 for check in checks if check["status"] == "problem")
     warning_count = sum(1 for check in checks if check["status"] == "warning")
     safe_for_overnight = problem_count == 0
@@ -288,6 +307,39 @@ def list_fetch_failures() -> dict[str, Any]:
 @router.get("/brief-review")
 def get_brief_review() -> dict[str, Any]:
     return database.brief_review(limit=25)
+
+
+@router.get("/digest-stats")
+def get_digest_stats() -> dict[str, Any]:
+    return database.latest_digest_stats()
+
+
+@router.patch("/digests/{digest_id}/delivery")
+def update_digest_delivery(digest_id: str, payload: DeliverySettingsPayload) -> dict[str, Any]:
+    email = payload.recipient_email.strip()
+    if payload.enabled and not _looks_like_email(email):
+        raise HTTPException(status_code=400, detail="Enter a valid recipient email address")
+    updated = database.update_delivery_settings(
+        digest_id=digest_id,
+        recipient_email=email,
+        enabled=payload.enabled,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    return {
+        **updated,
+        **email_delivery.delivery_capability(_settings()),
+    }
+
+
+@router.post("/digests/{digest_id}/delivery/send-test")
+def send_latest_digest_email(digest_id: str) -> dict[str, Any]:
+    if database.get_digest(digest_id) is None:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    result = email_delivery.send_latest_digest(digest_id)
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error") or "Email delivery failed")
+    return result
 
 
 @router.get("/source-scout")
@@ -419,12 +471,30 @@ def _callback_url(request: Request, settings: Settings) -> str:
     return f"{base_url}/api/admin/gmail/oauth/callback"
 
 
-def _delivery_status(request: Request, settings: Settings) -> dict[str, str]:
+def _delivery_status(request: Request, settings: Settings, digests: list[dict[str, Any]]) -> dict[str, Any]:
     base_url = (settings.public_base_url or str(request.base_url)).rstrip("/")
+    digest_id = str(digests[0]["id"]) if digests else ""
+    delivery_settings = database.get_delivery_settings(digest_id) if digest_id else {
+        "digest_id": None,
+        "recipient_email": "",
+        "enabled": False,
+        "last_delivery_status": None,
+        "last_delivered_at": None,
+        "last_error": None,
+        "updated_at": None,
+    }
     return {
         "latest_brief_path": "/brief",
         "latest_brief_url": f"{base_url}/brief",
+        "email": {
+            **delivery_settings,
+            **email_delivery.delivery_capability(settings),
+        },
     }
+
+
+def _looks_like_email(value: str) -> bool:
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value))
 
 
 def _oauth_flow(
