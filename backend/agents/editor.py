@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from backend.agents.librarian.text_utils import fallback_text, keyword_set
 
 
 def prepare_issue_articles(digest: dict[str, Any], results: Iterable[ArticleFetchResult]) -> list[ArticleFetchResult]:
-    interest_tokens = keyword_set(str(digest.get("interest") or ""))
+    interest_tokens = _filtered_interest_tokens(str(digest.get("interest") or ""))
     threshold = float(digest.get("threshold") or 0.45)
     prepared: list[ArticleFetchResult] = []
 
@@ -71,8 +72,17 @@ def _prepare_result(
     else:
         section = _section_for(result.title, source_text, keywords)
     relevance = _relevance_score(result, interest_tokens, keywords)
+    topic_signal = _has_ai_topic_signal(result)
+    if topic_signal and result.payload.source_type == "gmail_link":
+        relevance = min(1.0, relevance + 0.18)
 
-    if result.payload.source_type == "reddit_thread":
+    if (
+        _requires_ai_topic_gate(interest_tokens)
+        and result.payload.source_type == "gmail_link"
+        and not topic_signal
+    ):
+        tier = "dropped"
+    elif result.payload.source_type == "reddit_thread":
         if relevance >= max(0.28, threshold - 0.18) and result.link_score >= 0.30:
             tier = "main"
         elif relevance >= 0.22 and result.link_score >= 0.35:
@@ -111,16 +121,42 @@ def _relevance_score(result: ArticleFetchResult, interest_tokens: set[str], keyw
     if not haystack:
         return 0.0
 
-    overlap = len(haystack & interest_tokens) / max(1, len(interest_tokens)) if interest_tokens else 0.4
+    overlap = len(haystack & interest_tokens) / max(1, min(len(interest_tokens), 8)) if interest_tokens else 0.4
     title_tokens = keyword_set(result.title)
     title_overlap = len(title_tokens & interest_tokens) / max(1, len(title_tokens)) if title_tokens and interest_tokens else 0
-    keyword_overlap = len(set(keywords) & interest_tokens) / max(1, len(keywords)) if keywords and interest_tokens else 0
+    keyword_tokens = keyword_set(" ".join(keywords))
+    keyword_overlap = len(keyword_tokens & interest_tokens) / max(1, len(keyword_tokens)) if keyword_tokens and interest_tokens else 0
     recency = _recency_score(result.payload.published_at)
     quality = 0.07 if result.fetched else -0.08
     score = 0.06 + quality + (0.36 * overlap) + (0.16 * title_overlap) + (0.12 * keyword_overlap)
     score += 0.08 * min(max(result.link_score, 0.0), 1.0)
     score += 0.06 * recency
     return max(0.0, min(score, 1.0))
+
+
+def _filtered_interest_tokens(interest: str) -> set[str]:
+    return keyword_set(interest) - GENERIC_INTEREST_TOKENS
+
+
+def _requires_ai_topic_gate(interest_tokens: set[str]) -> bool:
+    return bool(interest_tokens & AI_INTEREST_TOKENS)
+
+
+def _has_ai_topic_signal(result: ArticleFetchResult) -> bool:
+    metadata = result.payload.metadata or {}
+    primary_context = " ".join(
+        str(value)
+        for value in (
+            result.title,
+            metadata.get("link_text"),
+        )
+        if value
+    )
+    if AI_TOPIC_RE.search(primary_context):
+        return True
+
+    summary_context = result.editor_summary or result.excerpt
+    return len(list(AI_TOPIC_RE.finditer(summary_context))) >= 2
 
 
 def _section_for(title: str, text: str, keywords: list[str]) -> str:
@@ -161,10 +197,59 @@ def _sort_key(result: ArticleFetchResult) -> tuple[float, float, float]:
 
 
 SECTION_MARKERS = (
-    ("Models & Labs", ("model", "gemini", "gpt", "claude", "openai", "anthropic", "google", "llama", "qwen")),
+    ("Models & Labs", ("model", "gemini", "gpt", "claude", "openai", "anthropic", "llama", "qwen")),
     ("Agents & Developer Tools", ("agent", "codex", "mcp", "sdk", "api", "developer", "workflow", "automation")),
     ("AI Infrastructure", ("gpu", "compute", "nvidia", "capacity", "training", "inference", "mlx", "cluster")),
     ("Business & Markets", ("enterprise", "business", "market", "investor", "revenue", "startup", "acquires")),
     ("Security & Policy", ("security", "privacy", "copyright", "regulation", "provenance", "policy")),
     ("Product & Work", ("product", "search", "workflow", "customer", "operator", "dashboard")),
+)
+
+
+GENERIC_INTEREST_TOKENS = {
+    "daily",
+    "latest",
+    "local",
+    "news",
+    "release",
+    "releases",
+    "update",
+    "updates",
+}
+
+AI_INTEREST_TOKENS = {
+    "agent",
+    "agentic",
+    "agents",
+    "ai",
+    "artificial",
+    "automation",
+    "claude",
+    "codex",
+    "gemini",
+    "gpt",
+    "inference",
+    "llm",
+    "llms",
+    "machine",
+    "mcp",
+    "model",
+    "models",
+    "openai",
+    "qwen",
+}
+
+AI_TOPIC_RE = re.compile(
+    r"\b(?:"
+    r"ai agent(?:s)?|"
+    r"artificial intelligence|"
+    r"generative ai|"
+    r"large language model(?:s)?|"
+    r"machine learning|"
+    r"fine[- ]?tuning|"
+    r"agentic|agents?|ai|anthropic|chatgpt|claude|codex|copilot|cursor|deepseek|gemini|genai|"
+    r"gpt(?:[- ]?\d+)?|inference|llama|llm(?:s)?|mcp|mistral|mlx|model(?:s)?|neural|ollama|"
+    r"openai|qwen|training|transformer(?:s)?"
+    r")\b",
+    re.IGNORECASE,
 )

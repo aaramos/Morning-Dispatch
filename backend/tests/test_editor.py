@@ -146,3 +146,67 @@ def test_prepare_issue_articles_drops_author_bios_after_redirect():
     prepared = prepare_issue_articles({"interest": "AI model release news", "threshold": 0.45}, [enrich_article(author_page)])
 
     assert prepared == []
+
+
+def test_prepare_issue_articles_drops_lifestyle_story_from_ai_newsletter():
+    prepared = prepare_issue_articles(
+        {"interest": "Local AI and model release news", "threshold": 0.45},
+        [
+            enrich_article(
+                result(
+                    "How to Grow and Care for Dog Vomit Slime Mold",
+                    (
+                        "Dog vomit slime mold is a harmless protist that thrives on decaying organic matter "
+                        "in moist garden mulch. Gardeners can remove it by scooping affected mulch or waiting "
+                        "for natural predators like slugs and beetles."
+                    ),
+                    link_score=0.98,
+                )
+            )
+        ],
+    )
+
+    assert prepared == []
+
+
+def test_prepare_issue_articles_drops_incidental_ai_mention():
+    prepared = prepare_issue_articles(
+        {"interest": "Local AI and model release news", "threshold": 0.45},
+        [
+            enrich_article(
+                result(
+                    "Spotify to Reserve Concert Tickets for Top Fans",
+                    (
+                        "Spotify will reserve concert tickets for highly engaged listeners. "
+                        "The platform will monitor streams and shares to prevent bots or AI agents "
+                        "from gaming access to tickets, but the story is about music fandom and ticketing."
+                    ),
+                    link_score=0.95,
+                )
+            )
+        ],
+    )
+
+    assert prepared == []
+
+
+def test_prepare_issue_articles_keeps_clear_ai_product_story():
+    prepared = prepare_issue_articles(
+        {"interest": "Local AI and model release news", "threshold": 0.45},
+        [
+            enrich_article(
+                result(
+                    "Spotify launches AI audiobook creation tools",
+                    (
+                        "Spotify is launching AI audiobook creation tools that use generative AI voices "
+                        "from ElevenLabs. The product could shift how authors create synthetic audio and "
+                        "how AI-generated media gets distributed."
+                    ),
+                    link_score=0.95,
+                )
+            )
+        ],
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0].tier == "lead"
