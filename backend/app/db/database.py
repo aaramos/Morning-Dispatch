@@ -1226,15 +1226,18 @@ def render_ingested_issue(
     lead_article = next((result for result in fetched_articles if result.tier == "lead"), None)
     main_articles = [result for result in fetched_articles if result is not lead_article and result.tier == "main"]
     lower_confidence_articles = [result for result in fetched_articles if result.tier == "lower_confidence"]
-    hidden_article_count = max(0, len(fetched_articles) - len(main_articles) - len(lower_confidence_articles) - (1 if lead_article else 0))
+    hidden_article_count = max(
+        0,
+        len(fetched_articles) - len(main_articles) - len(lower_confidence_articles) - (1 if lead_article else 0),
+    )
 
-    newsletter_items = [_render_newsletter_item(payload) for payload in body_payloads[:8]]
+    newsletter_items = [_render_newsletter_item(payload) for payload in body_payloads]
     newsletter_html = "\n".join(item for item in newsletter_items if item)
     lead_html = _render_article_card(lead_article, variant="lead", issue_id=issue_id) if lead_article else ""
     section_html = _render_article_sections(main_articles, issue_id=issue_id)
     lower_html = "\n".join(
         _render_article_card(result, variant="compact", issue_id=issue_id)
-        for result in lower_confidence_articles[:8]
+        for result in lower_confidence_articles
     )
     stats_html = _render_digest_stats(
         digest_stats
@@ -1809,7 +1812,7 @@ def _render_article_sections(results: list[ArticleFetchResult], *, issue_id: str
     for section, section_results in grouped.items():
         cards = "\n".join(
             _render_article_card(result, variant="compact", issue_id=issue_id)
-            for result in section_results[:6]
+            for result in section_results
         )
         sections.append(
             f"""

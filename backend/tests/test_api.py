@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
 
 from backend.agents.agentic import AgentDecision
@@ -260,6 +261,56 @@ def test_newsletter_cleanup_removes_utility_clusters_and_sponsor_blocks():
     assert "Follow image link" not in rundown
     assert tldr == "Microsoft plans to supply its Maia AI chips to Anthropic."
     assert "SPONSOR" not in tldr
+
+
+def test_issue_renderer_includes_all_ranked_articles_and_newsletters():
+    newsletters = [
+        NormalizedPayload(
+            source_type="gmail",
+            source_name=f"newsletter-{index}@example.com",
+            raw_text=f"This newsletter contains useful AI product and model workflow context number {index}.",
+            published_at="2026-05-20T12:00:00+00:00",
+            metadata={"subject": f"Newsletter {index}"},
+        )
+        for index in range(10)
+    ]
+    article_results = []
+    for index in range(30):
+        payload = NormalizedPayload(
+            source_type="gmail_link",
+            source_name="newsletter@example.com",
+            original_url=f"https://example.com/articles/{index}",
+            published_at="2026-05-20T12:00:00+00:00",
+            metadata={"link_text": f"Article {index}"},
+        )
+        article_results.append(
+            ArticleFetchResult(
+                payload=payload,
+                original_url=f"https://example.com/articles/{index}",
+                final_url=f"https://example.com/articles/{index}",
+                title=f"Article {index}",
+                text="A useful article about AI agents, models, and product workflows.",
+                excerpt="A useful article about AI agents, models, and product workflows.",
+                domain="example.com",
+                status="fetched",
+                tier="lead" if index == 0 else "main" if index < 18 else "lower_confidence",
+                section="Models & Labs",
+                relevance_score=0.9,
+            )
+        )
+
+    html = database.render_ingested_issue(
+        "AI Morning Brief",
+        "A complete issue should render every selected item.",
+        newsletters,
+        article_results,
+        lookback_hours=24,
+    )
+    soup = BeautifulSoup(html, "html.parser")
+
+    assert len(soup.select("article.article-card")) == 30
+    assert len(soup.select("article.newsletter")) == 10
+    assert "additional fetched article" not in html
 
 
 def test_admin_reports_fetch_failures_and_review_counts(monkeypatch, tmp_path):
