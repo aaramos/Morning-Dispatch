@@ -18,12 +18,16 @@ SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 def delivery_capability(settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
-    token_scopes = _token_scopes(settings)
+    token_scopes = gmail_token_scopes(settings)
     return {
         "gmail_send_ready": SEND_SCOPE in token_scopes,
         "requires_gmail_reconnect": settings.gmail_credentials_path.exists() and SEND_SCOPE not in token_scopes,
         "token_scopes": sorted(token_scopes),
     }
+
+
+def gmail_token_scopes(settings: Settings | None = None) -> set[str]:
+    return _token_scopes(settings or get_settings())
 
 
 async def deliver_scheduled_digest(run: dict[str, Any] | None) -> dict[str, Any] | None:

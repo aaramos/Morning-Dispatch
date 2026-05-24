@@ -28,6 +28,13 @@ type GmailAdminStatus = {
   connected: boolean;
   client_secret_path: string;
   credentials_path: string;
+  scopes: string[];
+  token_scopes: string[];
+  missing_scopes: string[];
+  requires_reconnect: boolean;
+  hosted_gmail_mcp_enabled: boolean;
+  hosted_gmail_mcp_ready: boolean;
+  google_cloud_project_id: string | null;
   redirect_uri: string;
   oauth_redirect_ready: boolean;
   redirect_warning: string | null;
@@ -1136,9 +1143,21 @@ function AdminApp() {
                 <small>{pipeline?.model.enabled ? `${pipeline.model.max_items}/run · cache reused` : "Deterministic summaries"}</small>
               </div>
               <div>
-                <span>Gmail MCP</span>
-                <strong>{pipeline?.mcp.gmail.connected ? "Connected" : "Offline"}</strong>
-                <small>{formatMcpStatus(pipeline?.mcp)}</small>
+                <span>Gmail Source</span>
+                <strong>
+                  {pipeline?.gmail.hosted_gmail_mcp_enabled && pipeline.gmail.hosted_gmail_mcp_ready
+                    ? "Hosted"
+                    : pipeline?.gmail.connected
+                      ? "Direct API"
+                      : "Offline"}
+                </strong>
+                <small>
+                  {pipeline?.gmail.requires_reconnect
+                    ? "Reconnect Gmail"
+                    : pipeline?.gmail.hosted_gmail_mcp_enabled && pipeline.gmail.hosted_gmail_mcp_ready
+                      ? "Google-hosted Gmail MCP ready"
+                      : "Gmail API reads newsletters directly"}
+                </small>
               </div>
               <div>
                 <span>Delivery</span>
@@ -1964,7 +1983,31 @@ function AdminApp() {
               </div>
               <div>
                 <dt>Gmail token</dt>
-                <dd>{status?.connected ? "Connected" : "Not connected"}</dd>
+                <dd>
+                  {status?.connected
+                    ? status.requires_reconnect
+                      ? "Reconnect needed"
+                      : "Connected"
+                    : "Not connected"}
+                </dd>
+              </div>
+              <div>
+                <dt>Hosted Gmail MCP</dt>
+                <dd>
+                  {status?.hosted_gmail_mcp_enabled && status.hosted_gmail_mcp_ready
+                    ? "Ready"
+                    : status?.hosted_gmail_mcp_enabled
+                      ? "Waiting for reconnect"
+                      : "Off"}
+                </dd>
+              </div>
+              <div>
+                <dt>Granted scopes</dt>
+                <dd>{status?.token_scopes?.length ? status.token_scopes.length : 0}</dd>
+              </div>
+              <div>
+                <dt>Missing scopes</dt>
+                <dd>{status?.missing_scopes?.length ? status.missing_scopes.join(", ") : "None"}</dd>
               </div>
               <div>
                 <dt>Redirect URI</dt>
@@ -2060,13 +2103,6 @@ function formatSchedulerTime(timeValue: string | null | undefined, timezone: str
   const displayHour = hour % 12 || 12;
   const zone = timezone === "America/Los_Angeles" ? "Pacific" : timezone;
   return `${displayHour}:${String(minute).padStart(2, "0")} ${period}${zone ? ` ${zone}` : ""}`;
-}
-
-function formatMcpStatus(status: McpStatus | null | undefined): string {
-  if (!status) return "Checking...";
-  if (!status.available) return status.error ?? "oMLX MCP unavailable";
-  const gmailTools = `${status.gmail.tools_count} Gmail tool${status.gmail.tools_count === 1 ? "" : "s"}`;
-  return `${gmailTools} · ${status.tool_count} total`;
 }
 
 function formatStatusLabel(value: string | null | undefined): string {

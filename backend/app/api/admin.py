@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from backend.agents.digestor.gmail import SCOPES
+from backend.agents.digestor.gmail import required_scopes
 from backend.agents.digestor.podcast import discover_podcasts
 from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
 from backend.app.db import database
@@ -87,12 +87,26 @@ def gmail_status(request: Request) -> dict[str, Any]:
     settings = _settings()
     redirect_uri = _callback_url(request, settings)
     redirect_warning = _redirect_warning(redirect_uri)
+    token_scopes = email_delivery.gmail_token_scopes(settings)
+    scopes = required_scopes(hosted_mcp_enabled=settings.gmail_remote_mcp_enabled)
+    missing_scopes = sorted(set(scopes) - token_scopes) if settings.gmail_credentials_path.exists() else []
+    cloud_scope = "https://www.googleapis.com/auth/cloud-platform"
     return {
         "configured": settings.gmail_client_secret_path.exists(),
         "connected": settings.gmail_credentials_path.exists(),
         "client_secret_path": str(settings.gmail_client_secret_path),
         "credentials_path": str(settings.gmail_credentials_path),
-        "scopes": SCOPES,
+        "scopes": scopes,
+        "token_scopes": sorted(token_scopes),
+        "missing_scopes": missing_scopes,
+        "requires_reconnect": bool(missing_scopes),
+        "hosted_gmail_mcp_enabled": settings.gmail_remote_mcp_enabled,
+        "hosted_gmail_mcp_ready": bool(
+            settings.gmail_remote_mcp_enabled
+            and settings.google_cloud_project_id
+            and cloud_scope in token_scopes
+        ),
+        "google_cloud_project_id": settings.google_cloud_project_id,
         "redirect_uri": redirect_uri,
         "oauth_redirect_ready": redirect_warning is None,
         "redirect_warning": redirect_warning,
@@ -185,13 +199,12 @@ def _admin_health(
     def add(name: str, status: str, message: str) -> None:
         checks.append({"name": name, "status": status, "message": message})
 
-    add(
-        "Gmail",
-        "ok" if gmail.get("configured") and gmail.get("connected") else "problem",
-        "Connected and ready to read newsletters."
-        if gmail.get("configured") and gmail.get("connected")
-        else "Gmail login is not complete.",
-    )
+    if not gmail.get("configured") or not gmail.get("connected"):
+        add("Gmail", "problem", "Gmail login is not complete.")
+    elif gmail.get("requires_reconnect"):
+        add("Gmail", "warning", "Gmail needs a reconnect to grant the required permissions.")
+    else:
+        add("Gmail", "ok", "Connected and ready to read newsletters.")
     add(
         "Reddit",
         "ok" if (mcp.get("reddit") or {}).get("connected") else "warning",
@@ -594,7 +607,7 @@ def _oauth_flow(
 
     return Flow.from_client_secrets_file(
         str(settings.gmail_client_secret_path),
-        scopes=SCOPES,
+        scopes=required_scopes(hosted_mcp_enabled=settings.gmail_remote_mcp_enabled),
         redirect_uri=redirect_uri,
         state=state,
         code_verifier=code_verifier,

@@ -9,7 +9,7 @@ from backend.agents.critic import apply_critic_repairs
 from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.agentic import AgentDecision
 from backend.agents.digestor.base import NormalizedPayload
-from backend.agents.digestor.gmail_mcp_client import fetch_newsletters
+from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes, mark_podcast_payloads_seen
 from backend.agents.digestor.reddit import fetch_reddit_threads
 from backend.agents.editorial_decisions import apply_editorial_decisions

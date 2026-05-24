@@ -19,10 +19,21 @@ from backend.db.queries import get_watermark, upsert_watermark
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.compose",
+]
+HOSTED_GMAIL_MCP_SCOPES = [
+    "https://mail.google.com/",
+    "https://www.googleapis.com/auth/cloud-platform",
 ]
 CREDENTIALS_PATH = "/secrets/gmail_credentials.json"
 
 logger = logging.getLogger(__name__)
+
+
+def required_scopes(*, hosted_mcp_enabled: bool = False) -> list[str]:
+    if not hosted_mcp_enabled:
+        return list(SCOPES)
+    return [*SCOPES, *HOSTED_GMAIL_MCP_SCOPES]
 
 
 @dataclass(frozen=True)
