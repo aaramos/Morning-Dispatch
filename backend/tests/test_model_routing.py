@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 
+import httpx
+from httpx._content import IteratorByteStream
+
 from backend.agents.digestor.base import NormalizedPayload
+from backend.agents.model import client as model_client_module
 from backend.app.core.config import get_settings
 from backend.app.services import model_routing
 
@@ -79,3 +83,15 @@ def test_private_source_forces_cloud_route_to_local(monkeypatch, tmp_path):
     assert resolution.client is not None
     assert resolution.client.config.provider == "local"
     assert resolution.client.config.model == "local-default"
+
+
+def test_streaming_http_error_detail_does_not_mask_model_fallback():
+    response = httpx.Response(
+        401,
+        request=httpx.Request("POST", "https://ollama.com/api/chat"),
+        stream=IteratorByteStream(iter([b'{"error":"invalid api key"}'])),
+    )
+
+    detail = model_client_module._response_detail(response)
+
+    assert detail == "Unauthorized"

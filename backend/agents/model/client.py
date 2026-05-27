@@ -633,7 +633,10 @@ def _http_error_message(exc: httpx.HTTPStatusError) -> str:
 
 
 def _response_detail(response: httpx.Response) -> str:
-    text = response.text.strip()
+    try:
+        text = response.text.strip()
+    except httpx.ResponseNotRead:
+        return response.reason_phrase[:500]
     if not text:
         return ""
     try:

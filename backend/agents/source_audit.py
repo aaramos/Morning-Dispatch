@@ -15,7 +15,8 @@ from backend.agents.model import ModelClient, ModelClientError
 from backend.agents.model.metrics import record_model_error_metric, record_model_response_metric
 from backend.app.core.config import get_settings
 
-MAX_AUDIT_CANDIDATES = 80
+MAX_AUDIT_CANDIDATES = 28
+RETRY_AUDIT_CANDIDATES = 10
 URL_DATE_RE = re.compile(r"/(20\d{2})[/-](0[1-9]|1[0-2])(?:[/-]([0-3]\d))?")
 
 
@@ -56,68 +57,190 @@ async def apply_source_audit(
             )
         ], {**summary, "status": "fallback"}
 
-    prompt = _audit_prompt(profile, result_list, candidates, lookback_hours)
+    try:
+        payload, elapsed_ms = await _complete_audit(
+            client,
+            profile,
+            result_list,
+            candidates,
+            lookback_hours=lookback_hours,
+            inference_run_id=inference_run_id,
+            article_id="source_audit_batch",
+            max_tokens=1600,
+            compact=False,
+        )
+    except ModelClientError as first_error:
+        retry_candidates = _retry_candidate_indexes(result_list, candidates)
+        if retry_candidates:
+            try:
+                payload, elapsed_ms = await _complete_audit(
+                    client,
+                    profile,
+                    result_list,
+                    retry_candidates,
+                    lookback_hours=lookback_hours,
+                    inference_run_id=inference_run_id,
+                    article_id="source_audit_retry",
+                    max_tokens=900,
+                    compact=True,
+                )
+            except ModelClientError as retry_error:
+                return _failed_audit_result(
+                    result_list,
+                    candidates,
+                    model_name=model_name,
+                    error=retry_error,
+                    first_error=first_error,
+                )
+        else:
+            return _failed_audit_result(result_list, candidates, model_name=model_name, error=first_error)
+
+    updated, decisions, audit_summary = _apply_audit_payload(
+        result_list,
+        payload,
+        model_name=model_name,
+        elapsed_ms=elapsed_ms,
+    )
+    audit_summary["candidate_count"] = len(candidates)
+    return updated, decisions, audit_summary
+
+
+async def _complete_audit(
+    client: ModelClient,
+    profile: TopicProfile | dict[str, Any],
+    result_list: list[ArticleFetchResult],
+    candidates: list[int],
+    *,
+    lookback_hours: int,
+    inference_run_id: str | None,
+    article_id: str,
+    max_tokens: int,
+    compact: bool,
+) -> tuple[dict[str, Any], int]:
+    prompt = _audit_prompt(profile, result_list, candidates, lookback_hours, compact=compact)
     started_at = perf_counter()
     try:
         if hasattr(client, "complete_json_with_metrics"):
             response, payload = await client.complete_json_with_metrics(
                 system=SOURCE_AUDIT_SYSTEM_PROMPT,
                 prompt=prompt,
-                max_tokens=2400,
+                max_tokens=max_tokens,
             )
             record_model_response_metric(
                 run_id=inference_run_id,
-                article_id="source_audit_batch",
+                article_id=article_id,
                 mode="source_audit",
                 model_client=client,
                 response=response,
                 system_prompt=SOURCE_AUDIT_SYSTEM_PROMPT,
                 prompt=prompt,
             )
-        else:
-            payload = await client.complete_json(system=SOURCE_AUDIT_SYSTEM_PROMPT, prompt=prompt, max_tokens=2400)
+            return payload, _elapsed_ms(started_at)
+        payload = await client.complete_json(system=SOURCE_AUDIT_SYSTEM_PROMPT, prompt=prompt, max_tokens=max_tokens)
+        return payload, _elapsed_ms(started_at)
     except ModelClientError as exc:
-        record_model_error_metric(
-            run_id=inference_run_id,
-            article_id="source_audit_batch",
-            mode="source_audit",
-            model_client=client,
-            system_prompt=SOURCE_AUDIT_SYSTEM_PROMPT,
+        _record_audit_error(
+            exc,
+            client=client,
+            inference_run_id=inference_run_id,
+            article_id=article_id,
             prompt=prompt,
-            status=exc.status,
-            error_detail=str(exc),
-            total_ms=exc.total_ms if exc.total_ms is not None else _elapsed_ms(started_at),
-            queue_wait_ms=exc.queue_wait_ms,
-            ttft_ms=exc.ttft_ms,
-            generation_ms=exc.generation_ms,
-            prompt_tokens=exc.prompt_tokens,
-            completion_tokens=exc.completion_tokens,
-            tokens_per_sec=exc.tokens_per_sec,
+            started_at=started_at,
         )
-        return result_list, [
-            AgentDecision(
-                agent="source_audit",
-                target="candidate_pool",
-                decision="fallback",
-                action="pass_through",
-                reason=f"Source audit model failed, so unaudited candidates continued: {exc.status}",
-                model_name=model_name,
-                metadata={"status": exc.status, "elapsed_ms": _elapsed_ms(started_at), "candidate_count": len(candidates)},
-            )
-        ], {
-            **summary,
-            "status": "failed",
-            "issues": [{"source_name": "Source Audit", "reason": f"Audit model failed: {exc.status}"}],
-        }
+        raise
 
-    updated, decisions, audit_summary = _apply_audit_payload(
-        result_list,
-        payload,
-        model_name=model_name,
-        elapsed_ms=_elapsed_ms(started_at),
+
+def _record_audit_error(
+    exc: ModelClientError,
+    *,
+    client: ModelClient,
+    inference_run_id: str | None,
+    article_id: str,
+    prompt: str,
+    started_at: float,
+) -> None:
+    record_model_error_metric(
+        run_id=inference_run_id,
+        article_id=article_id,
+        mode="source_audit",
+        model_client=client,
+        system_prompt=SOURCE_AUDIT_SYSTEM_PROMPT,
+        prompt=prompt,
+        status=exc.status,
+        error_detail=str(exc),
+        total_ms=exc.total_ms if exc.total_ms is not None else _elapsed_ms(started_at),
+        queue_wait_ms=exc.queue_wait_ms,
+        ttft_ms=exc.ttft_ms,
+        generation_ms=exc.generation_ms,
+        prompt_tokens=exc.prompt_tokens,
+        completion_tokens=exc.completion_tokens,
+        tokens_per_sec=exc.tokens_per_sec,
     )
-    audit_summary["candidate_count"] = len(candidates)
-    return updated, decisions, audit_summary
+
+
+def _failed_audit_result(
+    result_list: list[ArticleFetchResult],
+    candidates: list[int],
+    *,
+    model_name: str | None,
+    error: ModelClientError,
+    first_error: ModelClientError | None = None,
+) -> tuple[list[ArticleFetchResult], list[AgentDecision], dict[str, Any]]:
+    friendly_reason = _friendly_model_error(error)
+    metadata: dict[str, Any] = {
+        "status": error.status,
+        "reason": friendly_reason,
+        "candidate_count": len(candidates),
+    }
+    if first_error is not None:
+        metadata["first_attempt_status"] = first_error.status
+        metadata["first_attempt_reason"] = _friendly_model_error(first_error)
+    return result_list, [
+        AgentDecision(
+            agent="source_audit",
+            target="candidate_pool",
+            decision="fallback",
+            action="pass_through",
+            reason=f"Source audit could not complete, so unaudited candidates continued: {friendly_reason}",
+            model_name=model_name,
+            metadata=metadata,
+        )
+    ], {
+        "status": "failed",
+        "candidate_count": len(candidates),
+        "included_count": len(candidates),
+        "excluded_count": 0,
+        "context_count": 0,
+        "issues": [{"source_name": "Source Audit", "reason": f"Audit could not complete: {friendly_reason}"}],
+    }
+
+
+def _friendly_model_error(exc: ModelClientError) -> str:
+    text = str(exc).strip()
+    lowered = text.lower()
+    if "401" in text or "unauthorized" in lowered:
+        return "Ollama Cloud rejected the model request; check the cloud API key or route this agent local-only."
+    if "peer closed connection" in lowered or "incomplete chunked read" in lowered:
+        return "The local model connection closed before the audit finished. The audit was retried with a smaller batch."
+    if exc.status == "parse_error":
+        return "The model returned text that was not valid audit JSON."
+    if exc.status == "timeout":
+        return "The model did not finish the audit in time."
+    return text or exc.status or "The model call failed."
+
+
+def _retry_candidate_indexes(results: list[ArticleFetchResult], candidates: list[int]) -> list[int]:
+    if len(candidates) <= 1:
+        return []
+    ranked = sorted(
+        candidates,
+        key=lambda index: (
+            float(results[index].relevance_score or 0.0),
+            float(results[index].link_score or 0.0),
+        ),
+        reverse=True,
+    )
+    return ranked[: min(RETRY_AUDIT_CANDIDATES, len(ranked))]
 
 
 def _audit_prompt(
@@ -125,10 +248,12 @@ def _audit_prompt(
     results: list[ArticleFetchResult],
     indexes: list[int],
     lookback_hours: int,
+    *,
+    compact: bool = False,
 ) -> str:
     cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
     profile_record = _profile_record(profile)
-    records = [_article_record(index, results[index]) for index in indexes]
+    records = [_article_record(index, results[index], compact=compact) for index in indexes]
     return json.dumps(
         {
             "task": "Audit candidate sources before ranking a Morning Dispatch brief.",
@@ -196,10 +321,12 @@ def _candidate_indexes(results: list[ArticleFetchResult]) -> list[int]:
     ]
 
 
-def _article_record(index: int, result: ArticleFetchResult) -> dict[str, Any]:
+def _article_record(index: int, result: ArticleFetchResult, *, compact: bool = False) -> dict[str, Any]:
     metadata = dict(result.payload.metadata or {})
     result_metadata = dict(result.metadata or {})
     url = result.final_url or result.original_url or result.payload.original_url or ""
+    summary_limit = 320 if compact else 500
+    text_limit = 220 if compact else 420
     return {
         "index": index,
         "title": result.title,
@@ -211,9 +338,9 @@ def _article_record(index: int, result: ArticleFetchResult) -> dict[str, Any]:
         "fetched_at": result.payload.fetched_at,
         "metadata_dates": _metadata_dates(metadata),
         "url_date_hint": _url_date_hint(url),
-        "summary": (result.editor_summary or result.excerpt or "")[:700],
-        "text_sample": (result.text or "")[:900],
-        "translation": result_metadata.get("translation") or metadata.get("translation"),
+        "summary": (result.editor_summary or result.excerpt or "")[:summary_limit],
+        "text_sample": (result.text or "")[:text_limit],
+        "translation": _translation_record(result_metadata.get("translation") or metadata.get("translation")),
         "relevance_score": result.relevance_score,
         "link_score": result.link_score,
     }
@@ -222,6 +349,16 @@ def _article_record(index: int, result: ArticleFetchResult) -> dict[str, Any]:
 def _metadata_dates(metadata: dict[str, Any]) -> dict[str, Any]:
     keys = ("published_at", "published", "date", "created_at", "updated_at", "search_result_date", "pub_date")
     return {key: metadata.get(key) for key in keys if metadata.get(key)}
+
+
+def _translation_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: value.get(key)
+        for key in ("translated", "source_language", "source_language_name", "mode", "error")
+        if value.get(key) is not None
+    }
 
 
 def _url_date_hint(url: str) -> str | None:
