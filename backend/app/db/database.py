@@ -968,6 +968,12 @@ def update_exploration_status(
     if existing is None:
         return None
     finished_at = utc_now() if status in {"complete", "failed"} else existing.get("finished_at")
+    progress = dict(existing.get("progress") or {})
+    if status in {"complete", "failed"}:
+        queue = dict(progress.get("queue") or {})
+        queue["status"] = status
+        queue["message"] = "Brief ready." if status == "complete" else "Build failed."
+        progress["queue"] = queue
     with connect() as connection:
         connection.execute(
             """
@@ -975,7 +981,8 @@ def update_exploration_status(
             SET status = ?,
                 brief_ref = COALESCE(?, brief_ref),
                 emailed = COALESCE(?, emailed),
-                finished_at = ?
+                finished_at = ?,
+                progress_json = ?
             WHERE exploration_id = ?
             """,
             (
@@ -983,6 +990,7 @@ def update_exploration_status(
                 brief_ref,
                 None if emailed is None else int(emailed),
                 finished_at,
+                json.dumps(progress, sort_keys=True),
                 exploration_id,
             ),
         )

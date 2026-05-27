@@ -183,6 +183,36 @@ def test_topic_profile_and_exploration_tables(monkeypatch, tmp_path) -> None:
     assert updated["finished_at"]
 
 
+def test_completed_exploration_clears_running_queue_marker(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    profile = database.upsert_topic_profile(
+        {
+            "statement": "Track local AI infrastructure",
+            "scope": "Local AI inference and Apple Silicon tools",
+            "source_selection": {"web_search": True},
+        }
+    )
+    exploration = database.create_exploration(
+        topic_id=profile["topic_id"],
+        mode="show_now",
+        source_selection={"web_search": True},
+        status="running",
+    )
+    database.update_exploration_progress(
+        exploration["exploration_id"],
+        progress={"queue": {"status": "running", "message": "Building now.", "action": "build"}},
+    )
+
+    completed = database.update_exploration_status(exploration["exploration_id"], status="complete")
+
+    assert completed is not None
+    assert completed["status"] == "complete"
+    assert completed["progress"]["queue"]["status"] == "complete"
+    assert completed["progress"]["queue"]["message"] == "Brief ready."
+
+
 def test_run_digest_core_emits_editorial_and_critic_reasoning(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
