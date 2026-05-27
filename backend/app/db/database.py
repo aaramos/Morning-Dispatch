@@ -2567,6 +2567,7 @@ def render_ingested_issue(
     .story-meta, .chip-row, .keywords, .feedback-controls {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
     .source-type, .score {{ display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; font: 700 .68rem/1 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .04em; background: rgba(255, 250, 241, .72); }}
     .source-type.youtube, .source-type.podcast, .source-type.foreign-media, .translation-badge {{ color: var(--accent-dark); border-color: rgba(181, 58, 50, .34); background: rgba(181, 58, 50, .08); }}
+    .translation-badge.low, .translation-badge.unavailable {{ color: #7a4c10; border-color: rgba(156, 97, 18, .34); background: rgba(156, 97, 18, .10); }}
     .translation-original {{ margin-top: 10px; color: var(--muted); font-size: .88rem; }}
     .translation-original summary {{ cursor: pointer; font-weight: 800; color: var(--accent-dark); }}
     .translation-original p {{ margin: 8px 0 0; line-height: 1.45; }}
@@ -2629,7 +2630,8 @@ def render_ingested_issue(
     .foreign-tabs button.active {{ background: var(--ink); color: var(--paper); border-color: var(--ink); }}
     .foreign-view[hidden] {{ display: none; }}
     .foreign-view {{ border-top: 1px solid var(--line); padding-top: 16px; }}
-    .foreign-status, .foreign-notice {{ color: var(--muted); font: 700 .82rem/1.45 var(--body); }}
+    .foreign-status, .foreign-notice, .foreign-provenance {{ color: var(--muted); font: 700 .82rem/1.45 var(--body); }}
+    .foreign-provenance {{ margin: 8px 0 0; }}
     .foreign-body p {{ margin: 0 0 12px; font-size: 1rem; line-height: 1.62; color: #3f382f; }}
     body.modal-open {{ overflow: hidden; }}
     .empty {{ margin-top: 32px; padding: 24px; border: 1px dashed #b9ae9d; font: 1rem var(--body); background: var(--paper); }}
@@ -3225,11 +3227,29 @@ def _translation_badge_html(result: ArticleFetchResult) -> str:
     source_language = str(translation.get("source_language") or (result.payload.metadata or {}).get("source_language") or "").strip()
     if not source_language:
         return ""
+    source_language_name = str(translation.get("source_language_name") or (result.payload.metadata or {}).get("source_language_name") or source_language.upper()).strip()
+    quality = _translation_quality_label(translation)
+    mode = str(translation.get("mode") or "").strip()
+    translator = str(translation.get("translator") or "").strip()
     if translation and not translation.get("translated"):
         label = f"{source_language.upper()} translation unavailable"
+        class_name = "source-type translation-badge unavailable"
     else:
         label = f"{source_language.upper()} -> EN"
-    return f'<span class="source-type translation-badge">{escape(label)}</span>'
+        if quality:
+            label = f"{label} · {quality.upper()}"
+        class_name = "source-type translation-badge"
+        if quality == "low":
+            class_name = f"{class_name} low"
+    title_parts = [f"Translated from {source_language_name}"]
+    if quality:
+        title_parts.append(f"{quality} confidence")
+    if translator:
+        title_parts.append(f"model: {translator}")
+    if mode:
+        title_parts.append(f"mode: {mode}")
+    title = "; ".join(title_parts)
+    return f'<span class="{class_name}" title="{escape(title, quote=True)}">{escape(label)}</span>'
 
 
 def _translation_original_html(result: ArticleFetchResult) -> str:
@@ -3239,14 +3259,37 @@ def _translation_original_html(result: ArticleFetchResult) -> str:
     if not original_title and not original_summary:
         return ""
     source_language_name = str(translation.get("source_language_name") or (result.payload.metadata or {}).get("source_language_name") or "original").strip()
+    context = _translation_context_label(translation)
+    summary_label = f"Original {source_language_name} text"
+    if context:
+        summary_label = f"{summary_label} · {context}"
     title_html = f"<p><strong>Title:</strong> {escape(original_title)}</p>" if original_title else ""
     summary_html = f"<p><strong>Summary:</strong> {escape(original_summary)}</p>" if original_summary else ""
     return (
         f'<details class="translation-original">'
-        f"<summary>Original {escape(source_language_name)} text</summary>"
+        f"<summary>{escape(summary_label)}</summary>"
         f"{title_html}{summary_html}"
         f"</details>"
     )
+
+
+def _translation_quality_label(translation: dict[str, Any]) -> str:
+    quality = str(translation.get("quality") or translation.get("translation_quality") or "").strip().lower()
+    return quality if quality in {"high", "medium", "low"} else ""
+
+
+def _translation_context_label(translation: dict[str, Any]) -> str:
+    parts: list[str] = []
+    quality = _translation_quality_label(translation)
+    translator = str(translation.get("translator") or "").strip()
+    mode = str(translation.get("mode") or "").strip()
+    if quality:
+        parts.append(f"{quality} confidence")
+    if translator:
+        parts.append(translator)
+    if mode and mode != "fast":
+        parts.append(mode.replace("_", " "))
+    return " · ".join(parts)
 
 
 def _keyword_html(result: ArticleFetchResult) -> str:
@@ -3294,6 +3337,9 @@ def _foreign_article_attributes(result: ArticleFetchResult, *, modal_id: str) ->
         "foreign-source-language-name": str(translation.get("source_language_name") or payload_metadata.get("source_language_name") or ""),
         "foreign-original-title": str(translation.get("original_title") or payload_metadata.get("original_search_title") or ""),
         "foreign-original-summary": str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or ""),
+        "foreign-translation-quality": _translation_quality_label(translation),
+        "foreign-translation-mode": str(translation.get("mode") or ""),
+        "foreign-translator": str(translation.get("translator") or ""),
     }
     return "".join(
         f' data-{escape(key, quote=True)}="{escape(value, quote=True)}"'
@@ -3472,16 +3518,21 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
     original_summary = str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or "").strip()
     original_seed = "\n\n".join(part for part in (original_title, original_summary) if part)
     original_html = _render_transcript_paragraphs(original_seed)
+    translation_context = _translation_context_label(translation)
+    provenance = f"Metadata translation from {source_language_name}"
+    if translation_context:
+        provenance = f"{provenance} · {translation_context}"
     return f"""
         <div class="podcast-modal foreign-modal" id="{escape(modal_id, quote=True)}" data-foreign-exploration-id="{escape(issue_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
           <div class="podcast-panel youtube-panel">
             <a class="podcast-close" data-foreign-close href="#">Close</a>
-            <div class="section-kicker">Machine translated</div>
+            <div class="section-kicker">Machine translated from {escape(source_language_name)}</div>
             <h3 id="{escape(modal_id, quote=True)}-title">{escape(_story_title(result))}</h3>
             <div class="podcast-actions">
               <a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">View original source</a>
             </div>
-            <p class="foreign-status" aria-live="polite">Open this article to translate the full body.</p>
+            <p class="foreign-provenance" data-foreign-provenance>{escape(provenance)}</p>
+            <p class="foreign-status" aria-live="polite">Open this article to translate the full body. The current card uses translated metadata.</p>
             <div class="foreign-tabs" role="tablist" aria-label="Article language view">
               <button type="button" class="active" data-foreign-tab="translated">Translated</button>
               <button type="button" data-foreign-tab="original">Original {escape(source_language_name)}</button>
@@ -4066,6 +4117,7 @@ def _render_podcast_modal_script() -> str:
         if (!modal || modal.getAttribute("data-foreign-loaded") === "true") return;
         const status = modal.querySelector(".foreign-status");
         const notice = modal.querySelector(".foreign-notice");
+        const provenance = modal.querySelector("[data-foreign-provenance]");
         const translatedBody = modal.querySelector("[data-foreign-translated-body]");
         const originalBody = modal.querySelector("[data-foreign-original-body]");
         const explorationId = modal.getAttribute("data-foreign-exploration-id");
@@ -4091,7 +4143,26 @@ def _render_podcast_modal_script() -> str:
           if (translatedBody) translatedBody.innerHTML = paragraphs(data.translated_body || data.translated_summary);
           if (originalBody) originalBody.innerHTML = paragraphs([data.original_title, data.original_body].filter(Boolean).join("\\n\\n"));
           if (notice) notice.textContent = data.notice || "";
-          if (status) status.textContent = data.cached ? "Loaded from translation cache." : "Translated article ready.";
+          const quality = data.translation_quality || data.quality || trigger.getAttribute("data-foreign-translation-quality") || "";
+          const translator = data.translator || trigger.getAttribute("data-foreign-translator") || "";
+          const mode = data.mode || trigger.getAttribute("data-foreign-translation-mode") || "";
+          if (provenance) {
+            provenance.textContent = [
+              data.source_language_name ? `Full translation from ${data.source_language_name}` : "Full translation",
+              quality ? `${quality} confidence` : "",
+              translator ? `model: ${translator}` : "",
+              mode ? `mode: ${mode}` : ""
+            ].filter(Boolean).join(" · ");
+          }
+          if (status) {
+            if (data.status === "translated_summary_only") {
+              status.textContent = data.cached ? "Loaded summary translation from cache." : "Translated available text; full body was not available.";
+            } else if (data.status === "translation_unavailable" || data.status === "translation_failed") {
+              status.textContent = "Full translation is unavailable. Open the original source for details.";
+            } else {
+              status.textContent = data.cached ? "Loaded from translation cache." : "Translated article ready.";
+            }
+          }
           modal.setAttribute("data-foreign-loaded", "true");
         } catch (_error) {
           modal.removeAttribute("data-foreign-loaded");

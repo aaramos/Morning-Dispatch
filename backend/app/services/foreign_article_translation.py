@@ -53,14 +53,14 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
         concurrency=1,
     )
     result = fetched[0] if fetched else None
-    original_body = _clean(getattr(result, "text", "") or original_summary or summary)
+    original_body = _clean_body(getattr(result, "text", "") or original_summary or summary)
     fetch_status = str(getattr(result, "status", "") or "unavailable")
     original_unavailable = result is None or not getattr(result, "fetched", False) or len(original_body) < 180
 
     settings = get_settings()
     client = ModelClient.from_settings(settings)
     if client is None:
-        response = {
+        return {
             "status": "translation_unavailable",
             "url": url,
             "title": title,
@@ -72,15 +72,16 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
             "original_body": original_body or original_summary,
             "original_unavailable": original_unavailable,
             "fetch_status": fetch_status,
+            "translation_quality": "unavailable",
+            "translator": "",
+            "mode": "unavailable",
             "notice": "Translation model is not available, so the original text is shown.",
             "cached": False,
         }
-        _write_cache(cache_key, response)
-        return response
 
     text_to_translate = original_body or original_summary or summary
     if not text_to_translate:
-        response = {
+        return {
             "status": "original_unavailable",
             "url": url,
             "title": title,
@@ -92,11 +93,12 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
             "original_body": "",
             "original_unavailable": True,
             "fetch_status": fetch_status,
+            "translation_quality": "unavailable",
+            "translator": _model_name(client),
+            "mode": "unavailable",
             "notice": "The original article body could not be fetched.",
             "cached": False,
         }
-        _write_cache(cache_key, response)
-        return response
 
     try:
         model_payload = await client.complete_json(
@@ -120,7 +122,7 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if fallback is not None:
             translated_title = _clean(fallback.get("title")) or title
-            translated_body = _clean(fallback.get("body")) or summary or title
+            translated_body = _clean_body(fallback.get("body")) or summary or title
             response = {
                 "status": "translated" if not original_unavailable else "translated_summary_only",
                 "url": url,
@@ -133,6 +135,9 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
                 "original_body": original_body or original_summary,
                 "original_unavailable": original_unavailable,
                 "fetch_status": fetch_status,
+                "translation_quality": "medium",
+                "translator": _model_name(client),
+                "mode": "fallback_text",
                 "notice": (
                     "Original body could not be fully fetched; translated available text is shown."
                     if original_unavailable
@@ -154,14 +159,19 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
             "original_body": original_body or original_summary,
             "original_unavailable": original_unavailable,
             "fetch_status": fetch_status,
+            "translation_quality": "failed",
+            "translator": _model_name(client),
+            "mode": "failed",
             "notice": f"Translation failed: {exc.status}",
             "cached": False,
         }
 
     translated_title = _clean(model_payload.get("title_en")) if isinstance(model_payload, dict) else ""
-    translated_body = _clean(model_payload.get("body_en")) if isinstance(model_payload, dict) else ""
+    translated_body = _clean_body(model_payload.get("body_en")) if isinstance(model_payload, dict) else ""
+    quality = _translation_quality(model_payload.get("quality") if isinstance(model_payload, dict) else None)
     if not translated_body:
         translated_body = summary or title
+        quality = "low"
 
     response = {
         "status": "translated" if not original_unavailable else "translated_summary_only",
@@ -175,7 +185,10 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
         "original_body": original_body or original_summary,
         "original_unavailable": original_unavailable,
         "fetch_status": fetch_status,
-        "notice": "Original body could not be fully fetched; translated available text is shown." if original_unavailable else "",
+        "translation_quality": quality,
+        "translator": _model_name(client),
+        "mode": "json",
+        "notice": _translation_notice(original_unavailable=original_unavailable, quality=quality),
         "cached": False,
     }
     _write_cache(cache_key, response)
@@ -201,6 +214,7 @@ def _translation_prompt(*, url: str, source_language_name: str, title: str, body
             "schema": {
                 "title_en": "English title",
                 "body_en": "Full English translation with paragraphs",
+                "quality": "high|medium|low",
             },
         },
         ensure_ascii=False,
@@ -288,7 +302,7 @@ def _cache_path(cache_key: str) -> Path:
 
 
 def _cache_key(*, url: str, source_language: str) -> str:
-    raw = "\n".join(("foreign-article-v1", source_language, url))
+    raw = "\n".join(("foreign-article-v2", source_language, url))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -308,7 +322,33 @@ def _clean(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _clean_body(value: Any) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [re.sub(r"[ \t]+", " ", part).strip() for part in re.split(r"\n{2,}", text)]
+    return "\n\n".join(part for part in paragraphs if part)
+
+
 def _clip(value: str, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
     return value[:max_chars].rsplit(" ", 1)[0].strip() or value[:max_chars]
+
+
+def _translation_quality(value: Any) -> str:
+    quality = str(value or "").strip().lower()
+    return quality if quality in {"high", "medium", "low"} else "medium"
+
+
+def _translation_notice(*, original_unavailable: bool, quality: str) -> str:
+    notices: list[str] = []
+    if original_unavailable:
+        notices.append("Original body could not be fully fetched; translated available text is shown.")
+    if quality == "low":
+        notices.append("Translation confidence is low; compare against the original before relying on details.")
+    return " ".join(notices)
+
+
+def _model_name(model_client: object) -> str:
+    config = getattr(model_client, "config", None)
+    model = getattr(config, "model", None)
+    return str(model or get_settings().librarian_model or "unknown")

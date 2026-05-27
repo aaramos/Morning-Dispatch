@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery.language_support import trusted_language_options
@@ -17,6 +18,65 @@ logger = logging.getLogger(__name__)
 
 MAX_FOREIGN_LANGUAGES = 3
 DEFAULT_RESULTS_PER_LANGUAGE = 6
+NON_FOREIGN_MEDIA_LANGUAGE_CODES = {"en"}
+SCRIPT_RE = {
+    "ko": re.compile(r"[\uac00-\ud7af]"),
+    "ja": re.compile(r"[\u3040-\u30ff\u3400-\u9fff]"),
+    "zh": re.compile(r"[\u3400-\u9fff]"),
+    "yue": re.compile(r"[\u3400-\u9fff]"),
+}
+FOREIGN_MEDIA_BLOCKED_DOMAINS = {
+    "blog.maxthon.com",
+    "finance.yahoo.com",
+    "news.yahoo.com",
+    "yahoo.com",
+    "msn.com",
+    "marketbeat.com",
+    "marketgrowthreports.com",
+    "instagram.com",
+    "threads.net",
+    "youtube.com",
+    "youtu.be",
+}
+FOREIGN_MEDIA_PREFERRED_DOMAINS = {
+    "ko": {
+        "businesspost.co.kr",
+        "chosunbiz.com",
+        "ddaily.co.kr",
+        "etnews.com",
+        "hankyung.com",
+        "mk.co.kr",
+        "news.einfomax.co.kr",
+        "press9.kr",
+        "sedaily.com",
+        "thelec.kr",
+        "zdnet.co.kr",
+    },
+    "ja": {
+        "bloomberg.co.jp",
+        "itmedia.co.jp",
+        "jiji.com",
+        "nikkei.com",
+        "toyokeizai.net",
+        "xtech.nikkei.com",
+    },
+    "zh": {
+        "cnyes.com",
+        "ctee.com.tw",
+        "digitimes.com.tw",
+        "money.udn.com",
+        "technews.tw",
+        "udn.com",
+    },
+}
+LOW_SIGNAL_TITLE_PHRASES = (
+    "market size",
+    "market share",
+    "market report",
+    "market growth",
+    "industry analysis",
+    "forecast",
+)
 
 
 class ForeignMediaSourceAdapter:
@@ -52,7 +112,27 @@ class ForeignMediaSourceAdapter:
             for rank, hit in enumerate(result[:per_language_limit], start=1):
                 if not hit.url:
                     continue
-                score = round(max(0.0, min(0.98, float(hit.score or 0.55) + max(0.0, 0.05 - rank * 0.005))), 3)
+                quality = _foreign_media_quality(hit, language_code)
+                if quality["decision"] == "exclude":
+                    logger.info(
+                        "Foreign media result excluded for %s: %s (%s)",
+                        language_code,
+                        hit.url,
+                        quality["reason"],
+                    )
+                    continue
+                score = round(
+                    max(
+                        0.0,
+                        min(
+                            0.98,
+                            float(hit.score or 0.55)
+                            + max(0.0, 0.05 - rank * 0.005)
+                            + float(quality.get("score_adjustment") or 0.0),
+                        ),
+                    ),
+                    3,
+                )
                 candidates.append(
                     Candidate(
                         adapter=self.name,
@@ -72,10 +152,11 @@ class ForeignMediaSourceAdapter:
                                 "needs_translation": True,
                                 "original_search_title": hit.title,
                                 "original_search_summary": hit.snippet,
+                                "foreign_quality": quality,
                             },
                         ),
                         score=score,
-                        reason=f"Native-language {language_name} web result.",
+                        reason=f"Native-language {language_name} web result. {quality['reason']}",
                     )
                 )
         return candidates
@@ -113,7 +194,7 @@ def _sanitize_plan(value: Any) -> tuple[dict[str, Any], ...]:
         if not isinstance(item, dict):
             continue
         code = str(item.get("code") or item.get("language") or "").strip().lower()
-        if code not in languages or code in seen:
+        if code not in languages or code in seen or code in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
             continue
         native_query = " ".join(str(item.get("native_query") or "").split()).strip()
         if not native_query:
@@ -138,7 +219,7 @@ def _derive_language_seeds(profile: TopicProfile) -> list[dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
 
     for code, reason in _explicit_language_requests(text):
-        if code in languages:
+        if code in languages and code not in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
             selected.setdefault(code, {**languages[code], "reason": reason, "native_entity_terms": []})
 
     for hint in ENTITY_LANGUAGE_HINTS:
@@ -324,6 +405,63 @@ def _fallback_language_terms(code: str) -> list[str]:
         "ur": ["تازہ خبریں", "مارکیٹ", "آؤٹ لک"],
         "vi": ["tin mới nhất", "thị trường", "triển vọng"],
     }.get(code, [])
+
+
+def _foreign_media_quality(hit: Any, language_code: str) -> dict[str, Any]:
+    url = str(getattr(hit, "url", "") or "")
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    title = str(getattr(hit, "title", "") or "")
+    snippet = str(getattr(hit, "snippet", "") or "")
+    combined = f"{title} {snippet}"
+    title_lower = title.casefold()
+    url_lower = url.casefold()
+
+    if _host_matches(host, FOREIGN_MEDIA_BLOCKED_DOMAINS):
+        return _quality_result("exclude", "blocked aggregator, social, video, or low-quality domain")
+    if "/tag/" in url_lower or "/tags/" in url_lower or title_lower.startswith("tag "):
+        return _quality_result("exclude", "tag/archive pages are not article coverage")
+    if any(phrase in title_lower for phrase in LOW_SIGNAL_TITLE_PHRASES):
+        return _quality_result("exclude", "generic market-report page")
+    if _looks_like_english_result(language_code, combined):
+        return _quality_result("exclude", "result does not look like native-language coverage")
+
+    preferred_domains = FOREIGN_MEDIA_PREFERRED_DOMAINS.get(language_code, set())
+    if _host_matches(host, preferred_domains):
+        return _quality_result("include", "preferred local business/technology source", score_adjustment=0.08)
+    if language_code in {"zh", "yue"} and host.endswith(".tw"):
+        return _quality_result("include", "Taiwanese local-domain source", score_adjustment=0.06)
+    if language_code == "ko" and host.endswith(".kr"):
+        return _quality_result("include", "Korean local-domain source", score_adjustment=0.05)
+    if language_code == "ja" and host.endswith(".jp"):
+        return _quality_result("include", "Japanese local-domain source", score_adjustment=0.05)
+    if _contains_expected_script(language_code, combined):
+        return _quality_result("include", "native-script coverage")
+    return _quality_result("include", "accepted foreign-media result", score_adjustment=-0.04)
+
+
+def _quality_result(decision: str, reason: str, *, score_adjustment: float = 0.0) -> dict[str, Any]:
+    return {
+        "decision": decision,
+        "reason": reason,
+        "score_adjustment": score_adjustment,
+    }
+
+
+def _host_matches(host: str, domains: set[str]) -> bool:
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
+
+def _contains_expected_script(language_code: str, text: str) -> bool:
+    pattern = SCRIPT_RE.get(language_code)
+    return bool(pattern and pattern.search(text))
+
+
+def _looks_like_english_result(language_code: str, text: str) -> bool:
+    if language_code not in SCRIPT_RE:
+        return False
+    native_count = len(SCRIPT_RE[language_code].findall(text))
+    ascii_letters = len(re.findall(r"[A-Za-z]", text))
+    return (native_count == 0 and ascii_letters > 25) or (ascii_letters > 80 and native_count < 3)
 
 
 def _string_list(value: Any, *, limit: int = 12) -> list[str]:

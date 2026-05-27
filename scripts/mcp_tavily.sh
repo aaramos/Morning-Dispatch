@@ -14,4 +14,10 @@ if [[ -z "${TAVILY_API_KEY:-}" ]]; then
   exit 1
 fi
 
-exec npx -y mcp-remote https://mcp.tavily.com/mcp/ --header "Authorization: Bearer $TAVILY_API_KEY"
+exec npx -y mcp-remote https://mcp.tavily.com/mcp/ \
+  --header "Authorization: Bearer $TAVILY_API_KEY" \
+  2> >(
+    sed -E \
+      -e 's/(Authorization":"Bearer )[A-Za-z0-9_+=\/.-]+/\1[REDACTED]/g' \
+      -e 's/tvly-[A-Za-z0-9_-]+/[REDACTED_TAVILY_KEY]/g' >&2
+  )

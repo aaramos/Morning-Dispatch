@@ -55,6 +55,23 @@ def test_foreign_language_plan_derives_entity_languages(monkeypatch, tmp_path) -
     assert any("キオクシア" in item["native_query"] for item in plan)
 
 
+def test_foreign_language_plan_does_not_treat_english_exclusion_as_language_request(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track SK Hynix and Kioxia from local media, avoiding English-language pages.",
+            "scope": "Native-language semiconductor coverage",
+            "exclusions": ["English-language pages", "Yahoo", "MSN"],
+            "source_selection": {"foreign_media": True},
+        }
+    )
+
+    plan = asyncio.run(foreign_language_plan_for_profile(profile))
+
+    assert "en" not in [item["code"] for item in plan]
+    assert [item["code"] for item in plan] == ["ko", "ja"]
+
+
 def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     calls: list[dict[str, object]] = []
@@ -98,6 +115,106 @@ def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path)
     assert candidates[0].payload.source_type == "foreign_web"
     assert candidates[0].payload.metadata["needs_translation"] is True
     assert candidates[0].payload.metadata["source_language"] == "ko"
+    assert candidates[0].payload.metadata["foreign_quality"]["decision"] == "include"
+
+
+def test_foreign_media_adapter_filters_english_and_low_quality_results(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None):
+        assert language == "ko"
+        return [
+            SearchHit(
+                title="SK하이닉스, HBM 투자 확대",
+                url="https://www.thelec.kr/news/articleView.html?idxno=1",
+                snippet="SK하이닉스가 HBM 생산 투자를 확대했다.",
+                score=0.65,
+                provider="fake",
+            ),
+            SearchHit(
+                title="Why Micron and SK Hynix Could Quietly Become the Real AI Winners",
+                url="https://finance.yahoo.com/news/micron-hynix-ai-memory-120000000.html",
+                snippet="English-language syndicated market commentary about memory stocks and AI winners.",
+                score=0.95,
+                provider="fake",
+            ),
+            SearchHit(
+                title="SanDisk-Kioxia Alliance Through 2034 - Maxthon",
+                url="https://blog.maxthon.com/2026/02/08/sandisk-kioxia-alliance-through-2034",
+                snippet="A browser blog post about NAND.",
+                score=0.9,
+                provider="fake",
+            ),
+        ]
+
+    monkeypatch.setattr(foreign_media, "search_web", fake_search_web)
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track SK Hynix memory coverage from Korean sources.",
+            "scope": "Korean HBM investment signals",
+            "source_selection": {"foreign_media": True},
+            "foreign_language_plan": [
+                {
+                    "code": "ko",
+                    "name": "Korean",
+                    "native_query": "SK하이닉스 HBM 투자 최신 뉴스",
+                    "native_entity_terms": ["SK하이닉스"],
+                }
+            ],
+        }
+    )
+
+    candidates = asyncio.run(ForeignMediaSourceAdapter().query(profile, SourceAdapterContext(exploration_id="ko-quality")))
+
+    assert len(candidates) == 1
+    assert candidates[0].payload.original_url == "https://www.thelec.kr/news/articleView.html?idxno=1"
+    assert candidates[0].payload.metadata["foreign_quality"]["reason"] == "preferred local business/technology source"
+
+
+def test_foreign_media_adapter_prefers_taiwanese_native_sources(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None):
+        assert language == "zh"
+        return [
+            SearchHit(
+                title="台積電先進製程需求升溫",
+                url="https://technews.tw/2026/05/01/tsmc-ai-demand/",
+                snippet="台積電先進製程與 AI 需求相關報導。",
+                score=0.6,
+                provider="fake",
+            ),
+            SearchHit(
+                title="TSMC shares rise as AI demand improves",
+                url="https://example.com/markets/tsmc-ai-demand",
+                snippet="English market recap with no Chinese source text in title or summary.",
+                score=0.9,
+                provider="fake",
+            ),
+        ]
+
+    monkeypatch.setattr(foreign_media, "search_web", fake_search_web)
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track TSMC using Taiwan media.",
+            "scope": "Taiwan semiconductor coverage",
+            "source_selection": {"foreign_media": True},
+            "foreign_language_plan": [
+                {
+                    "code": "zh",
+                    "name": "Mandarin Chinese",
+                    "native_query": "台積電 AI 需求 半導體 最新",
+                    "native_entity_terms": ["台積電"],
+                }
+            ],
+        }
+    )
+
+    candidates = asyncio.run(ForeignMediaSourceAdapter().query(profile, SourceAdapterContext(exploration_id="tw-quality")))
+
+    assert len(candidates) == 1
+    assert candidates[0].payload.original_url == "https://technews.tw/2026/05/01/tsmc-ai-demand/"
+    assert candidates[0].payload.metadata["foreign_quality"]["reason"] == "preferred local business/technology source"
 
 
 def test_foreign_metadata_translation_preserves_original() -> None:
@@ -503,3 +620,132 @@ def test_foreign_article_translation_uses_text_fallback_when_json_fails(monkeypa
     assert response["status"] == "translated"
     assert response["translated_title"] == "SK Hynix company analysis report"
     assert "high-value memory sales" in response["translated_body"]
+    assert response["translation_quality"] == "medium"
+    assert response["mode"] == "fallback_text"
+
+
+def test_foreign_article_translation_preserves_quality_and_paragraphs(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    class FakeJsonModel:
+        config = type("Config", (), {"model": "fake-gemma"})()
+
+        async def complete_json(self, **_kwargs):
+            return {
+                "title_en": "TSMC demand improves",
+                "body_en": "TSMC demand improved in AI chips.\n\nManagement still flagged export and margin risks.",
+                "quality": "low",
+            }
+
+    fetched_result = ArticleFetchResult(
+        payload=NormalizedPayload(
+            source_type="foreign_web",
+            source_name="TechNews",
+            raw_text="台積電需求升溫",
+            original_url="https://technews.tw/2026/05/01/tsmc-ai-demand/",
+        ),
+        original_url="https://technews.tw/2026/05/01/tsmc-ai-demand/",
+        final_url="https://technews.tw/2026/05/01/tsmc-ai-demand/",
+        title="台積電需求升溫",
+        text="台積電 AI 晶片需求升溫。\n\n管理層仍提醒出口與毛利風險。",
+        excerpt="台積電 AI 晶片需求升溫。",
+        domain="technews.tw",
+        status="fetched",
+    )
+
+    async def fake_fetch_articles(*_args, **_kwargs):
+        return [fetched_result]
+
+    monkeypatch.setattr(foreign_article_translation, "fetch_articles_for_payloads", fake_fetch_articles)
+    monkeypatch.setattr(
+        foreign_article_translation.ModelClient,
+        "from_settings",
+        staticmethod(lambda _settings: FakeJsonModel()),
+    )
+
+    response = asyncio.run(
+        foreign_article_translation.translate_foreign_article(
+            {
+                "url": "https://technews.tw/2026/05/01/tsmc-ai-demand/",
+                "title": "台積電需求升溫",
+                "summary": "台積電 AI 晶片需求升溫。",
+                "source_language": "zh",
+                "source_language_name": "Mandarin Chinese",
+            }
+        )
+    )
+
+    assert response["translation_quality"] == "low"
+    assert response["translator"] == "fake-gemma"
+    assert response["mode"] == "json"
+    assert "\n\nManagement still flagged" in response["translated_body"]
+    assert "Translation confidence is low" in response["notice"]
+
+
+def test_foreign_article_translation_model_unavailable_is_not_cached(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    class FakeJsonModel:
+        config = type("Config", (), {"model": "fake-gemma"})()
+
+        async def complete_json(self, **_kwargs):
+            return {
+                "title_en": "Kioxia demand improves",
+                "body_en": "Kioxia demand improved.",
+                "quality": "high",
+            }
+
+    fetched_result = ArticleFetchResult(
+        payload=NormalizedPayload(
+            source_type="foreign_web",
+            source_name="Example Japan",
+            raw_text="キオクシア需要改善",
+            original_url="https://example.jp/news/1",
+        ),
+        original_url="https://example.jp/news/1",
+        final_url="https://example.jp/news/1",
+        title="キオクシア需要改善",
+        text="キオクシアの需要改善とNAND市況の回復について詳しく報じた本文です。" * 12,
+        excerpt="キオクシア需要改善。",
+        domain="example.jp",
+        status="fetched",
+    )
+
+    async def fake_fetch_articles(*_args, **_kwargs):
+        return [fetched_result]
+
+    monkeypatch.setattr(foreign_article_translation, "fetch_articles_for_payloads", fake_fetch_articles)
+    monkeypatch.setattr(foreign_article_translation.ModelClient, "from_settings", staticmethod(lambda _settings: None))
+
+    unavailable = asyncio.run(
+        foreign_article_translation.translate_foreign_article(
+            {
+                "url": "https://example.jp/news/1",
+                "title": "キオクシア需要改善",
+                "summary": "キオクシア需要改善。",
+                "source_language": "ja",
+                "source_language_name": "Japanese",
+            }
+        )
+    )
+
+    monkeypatch.setattr(
+        foreign_article_translation.ModelClient,
+        "from_settings",
+        staticmethod(lambda _settings: FakeJsonModel()),
+    )
+    translated = asyncio.run(
+        foreign_article_translation.translate_foreign_article(
+            {
+                "url": "https://example.jp/news/1",
+                "title": "キオクシア需要改善",
+                "summary": "キオクシア需要改善。",
+                "source_language": "ja",
+                "source_language_name": "Japanese",
+            }
+        )
+    )
+
+    assert unavailable["status"] == "translation_unavailable"
+    assert translated["status"] == "translated"
+    assert translated["cached"] is False
