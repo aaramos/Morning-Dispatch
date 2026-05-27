@@ -5769,7 +5769,7 @@ def get_latest_issue(digest_id: str) -> dict[str, Any] | None:
             """
             SELECT * FROM digest_issues
             WHERE digest_id = ?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, rowid DESC
             LIMIT 1
             """,
             (digest_id,),

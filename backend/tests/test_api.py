@@ -126,8 +126,8 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "2026-05-20T12:00:00+00:00" not in html.text
         assert "05/20/2026" in html.text
         assert re.search(r"Generated \d{2}/\d{2}/\d{4} ", html.text)
-        assert re.search(r"Generated \d{2}/\d{2}/\d{4} .* Source scope: last 24 hours", html.text)
-        assert "Last 24 hours" not in html.text
+        assert "Source scope: last 2 days" in html.text
+        assert "Last 2 days" not in html.text
         assert "https://example.com/model-release" in html.text
         assert "Ranked stories" in html.text
         assert "Fetched Articles" not in html.text
