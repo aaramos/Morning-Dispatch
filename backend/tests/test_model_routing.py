@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import json
+
+from backend.agents.digestor.base import NormalizedPayload
+from backend.app.core.config import get_settings
+from backend.app.services import model_routing
+
+
+def configure_runtime(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv("MORNING_DISPATCH_DB_PATH", str(runtime / "data" / "db" / "morning_dispatch.sqlite3"))
+    monkeypatch.setenv("MORNING_DISPATCH_MODEL_API_KEY", "local-key")
+    monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_MODEL", "local-default")
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
+    return runtime
+
+
+def test_model_routes_default_to_local(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    settings = get_settings()
+
+    status = model_routing.routes_status(settings)
+
+    assert status["routes"]["editorial"]["provider"] == "local"
+    assert status["routes"]["editorial"]["effective_model"] == "local-default"
+
+
+def test_model_routes_can_be_saved(monkeypatch, tmp_path):
+    runtime = configure_runtime(monkeypatch, tmp_path)
+    settings = get_settings()
+
+    model_routing.save_routes(
+        settings,
+        {"editorial": {"provider": "ollama_cloud", "model": "gpt-oss:120b", "allow_private_cloud": False}},
+    )
+
+    payload = json.loads((runtime / "data" / "model-settings.json").read_text(encoding="utf-8"))
+    assert payload["model_routes"]["editorial"]["provider"] == "ollama_cloud"
+    assert payload["model_routes"]["editorial"]["model"] == "gpt-oss:120b"
+
+
+def test_cloud_route_uses_ollama_for_public_sources(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_API_KEY", "ollama-key")
+    settings = get_settings()
+    model_routing.save_routes(
+        settings,
+        {"editorial": {"provider": "ollama_cloud", "model": "gpt-oss:120b", "allow_private_cloud": False}},
+    )
+    settings = get_settings()
+    public_item = NormalizedPayload(source_type="youtube_video", raw_text="public video")
+
+    resolution = model_routing.client_for_agent("editorial", settings=settings, items=[public_item])
+
+    assert resolution.client is not None
+    assert resolution.client.config.provider == "ollama_cloud"
+    assert resolution.client.config.api_mode == "ollama"
+    assert resolution.client.config.model == "gpt-oss:120b"
+
+
+def test_private_source_forces_cloud_route_to_local(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_API_KEY", "ollama-key")
+    settings = get_settings()
+    model_routing.save_routes(
+        settings,
+        {"critic": {"provider": "ollama_cloud", "model": "gpt-oss:120b", "allow_private_cloud": False}},
+    )
+    settings = get_settings()
+    private_item = NormalizedPayload(source_type="gmail_link", raw_text="private newsletter")
+
+    resolution = model_routing.client_for_agent("critic", settings=settings, items=[private_item])
+
+    assert resolution.privacy_forced_local is True
+    assert resolution.client is not None
+    assert resolution.client.config.provider == "local"
+    assert resolution.client.config.model == "local-default"

@@ -11,17 +11,22 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.api.admin import router as admin_router
 from backend.app.api.routes import delivery_router, router as api_router
 from backend.app.db.database import init_database
+from backend.app.services import explore
 from backend.app.services.scheduler import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_database()
+    explore.cleanup_expired_exploration_briefs()
+    explore.purge_expired_deleted_explorations()
+    await explore.start_build_queue()
     await start_scheduler()
     try:
         yield
     finally:
         await stop_scheduler()
+        await explore.stop_build_queue()
 
 
 def create_app() -> FastAPI:

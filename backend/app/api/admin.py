@@ -18,7 +18,17 @@ from backend.agents.digestor.gmail import required_scopes
 from backend.agents.digestor.podcast import discover_podcasts
 from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
 from backend.app.db import database
-from backend.app.services import email_delivery, mcp_status, model_catalog, model_jobs, scheduler, source_scout, verification
+from backend.app.services import (
+    email_delivery,
+    mcp_status,
+    model_catalog,
+    model_jobs,
+    model_routing,
+    scheduler,
+    secret_health,
+    source_scout,
+    verification,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +54,20 @@ class ModelJobPayload(BaseModel):
 
 class ModelSelectionPayload(BaseModel):
     model_name: str = Field(min_length=1, max_length=180)
+
+
+class ModelRoutePayload(BaseModel):
+    provider: str = Field(default="local", max_length=40)
+    model: str | None = Field(default=None, max_length=180)
+    allow_private_cloud: bool = False
+
+
+class ModelRoutesPayload(BaseModel):
+    routes: dict[str, ModelRoutePayload] = Field(default_factory=dict)
+
+
+class OllamaCloudCredentialsPayload(BaseModel):
+    api_key: str = Field(min_length=1, max_length=1000)
 
 
 class DeliverySettingsPayload(BaseModel):
@@ -121,6 +145,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
     mcp = await mcp_status.status(settings)
     gmail = gmail_status(request)
     scheduler_status = scheduler.status()
+    secret_status = secret_health.status(settings)
     digests = [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()]
     delivery_status = _delivery_status(request, settings, digests)
     podcast_status = _podcast_status(settings, digests)
@@ -156,7 +181,9 @@ async def admin_status(request: Request) -> dict[str, Any]:
             inference_metrics=inference_metrics,
             source_scout=source_scout,
             delivery=delivery_status,
+            secret_status=secret_status,
         ),
+        "secret_health": secret_status,
         "gmail": gmail,
         "model": {
             "enabled": settings.librarian_use_model,
@@ -167,6 +194,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
             "selection_source": model_catalog.selected_model_source(settings),
             "settings_path": str(settings.model_settings_path),
             "catalog": catalog,
+            "routing": model_routing.routes_status(settings),
         },
         "mcp": mcp,
         "scheduler": scheduler_status,
@@ -183,6 +211,11 @@ async def admin_status(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/secrets/status")
+def secrets_status() -> dict[str, Any]:
+    return secret_health.status(_settings())
+
+
 def _admin_health(
     *,
     gmail: dict[str, Any],
@@ -193,6 +226,7 @@ def _admin_health(
     inference_metrics: dict[str, Any],
     source_scout: dict[str, Any],
     delivery: dict[str, Any],
+    secret_status: dict[str, Any],
 ) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
 
@@ -277,6 +311,16 @@ def _admin_health(
     else:
         add("Email delivery", "warning", "Digest email delivery is not enabled yet.")
 
+    secret_summary = secret_status.get("summary") if isinstance(secret_status.get("summary"), dict) else {}
+    secret_warnings = int(secret_summary.get("warning_count") or 0)
+    add(
+        "Secrets",
+        "ok" if secret_warnings == 0 else "warning",
+        "Secrets are stored with owner-only app permissions."
+        if secret_warnings == 0
+        else f"Secret storage has {secret_warnings} item(s) to review.",
+    )
+
     problem_count = sum(1 for check in checks if check["status"] == "problem")
     warning_count = sum(1 for check in checks if check["status"] == "warning")
     safe_for_overnight = problem_count == 0
@@ -315,6 +359,17 @@ async def select_model(payload: ModelSelectionPayload) -> dict[str, Any]:
         "selection_source": model_catalog.selected_model_source(updated_settings),
         "catalog": await model_catalog.catalog_status(updated_settings),
     }
+
+
+@router.post("/model/routes")
+def save_model_routes(payload: ModelRoutesPayload) -> dict[str, Any]:
+    routes_payload = {agent: route.model_dump() for agent, route in payload.routes.items()}
+    return model_routing.save_routes(_settings(), routes_payload)
+
+
+@router.post("/model/ollama-cloud/credentials")
+def save_ollama_cloud_credentials(payload: OllamaCloudCredentialsPayload) -> dict[str, Any]:
+    return model_routing.save_ollama_api_key(_settings(), payload.api_key)
 
 
 @router.get("/model/jobs")
@@ -616,6 +671,10 @@ def _oauth_flow(
 
 def _write_secret_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path.parent)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     try:
         path.chmod(0o600)
@@ -625,6 +684,10 @@ def _write_secret_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _write_secret_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path.parent)
     path.write_text(value.strip() + "\n", encoding="utf-8")
     try:
         path.chmod(0o600)
@@ -660,12 +723,43 @@ def _finish_gmail_oauth(settings: Settings, request: Request, authorization_resp
         redirect_uri = _callback_url(request, settings)
         flow = _oauth_flow(settings, redirect_uri, state=str(expected_state), code_verifier=str(code_verifier))
         _allow_private_http_redirect(redirect_uri)
-        flow.fetch_token(authorization_response=authorization_response)
-        _write_secret_json(settings.gmail_credentials_path, json.loads(flow.credentials.to_json()))
+        _fetch_token_accepting_extra_scopes(flow, authorization_response)
+        credentials = flow.credentials
+        _verify_gmail_credentials_scopes(credentials, settings)
+        _write_secret_json(settings.gmail_credentials_path, json.loads(credentials.to_json()))
         settings.gmail_oauth_state_path.unlink(missing_ok=True)
     except Exception as exc:
         logger.warning("Gmail OAuth callback failed: %s", exc)
         raise HTTPException(status_code=400, detail="Gmail connection failed") from exc
+
+
+def _fetch_token_accepting_extra_scopes(flow: Any, authorization_response: str) -> None:
+    previous_value = os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE")
+    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+    try:
+        flow.fetch_token(authorization_response=authorization_response)
+    finally:
+        if previous_value is None:
+            os.environ.pop("OAUTHLIB_RELAX_TOKEN_SCOPE", None)
+        else:
+            os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = previous_value
+
+
+def _verify_gmail_credentials_scopes(credentials: Any, settings: Settings) -> None:
+    required = set(required_scopes(hosted_mcp_enabled=settings.gmail_remote_mcp_enabled))
+    granted = _credential_scope_set(credentials)
+    if granted and not required.issubset(granted):
+        missing = sorted(required - granted)
+        raise RuntimeError(f"Gmail did not grant required scope(s): {', '.join(missing)}")
+
+
+def _credential_scope_set(credentials: Any) -> set[str]:
+    raw_scopes = getattr(credentials, "granted_scopes", None) or getattr(credentials, "scopes", None) or []
+    if isinstance(raw_scopes, str):
+        return {scope for scope in raw_scopes.split() if scope}
+    if isinstance(raw_scopes, list | tuple | set):
+        return {str(scope) for scope in raw_scopes if scope}
+    return set()
 
 
 def _state_from_authorization_response(authorization_response: str) -> str | None:

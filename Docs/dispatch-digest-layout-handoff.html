@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Morning Dispatch UI/UX Handoff</title>
+  <style>
+    :root {
+      color: #191817;
+      background: #f4f1ea;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 40px 22px 72px;
+    }
+
+    main {
+      width: min(1120px, 100%);
+      margin: 0 auto;
+    }
+
+    header {
+      border-bottom: 2px solid #1f1d1a;
+      padding-bottom: 22px;
+      margin-bottom: 28px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(2.3rem, 6vw, 5rem);
+      line-height: .95;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 12px;
+      font-size: 1.25rem;
+    }
+
+    h3 {
+      margin: 20px 0 8px;
+      font-size: 1rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: #716b62;
+    }
+
+    p {
+      margin: 0 0 14px;
+      max-width: 820px;
+    }
+
+    code {
+      background: #e8e1d5;
+      padding: 2px 5px;
+      border-radius: 4px;
+    }
+
+    ul {
+      margin: 0 0 18px;
+      padding-left: 22px;
+    }
+
+    li {
+      margin-bottom: 8px;
+    }
+
+    .meta {
+      color: #6f6a62;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      font-size: .78rem;
+    }
+
+    .section {
+      background: #fffaf2;
+      border: 1px solid #d5cec2;
+      border-radius: 10px;
+      padding: 24px;
+      margin: 22px 0;
+    }
+
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    figure {
+      margin: 0;
+      background: #ffffff;
+      border: 1px solid #d5cec2;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    figcaption {
+      padding: 12px 14px;
+      font-size: .86rem;
+      color: #5d5851;
+      font-weight: 700;
+    }
+
+    .prompt {
+      white-space: pre-wrap;
+      background: #191817;
+      color: #fffaf2;
+      border-radius: 10px;
+      padding: 22px;
+      overflow-x: auto;
+      font: 0.94rem/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .callout {
+      border-left: 4px solid #dda66d;
+      padding: 12px 16px;
+      background: #f6efe3;
+      margin: 18px 0;
+    }
+
+    @media (max-width: 880px) {
+      body {
+        padding: 24px 14px 52px;
+      }
+
+      .section {
+        padding: 18px;
+      }
+
+      .image-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="meta">Morning Dispatch - UI/UX handoff - May 26, 2026</p>
+      <h1>Digest Layout Redesign Handoff</h1>
+      <p>
+        This document describes the current Morning Dispatch user experience and provides a handoff prompt for revising the digest layout.
+        The screenshots below capture the present app state at <code>127.0.0.1:8000</code>.
+      </p>
+    </header>
+
+    <section class="section">
+      <h2>Current Screens</h2>
+      <p>
+        The product currently uses a warm paper surface, black primary controls, rounded source chips, and a newspaper-inspired brief page.
+        The home page and admin are intentionally simple; the digest page is the surface most in need of layout refinement.
+      </p>
+      <div class="image-grid">
+        <figure>
+          <img src="ux-handoff-assets/home-current.png" alt="Current Dispatch home screen with recent explorations, composer, and source chips" />
+          <figcaption>Home: recent explorations, composer, source chips, submit action.</figcaption>
+        </figure>
+        <figure>
+          <img src="ux-handoff-assets/admin-library-current.png" alt="Current Dispatch admin screen with tab navigation" />
+          <figcaption>Admin: separate full page with tabs for Status, Sources, Library, Delivery, and Models.</figcaption>
+        </figure>
+        <figure>
+          <img src="ux-handoff-assets/brief-current.png" alt="Current rendered brief with large title, article grid, and digest stats" />
+          <figcaption>Brief: newspaper-style rendered HTML with article cards and digest stats.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Current Product Flow</h2>
+      <ul>
+        <li>Everything starts as an on-demand exploration. The user describes an interest in the composer.</li>
+        <li>The AI refinement flow asks questions, then the user confirms scope, depth, recency, exclusions, and sources.</li>
+        <li>The app builds a brief from selected sources. Source chips define what the AI is allowed to search.</li>
+        <li>After the brief is ready, the user can open it, rebuild it, send it to inbox if delivery is configured, or schedule it as a recurring digest.</li>
+        <li>Scheduled digests and one-off explorations share the same brief rendering core.</li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>Current Home UI</h2>
+      <ul>
+        <li>Header: Dispatch brand mark on the left and a three-dot Admin entry on the right.</li>
+        <li>Returning state: recent explorations appear above the composer as full-width rounded pills.</li>
+        <li>Composer placeholder: <code>Describe what you're interested in?</code></li>
+        <li>Source chips: Web defaults selected; enabled sources can be added or removed before build; disabled sources show as unavailable.</li>
+        <li>Current visual language: soft gray background, white panels, black selected states, rounded controls, restrained typography.</li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>Current Admin UI</h2>
+      <ul>
+        <li>Admin is a separate page behind the three-dot menu.</li>
+        <li>Tabs: Status, Sources, Library, Delivery, Models.</li>
+        <li>Library shows explorations and digests, with independent Recent/Name sort toggles.</li>
+        <li>Sources exposes connection state for Web, Gmail, Reddit, Podcast, YouTube, Collections, and Markets.</li>
+        <li>Admin should remain functional and calm; it is not the primary consumer experience.</li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>Current Brief UI</h2>
+      <ul>
+        <li>The brief is server-rendered HTML, independent from the React admin/home shell.</li>
+        <li>It uses a newspaper-like theme: warm paper background, large serif headline, strong section rules, and a two-column desktop grid.</li>
+        <li>Primary left column contains lead story, fetched article sections, lower-confidence items, and source cards.</li>
+        <li>Right column contains digest stats and source notes.</li>
+        <li>Article cards show source/domain, date, publisher/channel, relevance score, title, AI summary, keywords, and feedback controls.</li>
+        <li>Podcast items can open an in-brief modal with player and transcript.</li>
+        <li>YouTube items can open an in-brief modal with embedded YouTube player, title, channel, summary, transcript, and open-on-YouTube link.</li>
+      </ul>
+      <div class="callout">
+        The brief layout currently feels more like an internal report/newspaper prototype than a polished consumer reading experience.
+        The redesign should make scanning, reading, source review, and media inspection feel deliberate and premium.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>What Should Stay Intact</h2>
+      <ul>
+        <li>Do not change the exploration to digest flow.</li>
+        <li>Do not remove source attribution, relevance scoring, feedback controls, or generated-time metadata.</li>
+        <li>Keep the atomic brief behavior: the ranked brief renders as a coherent whole after build completion.</li>
+        <li>Keep YouTube and Podcast modal review patterns, but the visual design may change.</li>
+        <li>Preserve mobile support and avoid overlapping text or controls.</li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>Handoff Prompt</h2>
+      <div class="prompt">You are redesigning the Morning Dispatch brief layout.
+
+Context:
+Morning Dispatch is a local-first personal intelligence app. A user describes an interest, the AI refines it, selected sources are searched, and the system produces an on-demand exploration brief. A completed exploration can later become a recurring digest. Explorations and digests share the same rendered brief template.
+
+Current UI:
+- Home is a simple Dispatch panel with recent explorations, a large composer, source chips, and Submit.
+- Admin is a separate full page behind a three-dot menu with tabs for Status, Sources, Library, Delivery, and Models.
+- The brief is server-rendered HTML with a newspaper-like visual style: warm paper background, large serif H1, two-column grid, fetched article cards, digest stats, source notes, and feedback controls.
+- YouTube and Podcast items can open modals for media playback and transcript review.
+
+Redesign goal:
+Create a more polished, readable digest/brief experience. The brief should feel like a premium intelligence product, not a raw report. It should help the reader quickly understand the lead, scan sections, inspect sources, and open rich media without losing context.
+
+Primary surface to redesign:
+The rendered brief page. Preserve the existing home/admin patterns unless a small supporting adjustment is necessary.
+
+Must keep:
+- Article title, source, date, publisher/channel, relevance score, summary, keywords, and feedback controls.
+- Digest stats and generation metadata.
+- Source notes / provenance area.
+- Lower-confidence section if present.
+- Podcast modal with player/transcript.
+- YouTube modal with embedded player, title, summary, transcript, and YouTube link.
+- Responsive mobile layout.
+
+Design expectations:
+- Prioritize readability and scanning.
+- Give the lead story stronger editorial hierarchy without making the page feel like a marketing hero.
+- Make source sections easier to compare.
+- Treat media items such as YouTube and Podcast as first-class digest cards.
+- Keep controls calm and obvious.
+- Avoid nested cards, decorative gradient blobs, and oversized UI that wastes reading space.
+- Use a restrained palette with enough contrast between reading surfaces, metadata, and actions.
+- Make long titles safe: no overflow, no awkward clipping, no overlap.
+
+Suggested directions to explore:
+1. A tighter editorial layout with a lead module, section index, compact story cards, and a sticky or side digest summary.
+2. Rich media cards for YouTube/Podcast that show thumbnail/artwork, duration, channel/show, and a clear review action.
+3. A better source/provenance drawer or section that explains where the brief came from without crowding the main reading path.
+4. A clearer distinction between main ranked items, lower-confidence items, and source notes.
+
+Deliverables:
+- Updated brief layout mockup for desktop and mobile.
+- Component/state notes for article cards, lead story, source sections, digest stats, YouTube modal, Podcast modal, and feedback controls.
+- Any recommended copy changes for labels, section headings, and action names.
+- A migration note describing what can change in CSS only versus what needs renderer/template changes.</div>
+    </section>
+  </main>
+</body>
+</html>

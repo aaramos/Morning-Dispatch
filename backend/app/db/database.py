@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape, unescape
 from pathlib import Path
 from typing import Any, Iterator
@@ -114,10 +114,14 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 def init_database() -> None:
     with connect() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA_SQL)
+        _ensure_explore_tables(connection)
         _ensure_digest_run_metric_columns(connection)
         _ensure_digest_delivery_settings_table(connection)
         _ensure_podcast_metrics_table(connection)
+        _ensure_youtube_quota_table(connection)
+        _ensure_collection_tables(connection)
         _ensure_inference_metric_status_values(connection)
         _ensure_default_profile(connection)
 
@@ -135,6 +139,246 @@ def _ensure_default_profile(connection: sqlite3.Connection) -> None:
         """,
         (new_id(), "Adrian", now, now),
     )
+
+
+def _ensure_youtube_quota_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS youtube_quota_usage (
+          usage_date       TEXT PRIMARY KEY,
+          units_used       INTEGER NOT NULL DEFAULT 0,
+          updated_at       TEXT NOT NULL
+        ) STRICT
+        """
+    )
+
+
+def _ensure_collection_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_files (
+          id                TEXT PRIMARY KEY,
+          collection_name   TEXT NOT NULL,
+          file_path         TEXT NOT NULL UNIQUE,
+          relative_path     TEXT NOT NULL,
+          file_type         TEXT NOT NULL,
+          last_modified     REAL NOT NULL,
+          last_indexed      REAL,
+          status            TEXT NOT NULL CHECK(status IN ('pending','indexed','failed','unsupported')),
+          error_message     TEXT,
+          chunk_count       INTEGER NOT NULL DEFAULT 0,
+          updated_at        TEXT NOT NULL
+        ) STRICT
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_chunks (
+          id                TEXT PRIMARY KEY,
+          file_id           TEXT NOT NULL REFERENCES collection_files(id) ON DELETE CASCADE,
+          collection_name   TEXT NOT NULL,
+          file_path         TEXT NOT NULL,
+          relative_path     TEXT NOT NULL,
+          chunk_index       INTEGER NOT NULL,
+          text              TEXT NOT NULL,
+          created_at        TEXT NOT NULL
+        ) STRICT
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_collection_files_collection ON collection_files(collection_name)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_collection_files_status ON collection_files(status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_collection_chunks_collection ON collection_chunks(collection_name)")
+
+
+def record_youtube_quota(units_used: int, *, usage_date: str | None = None) -> dict[str, Any]:
+    units = max(0, int(units_used or 0))
+    if units <= 0:
+        return youtube_quota_summary(usage_date=usage_date)
+    date_key = usage_date or _pacific_date_key()
+    now = utc_now()
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO youtube_quota_usage (usage_date, units_used, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(usage_date) DO UPDATE SET
+              units_used = youtube_quota_usage.units_used + excluded.units_used,
+              updated_at = excluded.updated_at
+            """,
+            (date_key, units, now),
+        )
+        row = connection.execute(
+            "SELECT * FROM youtube_quota_usage WHERE usage_date = ?",
+            (date_key,),
+        ).fetchone()
+    return row_to_dict(row) or {"usage_date": date_key, "units_used": units, "updated_at": now}
+
+
+def youtube_quota_summary(*, usage_date: str | None = None) -> dict[str, Any]:
+    date_key = usage_date or _pacific_date_key()
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM youtube_quota_usage WHERE usage_date = ?",
+            (date_key,),
+        ).fetchone()
+    record = row_to_dict(row) or {"usage_date": date_key, "units_used": 0, "updated_at": None}
+    record["units_used"] = int(record.get("units_used") or 0)
+    return record
+
+
+def upsert_collection_file(
+    *,
+    collection_name: str,
+    file_path: str,
+    relative_path: str,
+    file_type: str,
+    last_modified: float,
+    status: str,
+    error_message: str | None = None,
+    chunk_count: int = 0,
+) -> dict[str, Any]:
+    now = utc_now()
+    with connect() as connection:
+        existing = connection.execute(
+            "SELECT id FROM collection_files WHERE file_path = ?",
+            (file_path,),
+        ).fetchone()
+        file_id = str(existing["id"]) if existing else new_id()
+        connection.execute(
+            """
+            INSERT INTO collection_files (
+              id, collection_name, file_path, relative_path, file_type, last_modified,
+              last_indexed, status, error_message, chunk_count, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_path) DO UPDATE SET
+              collection_name = excluded.collection_name,
+              relative_path = excluded.relative_path,
+              file_type = excluded.file_type,
+              last_modified = excluded.last_modified,
+              last_indexed = excluded.last_indexed,
+              status = excluded.status,
+              error_message = excluded.error_message,
+              chunk_count = excluded.chunk_count,
+              updated_at = excluded.updated_at
+            """,
+            (
+                file_id,
+                collection_name,
+                file_path,
+                relative_path,
+                file_type,
+                float(last_modified),
+                float(last_modified) if status == "indexed" else None,
+                status,
+                error_message,
+                max(0, int(chunk_count or 0)),
+                now,
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM collection_files WHERE file_path = ?",
+            (file_path,),
+        ).fetchone()
+    return row_to_dict(row) or {}
+
+
+def replace_collection_chunks(
+    *,
+    file_id: str,
+    collection_name: str,
+    file_path: str,
+    relative_path: str,
+    chunks: list[str],
+) -> None:
+    now = utc_now()
+    with connect() as connection:
+        connection.execute("DELETE FROM collection_chunks WHERE file_id = ?", (file_id,))
+        for index, text in enumerate(chunks):
+            clean_text = str(text or "").strip()
+            if not clean_text:
+                continue
+            connection.execute(
+                """
+                INSERT INTO collection_chunks (
+                  id, file_id, collection_name, file_path, relative_path, chunk_index, text, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id(),
+                    file_id,
+                    collection_name,
+                    file_path,
+                    relative_path,
+                    index,
+                    clean_text,
+                    now,
+                ),
+            )
+
+
+def delete_collection_files_not_seen(*, root_path: str, seen_paths: set[str]) -> int:
+    prefix = str(Path(root_path).expanduser())
+    deleted = 0
+    with connect() as connection:
+        rows = connection.execute("SELECT id, file_path FROM collection_files").fetchall()
+        for row in rows:
+            file_path = str(row["file_path"] or "")
+            if not file_path.startswith(prefix):
+                continue
+            if file_path in seen_paths:
+                continue
+            connection.execute("DELETE FROM collection_files WHERE id = ?", (row["id"],))
+            deleted += 1
+    return deleted
+
+
+def collection_index_summary(*, root_path: str | None = None) -> dict[str, Any]:
+    prefix = str(Path(root_path).expanduser()) if root_path else None
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM collection_files").fetchall()
+    records = [row_to_dict(row) or {} for row in rows]
+    if prefix:
+        records = [record for record in records if str(record.get("file_path") or "").startswith(prefix)]
+    collections = sorted({str(record.get("collection_name") or "") for record in records if record.get("collection_name")})
+    return {
+        "collection_count": len(collections),
+        "collections": collections,
+        "file_count": len(records),
+        "indexed_count": sum(1 for record in records if record.get("status") == "indexed"),
+        "unsupported_count": sum(1 for record in records if record.get("status") == "unsupported"),
+        "failed_count": sum(1 for record in records if record.get("status") == "failed"),
+        "chunk_count": sum(int(record.get("chunk_count") or 0) for record in records),
+    }
+
+
+def list_collection_chunks(*, collection_names: list[str] | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+    names = {name.strip().lower() for name in collection_names or [] if name.strip()}
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT cc.*, cf.status
+            FROM collection_chunks cc
+            JOIN collection_files cf ON cf.id = cc.file_id
+            WHERE cf.status = 'indexed'
+            ORDER BY cc.created_at DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 1000)),),
+        ).fetchall()
+    records = [row_to_dict(row) or {} for row in rows]
+    if names:
+        records = [record for record in records if str(record.get("collection_name") or "").strip().lower() in names]
+    return records
+
+
+def _pacific_date_key() -> str:
+    try:
+        timezone = ZoneInfo("America/Los_Angeles")
+    except ZoneInfoNotFoundError:
+        timezone = UTC
+    return datetime.now(timezone).date().isoformat()
 
 
 def _ensure_digest_run_metric_columns(connection: sqlite3.Connection) -> None:
@@ -176,6 +420,126 @@ def _ensure_digest_delivery_settings_table(connection: sqlite3.Connection) -> No
         ) STRICT
         """
     )
+
+
+def _ensure_explore_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS topic_profiles (
+          topic_id        TEXT PRIMARY KEY,
+          statement       TEXT NOT NULL,
+          profile_json    TEXT NOT NULL,
+          schedule        TEXT,
+          created_at      TEXT NOT NULL,
+          updated_at      TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS refinement_sessions (
+          session_id     TEXT PRIMARY KEY,
+          statement      TEXT NOT NULL,
+          profile_json   TEXT NOT NULL,
+          messages_json  TEXT NOT NULL,
+          pending_field  TEXT,
+          turn_count     INTEGER NOT NULL DEFAULT 0,
+          status         TEXT NOT NULL CHECK(status IN ('active','finalized')),
+          topic_id       TEXT REFERENCES topic_profiles(topic_id),
+          created_at     TEXT NOT NULL,
+          updated_at     TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS explorations (
+          exploration_id         TEXT PRIMARY KEY,
+          topic_id               TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          mode                   TEXT NOT NULL CHECK(mode IN ('show_now','scheduled')),
+          source_selection_json  TEXT NOT NULL,
+          progress_json          TEXT NOT NULL DEFAULT '{}',
+          status                 TEXT NOT NULL CHECK(status IN ('queued','running','complete','failed')),
+          brief_ref              TEXT,
+          emailed                INTEGER NOT NULL DEFAULT 0,
+          started_at             TEXT NOT NULL,
+          finished_at            TEXT,
+          deleted_at             TEXT,
+          delete_after           TEXT,
+          purged_at              TEXT
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS promoted_sources (
+          id          TEXT PRIMARY KEY,
+          topic_id    TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          adapter     TEXT NOT NULL,
+          ref         TEXT NOT NULL,
+          has_feed    INTEGER NOT NULL DEFAULT 0,
+          feed_url    TEXT,
+          created_at  TEXT NOT NULL
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_topic_profiles_updated_at ON topic_profiles(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_refinement_sessions_updated_at ON refinement_sessions(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_explorations_topic_id ON explorations(topic_id);
+        CREATE INDEX IF NOT EXISTS idx_explorations_status ON explorations(status);
+        CREATE INDEX IF NOT EXISTS idx_promoted_sources_topic_id ON promoted_sources(topic_id);
+        """
+    )
+    existing_columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(explorations)").fetchall()
+    }
+    if "progress_json" not in existing_columns:
+        connection.execute(
+            "ALTER TABLE explorations ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    for column in ("deleted_at", "delete_after", "purged_at"):
+        if column not in existing_columns:
+            connection.execute(f"ALTER TABLE explorations ADD COLUMN {column} TEXT")
+    _ensure_exploration_status_allows_queued(connection)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_explorations_topic_id ON explorations(topic_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_explorations_status ON explorations(status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_explorations_deleted_at ON explorations(deleted_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_explorations_delete_after ON explorations(delete_after)")
+
+
+def _ensure_exploration_status_allows_queued(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'explorations'"
+    ).fetchone()
+    table_sql = str(row["sql"] or "") if row else ""
+    if "'queued'" in table_sql:
+        return
+    connection.execute("ALTER TABLE explorations RENAME TO explorations_old")
+    connection.execute(
+        """
+        CREATE TABLE explorations (
+          exploration_id         TEXT PRIMARY KEY,
+          topic_id               TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          mode                   TEXT NOT NULL CHECK(mode IN ('show_now','scheduled')),
+          source_selection_json  TEXT NOT NULL,
+          progress_json          TEXT NOT NULL DEFAULT '{}',
+          status                 TEXT NOT NULL CHECK(status IN ('queued','running','complete','failed')),
+          brief_ref              TEXT,
+          emailed                INTEGER NOT NULL DEFAULT 0,
+          started_at             TEXT NOT NULL,
+          finished_at            TEXT,
+          deleted_at             TEXT,
+          delete_after           TEXT,
+          purged_at              TEXT
+        ) STRICT
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO explorations (
+          exploration_id, topic_id, mode, source_selection_json, progress_json,
+          status, brief_ref, emailed, started_at, finished_at, deleted_at,
+          delete_after, purged_at
+        )
+        SELECT
+          exploration_id, topic_id, mode, source_selection_json,
+          COALESCE(progress_json, '{}'), status, brief_ref, emailed, started_at,
+          finished_at, deleted_at, delete_after, purged_at
+        FROM explorations_old
+        """
+    )
+    connection.execute("DROP TABLE explorations_old")
 
 
 def _ensure_podcast_metrics_table(connection: sqlite3.Connection) -> None:
@@ -350,6 +714,772 @@ def list_digests(*, include_archived: bool = False) -> list[dict[str, Any]]:
             """
         ).fetchall()
     return [row_to_dict(row) for row in rows if row is not None]
+
+
+def upsert_topic_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    topic_id = str(profile.get("topic_id") or new_id())
+    statement = str(profile.get("statement") or "").strip()
+    if not statement:
+        raise ValueError("Topic profile statement is required")
+    profile = {**profile, "topic_id": topic_id}
+    now = utc_now()
+    with connect() as connection:
+        existing = connection.execute(
+            "SELECT created_at FROM topic_profiles WHERE topic_id = ?",
+            (topic_id,),
+        ).fetchone()
+        created_at = str(existing["created_at"]) if existing else now
+        connection.execute(
+            """
+            INSERT INTO topic_profiles (
+              topic_id, statement, profile_json, schedule, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(topic_id) DO UPDATE SET
+              statement = excluded.statement,
+              profile_json = excluded.profile_json,
+              schedule = excluded.schedule,
+              updated_at = excluded.updated_at
+            """,
+            (
+                topic_id,
+                statement,
+                json.dumps(profile, sort_keys=True),
+                profile.get("schedule"),
+                created_at,
+                now,
+            ),
+        )
+    record = get_topic_profile(topic_id)
+    if record is None:
+        raise RuntimeError("Topic profile was not saved")
+    return record
+
+
+def list_topic_profiles(*, include_deleted: bool = False) -> list[dict[str, Any]]:
+    deleted_filter = "" if include_deleted else "WHERE COALESCE(json_extract(profile_json, '$.deleted'), 0) != 1"
+    with connect() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT * FROM topic_profiles
+            {deleted_filter}
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+    return [_topic_profile_row_to_dict(row) for row in rows]
+
+
+def list_scheduled_topic_profiles(
+    *,
+    include_archived: bool = False,
+    include_paused: bool = False,
+    include_deleted: bool = False,
+) -> list[dict[str, Any]]:
+    archived_filter = "" if include_archived else "AND COALESCE(json_extract(profile_json, '$.archived'), 0) != 1"
+    paused_filter = "" if include_paused else "AND COALESCE(json_extract(profile_json, '$.status'), 'active') != 'paused'"
+    deleted_filter = "" if include_deleted else "AND COALESCE(json_extract(profile_json, '$.deleted'), 0) != 1"
+    with connect() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT * FROM topic_profiles
+            WHERE schedule IS NOT NULL
+              AND TRIM(schedule) != ''
+              {archived_filter}
+              {paused_filter}
+              {deleted_filter}
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+    return [_topic_profile_row_to_dict(row) for row in rows]
+
+
+def get_topic_profile(topic_id: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM topic_profiles WHERE topic_id = ?",
+            (topic_id,),
+        ).fetchone()
+    return _topic_profile_row_to_dict(row) if row else None
+
+
+def create_refinement_session(
+    *,
+    statement: str,
+    profile: dict[str, Any],
+    messages: list[dict[str, str]],
+    pending_field: str | None,
+    status: str = "active",
+) -> dict[str, Any]:
+    now = utc_now()
+    session_id = new_id()
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO refinement_sessions (
+              session_id, statement, profile_json, messages_json, pending_field,
+              turn_count, status, topic_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, ?)
+            """,
+            (
+                session_id,
+                statement,
+                json.dumps(profile, sort_keys=True),
+                json.dumps(messages),
+                pending_field,
+                status,
+                now,
+                now,
+            ),
+        )
+    record = get_refinement_session(session_id)
+    if record is None:
+        raise RuntimeError("Refinement session was not created")
+    return record
+
+
+def get_refinement_session(session_id: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM refinement_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return _refinement_session_row_to_dict(row) if row else None
+
+
+def update_refinement_session(
+    session_id: str,
+    *,
+    profile: dict[str, Any],
+    messages: list[dict[str, str]],
+    pending_field: str | None,
+    turn_count: int,
+    status: str,
+    topic_id: str | None,
+) -> dict[str, Any] | None:
+    if get_refinement_session(session_id) is None:
+        return None
+    now = utc_now()
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE refinement_sessions
+            SET profile_json = ?,
+                messages_json = ?,
+                pending_field = ?,
+                turn_count = ?,
+                status = ?,
+                topic_id = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            (
+                json.dumps(profile, sort_keys=True),
+                json.dumps(messages),
+                pending_field,
+                int(turn_count),
+                status,
+                topic_id,
+                now,
+                session_id,
+            ),
+        )
+    return get_refinement_session(session_id)
+
+
+def delete_refinement_session(session_id: str) -> bool:
+    with connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM refinement_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        return bool(cursor.rowcount)
+
+
+def create_exploration(
+    *,
+    topic_id: str,
+    mode: str,
+    source_selection: dict[str, bool],
+    status: str = "running",
+) -> dict[str, Any]:
+    if status not in {"queued", "running", "complete", "failed"}:
+        raise ValueError("Unsupported exploration status")
+    now = utc_now()
+    exploration_id = new_id()
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO explorations (
+              exploration_id, topic_id, mode, source_selection_json, status,
+              progress_json, brief_ref, emailed, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, '{}', NULL, 0, ?, NULL)
+            """,
+            (
+                exploration_id,
+                topic_id,
+                mode,
+                json.dumps(source_selection, sort_keys=True),
+                status,
+                now,
+            ),
+        )
+    record = get_exploration(exploration_id)
+    if record is None:
+        raise RuntimeError("Exploration was not created")
+    return record
+
+
+def get_latest_exploration(
+    *,
+    topic_id: str,
+    mode: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    conditions = ["topic_id = ?", "deleted_at IS NULL"]
+    values: list[Any] = [topic_id]
+    if mode is not None:
+        conditions.append("mode = ?")
+        values.append(mode)
+    if status is not None:
+        conditions.append("status = ?")
+        values.append(status)
+    query = f"""
+        SELECT *
+        FROM explorations
+        WHERE {" AND ".join(conditions)}
+        ORDER BY COALESCE(finished_at, started_at) DESC
+        LIMIT 1
+    """
+    with connect() as connection:
+        row = connection.execute(query, tuple(values)).fetchone()
+    return _exploration_row_to_dict(row) if row else None
+
+
+def update_exploration_status(
+    exploration_id: str,
+    *,
+    status: str,
+    brief_ref: str | None = None,
+    emailed: bool | None = None,
+) -> dict[str, Any] | None:
+    existing = get_exploration(exploration_id)
+    if existing is None:
+        return None
+    finished_at = utc_now() if status in {"complete", "failed"} else existing.get("finished_at")
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE explorations
+            SET status = ?,
+                brief_ref = COALESCE(?, brief_ref),
+                emailed = COALESCE(?, emailed),
+                finished_at = ?
+            WHERE exploration_id = ?
+            """,
+            (
+                status,
+                brief_ref,
+                None if emailed is None else int(emailed),
+                finished_at,
+                exploration_id,
+            ),
+        )
+    return get_exploration(exploration_id)
+
+
+def update_exploration_progress(
+    exploration_id: str,
+    *,
+    progress: dict[str, Any],
+) -> dict[str, Any] | None:
+    if get_exploration(exploration_id) is None:
+        return None
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE explorations
+            SET progress_json = ?
+            WHERE exploration_id = ?
+            """,
+            (json.dumps(progress, sort_keys=True), exploration_id),
+        )
+    return get_exploration(exploration_id)
+
+
+def claim_next_queued_exploration() -> dict[str, Any] | None:
+    now = utc_now()
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT exploration_id
+            FROM explorations
+            WHERE status = 'queued'
+              AND deleted_at IS NULL
+            ORDER BY started_at ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        exploration_id = str(row["exploration_id"])
+        connection.execute(
+            """
+            UPDATE explorations
+            SET status = 'running',
+                started_at = ?,
+                finished_at = NULL
+            WHERE exploration_id = ? AND status = 'queued'
+            """,
+            (now, exploration_id),
+        )
+    return get_exploration(exploration_id)
+
+
+def requeue_running_explorations() -> int:
+    with connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE explorations
+            SET status = 'queued',
+                finished_at = NULL
+            WHERE status = 'running'
+              AND deleted_at IS NULL
+            """
+        )
+        return int(cursor.rowcount or 0)
+
+
+def mark_exploration_emailed(exploration_id: str) -> dict[str, Any] | None:
+    if get_exploration(exploration_id) is None:
+        return None
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE explorations
+            SET emailed = 1
+            WHERE exploration_id = ?
+            """,
+            (exploration_id,),
+        )
+    return get_exploration(exploration_id)
+
+
+def get_exploration(exploration_id: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM explorations WHERE exploration_id = ?",
+            (exploration_id,),
+        ).fetchone()
+    return _exploration_row_to_dict(row) if row else None
+
+
+def list_explorations(
+    topic_id: str | None = None,
+    *,
+    limit: int | None = None,
+    include_deleted: bool = False,
+    only_deleted: bool = False,
+) -> list[dict[str, Any]]:
+    conditions: list[str] = []
+    values: list[Any] = []
+    if topic_id:
+        conditions.append("topic_id = ?")
+        values.append(topic_id)
+    if only_deleted:
+        conditions.append("deleted_at IS NOT NULL")
+    elif not include_deleted:
+        conditions.append("deleted_at IS NULL")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    limit_clause = "LIMIT ?" if limit is not None else ""
+    if limit is not None:
+        values.append(max(1, int(limit)))
+    with connect() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT *
+            FROM explorations
+            {where}
+            ORDER BY started_at DESC
+            {limit_clause}
+            """,
+            tuple(values),
+        ).fetchall()
+    return [_exploration_row_to_dict(row) for row in rows]
+
+
+def soft_delete_exploration(
+    exploration_id: str,
+    *,
+    retention_days: int = 7,
+) -> dict[str, Any] | None:
+    existing = get_exploration(exploration_id)
+    if existing is None:
+        return None
+    now_dt = datetime.now(UTC)
+    deleted_at = now_dt.isoformat(timespec="seconds")
+    delete_after = (now_dt + timedelta(days=max(1, retention_days))).isoformat(timespec="seconds")
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE explorations
+            SET deleted_at = COALESCE(deleted_at, ?),
+                delete_after = COALESCE(delete_after, ?)
+            WHERE exploration_id = ?
+            """,
+            (deleted_at, delete_after, exploration_id),
+        )
+        _hide_standalone_topic_if_fully_deleted(connection, str(existing["topic_id"]))
+    return get_exploration(exploration_id)
+
+
+def restore_exploration(exploration_id: str) -> dict[str, Any] | None:
+    existing = get_exploration(exploration_id)
+    if existing is None or not existing.get("deleted_at"):
+        return existing
+    now = utc_now()
+    if str(existing.get("delete_after") or "") <= now:
+        return None
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE explorations
+            SET deleted_at = NULL,
+                delete_after = NULL,
+                purged_at = NULL
+            WHERE exploration_id = ?
+            """,
+            (exploration_id,),
+        )
+        _restore_topic_after_exploration_undo(connection, str(existing["topic_id"]))
+    return get_exploration(exploration_id)
+
+
+def purge_expired_deleted_explorations() -> int:
+    now = utc_now()
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM explorations
+            WHERE deleted_at IS NOT NULL
+              AND delete_after IS NOT NULL
+              AND delete_after <= ?
+            """,
+            (now,),
+        ).fetchall()
+        purged = 0
+        for row in rows:
+            record = _exploration_row_to_dict(row)
+            topic_id = str(record.get("topic_id") or "")
+            _delete_exploration_artifacts(record)
+            connection.execute(
+                "DELETE FROM explorations WHERE exploration_id = ?",
+                (record["exploration_id"],),
+            )
+            _delete_standalone_topic_if_orphaned(connection, topic_id)
+            purged += 1
+    return purged
+
+
+def reset_exploration_for_rebuild(
+    exploration_id: str,
+    *,
+    source_selection: dict[str, bool],
+    progress: dict[str, Any],
+) -> dict[str, Any] | None:
+    existing = get_exploration(exploration_id)
+    if existing is None or existing.get("deleted_at"):
+        return None
+    now = utc_now()
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE explorations
+            SET status = 'queued',
+                source_selection_json = ?,
+                progress_json = ?,
+                brief_ref = NULL,
+                emailed = 0,
+                started_at = ?,
+                finished_at = NULL
+            WHERE exploration_id = ?
+            """,
+            (
+                json.dumps(source_selection, sort_keys=True),
+                json.dumps(progress, sort_keys=True),
+                now,
+                exploration_id,
+            ),
+        )
+    return get_exploration(exploration_id)
+
+
+def clear_expired_exploration_briefs(*, before_started_at: str) -> int:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT exploration_id, brief_ref
+            FROM explorations
+            WHERE mode = 'show_now'
+              AND brief_ref IS NOT NULL
+              AND started_at < ?
+            """,
+            (before_started_at,),
+        ).fetchall()
+        cleared = 0
+        for row in rows:
+            brief_ref = str(row["brief_ref"] or "")
+            if brief_ref:
+                try:
+                    Path(brief_ref).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            connection.execute(
+                "UPDATE explorations SET brief_ref = NULL WHERE exploration_id = ?",
+                (row["exploration_id"],),
+            )
+            cleared += 1
+    return cleared
+
+
+def _delete_exploration_artifacts(record: dict[str, Any]) -> None:
+    settings = get_settings()
+    output_dir = (settings.data_dir / "digest-output").resolve()
+    exploration_id = str(record.get("exploration_id") or "").strip()
+    paths: set[Path] = set()
+    brief_ref = str(record.get("brief_ref") or "").strip()
+    if brief_ref:
+        paths.add(Path(brief_ref))
+    if exploration_id:
+        paths.update(output_dir.glob(f"exploration-{exploration_id}.*"))
+    for path in paths:
+        _unlink_if_under(path, output_dir)
+
+
+def _unlink_if_under(path: Path, parent: Path) -> None:
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        return
+    if parent not in (resolved_path, *resolved_path.parents):
+        return
+    try:
+        resolved_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _hide_standalone_topic_if_fully_deleted(connection: sqlite3.Connection, topic_id: str) -> None:
+    if not topic_id:
+        return
+    topic = connection.execute(
+        "SELECT schedule, profile_json FROM topic_profiles WHERE topic_id = ?",
+        (topic_id,),
+    ).fetchone()
+    if topic is None or str(topic["schedule"] or "").strip():
+        return
+    active_count = int(
+        connection.execute(
+            "SELECT COUNT(*) AS count FROM explorations WHERE topic_id = ? AND deleted_at IS NULL",
+            (topic_id,),
+        ).fetchone()["count"]
+    )
+    if active_count:
+        return
+    _set_topic_deleted(connection, topic_id, topic, deleted=True)
+
+
+def _restore_topic_after_exploration_undo(connection: sqlite3.Connection, topic_id: str) -> None:
+    if not topic_id:
+        return
+    topic = connection.execute(
+        "SELECT schedule, profile_json FROM topic_profiles WHERE topic_id = ?",
+        (topic_id,),
+    ).fetchone()
+    if topic is None or str(topic["schedule"] or "").strip():
+        return
+    _set_topic_deleted(connection, topic_id, topic, deleted=False)
+
+
+def _delete_standalone_topic_if_orphaned(connection: sqlite3.Connection, topic_id: str) -> None:
+    if not topic_id:
+        return
+    topic = connection.execute(
+        "SELECT schedule, profile_json FROM topic_profiles WHERE topic_id = ?",
+        (topic_id,),
+    ).fetchone()
+    if topic is None or str(topic["schedule"] or "").strip():
+        return
+    remaining_count = int(
+        connection.execute(
+            "SELECT COUNT(*) AS count FROM explorations WHERE topic_id = ?",
+            (topic_id,),
+        ).fetchone()["count"]
+    )
+    if remaining_count:
+        return
+    connection.execute("DELETE FROM promoted_sources WHERE topic_id = ?", (topic_id,))
+    connection.execute("DELETE FROM topic_profiles WHERE topic_id = ?", (topic_id,))
+
+
+def _set_topic_deleted(connection: sqlite3.Connection, topic_id: str, topic: sqlite3.Row, *, deleted: bool) -> None:
+    try:
+        profile = json.loads(str(topic["profile_json"] or "{}"))
+    except json.JSONDecodeError:
+        profile = {}
+    if not isinstance(profile, dict):
+        profile = {}
+    profile["deleted"] = deleted
+    profile["archived"] = deleted
+    if deleted:
+        profile["status"] = "deleted"
+    elif profile.get("status") == "deleted":
+        profile["status"] = "active"
+    now = utc_now()
+    connection.execute(
+        """
+        UPDATE topic_profiles
+        SET profile_json = ?,
+            updated_at = ?
+        WHERE topic_id = ?
+        """,
+        (json.dumps(profile, sort_keys=True), now, topic_id),
+    )
+
+
+def add_promoted_source(
+    *,
+    topic_id: str,
+    adapter: str,
+    ref: str,
+    has_feed: bool = False,
+    feed_url: str | None = None,
+) -> dict[str, Any]:
+    now = utc_now()
+    promoted_id = new_id()
+    with connect() as connection:
+        existing = connection.execute(
+            """
+            SELECT * FROM promoted_sources
+            WHERE topic_id = ? AND adapter = ? AND ref = ?
+            """,
+            (
+                topic_id,
+                str(adapter).strip(),
+                str(ref).strip(),
+            ),
+        ).fetchone()
+        if existing is not None:
+            return _promoted_source_row_to_dict(existing)
+        connection.execute(
+            """
+            INSERT INTO promoted_sources (
+              id, topic_id, adapter, ref, has_feed, feed_url, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (promoted_id, topic_id, adapter, ref, int(has_feed), feed_url, now),
+        )
+    record = get_promoted_source(promoted_id)
+    if record is None:
+        raise RuntimeError("Promoted source was not created")
+    return record
+
+
+def get_promoted_source(promoted_id: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM promoted_sources WHERE id = ?",
+            (promoted_id,),
+        ).fetchone()
+    return _promoted_source_row_to_dict(row) if row else None
+
+
+def _topic_profile_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    try:
+        profile = json.loads(record.pop("profile_json") or "{}")
+    except json.JSONDecodeError:
+        profile = {}
+    record["profile"] = _hydrate_promoted_sources(
+        record.get("topic_id") or "",
+        profile if isinstance(profile, dict) else {},
+    )
+    return record
+
+
+def _refinement_session_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    try:
+        profile = json.loads(record.pop("profile_json") or "{}")
+    except json.JSONDecodeError:
+        profile = {}
+    try:
+        messages = json.loads(record.pop("messages_json") or "[]")
+    except json.JSONDecodeError:
+        messages = []
+    record["profile"] = profile if isinstance(profile, dict) else {}
+    record["messages"] = messages if isinstance(messages, list) else []
+    return record
+
+
+def _exploration_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    try:
+        source_selection = json.loads(record.pop("source_selection_json") or "{}")
+    except json.JSONDecodeError:
+        source_selection = {}
+    record["source_selection"] = source_selection if isinstance(source_selection, dict) else {}
+    try:
+        progress = json.loads(record.pop("progress_json") or "{}")
+    except json.JSONDecodeError:
+        progress = {}
+    record["progress"] = progress if isinstance(progress, dict) else {}
+    record["emailed"] = bool(record.get("emailed"))
+    return record
+
+
+def _hydrate_promoted_sources(topic_id: str, profile: dict[str, Any]) -> dict[str, Any]:
+    profile_dict = dict(profile)
+    try:
+        rows = list_promoted_sources(topic_id)
+    except Exception:
+        rows = []
+    if rows:
+        profile_dict["promoted_sources"] = [
+            {
+                "adapter": row.get("adapter"),
+                "ref": row.get("ref"),
+                "has_feed": bool(row.get("has_feed")),
+                "feed_url": row.get("feed_url"),
+            }
+            for row in rows
+            if isinstance(row, dict) and row.get("adapter") and row.get("ref")
+        ]
+    else:
+        existing = profile_dict.get("promoted_sources")
+        if existing is None:
+            profile_dict["promoted_sources"] = []
+        elif not isinstance(existing, list):
+            profile_dict["promoted_sources"] = []
+    return profile_dict
+
+
+def _promoted_source_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    record["has_feed"] = bool(record.get("has_feed"))
+    return record
+
+
+def list_promoted_sources(topic_id: str) -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM promoted_sources WHERE topic_id = ? ORDER BY created_at DESC, id DESC",
+            (topic_id,),
+        ).fetchall()
+    return [_promoted_source_row_to_dict(row) for row in rows]
 
 
 def get_digest(digest_id: str) -> dict[str, Any] | None:
@@ -1130,7 +2260,7 @@ def cache_model_enrichments(article_results: list[ArticleFetchResult], *, model_
     return cached_count
 
 
-def _build_digest_stats(
+def build_digest_stats(
     *,
     configured_source_count: int,
     newsletter_count: int,
@@ -1159,9 +2289,36 @@ def _build_digest_stats(
         "completion_tokens": token_summary["completion_tokens"],
         "total_tokens": token_summary["total_tokens"],
         "model_call_count": token_summary["model_call_count"],
+        "model_success_count": token_summary["model_success_count"],
+        "model_failure_count": token_summary["model_failure_count"],
+        "completion_unavailable_count": token_summary["completion_unavailable_count"],
+        "model_usage": inference_model_usage_summary(inference_run_id),
         "processing_seconds": _nullable_float(duration_seconds),
         "stage_seconds": _normalize_stage_seconds(stage_seconds),
     }
+
+
+def _build_digest_stats(
+    *,
+    configured_source_count: int,
+    newsletter_count: int,
+    link_count: int,
+    podcast_episode_count: int = 0,
+    article_results: list[ArticleFetchResult],
+    duration_seconds: float | None,
+    inference_run_id: str | None,
+    stage_seconds: dict[str, float] | None,
+) -> dict[str, Any]:
+    return build_digest_stats(
+        configured_source_count=configured_source_count,
+        newsletter_count=newsletter_count,
+        link_count=link_count,
+        podcast_episode_count=podcast_episode_count,
+        article_results=article_results,
+        duration_seconds=duration_seconds,
+        inference_run_id=inference_run_id,
+        stage_seconds=stage_seconds,
+    )
 
 
 def _empty_token_summary() -> dict[str, int]:
@@ -1170,6 +2327,9 @@ def _empty_token_summary() -> dict[str, int]:
         "completion_tokens": 0,
         "total_tokens": 0,
         "model_call_count": 0,
+        "model_success_count": 0,
+        "model_failure_count": 0,
+        "completion_unavailable_count": 0,
     }
 
 
@@ -1193,6 +2353,9 @@ def inference_token_summary(inference_run_id: str | None) -> dict[str, int]:
             """
             SELECT
               COUNT(*) AS model_call_count,
+              COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS model_success_count,
+              COALESCE(SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END), 0) AS model_failure_count,
+              COALESCE(SUM(CASE WHEN completion_tokens IS NULL THEN 1 ELSE 0 END), 0) AS completion_unavailable_count,
               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
               COALESCE(SUM(completion_tokens), 0) AS completion_tokens
             FROM inference_metrics
@@ -1207,7 +2370,41 @@ def inference_token_summary(inference_run_id: str | None) -> dict[str, int]:
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "model_call_count": int(row["model_call_count"] or 0) if row else 0,
+        "model_success_count": int(row["model_success_count"] or 0) if row else 0,
+        "model_failure_count": int(row["model_failure_count"] or 0) if row else 0,
+        "completion_unavailable_count": int(row["completion_unavailable_count"] or 0) if row else 0,
     }
+
+
+def inference_model_usage_summary(inference_run_id: str | None) -> list[dict[str, Any]]:
+    if not inference_run_id:
+        return []
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+              model,
+              mode,
+              COUNT(*) AS call_count,
+              COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+              COALESCE(SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END), 0) AS failure_count
+            FROM inference_metrics
+            WHERE run_id = ?
+            GROUP BY model, mode
+            ORDER BY call_count DESC, model ASC, mode ASC
+            """,
+            (inference_run_id,),
+        ).fetchall()
+    return [
+        {
+            "model": str(row["model"] or "unknown"),
+            "mode": str(row["mode"] or "single"),
+            "call_count": int(row["call_count"] or 0),
+            "success_count": int(row["success_count"] or 0),
+            "failure_count": int(row["failure_count"] or 0),
+        }
+        for row in rows
+    ]
 
 
 def render_ingested_issue(
@@ -1219,38 +2416,61 @@ def render_ingested_issue(
     generated_at: str | None = None,
     issue_id: str | None = None,
     digest_stats: dict[str, Any] | None = None,
+    newsletter_payloads: list[NormalizedPayload] | None = None,
 ) -> str:
     article_results = article_results or []
-    body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
-    fetched_articles = [result for result in article_results if result.fetched and result.tier != "dropped"]
-    lead_article = next((result for result in fetched_articles if result.tier == "lead"), None)
-    main_articles = [result for result in fetched_articles if result is not lead_article and result.tier == "main"]
-    lower_confidence_articles = [result for result in fetched_articles if result.tier == "lower_confidence"]
-    hidden_article_count = max(
-        0,
-        len(fetched_articles) - len(main_articles) - len(lower_confidence_articles) - (1 if lead_article else 0),
+    body_payloads = (
+        list(newsletter_payloads)
+        if newsletter_payloads is not None
+        else [payload for payload in payloads if payload.source_type == "gmail"]
     )
+    fetched_articles = [result for result in article_results if result.fetched and result.tier != "dropped"]
+    story_articles = [result for result in fetched_articles if not _is_media_result(result)]
+    media_articles = [result for result in fetched_articles if _is_media_result(result)]
+    lead_article = next((result for result in story_articles if result.tier == "lead"), None)
+    if lead_article is None and story_articles:
+        lead_article = story_articles[0]
+    ranked_articles = [
+        result
+        for result in story_articles
+        if result is not lead_article and result.tier != "lower_confidence"
+    ]
+    lower_confidence_articles = [
+        result
+        for result in story_articles
+        if result is not lead_article and result.tier == "lower_confidence"
+    ]
 
     newsletter_items = [_render_newsletter_item(payload) for payload in body_payloads]
     newsletter_html = "\n".join(item for item in newsletter_items if item)
-    lead_html = _render_article_card(lead_article, variant="lead", issue_id=issue_id) if lead_article else ""
-    section_html = _render_article_sections(main_articles, issue_id=issue_id)
-    lower_html = "\n".join(
-        _render_article_card(result, variant="compact", issue_id=issue_id)
-        for result in lower_confidence_articles
+    effective_stats = digest_stats or _build_digest_stats(
+        configured_source_count=0,
+        newsletter_count=len(body_payloads),
+        link_count=sum(1 for payload in payloads if payload.source_type == "gmail_link"),
+        podcast_episode_count=sum(1 for payload in payloads if payload.source_type == "podcast_episode"),
+        article_results=article_results,
+        duration_seconds=None,
+        inference_run_id=None,
+        stage_seconds=None,
     )
-    stats_html = _render_digest_stats(
-        digest_stats
-        or _build_digest_stats(
-            configured_source_count=0,
-            newsletter_count=len(body_payloads),
-            link_count=sum(1 for payload in payloads if payload.source_type == "gmail_link"),
-            podcast_episode_count=sum(1 for payload in payloads if payload.source_type == "podcast_episode"),
-            article_results=article_results,
-            duration_seconds=None,
-            inference_run_id=None,
-            stage_seconds=None,
-        )
+    lead_html = _render_lead_story(lead_article, issue_id=issue_id) if lead_article else ""
+    image_strip_html = _render_image_strip([result for result in [lead_article, *ranked_articles, *media_articles] if result])
+    ranked_html = "\n".join(
+        _render_ranked_story(result, index=index, issue_id=issue_id)
+        for index, result in enumerate(ranked_articles, start=1)
+    )
+    media_html = "\n".join(_render_media_card(result, issue_id=issue_id) for result in media_articles)
+    lower_html = "\n".join(
+        _render_lower_confidence_story(result, index=index, issue_id=issue_id)
+        for index, result in enumerate(lower_confidence_articles, start=len(ranked_articles) + 1)
+    )
+    sidebar_html = _render_brief_sidebar(
+        stats=effective_stats,
+        newsletter_html=newsletter_html,
+        newsletter_count=len(newsletter_items),
+        article_count=len(story_articles),
+        media_count=len(media_articles),
+        lookback_hours=lookback_hours,
     )
     empty_state = ""
     if not payloads:
@@ -1260,22 +2480,32 @@ def render_ingested_issue(
           Check the source allowlist, Gmail labels, or the digest lookback window.
         </section>
         """
-    hidden_html_parts = []
-    if hidden_article_count:
-        hidden_html_parts.append(f"{hidden_article_count} additional fetched article(s)")
-    hidden_html = ""
-    if hidden_html_parts:
-        hidden_html = f'<p class="more-count">Plus {" and ".join(hidden_html_parts)}.</p>'
+    ranked_empty = ""
+    if not lead_html and not ranked_html and not media_html:
+        ranked_empty = '<p class="meta">No article pages were fetched yet.</p>'
+    media_section = ""
+    if media_html:
+        media_section = f"""
+        <section class="media-section" aria-labelledby="media-heading">
+          <div class="section-kicker">Media</div>
+          <h2 id="media-heading">Watch & listen</h2>
+          <div class="media-grid">{media_html}</div>
+        </section>
+        """
     lower_section = ""
     if lower_html:
         lower_section = f"""
-        <section class="section lower-confidence">
-          <h2>Lower Confidence</h2>
-          <div class="article-list">{lower_html}</div>
+        <section class="lower-confidence" aria-labelledby="lower-confidence-heading">
+          <div class="section-kicker">Lower confidence</div>
+          <h2 id="lower-confidence-heading">Worth a skim</h2>
+          <div class="low-conf-list">{lower_html}</div>
         </section>
         """
-    generated_footer = _render_generated_footer(generated_at or utc_now())
+    generated_value = generated_at or utc_now()
+    masthead_meta = _render_masthead_meta(generated_value, lookback_hours, effective_stats)
+    generated_footer = _render_generated_footer(generated_value)
     feedback_script = _render_feedback_script(issue_id)
+    podcast_script = _render_podcast_modal_script()
 
     return f"""<!doctype html>
 <html lang="en">
@@ -1283,88 +2513,180 @@ def render_ingested_issue(
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{escape(title)}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700;800&family=Playfair+Display:wght@700;800;900&display=swap" rel="stylesheet" />
   <style>
-    :root {{ color: #171717; background: #f7f3eb; }}
+    :root {{
+      color: #221d18;
+      background: #f4efe6;
+      --paper: #fffaf1;
+      --paper-deep: #f4efe6;
+      --ink: #221d18;
+      --muted: #796f65;
+      --line: #d8cbbc;
+      --accent: #b53a32;
+      --accent-dark: #84251f;
+      --sidebar: #ebe3d5;
+      --shadow: 0 24px 80px rgba(48, 35, 24, .13);
+      --display: 'Playfair Display', Georgia, 'Times New Roman', serif;
+      --body: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --mono: 'DM Mono', 'SFMono-Regular', Consolas, monospace;
+    }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ width: 100%; max-width: 100%; overflow-x: hidden; }}
-    body {{ margin: 0; font-family: Georgia, 'Times New Roman', serif; color: #171717; background: #f7f3eb; }}
-    main {{ width: min(1120px, 100%); margin: 0 auto; padding: 44px 24px 64px; }}
-    header {{ border-bottom: 3px solid #171717; padding-bottom: 18px; margin-bottom: 28px; }}
-    h1 {{ font-size: clamp(2.4rem, 7vw, 5.4rem); line-height: .9; margin: 0; letter-spacing: 0; }}
-    h2 {{ font: 800 0.9rem Arial, sans-serif; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 16px; }}
-    h3 {{ font-size: 1.35rem; line-height: 1.15; margin: 0 0 8px; }}
-    h1, h2, h3, p, a, .meta {{ overflow-wrap: anywhere; }}
-    a {{ color: #173f63; text-decoration-thickness: 1px; text-underline-offset: 3px; }}
+    body {{ margin: 0; font-family: var(--body); color: var(--ink); background: radial-gradient(circle at top left, #fffaf1 0, #f4efe6 38%, #eee4d5 100%); }}
+    .brief-shell {{ width: min(1180px, 100%); margin: 0 auto; padding: 34px 24px 64px; }}
+    .brief-masthead {{ display: flex; justify-content: space-between; gap: 18px; align-items: center; border-bottom: 1px solid var(--ink); padding-bottom: 16px; margin-bottom: 28px; }}
+    .masthead-brand {{ font-family: var(--display); font-size: clamp(2rem, 5vw, 4.2rem); font-weight: 900; line-height: .9; letter-spacing: 0; }}
+    .masthead-meta, .dateline, .section-kicker, .meta {{ font: 700 .74rem/1.35 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .masthead-meta {{ max-width: 48ch; text-align: right; }}
+    .brief-header {{ display: grid; gap: 14px; max-width: 920px; margin-bottom: 30px; }}
+    h1 {{ font-family: var(--display); font-size: 2.85rem; font-weight: 900; line-height: .98; margin: 0; letter-spacing: 0; }}
+    .brief-header h1 {{ display: -webkit-box; max-height: 11.18rem; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: break-word; word-break: normal; hyphens: auto; }}
+    h2 {{ font-family: var(--display); font-size: clamp(2rem, 4vw, 3.2rem); line-height: .95; margin: 0 0 18px; letter-spacing: 0; }}
+    h3 {{ font-family: var(--display); font-size: clamp(1.35rem, 3vw, 2.05rem); line-height: 1.05; margin: 0; letter-spacing: 0; }}
+    h1, h2, h3, h4, p, a, .meta, .story-title, .side-value {{ overflow-wrap: anywhere; }}
+    a {{ color: inherit; text-decoration-thickness: 1px; text-underline-offset: 4px; }}
     img, video, iframe, table {{ max-width: 100%; }}
-    .date {{ margin-top: 12px; font: 700 0.8rem Arial, sans-serif; text-transform: uppercase; }}
-    .snapshot {{ font-size: 1.28rem; line-height: 1.45; max-width: 820px; margin-bottom: 28px; }}
-    .meta {{ font: 700 0.74rem Arial, sans-serif; color: #5f675f; text-transform: uppercase; overflow-wrap: anywhere; }}
-    .grid {{ display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); gap: 32px; align-items: start; }}
-    .section {{ border-top: 1px solid #171717; padding-top: 18px; }}
-    .section + .section {{ margin-top: 32px; }}
-    .grid, .section, .article-card, .newsletter, .link-item {{ min-width: 0; }}
-    .article-card {{ padding: 0 0 22px; margin-bottom: 22px; border-bottom: 1px solid #d4cbbd; }}
-    .article-card p {{ font-size: 1rem; line-height: 1.55; margin: 10px 0 0; }}
-    .article-card a {{ color: inherit; }}
-    .article-card.lead {{ padding-bottom: 28px; margin-bottom: 28px; border-bottom: 3px solid #171717; }}
-    .article-card.lead h3 {{ font-size: clamp(2rem, 5vw, 3.8rem); line-height: .95; max-width: 850px; }}
-    .article-card.lead p {{ font-size: 1.15rem; line-height: 1.55; max-width: 850px; }}
-    .article-section {{ margin-bottom: 26px; }}
-    .article-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; }}
-    .article-list .article-card:last-child, .article-grid .article-card:last-child {{ margin-bottom: 0; }}
-    .score {{ display: inline-block; margin-left: 8px; color: #7a4f16; }}
-    .keywords {{ margin-top: 10px; font: 700 .72rem Arial, sans-serif; color: #6a746e; text-transform: uppercase; }}
-    .feedback-controls {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-family: Arial, sans-serif; }}
-    .feedback-controls button {{ border: 1px solid #d4cbbd; border-radius: 8px; background: #fffaf0; color: #173f63; padding: 6px 10px; font: 800 .72rem Arial, sans-serif; cursor: pointer; }}
-    .feedback-controls button:hover {{ background: #efe7d8; }}
+    .snapshot {{ font-size: clamp(1.12rem, 2vw, 1.42rem); line-height: 1.45; margin: 0; color: #3f382f; max-width: 820px; }}
+    .brief-body {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); gap: 34px; align-items: start; }}
+    .story-column, .brief-sidebar, .lead-block, .story-row, .media-card, .low-conf-row, .newsletter {{ min-width: 0; }}
+    .story-column {{ display: grid; gap: 30px; }}
+    .img-strip {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
+    .strip-frame, .story-thumb, .media-thumb {{ position: relative; overflow: hidden; background: #e5dacb; border: 1px solid var(--line); }}
+    .strip-frame {{ aspect-ratio: 4 / 3; }}
+    .strip-frame img, .story-thumb img, .media-thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+    .fallback-art {{ display: grid; place-items: center; min-height: 100%; color: var(--accent); background: linear-gradient(135deg, #fbf3e5, #e9ddcb); }}
+    .fallback-art svg {{ width: 34px; height: 34px; }}
+    .lead-block {{ display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 18px; padding: 24px 0 28px; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }}
+    .lead-bar {{ background: var(--accent); border-radius: 999px; }}
+    .lead-content {{ display: grid; gap: 13px; }}
+    .lead-title {{ font-family: var(--display); font-size: clamp(2.25rem, 5vw, 4.4rem); line-height: .9; font-weight: 900; }}
+    .lead-summary {{ font-size: 1.14rem; line-height: 1.55; margin: 0; color: #3f382f; }}
+    .story-meta, .chip-row, .keywords, .feedback-controls {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
+    .source-type, .score {{ display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; font: 700 .68rem/1 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .04em; background: rgba(255, 250, 241, .72); }}
+    .source-type.youtube, .source-type.podcast, .source-type.foreign-media, .translation-badge {{ color: var(--accent-dark); border-color: rgba(181, 58, 50, .34); background: rgba(181, 58, 50, .08); }}
+    .translation-original {{ margin-top: 10px; color: var(--muted); font-size: .88rem; }}
+    .translation-original summary {{ cursor: pointer; font-weight: 800; color: var(--accent-dark); }}
+    .translation-original p {{ margin: 8px 0 0; line-height: 1.45; }}
+    .keywords {{ margin-top: 10px; font: 500 .72rem/1.5 var(--mono); color: var(--muted); }}
+    .keywords span {{ border-bottom: 1px dotted var(--line); }}
+    .ranked-section, .media-section, .lower-confidence {{ border-top: 1px solid var(--line); padding-top: 20px; }}
+    .story-list {{ display: grid; gap: 0; }}
+    .story-row {{ display: grid; grid-template-columns: 64px minmax(0, 1fr) 132px; gap: 18px; padding: 22px 0; border-bottom: 1px solid var(--line); align-items: start; }}
+    .story-num {{ font-family: var(--display); font-size: 2.45rem; line-height: .9; color: var(--accent); font-weight: 900; }}
+    .story-copy {{ display: grid; gap: 9px; }}
+    .story-title {{ font-family: var(--display); font-size: clamp(1.42rem, 2.5vw, 2.05rem); line-height: 1.02; font-weight: 800; }}
+    .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-transcript p {{ font-size: .98rem; line-height: 1.58; margin: 0; color: #4a4138; }}
+    .story-thumb {{ aspect-ratio: 1; border-radius: 2px; }}
+    .media-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
+    .media-card {{ display: grid; gap: 12px; padding: 14px; background: rgba(255, 250, 241, .68); border: 1px solid var(--line); box-shadow: 0 10px 34px rgba(48, 35, 24, .06); }}
+    .media-thumb {{ aspect-ratio: 16 / 9; }}
+    .media-title {{ font-family: var(--display); font-size: 1.42rem; line-height: 1.04; font-weight: 800; }}
+    .media-cta {{ justify-self: start; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--accent); border-radius: 999px; color: var(--accent-dark); padding: 8px 12px; font: 800 .76rem/1 var(--body); text-decoration: none; }}
+    .low-conf-list {{ display: grid; gap: 0; }}
+    .low-conf-row {{ display: grid; grid-template-columns: 50px minmax(0, 1fr); gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--line); opacity: .78; }}
+    .low-conf-row .story-num {{ font-size: 1.7rem; color: var(--muted); }}
+    .brief-sidebar {{ position: sticky; top: 22px; display: grid; gap: 16px; }}
+    .side-panel {{ background: var(--sidebar); border: 1px solid var(--line); padding: 18px; box-shadow: var(--shadow); }}
+    .side-panel h2 {{ font-size: 1.55rem; margin-bottom: 14px; }}
+    .side-stats {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
+    .side-stat {{ border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 9px; }}
+    .side-stat span {{ display: block; font: 700 .66rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .side-stat strong {{ display: block; margin-top: 3px; font-family: var(--display); font-size: 1.45rem; line-height: 1; }}
+    .side-note {{ margin-top: 16px; border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 13px; }}
+    .side-note h3 {{ margin: 0 0 7px; font: 800 .74rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .side-note p {{ margin: 0; color: #4f463d; font-size: .86rem; line-height: 1.45; }}
+    .stage-list {{ margin: 10px 0 0; padding-left: 18px; color: var(--muted); font: 600 .78rem/1.6 var(--body); }}
+    details.source-notes {{ margin-top: 18px; border-top: 1px solid rgba(34, 29, 24, .26); padding-top: 14px; }}
+    details.source-notes summary {{ cursor: pointer; font: 800 .74rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .newsletter {{ padding: 14px 0; border-bottom: 1px solid rgba(34, 29, 24, .18); }}
+    .newsletter h3 {{ font-size: 1.1rem; line-height: 1.1; margin-top: 6px; }}
+    .feedback-controls {{ margin-top: 12px; }}
+    .feedback-controls button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); color: var(--accent-dark); padding: 7px 11px; font: 800 .72rem/1 var(--body); cursor: pointer; }}
+    .feedback-controls button:hover {{ background: #efe3d1; }}
     .feedback-controls[data-feedback='sent'] button {{ opacity: .55; }}
-    .feedback-state {{ color: #5f675f; font: 700 .72rem Arial, sans-serif; text-transform: uppercase; }}
-    .digest-stats {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }}
-    .digest-stat {{ border-top: 1px solid #d4cbbd; padding-top: 10px; min-width: 0; }}
-    .digest-stat span {{ display: block; font: 800 .68rem Arial, sans-serif; color: #6a746e; text-transform: uppercase; }}
-    .digest-stat strong {{ display: block; margin-top: 4px; font: 900 1.25rem Arial, sans-serif; color: #171717; overflow-wrap: anywhere; }}
-    .stage-list {{ margin-top: 4px; padding-left: 18px; color: #5f675f; font: 700 .74rem Arial, sans-serif; line-height: 1.6; }}
-    .newsletter {{ padding: 0 0 20px; margin-bottom: 20px; border-bottom: 1px solid #d4cbbd; }}
-    .newsletter p {{ font-size: 1rem; line-height: 1.55; margin: 10px 0 0; }}
-    .link-item {{ display: grid; gap: 5px; padding: 12px 0; border-bottom: 1px solid #d4cbbd; }}
-    details.source-notes {{ margin-top: 28px; border-top: 1px solid #171717; padding-top: 16px; }}
-    details.source-notes summary {{ cursor: pointer; font: 800 .9rem Arial, sans-serif; text-transform: uppercase; }}
-    .empty {{ margin-top: 32px; padding: 24px; border: 1px dashed #b9ae9d; font: 1rem Arial, sans-serif; background: #fffaf0; }}
-    .more-count {{ font: 700 .9rem Arial, sans-serif; color: #5f675f; margin-top: 16px; }}
-    .issue-footer {{ margin-top: 36px; padding-top: 16px; border-top: 1px solid #d4cbbd; font: 700 .76rem Arial, sans-serif; color: #5f675f; text-transform: uppercase; }}
-    @media (max-width: 820px) {{ .grid, .article-grid {{ grid-template-columns: 1fr; }} }}
+    .feedback-state {{ color: var(--muted); font: 700 .72rem var(--mono); text-transform: uppercase; }}
+    .podcast-modal-link, .youtube-modal-link {{ color: inherit; }}
+    .podcast-modal {{ position: fixed; inset: 0; z-index: 20; display: none; place-items: center; padding: 24px; background: rgba(34, 29, 24, .62); }}
+    .podcast-modal:target {{ display: grid; }}
+    .podcast-panel {{ width: min(920px, 100%); max-height: min(86vh, 980px); overflow: auto; background: var(--paper); border: 1px solid var(--ink); box-shadow: 0 24px 90px rgba(34, 29, 24, .34); padding: 24px; }}
+    .podcast-close {{ float: right; border: 1px solid var(--ink); border-radius: 999px; background: var(--ink); color: var(--paper); padding: 9px 13px; font: 800 .72rem/1 var(--body); cursor: pointer; text-decoration: none; }}
+    .podcast-brand {{ display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 18px; align-items: center; margin: 14px 0 20px; }}
+    .podcast-art {{ width: 132px; aspect-ratio: 1; object-fit: cover; border: 1px solid var(--line); background: #e5dacb; }}
+    .podcast-art.fallback {{ display: grid; place-items: center; font-family: var(--display); font-weight: 900; font-size: 2rem; color: var(--accent); }}
+    .podcast-panel h3 {{ font-size: clamp(1.8rem, 4vw, 3.1rem); line-height: .95; margin: 0 0 10px; }}
+    .podcast-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 18px; font: 800 .75rem var(--body); text-transform: uppercase; }}
+    .podcast-actions a {{ color: var(--accent-dark); }}
+    .podcast-player {{ width: 100%; margin: 4px 0 20px; }}
+    .youtube-panel {{ width: min(1040px, 100%); }}
+    .youtube-player {{ width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--ink); background: var(--ink); margin: 8px 0 20px; }}
+    .youtube-summary, .podcast-transcript {{ border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }}
+    .youtube-summary h4, .podcast-transcript h4 {{ margin: 0 0 10px; font: 800 .78rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .foreign-tabs {{ display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }}
+    .foreign-tabs button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); padding: 8px 12px; font: 800 .74rem/1 var(--body); cursor: pointer; }}
+    .foreign-tabs button.active {{ background: var(--ink); color: var(--paper); border-color: var(--ink); }}
+    .foreign-view[hidden] {{ display: none; }}
+    .foreign-view {{ border-top: 1px solid var(--line); padding-top: 16px; }}
+    .foreign-status, .foreign-notice {{ color: var(--muted); font: 700 .82rem/1.45 var(--body); }}
+    .foreign-body p {{ margin: 0 0 12px; font-size: 1rem; line-height: 1.62; color: #3f382f; }}
+    body.modal-open {{ overflow: hidden; }}
+    .empty {{ margin-top: 32px; padding: 24px; border: 1px dashed #b9ae9d; font: 1rem var(--body); background: var(--paper); }}
+    .issue-footer {{ margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--line); font: 700 .76rem var(--mono); color: var(--muted); text-transform: uppercase; }}
+    @media (max-width: 860px) {{
+      .brief-shell {{ padding: 26px 16px 48px; }}
+      .brief-header h1 {{ font-size: 2.35rem; line-height: 1; max-height: 9.4rem; }}
+      .brief-masthead {{ align-items: flex-start; flex-direction: column; }}
+      .masthead-meta {{ max-width: none; text-align: left; }}
+      .brief-body, .media-grid, .podcast-brand {{ grid-template-columns: 1fr; }}
+      .brief-sidebar {{ position: static; }}
+      .story-row {{ grid-template-columns: 48px minmax(0, 1fr); }}
+      .story-thumb {{ display: none; }}
+      .img-strip {{ grid-template-columns: 1fr; }}
+      .strip-frame {{ aspect-ratio: 16 / 9; }}
+      .podcast-panel {{ max-height: 90vh; }}
+    }}
+    @media (max-width: 480px) {{
+      .brief-shell {{ padding-inline: 12px; }}
+      .brief-header h1 {{ font-size: 1.9rem; line-height: 1; max-height: 7.6rem; }}
+      .lead-block {{ grid-template-columns: 7px minmax(0, 1fr); gap: 12px; }}
+      .side-stats {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
-  <main>
-    <header>
-      <h1>{escape(title)}</h1>
-      <div class="date">Morning Dispatch · Last {lookback_hours} hours</div>
+  <main class="brief-shell">
+    <header class="brief-masthead">
+      <div class="masthead-brand">Morning Dispatch</div>
+      <div class="masthead-meta">{masthead_meta}</div>
     </header>
-    <p class="snapshot">{escape(snapshot)}</p>
+    <section class="brief-header">
+      <div class="dateline">Editorial brief</div>
+      <h1>{escape(title)}</h1>
+      <p class="snapshot">{escape(snapshot)}</p>
+    </section>
     {empty_state}
-    <div class="grid">
-      <section class="section">
-        <h2>Fetched Articles</h2>
+    <div class="brief-body">
+      <div class="story-column">
+        {image_strip_html}
         {lead_html}
-        {section_html or '<p class="meta">No article pages were fetched yet.</p>'}
+        <section class="ranked-section" aria-labelledby="ranked-heading">
+          <div class="section-kicker">Ranked stories</div>
+          <h2 id="ranked-heading">Ranked stories</h2>
+          <div class="story-list">{ranked_html or ranked_empty or '<p class="meta">No additional ranked stories.</p>'}</div>
+        </section>
+        {media_section}
         {lower_section}
-        {hidden_html}
-      </section>
-      <section class="section">
-        <h2>Digest Stats</h2>
-        {stats_html}
-        <details class="source-notes" open>
-          <summary>Newsletter Briefs</summary>
-          {newsletter_html or '<p class="meta">No newsletter bodies were available.</p>'}
-        </details>
-      </section>
+      </div>
+      {sidebar_html}
     </div>
     {generated_footer}
-  </main>
-  {feedback_script}
-</body>
-</html>"""
+	  </main>
+	  {feedback_script}
+	  {podcast_script}
+	</body>
+	</html>"""
 
 
 def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None = None) -> str:
@@ -1381,12 +2703,15 @@ def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None
     body {{ margin: 0; font-family: Georgia, 'Times New Roman', serif; color: #171717; background: #f7f3eb; }}
     main {{ width: min(900px, 100%); margin: 0 auto; padding: 48px 24px; }}
     header {{ border-bottom: 2px solid #171717; padding-bottom: 18px; margin-bottom: 28px; }}
-    h1 {{ font-size: clamp(2.5rem, 8vw, 5rem); line-height: .9; margin: 0; letter-spacing: 0; }}
+    h1 {{ font-size: 2.6rem; line-height: 1; margin: 0; letter-spacing: 0; display: -webkit-box; max-height: 10.4rem; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: break-word; word-break: normal; hyphens: auto; }}
     h1, p {{ overflow-wrap: anywhere; }}
     .date {{ margin-top: 12px; font: 600 0.8rem Arial, sans-serif; text-transform: uppercase; }}
     .snapshot {{ font-size: 1.3rem; line-height: 1.5; max-width: 720px; }}
     .empty {{ margin-top: 32px; padding-top: 24px; border-top: 1px solid #c8bfae; font: 1rem Arial, sans-serif; }}
     .issue-footer {{ margin-top: 36px; padding-top: 16px; border-top: 1px solid #d4cbbd; font: 700 .76rem Arial, sans-serif; color: #5f675f; text-transform: uppercase; }}
+    @media (max-width: 640px) {{
+      h1 {{ font-size: 1.9rem; line-height: 1; max-height: 7.6rem; }}
+    }}
   </style>
 </head>
 <body>
@@ -1803,6 +3128,557 @@ def _render_newsletter_item(payload: NormalizedPayload) -> str:
     """
 
 
+def _is_media_result(result: ArticleFetchResult) -> bool:
+    return result.payload.source_type in {"podcast_episode", "youtube_video"} or result.content_type in {"podcast", "video"}
+
+
+def _result_metadata(result: ArticleFetchResult) -> dict[str, Any]:
+    return {**(result.payload.metadata or {}), **(result.metadata or {})}
+
+
+def _result_url(result: ArticleFetchResult) -> str:
+    return result.final_url or result.original_url or result.canonical_url or "#"
+
+
+def _result_image_url(result: ArticleFetchResult) -> str | None:
+    metadata = _result_metadata(result)
+    for key in ("image_url", "thumbnail_url"):
+        image_url = _safe_web_url(metadata.get(key))
+        if image_url:
+            return image_url
+    if result.payload.source_type == "youtube_video":
+        video_id = _youtube_video_id(metadata.get("video_id"), _result_url(result))
+        if video_id:
+            return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    return None
+
+
+def _youtube_video_id(raw_video_id: Any, youtube_url: str) -> str:
+    video_id = str(raw_video_id or "").strip()
+    if not video_id and youtube_url:
+        parsed = urlparse(youtube_url)
+        hostname = parsed.hostname or ""
+        if "youtu.be" in hostname:
+            video_id = parsed.path.strip("/")
+        elif "youtube" in hostname:
+            query = dict(parse_qsl(parsed.query, keep_blank_values=False))
+            video_id = str(query.get("v") or "").strip()
+    return video_id if re.fullmatch(r"[A-Za-z0-9_-]{6,}", video_id) else ""
+
+
+def _source_label(result: ArticleFetchResult) -> str:
+    source_type = result.payload.source_type
+    if source_type == "youtube_video":
+        return "YouTube"
+    if source_type == "podcast_episode":
+        return "Podcast"
+    if source_type == "reddit_thread":
+        return "Reddit"
+    if source_type == "collection_chunk":
+        return "Collection"
+    if source_type == "market_snapshot":
+        return "Markets"
+    if source_type == "foreign_web":
+        return "Foreign Media"
+    return "Web"
+
+
+def _source_class(result: ArticleFetchResult) -> str:
+    return _source_label(result).lower().replace(" ", "-")
+
+
+def _meta_line_for_result(result: ArticleFetchResult) -> str:
+    url = _result_url(result)
+    domain = result.domain or _domain(url) or _source_label(result).lower()
+    source = result.payload.source_name or _source_label(result)
+    translation = _translation_metadata(result)
+    if translation.get("translated"):
+        source = _story_title(result) or source
+    published = _format_article_date(result.payload.published_at)
+    parts = [domain]
+    if published:
+        parts.append(published)
+    parts.append(f"via {source}")
+    return " · ".join(part for part in parts if part)
+
+
+def _score_badge(result: ArticleFetchResult) -> str:
+    if result.relevance_score is None:
+        return ""
+    return f'<span class="score">{int(result.relevance_score * 100)}%</span>'
+
+
+def _source_badge(result: ArticleFetchResult) -> str:
+    label = _source_label(result)
+    return f'<span class="source-type {_source_class(result)}">{escape(label)}</span>{_translation_badge_html(result)}'
+
+
+def _translation_metadata(result: ArticleFetchResult) -> dict[str, Any]:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    payload_metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    translation = metadata.get("translation") or payload_metadata.get("translation")
+    return dict(translation) if isinstance(translation, dict) else {}
+
+
+def _translation_badge_html(result: ArticleFetchResult) -> str:
+    translation = _translation_metadata(result)
+    source_language = str(translation.get("source_language") or (result.payload.metadata or {}).get("source_language") or "").strip()
+    if not source_language:
+        return ""
+    if translation and not translation.get("translated"):
+        label = f"{source_language.upper()} translation unavailable"
+    else:
+        label = f"{source_language.upper()} -> EN"
+    return f'<span class="source-type translation-badge">{escape(label)}</span>'
+
+
+def _translation_original_html(result: ArticleFetchResult) -> str:
+    translation = _translation_metadata(result)
+    original_title = str(translation.get("original_title") or (result.payload.metadata or {}).get("original_search_title") or "").strip()
+    original_summary = str(translation.get("original_summary") or (result.payload.metadata or {}).get("original_search_summary") or "").strip()
+    if not original_title and not original_summary:
+        return ""
+    source_language_name = str(translation.get("source_language_name") or (result.payload.metadata or {}).get("source_language_name") or "original").strip()
+    title_html = f"<p><strong>Title:</strong> {escape(original_title)}</p>" if original_title else ""
+    summary_html = f"<p><strong>Summary:</strong> {escape(original_summary)}</p>" if original_summary else ""
+    return (
+        f'<details class="translation-original">'
+        f"<summary>Original {escape(source_language_name)} text</summary>"
+        f"{title_html}{summary_html}"
+        f"</details>"
+    )
+
+
+def _keyword_html(result: ArticleFetchResult) -> str:
+    keywords = [keyword for keyword in result.keywords[:5] if keyword]
+    if not keywords:
+        return ""
+    return '<div class="keywords">' + " ".join(f"<span>{escape(keyword)}</span>" for keyword in keywords) + "</div>"
+
+
+def _story_summary(result: ArticleFetchResult) -> str:
+    return _clean_newsletter_text(result.editor_summary or result.excerpt or result.text)
+
+
+def _story_title(result: ArticleFetchResult) -> str:
+    return _clean_newsletter_text(result.title) or result.title or _result_url(result)
+
+
+def _story_link_parts(result: ArticleFetchResult, *, issue_id: str | None) -> tuple[str, str, str, str, str]:
+    url = _result_url(result)
+    if not _supports_foreign_article_modal(result, issue_id=issue_id):
+        return url, ' target="_blank" rel="noreferrer"', "", "", ""
+    modal_id = _foreign_article_modal_id(result)
+    attributes = _foreign_article_attributes(result, modal_id=modal_id)
+    return f"#{modal_id}", "", ' class="foreign-article-link"', attributes, _render_foreign_article_modal(result, modal_id, issue_id)
+
+
+def _supports_foreign_article_modal(result: ArticleFetchResult, *, issue_id: str | None) -> bool:
+    if not issue_id:
+        return False
+    translation = _translation_metadata(result)
+    payload_metadata = result.payload.metadata or {}
+    source_language = str(translation.get("source_language") or payload_metadata.get("source_language") or "").strip()
+    return bool(source_language and _result_url(result).startswith(("http://", "https://")))
+
+
+def _foreign_article_attributes(result: ArticleFetchResult, *, modal_id: str) -> str:
+    translation = _translation_metadata(result)
+    payload_metadata = result.payload.metadata or {}
+    values = {
+        "foreign-article-target": modal_id,
+        "foreign-url": _result_url(result),
+        "foreign-title": _story_title(result),
+        "foreign-summary": _story_summary(result),
+        "foreign-source-language": str(translation.get("source_language") or payload_metadata.get("source_language") or ""),
+        "foreign-source-language-name": str(translation.get("source_language_name") or payload_metadata.get("source_language_name") or ""),
+        "foreign-original-title": str(translation.get("original_title") or payload_metadata.get("original_search_title") or ""),
+        "foreign-original-summary": str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or ""),
+    }
+    return "".join(
+        f' data-{escape(key, quote=True)}="{escape(value, quote=True)}"'
+        for key, value in values.items()
+        if value
+    )
+
+
+def _render_image_strip(results: list[ArticleFetchResult]) -> str:
+    frames = []
+    for result in results:
+        image_url = _result_image_url(result)
+        if not image_url:
+            continue
+        frames.append(
+            f"""
+            <figure class="strip-frame">
+              <img src="{escape(image_url, quote=True)}" alt="{escape(_story_title(result), quote=True)}" loading="lazy" />
+            </figure>
+            """
+        )
+        if len(frames) == 3:
+            break
+    if not frames:
+        return ""
+    return f'<section class="img-strip" aria-label="Story images">{"".join(frames)}</section>'
+
+
+def _render_thumbnail(result: ArticleFetchResult, class_name: str) -> str:
+    image_url = _result_image_url(result)
+    if image_url:
+        return (
+            f'<figure class="{class_name}">'
+            f'<img src="{escape(image_url, quote=True)}" alt="{escape(_story_title(result), quote=True)}" loading="lazy" />'
+            f'</figure>'
+        )
+    return f'<figure class="{class_name}">{_render_fallback_art(result)}</figure>'
+
+
+def _render_fallback_art(result: ArticleFetchResult) -> str:
+    return f'<div class="fallback-art" aria-hidden="true">{_source_icon_svg(result)}</div>'
+
+
+def _source_icon_svg(result: ArticleFetchResult) -> str:
+    label = _source_label(result)
+    if label == "YouTube":
+        path = '<path d="M9 7.5v9l8-4.5-8-4.5Z" fill="currentColor"/><rect x="3" y="5" width="18" height="14" rx="4" fill="none" stroke="currentColor" stroke-width="1.8"/>'
+    elif label == "Podcast":
+        path = '<path d="M12 4a4 4 0 0 1 4 4v4a4 4 0 0 1-8 0V8a4 4 0 0 1 4-4Z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
+    else:
+        path = '<path d="M4 18 9.5 9l4 5 2.5-3 4 7H4Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="16" cy="7" r="2" fill="currentColor"/><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>'
+    return f'<svg viewBox="0 0 24 24" role="img" aria-label="{escape(label)}">{path}</svg>'
+
+
+def _render_lead_story(result: ArticleFetchResult, *, issue_id: str | None = None) -> str:
+    url = _result_url(result)
+    link_url, link_target, link_class, link_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
+    feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
+    return f"""
+      <article class="lead-block">
+        <div class="lead-bar" aria-hidden="true"></div>
+        <div class="lead-content">
+          <div class="story-meta">{_source_badge(result)}{_score_badge(result)}<span class="meta">{escape(_meta_line_for_result(result))}</span></div>
+          <h2 class="lead-title"><a href="{escape(link_url, quote=True)}"{link_target}{link_class}{link_attributes}>{escape(_story_title(result))}</a></h2>
+          <p class="lead-summary">{escape(_story_summary(result))}</p>
+          {_translation_original_html(result)}
+          {_keyword_html(result)}
+          {feedback_html}
+          {modal_html}
+        </div>
+      </article>
+    """
+
+
+def _render_ranked_story(
+    result: ArticleFetchResult,
+    *,
+    index: int,
+    issue_id: str | None = None,
+) -> str:
+    url = _result_url(result)
+    link_url, link_target, link_class, link_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
+    feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
+    return f"""
+      <article class="story-row">
+        <div class="story-num">{index:02d}</div>
+        <div class="story-copy">
+          <div class="story-meta">{_source_badge(result)}{_score_badge(result)}<span class="meta">{escape(_meta_line_for_result(result))}</span></div>
+          <h3 class="story-title"><a href="{escape(link_url, quote=True)}"{link_target}{link_class}{link_attributes}>{escape(_story_title(result))}</a></h3>
+          <p class="story-summary">{escape(_story_summary(result))}</p>
+          {_translation_original_html(result)}
+          {_keyword_html(result)}
+          {feedback_html}
+          {modal_html}
+        </div>
+        {_render_thumbnail(result, "story-thumb")}
+      </article>
+    """
+
+
+def _render_lower_confidence_story(
+    result: ArticleFetchResult,
+    *,
+    index: int,
+    issue_id: str | None = None,
+) -> str:
+    url = _result_url(result)
+    link_url, link_target, link_class, link_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
+    feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
+    return f"""
+      <article class="low-conf-row">
+        <div class="story-num">{index:02d}</div>
+        <div>
+          <div class="story-meta">{_source_badge(result)}{_score_badge(result)}<span class="meta">{escape(_meta_line_for_result(result))}</span></div>
+          <h3 class="story-title"><a href="{escape(link_url, quote=True)}"{link_target}{link_class}{link_attributes}>{escape(_story_title(result))}</a></h3>
+          <p>{escape(_story_summary(result))}</p>
+          {_translation_original_html(result)}
+          {_keyword_html(result)}
+          {feedback_html}
+          {modal_html}
+        </div>
+      </article>
+    """
+
+
+def _render_media_card(result: ArticleFetchResult, *, issue_id: str | None = None) -> str:
+    url = _result_url(result)
+    title_attributes = ""
+    title_class = ""
+    title_target = ' target="_blank" rel="noreferrer"'
+    modal_html = ""
+    cta_copy = "Open"
+    if result.payload.source_type == "podcast_episode":
+        modal_id = _podcast_modal_id(result)
+        url = f"#{modal_id}"
+        title_attributes = f' data-podcast-modal-target="{escape(modal_id, quote=True)}"'
+        title_class = ' class="podcast-modal-link"'
+        title_target = ""
+        modal_html = _render_podcast_modal(result, modal_id)
+        cta_copy = "Listen"
+    elif result.payload.source_type == "youtube_video":
+        modal_id = _youtube_modal_id(result)
+        url = f"#{modal_id}"
+        title_attributes = f' data-youtube-modal-target="{escape(modal_id, quote=True)}"'
+        title_class = ' class="youtube-modal-link"'
+        title_target = ""
+        modal_html = _render_youtube_modal(result, modal_id)
+        cta_copy = "Watch"
+    feedback_html = _render_feedback_controls(issue_id, _result_url(result)) if result.fetched else ""
+    return f"""
+      <article class="media-card">
+        {_render_thumbnail(result, "media-thumb")}
+        <div class="story-meta">{_source_badge(result)}{_score_badge(result)}<span class="meta">{escape(_meta_line_for_result(result))}</span></div>
+        <h3 class="media-title"><a href="{escape(url, quote=True)}"{title_target}{title_class}{title_attributes}>{escape(_story_title(result))}</a></h3>
+        <p class="story-summary">{escape(_story_summary(result))}</p>
+        {_translation_original_html(result)}
+        {_keyword_html(result)}
+        <a class="media-cta" href="{escape(url, quote=True)}"{title_target}{title_attributes}>{escape(cta_copy)}</a>
+        {feedback_html}
+        {modal_html}
+      </article>
+    """
+
+
+def _foreign_article_modal_id(result: ArticleFetchResult) -> str:
+    raw_key = _result_url(result) or result.title or result.payload.id
+    return f"foreign-{hashlib.sha1(raw_key.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, issue_id: str) -> str:
+    url = _result_url(result)
+    translation = _translation_metadata(result)
+    payload_metadata = result.payload.metadata or {}
+    source_language_name = str(translation.get("source_language_name") or payload_metadata.get("source_language_name") or "Original").strip()
+    original_title = str(translation.get("original_title") or payload_metadata.get("original_search_title") or _story_title(result)).strip()
+    original_summary = str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or "").strip()
+    original_seed = "\n\n".join(part for part in (original_title, original_summary) if part)
+    original_html = _render_transcript_paragraphs(original_seed)
+    return f"""
+        <div class="podcast-modal foreign-modal" id="{escape(modal_id, quote=True)}" data-foreign-exploration-id="{escape(issue_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
+          <div class="podcast-panel youtube-panel">
+            <a class="podcast-close" data-foreign-close href="#">Close</a>
+            <div class="section-kicker">Machine translated</div>
+            <h3 id="{escape(modal_id, quote=True)}-title">{escape(_story_title(result))}</h3>
+            <div class="podcast-actions">
+              <a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">View original source</a>
+            </div>
+            <p class="foreign-status" aria-live="polite">Open this article to translate the full body.</p>
+            <div class="foreign-tabs" role="tablist" aria-label="Article language view">
+              <button type="button" class="active" data-foreign-tab="translated">Translated</button>
+              <button type="button" data-foreign-tab="original">Original {escape(source_language_name)}</button>
+            </div>
+            <section class="foreign-view" data-foreign-view="translated">
+              <div class="foreign-notice"></div>
+              <div class="foreign-body" data-foreign-translated-body>
+                <p>{escape(_story_summary(result))}</p>
+              </div>
+            </section>
+            <section class="foreign-view" data-foreign-view="original" hidden>
+              <div class="foreign-body" data-foreign-original-body>{original_html}</div>
+            </section>
+          </div>
+        </div>
+    """
+
+
+def _render_brief_sidebar(
+    *,
+    stats: dict[str, Any],
+    newsletter_html: str,
+    newsletter_count: int,
+    article_count: int,
+    media_count: int,
+    lookback_hours: int,
+) -> str:
+    total_model_calls = int(stats.get("model_call_count") or 0)
+    successful_model_calls = int(stats.get("model_success_count") or 0)
+    failed_model_calls = int(stats.get("model_failure_count") or 0)
+    ai_call_value = (
+        f"{_format_int(successful_model_calls)}/{_format_int(total_model_calls)} ok"
+        if total_model_calls and failed_model_calls
+        else _format_int(total_model_calls)
+    )
+    side_stats = [
+        ("Articles", _format_int(article_count)),
+        ("Media", _format_int(media_count)),
+        ("Sources", _format_int(stats.get("source_count"))),
+        ("Newsletters", _format_int(newsletter_count)),
+        ("Links", _format_int(stats.get("link_count"))),
+        ("AI tokens", _format_int(stats.get("total_tokens"))),
+        ("AI calls", ai_call_value),
+        ("Processing", _format_duration(stats.get("processing_seconds"))),
+        ("Recency", f"{lookback_hours}h"),
+    ]
+    stat_html = "\n".join(
+        f'<div class="side-stat"><span>{escape(label)}</span><strong class="side-value">{escape(value)}</strong></div>'
+        for label, value in side_stats
+    )
+    stage_seconds = stats.get("stage_seconds") if isinstance(stats.get("stage_seconds"), dict) else {}
+    stage_html = ""
+    if stage_seconds:
+        stage_labels = {
+            "ingestion": "Ingestion",
+            "fetching": "Fetching",
+            "classification": "Classification",
+            "editorial": "Editorial + review",
+            "publishing": "Publishing",
+        }
+        stage_items = "\n".join(
+            f"<li>{escape(stage_labels.get(str(key), str(key).replace('_', ' ').title()))}: {escape(_format_stage_duration(value))}</li>"
+            for key, value in stage_seconds.items()
+        )
+        stage_html = f'<ul class="stage-list">{stage_items}</ul>'
+    token_detail = _render_token_detail(stats)
+    completion_unavailable_count = int(stats.get("completion_unavailable_count") or 0)
+    token_warning = ""
+    if failed_model_calls:
+        unavailable_note = (
+            f" Completion tokens were unavailable for {_format_int(completion_unavailable_count)} failed call(s)."
+            if completion_unavailable_count
+            else ""
+        )
+        token_warning = (
+            f'<p class="meta">AI warning: {_format_int(failed_model_calls)} model call(s) failed before completion; '
+            f"this token total may be incomplete.{unavailable_note}</p>"
+        )
+    source_notes_html = ""
+    if newsletter_html:
+        source_notes_html = f"""
+          <details class="source-notes" open>
+            <summary>Source notes</summary>
+            {newsletter_html}
+          </details>
+        """
+    strategy_html = _render_sidebar_note("Search strategy", _search_strategy_text(stats))
+    model_usage_html = _render_sidebar_note("AI used", _model_usage_text(stats))
+    return f"""
+      <aside class="brief-sidebar" aria-label="Brief sources and process">
+        <section class="side-panel provenance">
+          <div class="section-kicker">Sources & process</div>
+          <h2>How this was made</h2>
+          <div class="side-stats">{stat_html}</div>
+          {strategy_html}
+          {model_usage_html}
+          {stage_html}
+          {token_detail}
+          {token_warning}
+          {source_notes_html}
+        </section>
+      </aside>
+    """
+
+
+def _render_sidebar_note(title: str, text: str | None) -> str:
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    return f"""
+          <div class="side-note">
+            <h3>{escape(title)}</h3>
+            <p>{escape(body)}</p>
+          </div>
+    """
+
+
+def _search_strategy_text(stats: dict[str, Any]) -> str:
+    strategy = stats.get("search_strategy") if isinstance(stats.get("search_strategy"), dict) else {}
+    summary = str(strategy.get("summary") or "").strip()
+    if summary:
+        return summary
+    queries = _string_values(strategy.get("queries") if isinstance(strategy, dict) else None, limit=2)
+    source_names = _string_values(strategy.get("sources") if isinstance(strategy, dict) else None, limit=5)
+    scope = str(strategy.get("source_scope") or stats.get("source_scope_label") or "").strip()
+    pieces: list[str] = []
+    if source_names:
+        pieces.append("Looked across " + ", ".join(source_names))
+    if queries:
+        pieces.append("Query examples: " + "; ".join(queries))
+    if scope:
+        pieces.append("Source scope: " + scope)
+    return ". ".join(pieces).strip()
+
+
+def _model_usage_text(stats: dict[str, Any]) -> str:
+    usage = stats.get("model_usage") if isinstance(stats.get("model_usage"), list) else []
+    if usage:
+        model_names: list[str] = []
+        total_calls = 0
+        successful = 0
+        failed = 0
+        modes: set[str] = set()
+        for row in usage:
+            if not isinstance(row, dict):
+                continue
+            model = str(row.get("model") or "").strip()
+            if model and model not in model_names:
+                model_names.append(model)
+            mode = str(row.get("mode") or "").strip()
+            if mode:
+                modes.add(_model_mode_label(mode))
+            total_calls += int(row.get("call_count") or 0)
+            successful += int(row.get("success_count") or 0)
+            failed += int(row.get("failure_count") or 0)
+        if model_names:
+            model_part = ", ".join(model_names[:3])
+            if len(model_names) > 3:
+                model_part += f" +{len(model_names) - 3} more"
+            task_part = ", ".join(sorted(modes)) if modes else "brief generation"
+            call_part = f"{successful}/{total_calls} calls completed" if failed else f"{total_calls} calls"
+            return f"{model_part} supported {task_part}; {call_part}."
+    fallback = str(stats.get("model_usage_summary") or "").strip()
+    if fallback:
+        return fallback
+    total_calls = int(stats.get("model_call_count") or 0)
+    if total_calls:
+        successful = int(stats.get("model_success_count") or 0)
+        failed = int(stats.get("model_failure_count") or 0)
+        return f"AI assisted the brief generation; {successful}/{total_calls} calls completed." if failed else f"AI assisted the brief generation across {total_calls} calls."
+    return ""
+
+
+def _model_mode_label(mode: str) -> str:
+    labels = {
+        "single": "article summaries",
+        "source_audit": "source audit",
+        "editorial": "ranking",
+        "critic": "review",
+        "refinement": "interest refinement",
+    }
+    return labels.get(mode, mode.replace("_", " "))
+
+
+def _string_values(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _render_article_sections(results: list[ArticleFetchResult], *, issue_id: str | None = None) -> str:
     grouped: dict[str, list[ArticleFetchResult]] = {}
     for result in results:
@@ -1849,15 +3725,234 @@ def _render_article_card(
     summary = _clean_newsletter_text(result.editor_summary or result.excerpt)
     title = _clean_newsletter_text(result.title) or result.title
     feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
+    podcast_modal_id = _podcast_modal_id(result) if result.payload.source_type == "podcast_episode" else ""
+    youtube_modal_id = _youtube_modal_id(result) if result.payload.source_type == "youtube_video" else ""
+    title_attributes = ""
+    title_class = ""
+    title_target = ' target="_blank" rel="noreferrer"'
+    modal_html = ""
+    if podcast_modal_id:
+        url = f"#{podcast_modal_id}"
+        title_attributes = f' data-podcast-modal-target="{escape(podcast_modal_id, quote=True)}"'
+        title_class = ' class="podcast-modal-link"'
+        title_target = ""
+        modal_html = _render_podcast_modal(result, podcast_modal_id)
+    elif youtube_modal_id:
+        url = f"#{youtube_modal_id}"
+        title_attributes = f' data-youtube-modal-target="{escape(youtube_modal_id, quote=True)}"'
+        title_class = ' class="youtube-modal-link"'
+        title_target = ""
+        modal_html = _render_youtube_modal(result, youtube_modal_id)
+    elif _supports_foreign_article_modal(result, issue_id=issue_id):
+        url, title_target, title_class, title_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
     return f"""
       <article class="{card_class}">
         <div class="meta">{meta}{score}</div>
-        <h3><a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">{escape(title)}</a></h3>
+        <h3><a href="{escape(url, quote=True)}"{title_target}{title_class}{title_attributes}>{escape(title)}</a></h3>
         <p>{escape(summary)}</p>
         {keyword_html}
         {feedback_html}
+        {modal_html}
       </article>
     """
+
+
+def _podcast_modal_id(result: ArticleFetchResult) -> str:
+    metadata = result.payload.metadata or {}
+    raw_key = str(metadata.get("podcast_episode_id") or result.original_url or result.title or result.payload.id)
+    return f"podcast-{hashlib.sha1(raw_key.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _render_podcast_modal(result: ArticleFetchResult, modal_id: str) -> str:
+    metadata = result.payload.metadata or {}
+    show_name = str(metadata.get("podcast_title") or result.payload.source_name or "Podcast")
+    episode_title = _clean_newsletter_text(str(metadata.get("title") or result.title or "Podcast episode"))
+    image_url = _safe_web_url(metadata.get("image_url"))
+    audio_url = _safe_web_url(metadata.get("audio_url"))
+    apple_url = _safe_web_url(metadata.get("apple_podcasts_url"))
+    episode_url = _safe_web_url(metadata.get("episode_url"))
+    transcript_source = str(metadata.get("transcript_source") or "show_notes")
+    transcript_label = "Transcript" if transcript_source in {"transcript", "transcript_cache"} else "Show Notes"
+    transcript_html = _render_transcript_paragraphs(_podcast_transcript_text(result))
+    duration = _format_duration(metadata.get("duration_seconds"))
+    meta_parts = [show_name]
+    if duration:
+        meta_parts.append(duration)
+    if result.payload.published_at:
+        meta_parts.append(_format_article_date(result.payload.published_at))
+    brand_html = (
+        f'<img class="podcast-art" src="{escape(image_url, quote=True)}" alt="{escape(show_name, quote=True)} artwork" loading="lazy" />'
+        if image_url
+        else f'<div class="podcast-art fallback" aria-hidden="true">{escape(_podcast_initials(show_name))}</div>'
+    )
+    player_html = (
+        f'<audio class="podcast-player" controls preload="none" src="{escape(audio_url, quote=True)}"></audio>'
+        if audio_url
+        else '<p class="meta">Audio is not available for this episode.</p>'
+    )
+    action_links = []
+    if apple_url:
+        action_links.append(f'<a href="{escape(apple_url, quote=True)}" target="_blank" rel="noreferrer">Apple Podcasts</a>')
+    if episode_url and episode_url != apple_url:
+        action_links.append(f'<a href="{escape(episode_url, quote=True)}" target="_blank" rel="noreferrer">Listen</a>')
+    actions_html = f'<div class="podcast-actions">{" ".join(action_links)}</div>' if action_links else ""
+    return f"""
+        <div class="podcast-modal" id="{escape(modal_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
+          <div class="podcast-panel">
+            <a class="podcast-close" data-podcast-close href="#">Close</a>
+            <div class="podcast-brand">
+              {brand_html}
+              <div>
+                <div class="meta">{escape(" · ".join(part for part in meta_parts if part))}</div>
+                <h3 id="{escape(modal_id, quote=True)}-title">{escape(episode_title)}</h3>
+                {actions_html}
+              </div>
+            </div>
+            {player_html}
+            <section class="podcast-transcript">
+              <h4>{escape(transcript_label)}</h4>
+              {transcript_html}
+            </section>
+          </div>
+        </div>
+    """
+
+
+def _youtube_modal_id(result: ArticleFetchResult) -> str:
+    metadata = result.payload.metadata or {}
+    raw_key = str(metadata.get("video_id") or result.original_url or result.title or result.payload.id)
+    return f"youtube-{hashlib.sha1(raw_key.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _render_youtube_modal(result: ArticleFetchResult, modal_id: str) -> str:
+    metadata = result.payload.metadata or {}
+    channel_name = str(metadata.get("channel_name") or result.payload.source_name or "YouTube")
+    video_title = _clean_newsletter_text(str(metadata.get("youtube_title") or metadata.get("title") or result.title or "YouTube video"))
+    youtube_url = _safe_web_url(metadata.get("youtube_url")) or _safe_web_url(result.final_url or result.original_url) or ""
+    embed_url = _youtube_embed_url(metadata.get("video_id"), youtube_url)
+    image_url = _result_image_url(result)
+    summary = _clean_newsletter_text(result.editor_summary or result.excerpt)
+    transcript_html = _render_transcript_paragraphs(_youtube_transcript_text(result))
+    duration = _format_duration(metadata.get("duration_seconds"))
+    meta_parts = [channel_name]
+    if duration:
+        meta_parts.append(duration)
+    if result.payload.published_at:
+        meta_parts.append(_format_article_date(result.payload.published_at))
+    player_html = (
+        f'<iframe class="youtube-player" data-youtube-src="{escape(embed_url, quote=True)}" title="{escape(video_title, quote=True)}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen loading="lazy"></iframe>'
+        if embed_url
+        else '<p class="meta">Video playback is not available for this item.</p>'
+    )
+    action_links = []
+    if youtube_url:
+        action_links.append(f'<a href="{escape(youtube_url, quote=True)}" target="_blank" rel="noreferrer">Watch on YouTube</a>')
+    actions_html = f'<div class="podcast-actions">{" ".join(action_links)}</div>' if action_links else ""
+    brand_art = (
+        f'<img class="podcast-art" src="{escape(image_url, quote=True)}" alt="{escape(channel_name, quote=True)} thumbnail" loading="lazy" />'
+        if image_url
+        else '<div class="podcast-art fallback" aria-hidden="true">YT</div>'
+    )
+    return f"""
+        <div class="podcast-modal youtube-modal" id="{escape(modal_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
+          <div class="podcast-panel youtube-panel">
+            <a class="podcast-close" data-youtube-close href="#">Close</a>
+            <div class="podcast-brand">
+              {brand_art}
+              <div>
+                <div class="meta">{escape(" · ".join(part for part in meta_parts if part))}</div>
+                <h3 id="{escape(modal_id, quote=True)}-title">{escape(video_title)}</h3>
+                {actions_html}
+              </div>
+            </div>
+            {player_html}
+            <section class="youtube-summary">
+              <h4>Summary</h4>
+              <p>{escape(summary)}</p>
+            </section>
+            <section class="podcast-transcript">
+              <h4>Transcript</h4>
+              {transcript_html}
+            </section>
+          </div>
+        </div>
+    """
+
+
+def _youtube_embed_url(raw_video_id: Any, youtube_url: str) -> str:
+    video_id = str(raw_video_id or "").strip()
+    if not video_id and youtube_url:
+        parsed = urlparse(youtube_url)
+        if parsed.hostname and "youtu.be" in parsed.hostname:
+            video_id = parsed.path.strip("/")
+        elif parsed.hostname and "youtube" in parsed.hostname:
+            query = dict(parse_qsl(parsed.query, keep_blank_values=False))
+            video_id = str(query.get("v") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,}", video_id):
+        return ""
+    return f"https://www.youtube-nocookie.com/embed/{video_id}?rel=0"
+
+
+def _youtube_transcript_text(result: ArticleFetchResult) -> str:
+    return " ".join((result.text or result.payload.raw_text or result.excerpt or "").split())
+
+
+def _safe_web_url(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text if text.startswith(("http://", "https://")) else None
+
+
+def _podcast_initials(value: str) -> str:
+    parts = [part[:1].upper() for part in re.findall(r"[A-Za-z0-9]+", value)[:3]]
+    return "".join(parts) or "P"
+
+
+def _format_duration(value: Any) -> str:
+    seconds = _nullable_int(value)
+    if not seconds:
+        return ""
+    hours, remainder = divmod(seconds, 3600)
+    minutes, _seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _podcast_transcript_text(result: ArticleFetchResult) -> str:
+    text = " ".join((result.text or result.payload.raw_text or result.excerpt or "").split())
+    match = re.search(r"(?:Transcript|Show notes):\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _render_transcript_paragraphs(text: str) -> str:
+    paragraphs = _transcript_paragraphs(text)
+    if not paragraphs:
+        return '<p>No transcript text is available yet.</p>'
+    return "\n".join(f"<p>{escape(paragraph)}</p>" for paragraph in paragraphs)
+
+
+def _transcript_paragraphs(text: str) -> list[str]:
+    cleaned = _clean_newsletter_text(text)
+    parts = [part.strip() for part in re.split(r"\n{2,}", cleaned) if part.strip()]
+    if len(parts) > 1:
+        return parts
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", cleaned) if sentence.strip()]
+    if not sentences:
+        return [cleaned] if cleaned else []
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip()
+        if current and len(candidate) > 760:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _render_feedback_controls(issue_id: str | None, url: str | None) -> str:
@@ -1909,6 +4004,146 @@ def _render_feedback_script(issue_id: str | None) -> str:
     """
 
 
+def _render_podcast_modal_script() -> str:
+    return """
+  <script>
+    (() => {
+      const activeModal = () => {
+        if (!window.location.hash) return null;
+        const id = window.location.hash.slice(1);
+        return document.getElementById(id);
+      };
+
+      const syncModalState = () => {
+        const modal = activeModal();
+        document.body.classList.toggle("modal-open", Boolean(modal && modal.classList.contains("podcast-modal")));
+        document.querySelectorAll(".podcast-modal audio").forEach((player) => {
+          if (!modal || !modal.contains(player)) player.pause();
+        });
+        document.querySelectorAll(".youtube-modal iframe[data-youtube-src]").forEach((player) => {
+          if (modal && modal.contains(player)) {
+            if (!player.getAttribute("src")) player.setAttribute("src", player.getAttribute("data-youtube-src"));
+          } else {
+            player.removeAttribute("src");
+          }
+        });
+      };
+
+      const closeModal = () => {
+        document.querySelectorAll(".podcast-modal audio").forEach((player) => player.pause());
+        document.querySelectorAll(".youtube-modal iframe[data-youtube-src]").forEach((player) => player.removeAttribute("src"));
+        document.body.classList.remove("modal-open");
+        if (window.location.hash) history.pushState("", document.title, window.location.pathname + window.location.search);
+      };
+
+      const paragraphs = (value) => {
+        const text = String(value || "").trim();
+        if (!text) return "<p>No article text is available.</p>";
+        return text
+          .split(/\\n{2,}/)
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .map((part) => `<p>${part.replace(/[&<>"']/g, (char) => ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;"
+          })[char])}</p>`)
+          .join("");
+      };
+
+      const setForeignView = (modal, viewName) => {
+        modal.querySelectorAll("[data-foreign-view]").forEach((view) => {
+          view.hidden = view.getAttribute("data-foreign-view") !== viewName;
+        });
+        modal.querySelectorAll("[data-foreign-tab]").forEach((button) => {
+          button.classList.toggle("active", button.getAttribute("data-foreign-tab") === viewName);
+        });
+      };
+
+      const loadForeignArticle = async (trigger, modal) => {
+        if (!modal || modal.getAttribute("data-foreign-loaded") === "true") return;
+        const status = modal.querySelector(".foreign-status");
+        const notice = modal.querySelector(".foreign-notice");
+        const translatedBody = modal.querySelector("[data-foreign-translated-body]");
+        const originalBody = modal.querySelector("[data-foreign-original-body]");
+        const explorationId = modal.getAttribute("data-foreign-exploration-id");
+        if (!explorationId) return;
+        modal.setAttribute("data-foreign-loaded", "loading");
+        if (status) status.textContent = "Fetching and translating the full article...";
+        try {
+          const response = await fetch(`/api/explore/explorations/${encodeURIComponent(explorationId)}/foreign-article/translation`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: trigger.getAttribute("data-foreign-url"),
+              title: trigger.getAttribute("data-foreign-title"),
+              summary: trigger.getAttribute("data-foreign-summary"),
+              source_language: trigger.getAttribute("data-foreign-source-language"),
+              source_language_name: trigger.getAttribute("data-foreign-source-language-name"),
+              original_title: trigger.getAttribute("data-foreign-original-title"),
+              original_summary: trigger.getAttribute("data-foreign-original-summary")
+            })
+          });
+          if (!response.ok) throw new Error("Translation request failed");
+          const data = await response.json();
+          if (translatedBody) translatedBody.innerHTML = paragraphs(data.translated_body || data.translated_summary);
+          if (originalBody) originalBody.innerHTML = paragraphs([data.original_title, data.original_body].filter(Boolean).join("\\n\\n"));
+          if (notice) notice.textContent = data.notice || "";
+          if (status) status.textContent = data.cached ? "Loaded from translation cache." : "Translated article ready.";
+          modal.setAttribute("data-foreign-loaded", "true");
+        } catch (_error) {
+          modal.removeAttribute("data-foreign-loaded");
+          if (status) status.textContent = "Could not translate this article. Try again or open the original source.";
+        }
+      };
+
+      document.addEventListener("click", (event) => {
+        const tab = event.target.closest("[data-foreign-tab]");
+        if (tab) {
+          const modal = tab.closest(".foreign-modal");
+          if (modal) setForeignView(modal, tab.getAttribute("data-foreign-tab"));
+          return;
+        }
+
+        const trigger = event.target.closest("[data-podcast-modal-target], [data-youtube-modal-target], [data-foreign-article-target]");
+        if (trigger) {
+          const modalId = trigger.getAttribute("data-podcast-modal-target") || trigger.getAttribute("data-youtube-modal-target") || trigger.getAttribute("data-foreign-article-target");
+          if (modalId) {
+            event.preventDefault();
+            window.location.hash = modalId;
+            syncModalState();
+            const modal = document.getElementById(modalId);
+            if (trigger.hasAttribute("data-foreign-article-target")) loadForeignArticle(trigger, modal);
+          }
+          return;
+        }
+
+        const closeButton = event.target.closest("[data-podcast-close], [data-youtube-close], [data-foreign-close]");
+        if (closeButton) {
+          event.preventDefault();
+          closeModal();
+          return;
+        }
+
+        if (event.target.classList && event.target.classList.contains("podcast-modal")) {
+          closeModal();
+        }
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape") return;
+        closeModal();
+      });
+
+      window.addEventListener("hashchange", syncModalState);
+      syncModalState();
+    })();
+  </script>
+    """
+
+
 def _render_digest_stats(stats: dict[str, Any]) -> str:
     stage_seconds = stats.get("stage_seconds") if isinstance(stats.get("stage_seconds"), dict) else {}
     stage_html = ""
@@ -1917,16 +4152,24 @@ def _render_digest_stats(stats: dict[str, Any]) -> str:
             "ingestion": "Ingestion",
             "fetching": "Article fetching",
             "classification": "AI classification",
-            "editorial": "Editor review",
+            "editorial": "Editorial + review",
             "publishing": "Publishing",
         }
         stage_items = "\n".join(
             f"<li>{escape(stage_labels.get(str(key), str(key).replace('_', ' ').title()))}: "
-            f"{escape(_format_duration(value))}</li>"
+            f"{escape(_format_stage_duration(value))}</li>"
             for key, value in stage_seconds.items()
         )
         stage_html = f'<div class="digest-stat"><span>Stage timing</span><ul class="stage-list">{stage_items}</ul></div>'
 
+    total_model_calls = int(stats.get("model_call_count") or 0)
+    successful_model_calls = int(stats.get("model_success_count") or 0)
+    failed_model_calls = int(stats.get("model_failure_count") or 0)
+    ai_call_value = (
+        f"{_format_int(successful_model_calls)}/{_format_int(total_model_calls)} ok"
+        if total_model_calls and failed_model_calls
+        else _format_int(total_model_calls)
+    )
     stat_items = [
         ("Sources", _format_int(stats.get("source_count"))),
         ("Newsletters", _format_int(stats.get("newsletter_count"))),
@@ -1934,19 +4177,26 @@ def _render_digest_stats(stats: dict[str, Any]) -> str:
         ("Podcast episodes", _format_int(stats.get("podcast_episode_count"))),
         ("Articles included", _format_int(stats.get("included_article_count"))),
         ("Items filtered", _format_int(int(stats.get("dropped_count") or 0) + int(stats.get("unresolved_count") or 0))),
-        ("Model tokens", _format_int(stats.get("total_tokens"))),
-        ("Model calls", _format_int(stats.get("model_call_count"))),
+        ("AI tokens", _format_int(stats.get("total_tokens"))),
+        ("AI calls", ai_call_value),
         ("Processing time", _format_duration(stats.get("processing_seconds"))),
     ]
     stat_html = "\n".join(
         f'<div class="digest-stat"><span>{escape(label)}</span><strong>{escape(value)}</strong></div>'
         for label, value in stat_items
     )
-    token_detail = ""
-    if int(stats.get("total_tokens") or 0):
-        token_detail = (
-            f"<p class=\"meta\">Token detail: {_format_int(stats.get('prompt_tokens'))} prompt + "
-            f"{_format_int(stats.get('completion_tokens'))} completion.</p>"
+    token_detail = _render_token_detail(stats)
+    completion_unavailable_count = int(stats.get("completion_unavailable_count") or 0)
+    token_warning = ""
+    if failed_model_calls:
+        unavailable_note = (
+            f" Completion tokens were unavailable for {_format_int(completion_unavailable_count)} failed call(s)."
+            if completion_unavailable_count
+            else ""
+        )
+        token_warning = (
+            f'<p class="meta">AI warning: {_format_int(failed_model_calls)} model call(s) failed before completion; '
+            f"this token total may be incomplete.{unavailable_note}</p>"
         )
     return f"""
       <div class="digest-stats">
@@ -1954,6 +4204,7 @@ def _render_digest_stats(stats: dict[str, Any]) -> str:
         {stage_html}
       </div>
       {token_detail}
+      {token_warning}
     """
 
 
@@ -1962,6 +4213,24 @@ def _format_int(value: Any) -> str:
         return f"{int(value or 0):,}"
     except (TypeError, ValueError):
         return "0"
+
+
+def _render_token_detail(stats: dict[str, Any]) -> str:
+    if not int(stats.get("total_tokens") or 0):
+        return ""
+    prompt = _format_int(stats.get("prompt_tokens"))
+    completion = int(stats.get("completion_tokens") or 0)
+    completion_display = _format_int(completion)
+    unavailable_count = int(stats.get("completion_unavailable_count") or 0)
+    failed_count = int(stats.get("model_failure_count") or 0)
+    if unavailable_count and failed_count and completion == 0:
+        return f'<p class="meta">Token detail: {prompt} prompt tokens recorded; completion tokens unavailable.</p>'
+    if unavailable_count and failed_count:
+        return (
+            f'<p class="meta">Token detail: {prompt} prompt + {completion_display} completion recorded; '
+            "some completion tokens unavailable.</p>"
+        )
+    return f'<p class="meta">Token detail: {prompt} prompt + {completion_display} completion.</p>'
 
 
 def _format_duration(value: Any) -> str:
@@ -1977,15 +4246,38 @@ def _format_duration(value: Any) -> str:
     return f"{remaining}s"
 
 
+def _format_stage_duration(value: Any) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return "not measured"
+    if seconds <= 0:
+        return "not measured"
+    return _format_duration(seconds)
+
+
 def _section_for_payload(payload: NormalizedPayload) -> str:
     if payload.source_type == "podcast_episode":
         return "Podcast Signals"
+    if payload.source_type == "youtube_video":
+        return "YouTube Videos"
+    if payload.source_type == "collection_chunk":
+        return "Collections"
+    if payload.source_type == "market_snapshot":
+        tier = str((payload.metadata or {}).get("tier") or "").strip().lower()
+        return "Core Companies" if tier == "core" else "Related Companies" if tier == "related" else "Markets"
     return "Newsletter" if payload.source_type == "gmail" else "Discovered Link"
 
 
 def _editor_note_for_payload(payload: NormalizedPayload) -> str:
     if payload.source_type == "podcast_episode":
         return "Podcast episode ingested from a configured feed or aggregator search."
+    if payload.source_type == "youtube_video":
+        return "YouTube video transcript ingested from a configured API search."
+    if payload.source_type == "collection_chunk":
+        return "Local collection file content retrieved from the selected Collections source."
+    if payload.source_type == "market_snapshot":
+        return "Public-market snapshot retrieved from free market data."
     if payload.source_type == "gmail_link":
         return "Extracted from an approved Gmail newsletter. Article fetch and enrichment are pending."
     return "Newsletter body ingested from an approved Gmail sender."
@@ -1999,6 +4291,18 @@ def _editor_note_for_result(result: ArticleFetchResult) -> str:
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         source = str((result.payload.metadata or {}).get("transcript_source") or "show notes").replace("_", " ")
         return f"Podcast episode summarized from {source}.{score}"
+    if result.payload.source_type == "youtube_video":
+        score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
+        source = str((result.payload.metadata or {}).get("transcript_source") or "transcript").replace("_", " ")
+        return f"YouTube video summarized from {source}.{score}"
+    if result.payload.source_type == "collection_chunk":
+        score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
+        collection = str((result.payload.metadata or {}).get("collection_name") or result.payload.source_name or "collection")
+        return f"Local collection context from {collection}.{score}"
+    if result.payload.source_type == "market_snapshot":
+        score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
+        ticker = str((result.payload.metadata or {}).get("ticker") or result.payload.source_name or "market")
+        return f"Public-market context for {ticker}.{score}"
     if result.fetched:
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         return f"Fetched from a link discovered in an approved Gmail newsletter.{score}"
@@ -2210,6 +4514,28 @@ def _format_article_date(value: str | None) -> str:
 
 def _render_generated_footer(generated_at: str | None) -> str:
     return f'<footer class="issue-footer">Generated {escape(_format_generated_timestamp(generated_at))}</footer>'
+
+
+def _render_masthead_meta(generated_at: str | None, lookback_hours: int, stats: dict[str, Any] | None = None) -> str:
+    source_scope = str((stats or {}).get("source_scope_label") or "").strip()
+    if not source_scope:
+        source_scope = _format_source_scope(lookback_hours)
+    return escape(f"Generated {_format_generated_timestamp(generated_at)} · Source scope: {source_scope}")
+
+
+def _format_source_scope(lookback_hours: int) -> str:
+    try:
+        hours = max(1, int(lookback_hours))
+    except (TypeError, ValueError):
+        hours = 24
+    if hours % 24 == 0:
+        days = hours // 24
+        if days == 1:
+            return "last 24 hours"
+        return f"last {days} days"
+    if hours == 1:
+        return "last hour"
+    return f"last {hours} hours"
 
 
 def _format_generated_timestamp(value: str | None) -> str:
@@ -2731,6 +5057,35 @@ def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:
         )
 
     model_summaries.sort(key=lambda row: (row["record_count"], row["success_count"]), reverse=True)
+    route_groups: dict[tuple[str, str, str | None, str | None], list[dict[str, Any]]] = {}
+    for row in records:
+        key = (
+            str(row.get("mode") or "single"),
+            str(row.get("model") or "unknown"),
+            _nullable_str(row.get("backend")),
+            _nullable_str(row.get("model_tag")),
+        )
+        route_groups.setdefault(key, []).append(row)
+
+    route_summaries = []
+    for (mode, model, backend, model_tag), group in route_groups.items():
+        durations = sorted(_model_service_ms(row) for row in group if row.get("total_ms") is not None)
+        success = sum(1 for row in group if row["status"] == "success")
+        route_summaries.append(
+            {
+                "mode": mode,
+                "model": model,
+                "backend": backend,
+                "model_tag": model_tag,
+                "record_count": len(group),
+                "success_count": success,
+                "failure_count": len(group) - success,
+                "avg_total_ms": _average(durations),
+                "fallback_rate": _rate(sum(1 for row in group if row.get("fallback_triggered")), len(group)),
+            }
+        )
+
+    route_summaries.sort(key=lambda row: (row["mode"], -row["record_count"]))
     recent = records[:20]
     return {
         "record_count": total_count,
@@ -2739,6 +5094,7 @@ def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:
         "latest_ts": records[0]["ts"] if records else None,
         "status_counts": status_counts,
         "models": model_summaries,
+        "routes": route_summaries,
         "recent": recent,
         "ttft_available": any(row.get("ttft_ms") is not None for row in records),
     }

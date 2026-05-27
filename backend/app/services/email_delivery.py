@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup
@@ -99,6 +100,50 @@ def send_latest_digest(digest_id: str, *, recipient_email: str | None = None) ->
         return {"status": "failed", "recipient_email": recipient, "error": _delivery_error(exc)}
 
 
+def send_exploration_brief(
+    exploration_id: str,
+    *,
+    recipient_email: str | None = None,
+) -> dict[str, Any]:
+    exploration = database.get_exploration(exploration_id)
+    if exploration is None or exploration.get("deleted_at"):
+        return {"status": "not_found", "error": "Exploration not found"}
+    recipient = (recipient_email or _default_recipient_email()).strip()
+    if not recipient:
+        return {"status": "skipped", "error": "No delivery email configured."}
+    brief_ref = str(exploration.get("brief_ref") or "")
+    if not brief_ref:
+        return {"status": "failed", "error": "No completed brief is available to send."}
+
+    try:
+        html = Path(brief_ref).read_text(encoding="utf-8")
+        topic = database.get_topic_profile(str(exploration.get("topic_id") or "")) or {}
+        profile = topic.get("profile") if isinstance(topic.get("profile"), dict) else {}
+        subject = _exploration_subject(profile)
+        service = _gmail_service()
+        email_html = _email_html(database.clean_issue_html_for_display(html))
+        plain_text = _html_to_text(email_html)
+        raw_message = _build_raw_message(
+            recipient=recipient,
+            subject=subject,
+            html=email_html,
+            plain_text=plain_text,
+        )
+        response = service.users().messages().send(userId="me", body={"raw": raw_message}).execute()
+        database.mark_exploration_emailed(exploration_id)
+        return {
+            "status": "sent",
+            "message_id": response.get("id"),
+            "recipient_email": recipient,
+            "delivered_at": database.utc_now(),
+        }
+    except OSError:
+        return {"status": "failed", "recipient_email": recipient, "error": "Exploration brief file was not found."}
+    except Exception as exc:  # pragma: no cover - Gmail API failures vary by account state.
+        logger.warning("Exploration email delivery failed for %s: %s", exploration_id, exc)
+        return {"status": "failed", "recipient_email": recipient, "error": _delivery_error(exc)}
+
+
 def _gmail_service() -> Any:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -137,6 +182,25 @@ def _email_html(html: str) -> str:
     for element in soup.select(".feedback-controls"):
         element.decompose()
     return str(soup)
+
+
+def _default_recipient_email() -> str:
+    enabled_settings = database.enabled_delivery_settings()
+    if enabled_settings:
+        return str(enabled_settings[0].get("recipient_email") or "")
+    for digest in database.list_digests():
+        delivery_settings = database.get_delivery_settings(str(digest.get("id") or ""))
+        recipient = str(delivery_settings.get("recipient_email") or "").strip()
+        if recipient:
+            return recipient
+    return ""
+
+
+def _exploration_subject(profile: dict[str, Any]) -> str:
+    scope = str(profile.get("scope") or profile.get("statement") or "").strip()
+    if scope:
+        return f"Morning Dispatch Explore: {scope[:100]}"
+    return "Morning Dispatch Explore"
 
 
 def _token_scopes(settings: Settings) -> set[str]:

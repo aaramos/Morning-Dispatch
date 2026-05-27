@@ -23,3 +23,8 @@ tsconfig.tsbuildinfo
 local.config.yaml
 runtime/
 output/
+secrets/
+*.pem
+*.key
+*credentials*.json
+*client_secret*.json

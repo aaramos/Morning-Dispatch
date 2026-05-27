@@ -11,6 +11,7 @@ ARTICLE_HTML = """
 <html>
   <head>
     <meta property="og:title" content="Useful AI Article" />
+    <meta property="og:image" content="/images/useful-ai.jpg" />
   </head>
   <body>
     <nav>Subscribe now</nav>
@@ -70,6 +71,8 @@ def test_extract_article_prefers_article_content():
     assert extracted.title == "Useful AI Article"
     assert "substantial paragraph about an AI system" in extracted.text
     assert "Subscribe now" not in extracted.text
+    assert extracted.image_url == "https://example.com/images/useful-ai.jpg"
+    assert extracted.image_source == "og:image"
 
 
 def test_fetch_articles_resolves_and_extracts(monkeypatch):
@@ -88,6 +91,8 @@ def test_fetch_articles_resolves_and_extracts(monkeypatch):
     assert results[0].final_url == "https://example.com/final-article"
     assert results[0].canonical_url == "https://example.com/final-article"
     assert results[0].domain == "example.com"
+    assert results[0].metadata["image_url"] == "https://example.com/images/useful-ai.jpg"
+    assert results[0].metadata["image_source"] == "og:image"
 
 
 def test_select_article_payloads_filters_junk_and_deduplicates():

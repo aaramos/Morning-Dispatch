@@ -19,6 +19,7 @@ def configure_runtime(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("MORNING_DISPATCH_MODEL_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_MODEL", "env-default-model")
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
     return runtime
 
 

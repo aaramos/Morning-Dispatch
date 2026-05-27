@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol
+
+from backend.agents.digestor.base import NormalizedPayload
+
+AdapterName = Literal["gmail", "reddit", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"]
+AdapterStatusValue = Literal["pending", "running", "completed", "timed_out", "failed", "skipped"]
+Depth = Literal["practitioner", "informed-generalist"]
+RecencyWeighting = Literal["breaking", "recent", "last_year", "all_available"]
+ScheduleValue = Literal["hourly", "daily", "weekdays", "weekly", "monthly"]
+VALID_SCHEDULES: set[str] = {"hourly", "daily", "weekdays", "weekly", "monthly"}
+
+DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
+    "gmail": True,
+    "reddit": True,
+    "podcasts": True,
+    "web_search": True,
+    "foreign_media": False,
+    "youtube": False,
+    "collections": False,
+    "markets": False,
+}
+
+DEFAULT_EXPLORE_SOURCE_SELECTION: dict[str, bool] = {
+    "gmail": False,
+    "reddit": False,
+    "podcasts": False,
+    "web_search": True,
+    "foreign_media": False,
+    "youtube": False,
+    "collections": False,
+    "markets": False,
+}
+
+
+@dataclass(frozen=True)
+class CostProfile:
+    label: str
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class SourceAdapterContext:
+    exploration_id: str
+    lookback_hours: int = 24
+    candidate_limit: int = 80
+
+
+@dataclass(frozen=True)
+class TopicProfile:
+    topic_id: str
+    statement: str
+    scope: str
+    subtopics: tuple[str, ...] = ()
+    keywords: tuple[str, ...] = ()
+    search_queries: tuple[str, ...] = ()
+    source_queries: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    foreign_language_plan: tuple[dict[str, Any], ...] = ()
+    depth: Depth = "informed-generalist"
+    recency_weighting: RecencyWeighting = "recent"
+    exclusions: tuple[str, ...] = ()
+    source_selection: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_SOURCE_SELECTION))
+    requested_sources: tuple[dict[str, Any], ...] = ()
+    promoted_sources: tuple[dict[str, Any], ...] = ()
+    models: dict[str, str | None] = field(default_factory=lambda: {"refinement": None, "brief": None})
+    schedule: ScheduleValue | None = None
+    schedule_config: dict[str, Any] = field(default_factory=dict)
+    delivery_config: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> TopicProfile:
+        topic_id = _clean_text(payload.get("topic_id")) or str(uuid.uuid4())
+        statement = _clean_text(payload.get("statement"))
+        scope = _clean_text(payload.get("scope")) or statement
+        depth = _depth(payload.get("depth"))
+        recency = _recency(payload.get("recency_weighting"))
+        return cls(
+            topic_id=topic_id,
+            statement=statement,
+            scope=scope,
+            subtopics=tuple(_string_list(payload.get("subtopics"))),
+            keywords=tuple(_string_list(payload.get("keywords"))),
+            search_queries=tuple(_string_list(payload.get("search_queries"))),
+            source_queries=_source_queries(payload.get("source_queries")),
+            foreign_language_plan=tuple(_dict_list(payload.get("foreign_language_plan"))),
+            depth=depth,
+            recency_weighting=recency,
+            exclusions=tuple(_string_list(payload.get("exclusions"))),
+            source_selection=_source_selection(payload.get("source_selection")),
+            requested_sources=tuple(_dict_list(payload.get("requested_sources"))),
+            promoted_sources=tuple(_dict_list(payload.get("promoted_sources"))),
+            models=_models(payload.get("models")),
+            schedule=_schedule(payload.get("schedule")),
+            schedule_config=_dict(payload.get("schedule_config")),
+            delivery_config=_dict(payload.get("delivery_config")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "topic_id": self.topic_id,
+            "statement": self.statement,
+            "scope": self.scope,
+            "subtopics": list(self.subtopics),
+            "keywords": list(self.keywords),
+            "search_queries": list(self.search_queries),
+            "source_queries": {key: list(value) for key, value in self.source_queries.items()},
+            "foreign_language_plan": [dict(item) for item in self.foreign_language_plan],
+            "depth": self.depth,
+            "recency_weighting": self.recency_weighting,
+            "exclusions": list(self.exclusions),
+            "source_selection": dict(self.source_selection),
+            "requested_sources": [dict(source) for source in self.requested_sources],
+            "promoted_sources": [dict(source) for source in self.promoted_sources],
+            "models": dict(self.models),
+            "schedule": self.schedule,
+            "schedule_config": dict(self.schedule_config),
+            "delivery_config": dict(self.delivery_config),
+        }
+
+    def search_text(self) -> str:
+        parts = [self.scope or self.statement, *self.subtopics, *self.keywords, *self.search_queries]
+        if self.exclusions:
+            parts.append("Avoid: " + ", ".join(self.exclusions))
+        return " ".join(part for part in parts if part).strip()
+
+    def discovery_text(self) -> str:
+        """Positive topic text for external source queries."""
+        parts = [self.statement, self.scope, *self.subtopics, *self.keywords, *self.search_queries]
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for part in parts:
+            value = str(part or "").strip()
+            key = value.lower()
+            if value and key not in seen:
+                cleaned.append(value)
+                seen.add(key)
+        return " ".join(cleaned).strip()
+
+    def query_for_source(self, adapter: str) -> str:
+        source_queries = self.source_queries.get(adapter, ())
+        if source_queries:
+            return " ".join(query for query in source_queries if query).strip()
+        if self.search_queries:
+            return " ".join(query for query in self.search_queries if query).strip()
+        return self.discovery_text()
+
+
+@dataclass(frozen=True)
+class Candidate:
+    adapter: str
+    payload: NormalizedPayload
+    score: float = 0.0
+    reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "adapter": self.adapter,
+            "score": self.score,
+            "reason": self.reason,
+            "payload": {
+                "id": self.payload.id,
+                "source_type": self.payload.source_type,
+                "source_name": self.payload.source_name,
+                "raw_text": self.payload.raw_text,
+                "original_url": self.payload.original_url,
+                "published_at": self.payload.published_at,
+                "fetched_at": self.payload.fetched_at,
+                "metadata": dict(self.payload.metadata or {}),
+            },
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
+class AdapterStatus:
+    name: str
+    status: AdapterStatusValue
+    candidate_count: int = 0
+    elapsed_ms: int = 0
+    timeout_seconds: float | None = None
+    message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "candidate_count": self.candidate_count,
+            "elapsed_ms": self.elapsed_ms,
+            "timeout_seconds": self.timeout_seconds,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    profile: TopicProfile
+    candidates: tuple[Candidate, ...]
+    statuses: tuple[AdapterStatus, ...]
+    exclusions: tuple[dict[str, Any], ...] = ()
+
+    def payloads(self) -> list[NormalizedPayload]:
+        return [candidate.payload for candidate in self.candidates]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "topic_profile": self.profile.to_dict(),
+            "candidate_count": len(self.candidates),
+            "candidates": [candidate.to_dict() for candidate in self.candidates],
+            "statuses": [status.to_dict() for status in self.statuses],
+            "exclusions": [dict(exclusion) for exclusion in self.exclusions],
+        }
+
+
+class SourceAdapter(Protocol):
+    name: str
+    cost_profile: CostProfile
+    good_for: tuple[str, ...]
+
+    async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
+        ...
+
+    async def fetch(self, candidate: Candidate) -> NormalizedPayload:
+        ...
+
+
+class AdapterUnavailable(RuntimeError):
+    pass
+
+
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _schedule(value: Any) -> ScheduleValue | None:
+    cleaned = _clean_text(value)
+    if not cleaned:
+        return None
+    if cleaned not in VALID_SCHEDULES:
+        raise ValueError(f"Unsupported topic profile schedule: {cleaned}")
+    return cleaned  # type: ignore[return-value]
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned = [_clean_text(item) for item in value]
+    return [item for item in cleaned if item]
+
+
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _source_queries(value: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, dict):
+        return {}
+    queries: dict[str, tuple[str, ...]] = {}
+    valid_adapters = {"gmail", "reddit", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"}
+    for raw_key, raw_queries in value.items():
+        key = _clean_text(raw_key)
+        if key not in valid_adapters:
+            continue
+        cleaned = tuple(_string_list(raw_queries)[:5])
+        if cleaned:
+            queries[key] = cleaned
+    return queries
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _source_selection(value: Any) -> dict[str, bool]:
+    selection = dict(DEFAULT_SOURCE_SELECTION)
+    if isinstance(value, dict):
+        for key, enabled in value.items():
+            clean_key = _clean_text(key)
+            if clean_key:
+                selection[clean_key] = bool(enabled)
+    return selection
+
+
+def _models(value: Any) -> dict[str, str | None]:
+    models: dict[str, str | None] = {"refinement": None, "brief": None}
+    if isinstance(value, dict):
+        for key in models:
+            raw_model = value.get(key)
+            models[key] = _optional_model_name(raw_model)
+    return models
+
+
+def _depth(value: Any) -> Depth:
+    return "practitioner" if _clean_text(value) == "practitioner" else "informed-generalist"
+
+
+def _recency(value: Any) -> RecencyWeighting:
+    cleaned = _clean_text(value)
+    if cleaned in {"breaking", "recent", "last_year", "all_available"}:
+        return cleaned  # type: ignore[return-value]
+    if cleaned == "evergreen":
+        return "all_available"
+    return "recent"
+
+
+def _optional_model_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None

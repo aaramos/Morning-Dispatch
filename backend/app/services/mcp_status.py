@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from backend.app.core.config import Settings
+from backend.app.core.secret_redaction import redact_secret_text
 
 GMAIL_FETCH_TOOL = "gmail__gmail_fetch_newsletters"
 REDDIT_BROWSE_TOOL = "reddit__browse_subreddit"
@@ -100,7 +101,7 @@ def _parse_servers(payload: Any) -> list[dict[str, Any]]:
                 "state": str(server.get("state") or "unknown"),
                 "transport": str(server.get("transport") or "unknown"),
                 "tools_count": int(server.get("tools_count") or 0),
-                "error": server.get("error") if server.get("error") else None,
+                "error": redact_secret_text(str(server.get("error"))) if server.get("error") else None,
             }
         )
     return servers

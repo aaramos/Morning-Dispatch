@@ -1,0 +1,505 @@
+from __future__ import annotations
+
+import asyncio
+
+from backend.agents.digestor.base import NormalizedPayload
+from backend.agents.discovery import foreign_media
+from backend.agents.discovery.foreign_media import ForeignMediaSourceAdapter, foreign_language_plan_for_profile
+from backend.agents.discovery.language_support import trusted_language_options
+from backend.agents.discovery.types import SourceAdapterContext, TopicProfile
+from backend.agents.discovery.web_search import SearchHit
+from backend.agents.editor import prepare_issue_articles
+from backend.agents.librarian.articles import ArticleFetchResult
+from backend.agents.librarian.enrichment import enrich_article_with_model, enrich_articles
+from backend.agents.model import ModelClientError
+from backend.app.db import database
+from backend.app.main import create_app
+from backend.app.services import foreign_article_translation
+from fastapi.testclient import TestClient
+
+
+def _runtime(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(tmp_path))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(tmp_path / "secrets"))
+    monkeypatch.setenv("MORNING_DISPATCH_DB_PATH", str(tmp_path / "data" / "db" / "morning_dispatch.sqlite3"))
+    monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "false")
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(tmp_path / "missing-hermes.env"))
+
+
+def test_trusted_language_config_matches_supported_language_set() -> None:
+    languages = {item["code"]: item for item in trusted_language_options()}
+
+    assert len(languages) == 49
+    assert languages["zh"]["name"] == "Mandarin Chinese"
+    assert languages["yue"]["scripts"] == ["Hans", "Hant"]
+    assert languages["th"]["scripts"] == ["Thai"]
+    assert languages["tpi"]["name"] == "Tok Pisin"
+    assert languages["tvl"]["name"] == "Vaiaku"
+
+
+def test_foreign_language_plan_derives_entity_languages(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track SK Hynix and Kioxia memory news from local media.",
+            "scope": "Memory makers and HBM supply signals",
+            "source_selection": {"web_search": True, "foreign_media": True},
+        }
+    )
+
+    plan = asyncio.run(foreign_language_plan_for_profile(profile))
+
+    assert [item["code"] for item in plan] == ["ko", "ja"]
+    assert any("SK하이닉스" in item["native_query"] for item in plan)
+    assert any("キオクシア" in item["native_query"] for item in plan)
+
+
+def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    calls: list[dict[str, object]] = []
+
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None):
+        calls.append({"query": query, "limit": limit, "language": language})
+        return [
+            SearchHit(
+                title="SK하이닉스 HBM 투자 확대",
+                url="https://example.kr/news/1",
+                snippet="SK하이닉스가 HBM 생산 투자를 확대했다.",
+                score=0.8,
+                provider="fake",
+            )
+        ]
+
+    monkeypatch.setattr(foreign_media, "search_web", fake_search_web)
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track SK Hynix.",
+            "scope": "SK Hynix HBM investment signals",
+            "source_selection": {"foreign_media": True},
+            "foreign_language_plan": [
+                {
+                    "code": "ko",
+                    "name": "Korean",
+                    "native_query": "SK하이닉스 HBM 투자 최신 뉴스",
+                    "native_entity_terms": ["SK하이닉스"],
+                    "reason": "because you're tracking SK Hynix",
+                }
+            ],
+        }
+    )
+
+    candidates = asyncio.run(
+        ForeignMediaSourceAdapter().query(profile, SourceAdapterContext(exploration_id="explore-1"))
+    )
+
+    assert calls[0]["language"] == "ko"
+    assert candidates[0].adapter == "foreign_media"
+    assert candidates[0].payload.source_type == "foreign_web"
+    assert candidates[0].payload.metadata["needs_translation"] is True
+    assert candidates[0].payload.metadata["source_language"] == "ko"
+
+
+def test_foreign_metadata_translation_preserves_original() -> None:
+    class FakeModel:
+        config = type("Config", (), {"model": "fake-gemma"})()
+
+        async def complete_json(self, **_kwargs):
+            return {
+                "title_en": "SK Hynix expands HBM investment",
+                "summary_en": "SK Hynix expanded investment in HBM production.",
+                "quality": "high",
+            }
+
+    payload = NormalizedPayload(
+        source_type="foreign_web",
+        source_name="Example Korea",
+        raw_text="SK하이닉스가 HBM 생산 투자를 확대했다.",
+        original_url="https://example.kr/news/1",
+        metadata={
+            "needs_translation": True,
+            "source_language": "ko",
+            "source_language_name": "Korean",
+            "original_search_title": "SK하이닉스 HBM 투자 확대",
+            "original_search_summary": "SK하이닉스가 HBM 생산 투자를 확대했다.",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://example.kr/news/1",
+        final_url="https://example.kr/news/1",
+        title="SK하이닉스 HBM 투자 확대",
+        text="SK하이닉스가 HBM 생산 투자를 확대했다.",
+        excerpt="SK하이닉스가 HBM 생산 투자를 확대했다.",
+        domain="example.kr",
+        status="fetched",
+        link_score=0.8,
+    )
+
+    translated = asyncio.run(enrich_article_with_model(result, model_client=FakeModel()))
+
+    assert translated.title == "SK Hynix expands HBM investment"
+    assert translated.editor_summary == "SK Hynix expanded investment in HBM production."
+    assert translated.metadata["translation"]["translated"] is True
+    assert translated.metadata["translation"]["original_title"] == "SK하이닉스 HBM 투자 확대"
+
+
+def test_foreign_metadata_translation_uses_text_fallback_when_json_fails() -> None:
+    class FakeFallbackModel:
+        config = type("Config", (), {"model": "fake-gemma"})()
+
+        async def complete_json(self, **_kwargs):
+            raise ModelClientError("bad json", status="parse_error")
+
+        async def complete(self, **_kwargs):
+            return (
+                "Title: SK Hynix expands HBM investment\n"
+                "Summary: SK Hynix expanded investment in HBM production."
+            )
+
+    payload = NormalizedPayload(
+        source_type="foreign_web",
+        source_name="Example Korea",
+        raw_text="SK하이닉스가 HBM 생산 투자를 확대했다.",
+        original_url="https://example.kr/news/1",
+        metadata={
+            "needs_translation": True,
+            "source_language": "ko",
+            "source_language_name": "Korean",
+            "original_search_title": "SK하이닉스 HBM 투자 확대",
+            "original_search_summary": "SK하이닉스가 HBM 생산 투자를 확대했다.",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://example.kr/news/1",
+        final_url="https://example.kr/news/1",
+        title="SK하이닉스 HBM 투자 확대",
+        text="SK하이닉스가 HBM 생산 투자를 확대했다.",
+        excerpt="SK하이닉스가 HBM 생산 투자를 확대했다.",
+        domain="example.kr",
+        status="fetched",
+        link_score=0.8,
+    )
+
+    translated = asyncio.run(enrich_article_with_model(result, model_client=FakeFallbackModel()))
+
+    assert translated.title == "SK Hynix expands HBM investment"
+    assert translated.editor_summary == "SK Hynix expanded investment in HBM production."
+    assert translated.metadata["translation"]["translated"] is True
+    assert translated.metadata["translation"]["mode"] == "fallback_text"
+    assert translated.metadata["translation"]["original_title"] == "SK하이닉스 HBM 투자 확대"
+
+
+def test_non_english_web_result_is_translated_even_outside_model_item_budget() -> None:
+    class FakeModel:
+        config = type("Config", (), {"model": "fake-gemma"})()
+
+        async def complete_json(self, **_kwargs):
+            return {
+                "title_en": "SK Hynix Q4 results beat expectations",
+                "summary_en": "SK Hynix's strong HBM results may support Micron and Sandisk through higher memory prices.",
+                "quality": "high",
+            }
+
+    thai_title = "ผลประกอบการไตรมาส 4 ของ SK Hynix ที่รายงานดีเกินคาด"
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name=thai_title,
+        raw_text="ผลกระทบเชิงบวกชัดเจน เพราะ SK Hynix เป็นผู้นำ HBM สำหรับ AI",
+        original_url="https://www.zyo71.com/2026/01/4-sk-hynix-sndk-mu.html",
+        metadata={"link_quality_score": 0.95},
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url,
+        final_url=payload.original_url,
+        title=thai_title,
+        text="ผลกระทบเชิงบวกชัดเจน เพราะ SK Hynix เป็นผู้นำ HBM สำหรับ AI",
+        excerpt="ผลกระทบเชิงบวกชัดเจน เพราะ SK Hynix เป็นผู้นำ HBM สำหรับ AI",
+        domain="zyo71.com",
+        status="fetched",
+        link_score=0.95,
+    )
+
+    translated = asyncio.run(enrich_articles([result], model_client=FakeModel(), model_max_items=0))[0]
+
+    assert translated.title == "SK Hynix Q4 results beat expectations"
+    assert translated.editor_summary.startswith("SK Hynix's strong HBM results")
+    assert translated.metadata["translation"]["translated"] is True
+    assert translated.metadata["translation"]["source_language"] == "th"
+    assert translated.metadata["translation"]["source_language_name"] == "Thai"
+    assert translated.metadata["translation"]["original_title"] == thai_title
+
+
+def test_script_detection_uses_trusted_language_scripts() -> None:
+    hindi_title = "माइक्रोन और हाइनिक्स मेमोरी बाजार की ताजा खबर"
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name=hindi_title,
+        raw_text="मेमोरी बाजार में मांग और कीमतों पर नई रिपोर्ट प्रकाशित हुई।",
+        original_url="https://example.in/news/memory",
+        metadata={"link_quality_score": 0.88},
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url,
+        final_url=payload.original_url,
+        title=hindi_title,
+        text="मेमोरी बाजार में मांग और कीमतों पर नई रिपोर्ट प्रकाशित हुई।",
+        excerpt="मेमोरी बाजार में मांग और कीमतों पर नई रिपोर्ट प्रकाशित हुई।",
+        domain="example.in",
+        status="fetched",
+        link_score=0.88,
+    )
+
+    untranslated = asyncio.run(enrich_article_with_model(result, model_client=None))
+
+    assert untranslated.metadata["translation"]["source_language"] == "hi"
+    assert untranslated.metadata["translation"]["source_language_name"] == "Hindi"
+
+
+def test_untranslated_non_english_web_result_is_moved_out_of_main_ranked_list() -> None:
+    thai_title = "ผลประกอบการไตรมาส 4 ของ SK Hynix ที่รายงานดีเกินคาด"
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name=thai_title,
+        raw_text="ผลกระทบเชิงบวกชัดเจน เพราะ SK Hynix เป็นผู้นำ HBM สำหรับ AI",
+        original_url="https://www.zyo71.com/2026/01/4-sk-hynix-sndk-mu.html",
+        metadata={"link_quality_score": 0.95},
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url,
+        final_url=payload.original_url,
+        title=thai_title,
+        text="ผลกระทบเชิงบวกชัดเจน เพราะ SK Hynix เป็นผู้นำ HBM สำหรับ AI",
+        excerpt="ผลกระทบเชิงบวกชัดเจน เพราะ SK Hynix เป็นผู้นำ HBM สำหรับ AI",
+        domain="zyo71.com",
+        status="fetched",
+        link_score=0.95,
+    )
+
+    untranslated = asyncio.run(enrich_article_with_model(result, model_client=None))
+
+    assert untranslated.tier == "lower_confidence"
+    assert untranslated.section == "Needs Translation"
+    assert untranslated.metadata["translation"]["translated"] is False
+    assert untranslated.metadata["translation"]["source_language"] == "th"
+
+    prepared = prepare_issue_articles(
+        {"interest": "SK Hynix HBM memory Micron Sandisk", "threshold": 0.05},
+        [untranslated],
+    )
+
+    assert prepared[0].tier == "lower_confidence"
+    assert prepared[0].section == "Needs Translation"
+
+
+def test_translated_web_story_gets_translation_badge_and_modal() -> None:
+    thai_title = "ผลประกอบการไตรมาส 4 ของ SK Hynix ที่รายงานดีเกินคาด"
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name=thai_title,
+        raw_text="ผลกระทบเชิงบวกชัดเจน เพราะ SK Hynix เป็นผู้นำ HBM สำหรับ AI",
+        original_url="https://www.zyo71.com/2026/01/4-sk-hynix-sndk-mu.html",
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url,
+        final_url=payload.original_url,
+        title="SK Hynix Q4 results beat expectations",
+        text="Translated body",
+        excerpt="Translated summary",
+        editor_summary="Translated summary",
+        domain="zyo71.com",
+        status="fetched",
+        link_score=0.95,
+        metadata={
+            "translation": {
+                "translated": True,
+                "source_language": "th",
+                "source_language_name": "Thai",
+                "original_title": thai_title,
+                "original_summary": payload.raw_text,
+            }
+        },
+    )
+
+    html = database.render_ingested_issue(
+        "Translated web brief",
+        "One translated web story.",
+        [],
+        [result],
+        lookback_hours=24,
+        issue_id="explore-1",
+    )
+
+    assert '<span class="source-type web">Web</span>' in html
+    assert "TH -&gt; EN" in html or "TH -&amp;gt; EN" in html
+    assert "data-foreign-article-target" in html
+    assert "foreign-modal" in html
+    assert f"via {thai_title}" not in html
+    assert "via SK Hynix Q4 results beat expectations" in html
+
+
+def test_foreign_story_renders_lazy_translation_modal() -> None:
+    payload = NormalizedPayload(
+        source_type="foreign_web",
+        source_name="Example Korea",
+        raw_text="",
+        original_url="https://example.kr/news/1",
+        metadata={
+            "source_language": "ko",
+            "source_language_name": "Korean",
+            "original_search_title": "원문 제목",
+            "original_search_summary": "원문 요약",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://example.kr/news/1",
+        final_url="https://example.kr/news/1",
+        title="Translated title",
+        text="Translated summary",
+        excerpt="Translated summary",
+        editor_summary="Translated summary",
+        domain="example.kr",
+        status="fetched",
+        tier="lead",
+        relevance_score=0.9,
+        metadata={
+            "translation": {
+                "translated": True,
+                "source_language": "ko",
+                "source_language_name": "Korean",
+                "original_title": "원문 제목",
+                "original_summary": "원문 요약",
+            }
+        },
+    )
+
+    html = database.render_ingested_issue(
+        "Foreign media brief",
+        "One translated story.",
+        [],
+        [result],
+        lookback_hours=24,
+        issue_id="explore-1",
+    )
+
+    assert "data-foreign-article-target" in html
+    assert "foreign-modal" in html
+    assert "KO -&gt; EN" in html or "KO -&amp;gt; EN" in html
+    assert "via 원문 제목" not in html
+    assert "via Translated title" in html
+    assert "/foreign-article/translation" in html
+    assert ".split(/\\n{2,}/)" in html
+    assert '.join("\\n\\n")' in html
+    assert ".split(/\n{2,}/)" not in html
+    assert '.join("\n\n")' not in html
+
+
+def test_foreign_article_translation_endpoint_requires_saved_brief_url(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    database.init_database()
+    profile = database.upsert_topic_profile(
+        {
+            "statement": "Track Korean memory news",
+            "scope": "Korean HBM signals",
+            "source_selection": {"foreign_media": True},
+        }
+    )
+    exploration = database.create_exploration(
+        topic_id=profile["topic_id"],
+        mode="show_now",
+        source_selection={"foreign_media": True},
+        status="complete",
+    )
+    output_dir = tmp_path / "data" / "digest-output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    brief_path = output_dir / "brief.html"
+    brief_path.write_text('<a href="https://example.kr/news/1">Story</a>', encoding="utf-8")
+    database.update_exploration_status(
+        exploration["exploration_id"],
+        status="complete",
+        brief_ref=str(brief_path),
+    )
+
+    async def fake_translate(payload: dict):
+        return {"status": "translated", "url": payload["url"], "translated_body": "English body."}
+
+    monkeypatch.setattr(foreign_article_translation, "translate_foreign_article", fake_translate)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        allowed = client.post(
+            f"/api/explore/explorations/{exploration['exploration_id']}/foreign-article/translation",
+            json={"url": "https://example.kr/news/1"},
+        )
+        blocked = client.post(
+            f"/api/explore/explorations/{exploration['exploration_id']}/foreign-article/translation",
+            json={"url": "https://not-in-brief.example/news"},
+        )
+
+    assert allowed.status_code == 200
+    assert allowed.json()["translated_body"] == "English body."
+    assert blocked.status_code == 403
+
+
+def test_foreign_article_translation_uses_text_fallback_when_json_fails(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    class FakeFallbackModel:
+        async def complete_json(self, **_kwargs):
+            raise ModelClientError("bad json", status="parse_error")
+
+        async def complete(self, **_kwargs):
+            return (
+                "Title: SK Hynix company analysis report\n"
+                "Body:\n"
+                "SK Hynix is expanding high-value memory sales around HBM and server DRAM. "
+                "The report says capacity investment supports growth, but supply discipline and demand durability remain important risks."
+            )
+
+    korean_body = "SK하이닉스는 고부가 메모리 판매를 확대하고 있다. " * 12
+    fetched_result = ArticleFetchResult(
+        payload=NormalizedPayload(
+            source_type="foreign_web",
+            source_name="Example Korea",
+            raw_text="SK하이닉스 종합 기업분석 리포트",
+            original_url="https://example.kr/news/1",
+        ),
+        original_url="https://example.kr/news/1",
+        final_url="https://example.kr/news/1",
+        title="SK하이닉스 종합 기업분석 리포트",
+        text=korean_body,
+        excerpt=korean_body,
+        domain="example.kr",
+        status="fetched",
+    )
+
+    async def fake_fetch_articles(*_args, **_kwargs):
+        return [fetched_result]
+
+    monkeypatch.setattr(foreign_article_translation, "fetch_articles_for_payloads", fake_fetch_articles)
+    monkeypatch.setattr(
+        foreign_article_translation.ModelClient,
+        "from_settings",
+        staticmethod(lambda _settings: FakeFallbackModel()),
+    )
+
+    response = asyncio.run(
+        foreign_article_translation.translate_foreign_article(
+            {
+                "url": "https://example.kr/news/1",
+                "title": "SK하이닉스 종합 기업분석 리포트",
+                "summary": "SK하이닉스는 고부가 메모리 판매를 확대하고 있다.",
+                "source_language": "ko",
+                "source_language_name": "Korean",
+            }
+        )
+    )
+
+    assert response["status"] == "translated"
+    assert response["translated_title"] == "SK Hynix company analysis report"
+    assert "high-value memory sales" in response["translated_body"]

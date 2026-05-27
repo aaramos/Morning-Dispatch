@@ -49,7 +49,13 @@ class FakeAsyncClient:
                 {
                     "servers": [
                         {"name": "fetch", "state": "connected", "transport": "stdio", "tools_count": 1},
-                        {"name": "gmail", "state": "connected", "transport": "stdio", "tools_count": 4},
+                        {
+                            "name": "gmail",
+                            "state": "connected",
+                            "transport": "stdio",
+                            "tools_count": 4,
+                            "error": "BRAVE_API_KEY=" + "BSA" + "secretthing1234567890",
+                        },
                     ]
                 }
             )
@@ -91,6 +97,7 @@ def test_mcp_status_reports_gmail_fetch_tool(monkeypatch, tmp_path):
     assert payload["gmail"]["connected"] is True
     assert payload["gmail"]["tools_count"] == 4
     assert payload["gmail"]["fetch_tool_present"] is True
+    assert "BSAsecretthing" not in str(payload["servers"])
 
 
 def test_mcp_status_degrades_when_omlx_unreachable(monkeypatch, tmp_path):

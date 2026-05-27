@@ -17,6 +17,7 @@ def configure_runtime(monkeypatch, tmp_path):
     )
     monkeypatch.delenv("MORNING_DISPATCH_PODCASTINDEX_API_KEY", raising=False)
     monkeypatch.delenv("MORNING_DISPATCH_PODCASTINDEX_API_SECRET", raising=False)
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
     return runtime
 
 

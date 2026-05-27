@@ -16,8 +16,10 @@ from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
 from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
+from backend.agents.source_audit import apply_source_audit
 from backend.app.core.config import get_settings
 from backend.app.db import database
+from backend.app.services import model_routing
 from langgraph.graph import END, START, StateGraph
 
 LOOKBACK_HOURS_BY_SCHEDULE = {
@@ -26,6 +28,16 @@ LOOKBACK_HOURS_BY_SCHEDULE = {
     "weekly": 168,
     "monthly": 720,
 }
+
+_running_digest_ids: set[str] = set()
+
+
+class DigestRunAlreadyRunning(RuntimeError):
+    """Raised when a digest run is already active in this app process."""
+
+
+def is_digest_running(digest_id: str) -> bool:
+    return str(digest_id) in _running_digest_ids
 
 
 class DigestGraphState(TypedDict, total=False):
@@ -44,6 +56,7 @@ class DigestGraphState(TypedDict, total=False):
     payloads: list[NormalizedPayload]
     podcast_decisions: Annotated[list[AgentDecision], add]
     editorial_decisions: list[AgentDecision]
+    source_audit_decisions: list[AgentDecision]
     critic_decisions: list[AgentDecision]
     quality_decisions: list[AgentDecision]
     fetched_articles: list[ArticleFetchResult]
@@ -56,28 +69,47 @@ class DigestGraphState(TypedDict, total=False):
     run: dict[str, Any]
 
 
-async def run_digest(digest_id: str, *, trigger: str = "manual") -> dict[str, Any] | None:
+async def run_digest(
+    digest_id: str,
+    *,
+    trigger: str = "manual",
+    lookback_hours: int | None = None,
+    skip_if_running: bool = False,
+) -> dict[str, Any] | None:
     started_at = monotonic()
     digest = database.get_digest(digest_id)
     if digest is None:
         return None
 
-    state = await _digest_graph().ainvoke(
-        DigestGraphState(
-            digest_id=digest_id,
-            trigger=trigger,
-            started_at=started_at,
-            stage_started=started_at,
-            stage_seconds={},
-            digest=digest,
-            inference_run_id=database.new_id(),
-            sender_allowlist=gmail_sender_allowlist(digest.get("sources", [])),
-            lookback_hours=LOOKBACK_HOURS_BY_SCHEDULE.get(str(digest.get("schedule", "daily")), 24),
-            model_cache_hit_count=0,
-            model_cache_miss_count=0,
-            model_cache_write_count=0,
+    digest_key = str(digest_id)
+    if digest_key in _running_digest_ids:
+        if skip_if_running:
+            return None
+        raise DigestRunAlreadyRunning(f"Digest {digest_id} is already running.")
+
+    _running_digest_ids.add(digest_key)
+    try:
+        state = await _digest_graph().ainvoke(
+            DigestGraphState(
+                digest_id=digest_id,
+                trigger=trigger,
+                started_at=started_at,
+                stage_started=started_at,
+                stage_seconds={},
+                digest=digest,
+                inference_run_id=database.new_id(),
+                sender_allowlist=gmail_sender_allowlist(digest.get("sources", [])),
+                lookback_hours=lookback_hours
+                if lookback_hours is not None
+                else LOOKBACK_HOURS_BY_SCHEDULE.get(str(digest.get("schedule", "daily")), 24),
+                model_cache_hit_count=0,
+                model_cache_miss_count=0,
+                model_cache_write_count=0,
+            )
         )
-    )
+    finally:
+        _running_digest_ids.discard(digest_key)
+
     return state.get("run")
 
 
@@ -182,11 +214,16 @@ async def _rank_articles(state: DigestGraphState) -> DigestGraphState:
     settings = get_settings()
     cache_hit_count = 0
     cache_miss_count = 0
-    if settings.librarian_use_model:
+    librarian_client = model_routing.client_for_agent(
+        "librarian",
+        settings=settings,
+        items=ranked_articles,
+    ).client
+    if librarian_client is not None:
         candidate_count = _model_cache_candidate_count(ranked_articles, settings.librarian_model_max_items)
         ranked_articles = database.apply_cached_model_enrichments(
             ranked_articles,
-            model_name=settings.librarian_model,
+            model_name=_model_client_name(librarian_client, settings.librarian_model),
             limit=settings.librarian_model_max_items,
         )
         cache_hit_count = sum(1 for result in ranked_articles if result.enrichment_source == "model_cache")
@@ -201,8 +238,15 @@ async def _rank_articles(state: DigestGraphState) -> DigestGraphState:
 
 
 async def _refine_with_model(state: DigestGraphState) -> DigestGraphState:
+    settings = get_settings()
+    librarian_client = model_routing.client_for_agent(
+        "librarian",
+        settings=settings,
+        items=state.get("ranked_articles", []),
+    ).client
     article_results = await refine_ranked_articles_with_model(
         state.get("ranked_articles", []),
+        model_client=librarian_client,
         inference_run_id=state["inference_run_id"],
         metrics_mode="batch" if state.get("trigger") == "scheduled" else "single",
     )
@@ -217,19 +261,61 @@ async def _refine_with_model(state: DigestGraphState) -> DigestGraphState:
 
 async def _review_quality(state: DigestGraphState) -> DigestGraphState:
     digest = state["digest"]
-    article_results, editorial_decisions = await apply_editorial_decisions(digest, state.get("article_results", []))
-    article_results, critic_decisions = await apply_critic_repairs(digest, state.get("payloads", []), article_results)
+    settings = get_settings()
+    source_audit_client = model_routing.client_for_agent(
+        "source_audit",
+        settings=settings,
+        items=state.get("article_results", []),
+    ).client
+    article_results, source_audit_decisions, _audit_summary = await apply_source_audit(
+        digest,
+        state.get("article_results", []),
+        lookback_hours=state["lookback_hours"],
+        model_client=source_audit_client,
+        inference_run_id=state["inference_run_id"],
+    )
+    editorial_client = model_routing.client_for_agent(
+        "editorial",
+        settings=settings,
+        items=article_results,
+    ).client
+    article_results, editorial_decisions = await apply_editorial_decisions(
+        digest,
+        article_results,
+        model_client=editorial_client,
+        inference_run_id=state["inference_run_id"],
+    )
+    critic_client = model_routing.client_for_agent(
+        "critic",
+        settings=settings,
+        items=article_results,
+    ).client
+    article_results, critic_decisions = await apply_critic_repairs(
+        digest,
+        state.get("payloads", []),
+        article_results,
+        model_client=critic_client,
+        inference_run_id=state["inference_run_id"],
+    )
     article_results, quality_decisions = apply_brief_quality_checks(article_results)
     stage_seconds = dict(state.get("stage_seconds", {}))
     stage_started = _mark_stage(stage_seconds, "editorial", state["stage_started"])
 
     cache_write_count = 0
-    settings = get_settings()
-    if settings.librarian_use_model:
-        cache_write_count = database.cache_model_enrichments(article_results, model_name=settings.librarian_model)
+    librarian_client = model_routing.client_for_agent(
+        "librarian",
+        settings=settings,
+        items=article_results,
+    ).client
+    if librarian_client is not None:
+        cache_write_count = database.cache_model_enrichments(
+            article_results,
+            model_name=_model_client_name(librarian_client, settings.librarian_model),
+        )
 
     return {
         "article_results": article_results,
+        "source_audit_decisions": source_audit_decisions,
         "editorial_decisions": editorial_decisions,
         "critic_decisions": critic_decisions,
         "quality_decisions": quality_decisions,
@@ -249,7 +335,6 @@ async def _publish_run(state: DigestGraphState) -> DigestGraphState:
     )
 
     stage_seconds = dict(state.get("stage_seconds", {}))
-    stage_seconds["publishing"] = 0.0
     run = database.create_ingested_run(
         digest=digest,
         payloads=state.get("payloads", []),
@@ -265,6 +350,7 @@ async def _publish_run(state: DigestGraphState) -> DigestGraphState:
         stage_seconds=stage_seconds,
         agent_decisions=(
             state.get("podcast_decisions", [])
+            + state.get("source_audit_decisions", [])
             + state.get("editorial_decisions", [])
             + state.get("critic_decisions", [])
             + state.get("quality_decisions", [])
@@ -289,6 +375,12 @@ def _model_cache_candidate_count(results: list[Any], limit: int) -> int:
         for result in results[:limit]
         if getattr(result, "fetched", False) and getattr(result, "tier", None) != "dropped"
     )
+
+
+def _model_client_name(model_client: Any, fallback: str | None) -> str:
+    config = getattr(model_client, "config", None)
+    model = getattr(config, "model", None)
+    return str(model or fallback or "unknown")
 
 
 def _mark_stage(stage_seconds: dict[str, float], name: str, started_at: float) -> float:

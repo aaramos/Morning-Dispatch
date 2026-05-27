@@ -4,16 +4,18 @@ import json
 import re
 from dataclasses import replace
 from time import perf_counter
+from collections.abc import Callable
 from typing import Any, Iterable
 
 from backend.agents.agentic import AgentDecision
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import ModelClient, ModelClientError
+from backend.agents.model.metrics import record_model_response_metric
 from backend.app.core.config import get_settings
 
-MAX_CRITIC_ARTICLES = 28
-MAX_NEWSLETTER_RECORDS = 8
+MAX_CRITIC_ARTICLES = 50
+MAX_NEWSLETTER_RECORDS = 20
 AUTO_REPAIR_ACTIONS = {"drop_article", "demote_article", "replace_lead", "clean_text"}
 DROP_FINDING_TYPES = {"duplicate", "promotional", "broken_link_noise", "low_value"}
 DEMOTE_FINDING_TYPES = {"weak_lead", "thin_context", "low_confidence"}
@@ -25,6 +27,8 @@ async def apply_critic_repairs(
     results: Iterable[ArticleFetchResult],
     *,
     model_client: ModelClient | None = None,
+    reasoning_callback: Callable[[str], None] | None = None,
+    inference_run_id: str | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision]]:
     result_list = _deterministic_repairs(list(results))
     active_count = sum(1 for result in result_list if result.tier != "dropped")
@@ -59,11 +63,29 @@ async def apply_critic_repairs(
     prompt = _critic_prompt(digest, payloads, result_list)
     started_at = perf_counter()
     try:
-        payload = await client.complete_json(
-            system=CRITIC_SYSTEM_PROMPT,
-            prompt=prompt,
-            max_tokens=1400,
-        )
+        if hasattr(client, "complete_json_with_metrics"):
+            response, payload = await client.complete_json_with_metrics(
+                system=CRITIC_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=1400,
+                on_token=reasoning_callback,
+            )
+            record_model_response_metric(
+                run_id=inference_run_id,
+                article_id="critic_batch",
+                mode="critic",
+                model_client=client,
+                response=response,
+                system_prompt=CRITIC_SYSTEM_PROMPT,
+                prompt=prompt,
+            )
+        else:
+            payload = await client.complete_json(
+                system=CRITIC_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=1400,
+                on_token=reasoning_callback,
+            )
     except ModelClientError as exc:
         return result_list, [
             AgentDecision(

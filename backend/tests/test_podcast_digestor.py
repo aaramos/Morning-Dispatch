@@ -12,6 +12,7 @@ def test_parse_podcast_feed_extracts_episode():
     <rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
       <channel>
         <title>AI Daily Brief</title>
+        <itunes:image href="https://podcasts.example.com/artwork.jpg" />
         <item>
           <title>OpenAI ships a new agent workflow</title>
           <description><![CDATA[<p>Agents, coding workflows, and local model updates.</p>]]></description>
@@ -36,6 +37,7 @@ def test_parse_podcast_feed_extracts_episode():
     assert episodes[0].description == "Agents, coding workflows, and local model updates."
     assert episodes[0].episode_url == "https://podcasts.example.com/openai-agent-workflow"
     assert episodes[0].audio_url == "https://cdn.example.com/audio.mp3"
+    assert episodes[0].image_url == "https://podcasts.example.com/artwork.jpg"
     assert episodes[0].duration_seconds == 750
     assert episodes[0].published_at == "2026-05-22T12:30:00+00:00"
 
@@ -72,6 +74,7 @@ def test_fetch_podcast_episode_payload_uses_show_notes(monkeypatch, tmp_path):
         audio_url="https://cdn.example.com/audio.mp3",
         duration_seconds=1800,
         apple_podcasts_url="https://podcasts.apple.com/podcast/id123456789",
+        image_url="https://podcasts.example.com/artwork.jpg",
     )
 
     async def fake_fetch_feed_episodes(_client, _source):
@@ -103,6 +106,7 @@ def test_fetch_podcast_episode_payload_uses_show_notes(monkeypatch, tmp_path):
     assert "Show notes:" in payload.raw_text
     assert payload.metadata["podcast_episode_id"] == "episode-1"
     assert payload.metadata["apple_podcasts_url"] == "https://podcasts.apple.com/podcast/id123456789"
+    assert payload.metadata["image_url"] == "https://podcasts.example.com/artwork.jpg"
     assert payload.metadata["transcript_source"] == "show_notes"
     assert any(decision.agent == "podcast_scout" for decision in decisions)
     summary = database.podcast_metrics_summary()
@@ -203,8 +207,9 @@ def test_apple_url_from_itunes_id():
     assert podcast._apple_url_from_itunes_id("0") is None
 
 
-def test_discover_podcasts_returns_empty_without_credentials(monkeypatch):
+def test_discover_podcasts_returns_empty_without_credentials(monkeypatch, tmp_path):
     monkeypatch.delenv("MORNING_DISPATCH_PODCASTINDEX_API_KEY", raising=False)
     monkeypatch.delenv("MORNING_DISPATCH_PODCASTINDEX_API_SECRET", raising=False)
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(tmp_path / "secrets"))
 
     assert asyncio.run(podcast.discover_podcasts("AI daily brief")) == []

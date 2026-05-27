@@ -19,6 +19,7 @@ def configure_runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "false")
     monkeypatch.setenv("MORNING_DISPATCH_SCHEDULER_DAILY_RUN_TIME", "05:00")
     monkeypatch.setenv("MORNING_DISPATCH_SCHEDULER_TIMEZONE", "America/Los_Angeles")
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
 
 
 def test_scheduler_runs_due_active_digest(monkeypatch, tmp_path):
@@ -35,8 +36,9 @@ def test_scheduler_runs_due_active_digest(monkeypatch, tmp_path):
     started: list[str] = []
     delivered: list[str] = []
 
-    async def fake_run_digest(digest_id: str, *, trigger: str = "manual"):
+    async def fake_run_digest(digest_id: str, *, trigger: str = "manual", skip_if_running: bool = False):
         started.append(f"{trigger}:{digest_id}")
+        assert skip_if_running is True
         return {"id": "run-1", "digest_id": digest_id}
 
     async def fake_delivery(run):
@@ -73,7 +75,7 @@ def test_scheduler_skips_recent_digest(monkeypatch, tmp_path):
     )
     started: list[str] = []
 
-    async def fake_run_digest(digest_id: str, *, trigger: str = "manual"):
+    async def fake_run_digest(digest_id: str, *, trigger: str = "manual", skip_if_running: bool = False):
         started.append(f"{trigger}:{digest_id}")
         return {"id": "run-2"}
 
@@ -83,6 +85,38 @@ def test_scheduler_skips_recent_digest(monkeypatch, tmp_path):
 
     assert count == 0
     assert started == []
+
+
+def test_scheduler_skips_digest_with_manual_run_in_progress(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    digest = database.create_digest(
+        {
+            "name": "Manual Brief",
+            "interest": "AI model releases",
+            "schedule": "daily",
+            "sources": [{"type": "gmail_newsletter", "sender": "example@example.com"}],
+        }
+    )
+    started: list[str] = []
+    delivered: list[str] = []
+
+    async def fake_run_digest(digest_id: str, *, trigger: str = "manual", skip_if_running: bool = False):
+        started.append(f"{trigger}:{digest_id}")
+        return {"id": "run-3", "digest_id": digest_id}
+
+    async def fake_delivery(run):
+        delivered.append(str(run["digest_id"]))
+
+    monkeypatch.setattr(scheduler.digest_runner, "is_digest_running", lambda digest_id: digest_id == digest["id"])
+    monkeypatch.setattr(scheduler.digest_runner, "run_digest", fake_run_digest)
+    monkeypatch.setattr(scheduler.email_delivery, "deliver_scheduled_digest", fake_delivery)
+
+    count = asyncio.run(scheduler.run_due_digests_once(datetime(2026, 5, 21, tzinfo=UTC)))
+
+    assert count == 0
+    assert started == []
+    assert delivered == []
 
 
 def test_daily_scheduler_uses_fixed_morning_time(monkeypatch, tmp_path):
@@ -118,3 +152,59 @@ def test_daily_scheduler_due_at_fixed_morning_time(monkeypatch, tmp_path):
 
     assert not scheduler.is_due(digest, latest_run, datetime(2026, 5, 22, 11, 59, tzinfo=UTC))
     assert scheduler.is_due(digest, latest_run, datetime(2026, 5, 22, 12, 0, tzinfo=UTC))
+
+
+def test_scheduler_runs_due_topic_profiles(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = database.upsert_topic_profile(
+        {
+            "statement": "Explore local AI news",
+            "scope": "Local AI and tools",
+            "source_selection": {"gmail": False, "reddit": False, "podcasts": False, "web_search": False},
+            "schedule": "hourly",
+        }
+    )
+
+    started: list[str] = []
+    scheduled_exploration_ids: list[str] = []
+    delivered: list[str] = []
+
+    async def fake_run_scheduled(topic_id: str, source_selection: dict[str, bool] | None = None):
+        started.append(topic_id)
+        exploration = database.create_exploration(topic_id=topic_id, mode="scheduled", source_selection=source_selection or {})
+        database.update_exploration_status(exploration["exploration_id"], status="complete", brief_ref="/tmp/fake-brief.html")
+        scheduled_exploration_ids.append(str(exploration["exploration_id"]))
+        return {"exploration": {"exploration_id": exploration["exploration_id"]}}
+
+    def fake_send_exploration_brief(exploration_id: str, recipient_email: str | None = None) -> dict[str, str]:
+        delivered.append(exploration_id)
+        return {"status": "sent"}
+
+    monkeypatch.setattr(scheduler.explore, "run_scheduled", fake_run_scheduled)
+    monkeypatch.setattr(scheduler.email_delivery, "send_exploration_brief", fake_send_exploration_brief)
+
+    count = asyncio.run(scheduler.run_due_digests_once(datetime(2026, 5, 22, 12, 0, tzinfo=UTC)))
+
+    assert count == 1
+    assert started == [topic["topic_id"]]
+    assert len(delivered) == 1
+    assert len(scheduled_exploration_ids) == 1
+    assert delivered == scheduled_exploration_ids
+
+
+def test_topic_due_checks_hourly_interval(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = database.upsert_topic_profile(
+        {
+            "statement": "Explore local AI news",
+            "scope": "Hourly interval check",
+            "schedule": "hourly",
+        }
+    )
+
+    latest_run = {"finished_at": "2026-05-22T10:00:00+00:00"}
+
+    assert scheduler.is_topic_due(topic, latest_run, datetime(2026, 5, 22, 10, 30, tzinfo=UTC)) is False
+    assert scheduler.is_topic_due(topic, latest_run, datetime(2026, 5, 22, 11, 0, tzinfo=UTC)) is True

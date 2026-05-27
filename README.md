@@ -21,6 +21,7 @@ This scaffold includes:
 - Newspaper-style HTML issue rendering with lead story, topic sections, lower-confidence items, and source notes
 - React/Vite management UI shell
 - Safe config examples with runtime data and secrets outside the project folder
+- Exploration flow for ad hoc topic discovery and on-demand briefs (show-now or schedule)
 
 The MVP is usable end to end: connect Gmail, run a digest, open the generated issue, and read the ranked article digest over localhost or the configured Tailscale HTTPS URL.
 
@@ -101,12 +102,82 @@ The Librarian can call an OpenAI-compatible local model endpoint, such as oMLX, 
 MORNING_DISPATCH_LIBRARIAN_USE_MODEL=auto \
 MORNING_DISPATCH_MODEL_BASE_URL=http://127.0.0.1:1234/v1 \
 MORNING_DISPATCH_LIBRARIAN_MODEL="Gemma-4 MTP 6Bit" \
-MORNING_DISPATCH_LIBRARIAN_MODEL_MAX_ITEMS=120 \
+MORNING_DISPATCH_LIBRARIAN_MODEL_MAX_ITEMS=250 \
 MORNING_DISPATCH_MODEL_CONCURRENCY=1 \
 MORNING_DISPATCH_MODEL_TIMEOUT_SECONDS=90 \
 MORNING_DISPATCH_MODEL_API_KEY=... \
 uv run python -m backend.app.server
 ```
+
+## Explore an Interest
+
+Morning Dispatch now supports a second flow for one-off exploration:
+
+- Start with a plain-English statement in the frontend Explore panel.
+- The refinement chat gathers a minimal topic profile (`scope`, `depth`, `recency_weighting`, `exclusions`).
+- Run immediately (“show now”) for a rendered brief, then optionally save and mail it.
+- Or save a `topic profile` and schedule it for recurring exploration.
+
+The same digest core does the candidate ranking and brief quality checks, so scheduled and ad-hoc flows stay consistent.
+
+## Web Search Adapter
+
+Discovery can use pluggable web search providers for discovery-only candidates:
+
+- `tavily`
+- `brave`
+- `serpapi`
+
+Configure with environment variables (or equivalent secret files in `${MORNING_DISPATCH_SECRETS_DIR}`):
+
+```bash
+MORNING_DISPATCH_WEB_SEARCH_PROVIDER=auto \
+MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH=/Users/macstudio/.hermes/.env \
+MORNING_DISPATCH_TAVILY_API_KEY=... \
+MORNING_DISPATCH_BRAVE_API_KEY=... \
+MORNING_DISPATCH_SERPAPI_API_KEY=...
+```
+
+`auto` selects the first configured key in this order: `tavily`, `brave`, `serpapi`.
+Setting a specific provider name forces that adapter.
+If no Morning Dispatch key is saved, the app also checks the shared search env file for names like
+`TAVILY_API_KEY`, `BRAVE_SEARCH_API_KEY`, and `SERPAPI_API_KEY`.
+
+## YouTube Adapter
+
+YouTube can be enabled as an optional source for on-demand briefs. It uses the YouTube Data API for discovery, then only includes videos when a native transcript is available.
+
+```bash
+MORNING_DISPATCH_YOUTUBE_API_KEY=... \
+MORNING_DISPATCH_YOUTUBE_MAX_RESULTS=15 \
+MORNING_DISPATCH_YOUTUBE_DURATION_FILTER=medium
+```
+
+You can also paste the API key in Admin -> Sources. YouTube is off by default and only runs when selected for a brief.
+
+## Collections Adapter
+
+Collections is an optional local source for briefs. First slice support indexes text-like files from top-level folders under the Collections root and sends relevant chunks into the shared brief pipeline.
+
+```bash
+MORNING_DISPATCH_COLLECTIONS_ROOT=/Users/macstudio/Documents/Collections \
+MORNING_DISPATCH_COLLECTIONS_MAX_RESULTS=12 \
+MORNING_DISPATCH_COLLECTIONS_MAX_FILE_BYTES=1000000
+```
+
+Create the folder from Admin -> Sources or from the inline source setup card. Add top-level folders inside it, then place `.txt`, `.md`, `.csv`, `.json`, `.yaml`, or `.html` files inside those folders.
+
+## Markets Adapter
+
+Markets is an optional source for public-company context. First slice support runs in Simple mode with free Yahoo Finance data through `yfinance`; no API key is required.
+
+```bash
+MORNING_DISPATCH_MARKETS_MODE=simple \
+MORNING_DISPATCH_MARKETS_MAX_CORE_COMPANIES=5 \
+MORNING_DISPATCH_MARKETS_MAX_RELATED_COMPANIES=5
+```
+
+The source selects relevant public companies from the topic, fetches recent price movement, market cap, analyst rating, sector, and recent news, then sends company snapshots into the shared brief pipeline.
 
 ## Frontend
 

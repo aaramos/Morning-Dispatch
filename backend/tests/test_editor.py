@@ -119,6 +119,58 @@ def test_prepare_issue_articles_keeps_reddit_community_signals():
     assert prepared[0].tier == "lead"
 
 
+def test_prepare_issue_articles_uses_avoid_terms_as_exclusions():
+    prepared = prepare_issue_articles(
+        {"interest": "Mexico City food, museums, and walking tours Avoid: fine dining, luxury shopping", "threshold": 0.45},
+        [
+            enrich_article(
+                result(
+                    "The 27 Best Restaurants in Mexico City",
+                    (
+                        "A Mexico City restaurant guide focused on world-class fine dining, Pujol, "
+                        "and expensive tasting menus in Polanco."
+                    ),
+                    link_score=0.98,
+                )
+            ),
+            enrich_article(
+                result(
+                    "Mexico City Street Food and Museum Walks",
+                    (
+                        "A Mexico City guide to street food markets, museums, historic neighborhoods, "
+                        "and practical walking tours for curious travelers."
+                    ),
+                    link_score=0.95,
+                )
+            ),
+        ],
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0].title == "Mexico City Street Food and Museum Walks"
+
+
+def test_prepare_issue_articles_uses_general_sections_for_non_ai_topics():
+    prepared = prepare_issue_articles(
+        {"interest": "Mexico City food markets, museums, biking, and walking tours", "threshold": 0.45},
+        [
+            enrich_article(
+                result(
+                    "Mexico City Market Food Guide",
+                    (
+                        "A Mexico City food market guide with tacos, neighborhood walking routes, "
+                        "museum stops, and cultural context for travelers."
+                    ),
+                    link_score=0.95,
+                )
+            )
+        ],
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0].section == "Food & Drink"
+
+
 def test_prepare_issue_articles_drops_author_bios_after_redirect():
     payload = NormalizedPayload(
         source_type="gmail_link",

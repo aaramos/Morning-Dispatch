@@ -5,13 +5,15 @@ from dataclasses import replace
 from time import perf_counter
 from typing import Any, Iterable
 from urllib.parse import urlparse
+from collections.abc import Callable
 
 from backend.agents.agentic import AgentDecision
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import ModelClient, ModelClientError
+from backend.agents.model.metrics import record_model_response_metric
 from backend.app.core.config import get_settings
 
-MAX_EDITORIAL_CANDIDATES = 36
+MAX_EDITORIAL_CANDIDATES = 80
 ALLOWED_SECTIONS = {
     "Models & Labs",
     "Agents & Developer Tools",
@@ -28,6 +30,8 @@ async def apply_editorial_decisions(
     results: Iterable[ArticleFetchResult],
     *,
     model_client: ModelClient | None = None,
+    reasoning_callback: Callable[[str], None] | None = None,
+    inference_run_id: str | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision]]:
     result_list = list(results)
     candidates = _candidate_indexes(result_list)
@@ -64,11 +68,29 @@ async def apply_editorial_decisions(
     prompt = _editorial_prompt(digest, result_list, candidates)
     started_at = perf_counter()
     try:
-        payload = await client.complete_json(
-            system=EDITORIAL_SYSTEM_PROMPT,
-            prompt=prompt,
-            max_tokens=1600,
-        )
+        if hasattr(client, "complete_json_with_metrics"):
+            response, payload = await client.complete_json_with_metrics(
+                system=EDITORIAL_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=1600,
+                on_token=reasoning_callback,
+            )
+            record_model_response_metric(
+                run_id=inference_run_id,
+                article_id="editorial_batch",
+                mode="editorial",
+                model_client=client,
+                response=response,
+                system_prompt=EDITORIAL_SYSTEM_PROMPT,
+                prompt=prompt,
+            )
+        else:
+            payload = await client.complete_json(
+                system=EDITORIAL_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=1600,
+                on_token=reasoning_callback,
+            )
     except ModelClientError as exc:
         return _normalize_lead(result_list), [
             AgentDecision(

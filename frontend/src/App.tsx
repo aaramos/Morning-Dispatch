@@ -1,491 +1,294 @@
-import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { ChangeEvent, FormEvent, ReactNode } from "react";
+
+type SourceKey = "web_search" | "foreign_media" | "gmail" | "reddit" | "podcasts" | "youtube" | "collections" | "markets";
+type FlowState = "idle" | "refining" | "confirm" | "building" | "ready" | "schedule";
+type SortMode = "recent" | "name";
+type SchedulePreset = "daily" | "weekdays" | "weekly" | "monthly";
+type SourceScope = "breaking" | "recent" | "last_year" | "all_available";
+type RefinementProgressPhase = "starting" | "answering" | "confirming";
+
+type SourceStatus = {
+  label: string;
+  enabled: boolean;
+  setup_required: boolean;
+  reason: string | null;
+  root_path?: string;
+  collection_count?: number;
+  indexed_count?: number;
+  unsupported_count?: number;
+  failed_count?: number;
+  mode?: string;
+  max_core_companies?: number;
+  max_related_companies?: number;
+};
+
+type SourceStatusResponse = {
+  sources: Record<SourceKey, SourceStatus>;
+};
+
+type TopicProfile = {
+  topic_id: string;
+  statement: string;
+  scope: string;
+  subtopics?: string[];
+  keywords?: string[];
+  search_queries?: string[];
+  source_queries?: Record<string, string[]>;
+  foreign_language_plan?: Array<{ code: string; name: string; native_query: string; reason?: string }>;
+  depth?: string;
+  recency_weighting?: string;
+  exclusions?: string[];
+  source_selection: Record<string, boolean>;
+  requested_sources?: Array<{ adapter: string; ref: string }>;
+  promoted_sources?: Array<{ adapter: string; ref: string; has_feed: boolean; feed_url: string | null }>;
+  schedule?: string | null;
+  schedule_config?: Record<string, unknown>;
+  delivery_config?: Record<string, unknown>;
+  status?: string;
+  archived?: boolean;
+  deleted?: boolean;
+};
+
+type TopicProfileResponse = {
+  topic_id: string;
+  statement: string;
+  schedule: string | null;
+  created_at?: string;
+  updated_at?: string;
+  profile: TopicProfile;
+  latest_exploration?: Exploration | null;
+  next_run_at?: string | null;
+};
+
+type RefinementSession = {
+  session_id: string;
+  statement: string;
+  status: "active" | "finalized";
+  turn_count: number;
+  messages: Array<{ role: "assistant" | "user"; content: string }>;
+  profile: TopicProfile;
+  topic_id: string | null;
+  topic_profile?: TopicProfileResponse;
+};
+
+type ExplorationIssue = {
+  source_name: string;
+  reason: string;
+};
+
+type Exploration = {
+  exploration_id: string;
+  topic_id: string;
+  mode: "show_now" | "scheduled";
+  source_selection: Record<string, boolean>;
+  progress: {
+    pipeline?: Record<string, string>;
+    sources?: Record<string, { status: string; candidate_count: number; message?: string | null }>;
+    candidate_count?: number;
+    requested_source_issues?: ExplorationIssue[];
+    source_audit_issues?: ExplorationIssue[];
+    built_with_issues?: boolean;
+    reasoning?: { editorial?: string; critic?: string };
+    queue?: { status?: string; message?: string };
+    source_audit?: { status?: string; message?: string; summary?: string };
+    brief?: {
+      title: string;
+      html_path?: string;
+      snapshot?: string;
+      stats?: { stage_seconds?: Record<string, number> };
+      candidate_count?: number;
+    };
+    error?: string;
+  };
+  status: "queued" | "running" | "complete" | "failed";
+  brief_ref: string | null;
+  emailed: boolean;
+  started_at: string;
+  finished_at: string | null;
+  deleted_at?: string | null;
+  delete_after?: string | null;
+  purged_at?: string | null;
+};
 
 type Digest = {
   id: string;
   name: string;
   interest: string;
-  schedule: "hourly" | "daily" | "weekly" | "monthly";
+  schedule: string;
   sources: Array<Record<string, string>>;
   status: string;
-  threshold: number;
+  updated_at?: string;
+  created_at?: string;
+  next_run_at?: string | null;
 };
 
-type Health = {
-  status: string;
-  database_path: string;
-  data_dir: string;
-  secrets_dir: string;
-};
-
-type Issue = {
-  id: string;
-  title: string;
-  snapshot: string;
-};
-
-type GmailAdminStatus = {
-  configured: boolean;
-  connected: boolean;
-  client_secret_path: string;
-  credentials_path: string;
-  scopes: string[];
-  token_scopes: string[];
-  missing_scopes: string[];
-  requires_reconnect: boolean;
-  hosted_gmail_mcp_enabled: boolean;
-  hosted_gmail_mcp_ready: boolean;
-  google_cloud_project_id: string | null;
-  redirect_uri: string;
-  oauth_redirect_ready: boolean;
-  redirect_warning: string | null;
-  network: string;
-};
-
-type SchedulerStatus = {
-  enabled: boolean;
-  running: boolean;
-  interval_seconds: number;
-  daily_run_time: string;
-  timezone: string;
-  last_check_at: string | null;
-  last_started_count: number;
-  last_error: string | null;
-};
-
-type ModelCacheStatus = {
-  record_count: number;
-  latest_updated_at: string | null;
-  models: Array<{ model_name: string; record_count: number; latest_updated_at: string | null }>;
-};
-
-type AvailableModel = {
-  id: string;
-  owned_by: string | null;
-  created: number | null;
-};
-
-type ModelCatalogStatus = {
-  available: boolean;
-  models: AvailableModel[];
-  error: string | null;
-  selected_model: string | null;
-  base_url: string | null;
-};
-
-type McpStatus = {
-  available: boolean;
-  error: string | null;
-  server_count: number;
-  tool_count: number;
-  gmail: {
+type AdminStatus = {
+  health?: {
+    headline: string;
+    safe_for_overnight: boolean;
+    problem_count: number;
+    warning_count: number;
+    checks: Array<{ name: string; status: string; message: string }>;
+  };
+  gmail?: {
+    configured: boolean;
     connected: boolean;
-    server_state: string;
-    tools_count: number;
-    fetch_tool_present: boolean;
-    error: string | null;
+    requires_reconnect: boolean;
+    network: string;
+    oauth_redirect_ready: boolean;
+    redirect_warning: string | null;
   };
-  reddit: {
-    connected: boolean;
-    server_state: string;
-    tools_count: number;
-    browse_tool_present: boolean;
-    search_tool_present: boolean;
-    error: string | null;
-  };
-};
-
-type AdminHealthStatus = {
-  status: "ready" | "needs_attention";
-  safe_for_overnight: boolean;
-  headline: string;
-  problem_count: number;
-  warning_count: number;
-  checks: Array<{
-    name: string;
-    status: "ok" | "warning" | "problem";
-    message: string;
-  }>;
-};
-
-type InferenceModelSummary = {
-  model: string;
-  backend: string | null;
-  model_tag: string | null;
-  quantization: string | null;
-  record_count: number;
-  success_count: number;
-  failure_count: number;
-  avg_total_ms: number | null;
-  p50_total_ms: number | null;
-  p95_total_ms: number | null;
-  avg_queue_wait_ms?: number | null;
-  avg_prompt_tokens: number | null;
-  avg_completion_tokens: number | null;
-  avg_tokens_per_sec: number | null;
-  schema_valid_rate: number | null;
-  fallback_rate: number | null;
-  articles_per_minute: number | null;
-  estimated_100_seconds: number | null;
-  estimated_500_seconds: number | null;
-};
-
-type InferenceMetricsStatus = {
-  record_count: number;
-  success_count: number;
-  failure_count: number;
-  latest_ts: string | null;
-  status_counts: Record<string, number>;
-  models: InferenceModelSummary[];
-  ttft_available: boolean;
-};
-
-type PodcastMetricsStatus = {
-  record_count: number;
-  latest_ts: string | null;
-  status_counts: Record<string, number>;
-  transcript_source_counts: Record<string, number>;
-  cache_hit_count: number;
-  audio_bytes: number;
-  transcript_words: number;
-  avg_download_ms: number | null;
-  avg_transcription_ms: number | null;
-  avg_total_ms: number | null;
-  recent: PodcastMetricRecord[];
-};
-
-type PodcastMetricRecord = {
-  id: string;
-  digest_id: string;
-  inference_run_id: string | null;
-  ts: string;
-  show_name: string | null;
-  episode_id: string | null;
-  episode_title: string | null;
-  feed_url: string | null;
-  audio_url: string | null;
-  episode_url: string | null;
-  apple_podcasts_url: string | null;
-  published_at: string | null;
-  duration_seconds: number | null;
-  quality_score: number | null;
-  transcript_source: string | null;
-  status: string;
-  error_detail: string | null;
-  feed_fetch_ms: number | null;
-  audio_download_ms: number | null;
-  transcription_ms: number | null;
-  total_ms: number | null;
-  audio_bytes: number | null;
-  transcript_words: number | null;
-  cache_hit: number;
-};
-
-type AgentDecisionsStatus = {
-  record_count: number;
-  latest_created_at: string | null;
-  latest_model_name: string | null;
-  agent_counts: Record<string, number>;
-  action_counts: Record<string, number>;
-  decision_counts: Record<string, number>;
-};
-
-type FetchFailureBreakdown = {
-  run_id: string | null;
-  run_at?: string | null;
-  digest_id?: string | null;
-  total_count: number;
-  groups: Array<{
-    status: string;
-    count: number;
-    fixability: string;
-  }>;
-  examples: Array<{
-    title: string;
-    url: string | null;
-    domain: string | null;
-    status: string;
-    reason: string;
-    fixability: string;
-    context: string | null;
-  }>;
-};
-
-type BriefReview = {
-  run_id: string | null;
-  issue_id: string | null;
-  generated_at: string | null;
-  counts: {
-    included: number;
-    unresolved: number;
-    dropped: number;
-    duplicate: number;
-    repaired: number;
-  };
-  included: ReviewItem[];
-  unresolved: ReviewItem[];
-  dropped: ReviewDecision[];
-  duplicates: ReviewDecision[];
-  repaired: ReviewDecision[];
-};
-
-type DigestStats = {
-  run_id: string | null;
-  generated_at: string | null;
-  source_count: number;
-  newsletter_count: number;
-  link_count: number;
-  podcast_episode_count: number;
-  article_candidate_count: number;
-  included_article_count: number;
-  unresolved_count: number;
-  dropped_count: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-  model_call_count: number;
-  processing_seconds: number | null;
-  stage_seconds: Record<string, number>;
-};
-
-type PodcastSource = {
-  key?: string;
-  digest_id?: string;
-  digest_name?: string;
-  type: "podcast_rss" | "podcast_search";
-  title?: string | null;
-  feed_url?: string | null;
-  site_url?: string | null;
-  author?: string | null;
-  query?: string | null;
-  aggregator?: string | null;
-  itunes_id?: string | null;
-  apple_podcasts_url?: string | null;
-  transcription?: string | null;
-};
-
-type PodcastStatus = {
-  aggregator_configured: boolean;
-  transcription_configured: boolean;
-  sources: PodcastSource[];
-  audio_cache_dir: string;
-  transcript_cache_dir: string;
-};
-
-type PodcastDiscoveryResponse = {
-  configured: boolean;
-  results: PodcastSource[];
-  message: string | null;
-};
-
-type EmailDeliveryStatus = {
-  digest_id: string | null;
-  recipient_email: string;
-  enabled: boolean;
-  last_delivery_status: string | null;
-  last_delivered_at: string | null;
-  last_error: string | null;
-  updated_at: string | null;
-  gmail_send_ready: boolean;
-  requires_gmail_reconnect: boolean;
-  token_scopes: string[];
-};
-
-type ReviewItem = {
-  title: string;
-  url: string | null;
-  domain: string | null;
-  tier: string | null;
-  section: string | null;
-  status: string | null;
-  reason: string | null;
-  score: number | null;
-  summary: string | null;
-};
-
-type ReviewDecision = {
-  agent: string;
-  target: string;
-  decision: string;
-  action: string;
-  reason: string | null;
-  confidence: number | null;
-  created_at: string;
-};
-
-type SourceScoutRun = {
-  id: string;
-  digest_id: string;
-  run_at: string;
-  status: "completed" | "partial" | "failed";
-  sampled_count: number;
-  active_count: number;
-  candidate_count: number;
-  retired_count: number;
-  summary: string | null;
-  error_detail: string | null;
-};
-
-type SourceScoutStatus = {
-  source_count: number;
-  active_count: number;
-  search_only_count: number;
-  candidate_count: number;
-  retired_count: number;
-  latest_run: SourceScoutRun | null;
-};
-
-type RedditSource = {
-  id: string;
-  digest_id: string;
-  subreddit: string;
-  state: "active" | "search_only" | "candidate" | "retired";
-  category: string | null;
-  score: number;
-  reason: string | null;
-  last_reviewed_at: string | null;
-  last_seen_post_at: string | null;
-  consecutive_stale_runs: number;
-  metadata: Record<string, unknown>;
-};
-
-type SourceScoutDecision = {
-  id: string;
-  scout_run_id: string;
-  digest_id: string;
-  agent: string;
-  subreddit: string;
-  decision: string;
-  action: string;
-  confidence: number | null;
-  reason: string | null;
-  metadata: Record<string, unknown>;
-  created_at: string;
-};
-
-type SourceScoutResponse = SourceScoutRun & {
-  sources: RedditSource[];
-  decisions: SourceScoutDecision[];
-};
-
-type VerificationRunResult = {
-  status: string;
-  mode?: string;
-  published?: boolean;
-  source_run_id?: string;
-  published_run_id?: string | null;
-  published_issue_id?: string | null;
-  podcast_episode_count?: number;
-  reviewed_article_count?: number;
-  active_before_count?: number;
-  active_after_count?: number;
-  dropped_count?: number;
-  lead_title?: string | null;
-  decision_count?: number;
-  stored_decision_count?: number;
-  reused_verified_decisions?: boolean;
-  action_counts?: Record<string, number>;
-  agent_counts?: Record<string, number>;
-  message?: string;
-};
-
-type AgentDecisionRecord = {
-  id: string;
-  agent: string;
-  decision: string;
-  action: string;
-  reason: string | null;
-  confidence: number | null;
-  target: string;
-  model_name: string | null;
-  created_at: string;
-};
-
-type ModelJob = {
-  id: string;
-  model_name: string;
-  status: "queued" | "running" | "completed" | "failed";
-  limit_count: number;
-  include_cached: number;
-  processed_count: number;
-  success_count: number;
-  cache_hit_count: number;
-  failure_count: number;
-  avg_total_ms: number | null;
-  estimated_100_seconds: number | null;
-  error_detail: string | null;
-  created_at: string;
-  started_at: string | null;
-  completed_at: string | null;
-};
-
-type DigestOverview = {
-  id: string;
-  name: string;
-  schedule: string;
-  status: string;
-  source_count: number;
-  latest_run_id: string | null;
-  latest_inference_run_id: string | null;
-  latest_run_at: string | null;
-  latest_completed_at: string | null;
-  latest_item_count: number | null;
-  latest_failed_count: number | null;
-  latest_fallback_count: number | null;
-  latest_newsletter_count: number | null;
-  latest_link_count: number | null;
-  latest_fetched_article_count: number | null;
-  latest_model_cache_hit_count: number | null;
-  latest_model_cache_miss_count: number | null;
-  latest_model_cache_write_count: number | null;
-  latest_duration_seconds: number | null;
-  latest_trigger: string | null;
-  latest_issue_id: string | null;
-  latest_issue_title: string | null;
-  next_run_at: string | null;
-  due: boolean;
-};
-
-type AdminPipelineStatus = {
-  system: {
-    environment: string;
-    database_path: string;
-    data_dir: string;
-    secrets_dir: string;
-    public_base_url: string | null;
-  };
-  delivery: {
-    latest_brief_path: string;
-    latest_brief_url: string;
-    email: EmailDeliveryStatus;
-  };
-  podcasts: PodcastStatus;
-  health: AdminHealthStatus;
-  gmail: GmailAdminStatus;
-  mcp: McpStatus;
-  model: {
+  scheduler?: {
+    running: boolean;
     enabled: boolean;
-    model: string | null;
-    base_url: string | null;
-    api_key_configured: boolean;
-    max_items: number;
-    selection_source: "admin" | "environment";
-    settings_path: string;
-    catalog: ModelCatalogStatus;
+    daily_run_time: string;
+    timezone: string;
+    last_error: string | null;
   };
-  scheduler: SchedulerStatus;
-  digests: DigestOverview[];
-  model_cache: ModelCacheStatus;
-  inference_metrics: InferenceMetricsStatus;
-  podcast_metrics: PodcastMetricsStatus;
-  agent_decisions: AgentDecisionsStatus;
-  source_scout: SourceScoutStatus;
-  fetch_failures: FetchFailureBreakdown;
-  brief_review: BriefReview;
-  digest_stats: DigestStats;
-  model_jobs: ModelJob[];
+  model?: {
+    model: string | null;
+    enabled: boolean;
+    api_key_configured: boolean;
+    catalog: {
+      available: boolean;
+      models: Array<{ id: string }>;
+      selected_model: string | null;
+      error: string | null;
+      providers?: {
+        local?: { available: boolean; models: Array<{ id: string }>; error: string | null };
+        ollama_cloud?: { available: boolean; configured: boolean; models: Array<{ id: string }>; error: string | null };
+      };
+    };
+    routing?: {
+      agents: Array<{ id: string; label: string; description: string }>;
+      providers: Array<{ id: string; label: string; configured: boolean; privacy: string }>;
+      routes: Record<string, { provider: string; model: string | null; allow_private_cloud: boolean; effective_model?: string | null; label?: string }>;
+      ollama_cloud: { configured: boolean; base_url: string; key_path: string };
+      privacy: { rule: string; private_sources: string[] };
+    };
+  };
+  delivery?: {
+    email: {
+      recipient_email: string | null;
+      enabled: boolean;
+      gmail_send_ready?: boolean;
+      last_delivery_status?: string | null;
+      last_delivered_at?: string | null;
+      last_error?: string | null;
+    };
+  };
+  digests?: Digest[];
+  inference_metrics?: {
+    record_count: number;
+    success_count: number;
+    failure_count: number;
+    latest_ts: string | null;
+    ttft_available?: boolean;
+    models?: Array<{ model: string; record_count: number; avg_total_ms: number | null; p95_total_ms: number | null }>;
+    routes?: Array<{ mode: string; model: string; backend: string | null; record_count: number; avg_total_ms: number | null; fallback_rate: number | null }>;
+  };
+  model_cache?: {
+    record_count: number;
+    latest_updated_at: string | null;
+  };
+  model_jobs?: Array<{
+    id: string;
+    model_name: string;
+    status: string;
+    processed_count: number;
+    limit_count: number;
+    created_at: string;
+  }>;
+  podcasts?: {
+    aggregator_configured: boolean;
+    transcription_configured: boolean;
+    sources: Array<Record<string, string | null>>;
+  };
+  secret_health?: {
+    secrets_dir: string;
+    directory_permissions: { status: string; mode: string | null; expected?: string };
+    summary: { configured_count: number; missing_count: number; warning_count: number };
+    items: Array<{
+      id: string;
+      label: string;
+      configured: boolean;
+      status: "ok" | "warning" | "missing" | string;
+      storage: string;
+      path: string | null;
+      message: string;
+      permissions?: { status: string; mode: string | null; expected?: string };
+    }>;
+    external_plaintext: Array<{ server: string; location: string; key: string; path: string }>;
+  };
 };
 
-const defaultInterest = "AI model releases, local AI infrastructure, investing signals, and practical product strategy.";
+type ModelRouteDraft = Record<string, { provider: string; model: string; allow_private_cloud: boolean }>;
+
+type LibraryResponse = {
+  explorations: Exploration[];
+  deleted_explorations: Exploration[];
+  topics: TopicProfileResponse[];
+  digests: TopicProfileResponse[];
+  legacy_digests: Digest[];
+};
+
+type ExplorationLibraryItem =
+  | { kind: "exploration"; exploration: Exploration; topic: TopicProfileResponse | null }
+  | { kind: "topic"; topic: TopicProfileResponse };
+
+type DigestLibraryItem =
+  | { kind: "topic"; topic: TopicProfileResponse }
+  | { kind: "legacy"; digest: Digest };
+
+type HomeRecentItem =
+  | { kind: "exploration"; exploration: Exploration; topic: TopicProfileResponse | null; digest: boolean }
+  | { kind: "topic"; topic: TopicProfileResponse; digest: boolean };
+
+type ConfirmationDraft = {
+  scope: string;
+  depth: "practitioner" | "informed-generalist";
+  recency_weighting: SourceScope;
+  exclusions: string;
+};
+
+type RefinementProgress = {
+  phase: RefinementProgressPhase;
+  startedAt: number;
+  label: string;
+};
+
+const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
+  { key: "web_search", label: "Web", icon: "🌐" },
+  { key: "foreign_media", label: "Foreign Media", icon: "🌍" },
+  { key: "gmail", label: "Gmail", icon: "✉️" },
+  { key: "reddit", label: "Reddit", icon: "🟠" },
+  { key: "podcasts", label: "Podcast", icon: "🎙️" },
+  { key: "youtube", label: "YouTube", icon: "▶" },
+  { key: "collections", label: "Collections", icon: "▣" },
+  { key: "markets", label: "Markets", icon: "$" },
+];
+
+const defaultSourceSelection: Record<SourceKey, boolean> = {
+  web_search: true,
+  foreign_media: false,
+  gmail: false,
+  reddit: false,
+  podcasts: false,
+  youtube: false,
+  collections: false,
+  markets: false,
+};
+
+const schedulePresets: Array<{ value: SchedulePreset; label: string }> = [
+  { value: "daily", label: "Daily" },
+  { value: "weekdays", label: "Weekdays" },
+  { value: "weekly", label: "Weekly" },
+  { value: "monthly", label: "Monthly" },
+];
+const interestDraftCookieName = "morning_dispatch_interest_draft";
+const interestDraftTtlSeconds = 60 * 60;
+const interestDraftTtlMs = interestDraftTtlSeconds * 1000;
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -498,1587 +301,2629 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function loadInterestDraft(): string {
+  const rawCookie = document.cookie
+    .split("; ")
+    .find((cookie) => cookie.startsWith(`${interestDraftCookieName}=`));
+  if (!rawCookie) return "";
+  try {
+    const payload = JSON.parse(decodeURIComponent(rawCookie.split("=").slice(1).join("="))) as {
+      statement?: string;
+      expires_at?: number;
+    };
+    if (!payload.expires_at || payload.expires_at <= Date.now()) {
+      clearInterestDraft();
+      return "";
+    }
+    return typeof payload.statement === "string" ? payload.statement : "";
+  } catch {
+    clearInterestDraft();
+    return "";
+  }
+}
+
+function saveInterestDraft(statement: string): void {
+  const cleanStatement = statement.trim() ? statement : "";
+  if (!cleanStatement) {
+    clearInterestDraft();
+    return;
+  }
+  const payload = encodeURIComponent(JSON.stringify({
+    statement: cleanStatement,
+    expires_at: Date.now() + interestDraftTtlMs,
+  }));
+  document.cookie = `${interestDraftCookieName}=${payload}; Max-Age=${interestDraftTtlSeconds}; Path=/; SameSite=Lax`;
+}
+
+function clearInterestDraft(): void {
+  document.cookie = `${interestDraftCookieName}=; Max-Age=0; Path=/; SameSite=Lax`;
+}
+
 export default function App() {
   if (window.location.pathname === "/admin") {
     return <AdminApp />;
   }
-
-  return <MorningDispatchApp />;
+  return <DispatchApp />;
 }
 
-function MorningDispatchApp() {
-
-  const [health, setHealth] = useState<Health | null>(null);
-  const [digests, setDigests] = useState<Digest[]>([]);
-  const [selectedDigestId, setSelectedDigestId] = useState<string | null>(null);
-  const [issue, setIssue] = useState<Issue | null>(null);
-  const [issueHtml, setIssueHtml] = useState("");
-  const [name, setName] = useState("AI Morning Brief");
-  const [interest, setInterest] = useState(defaultInterest);
-  const [sourceSender, setSourceSender] = useState("");
-  const [status, setStatus] = useState("Loading local app...");
-
-  const selectedDigest = useMemo(
-    () => digests.find((digest) => digest.id === selectedDigestId) ?? digests[0],
-    [digests, selectedDigestId],
-  );
-  const selectedDigestIssueId = selectedDigest?.id ?? null;
-
-  const refresh = useCallback(async () => {
-    const [healthResult, digestResult] = await Promise.all([
-      api<Health>("/api/health"),
-      api<Digest[]>("/api/digests"),
-    ]);
-    setHealth(healthResult);
-    setDigests(digestResult);
-    setSelectedDigestId((current) => current ?? digestResult[0]?.id ?? null);
-    setStatus("Ready");
-  }, []);
-
-  const loadLatestIssue = useCallback(async (digestId: string) => {
-    try {
-      const latest = await api<Issue>(`/api/digests/${digestId}/issues/latest`);
-      const html = await fetch(`/api/issues/${latest.id}/html`).then((response) => response.text());
-      setIssue(latest);
-      setIssueHtml(html);
-    } catch {
-      setIssue(null);
-      setIssueHtml("");
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    if (!selectedDigestIssueId) return;
-    void loadLatestIssue(selectedDigestIssueId);
-  }, [loadLatestIssue, selectedDigestIssueId]);
-
-  async function createDigest(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setStatus("Creating digest...");
-    const sources = sourceSender.trim()
-      ? [{ type: "gmail_newsletter", sender: sourceSender.trim() }]
-      : [];
-    const digest = await api<Digest>("/api/digests", {
-      method: "POST",
-      body: JSON.stringify({ name, interest, schedule: "daily", sources }),
-    });
-    setDigests((current) => [digest, ...current]);
-    setSelectedDigestId(digest.id);
-    setStatus("Digest created");
-  }
-
-  async function runSelectedDigest() {
-    if (!selectedDigest) return;
-    setStatus("Creating preview issue...");
-    await api(`/api/digests/${selectedDigest.id}/run`, { method: "POST" });
-    await loadLatestIssue(selectedDigest.id);
-    setStatus("Preview issue ready");
-  }
-
-  function openIssuePreview() {
-    if (!issue) return;
-    window.open(`/api/issues/${issue.id}/html`, "_blank", "noopener,noreferrer");
-  }
-
-  function openIssuePreviewFromKeyboard(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    openIssuePreview();
-  }
-
-  return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <div>
-          <p className="eyebrow">Morning Dispatch</p>
-          <h1>Local newspaper digests from curated newsletters.</h1>
-        </div>
-
-        <nav className="sidebar-nav">
-          <a href="/">Digests</a>
-          <a href="/admin">Admin</a>
-        </nav>
-
-        <section className="status-panel">
-          <span className="status-dot" />
-          <div>
-            <strong>{status}</strong>
-            <p>{health ? `Data: ${health.data_dir}` : "Starting backend connection"}</p>
-          </div>
-        </section>
-
-        <form className="create-form" onSubmit={createDigest}>
-          <label>
-            Digest name
-            <input value={name} onChange={(event) => setName(event.target.value)} />
-          </label>
-          <label>
-            Interest profile
-            <textarea value={interest} onChange={(event) => setInterest(event.target.value)} rows={5} />
-          </label>
-          <label>
-            First newsletter sender
-            <input
-              value={sourceSender}
-              onChange={(event) => setSourceSender(event.target.value)}
-              placeholder="newsletter@example.com"
-            />
-          </label>
-          <button type="submit">Create Digest</button>
-        </form>
-      </aside>
-
-      <section className="workspace">
-        <header className="toolbar">
-          <div>
-            <p className="eyebrow">Control Panel</p>
-            <h2>{selectedDigest?.name ?? "No digest yet"}</h2>
-          </div>
-          <button onClick={runSelectedDigest} disabled={!selectedDigest}>
-            Run Preview
-          </button>
-        </header>
-
-        <div className="content-grid">
-          <section className="panel">
-            <h3>Digests</h3>
-            {digests.length === 0 ? (
-              <p className="muted">Create your first digest to begin.</p>
-            ) : (
-              <div className="digest-list">
-                {digests.map((digest) => (
-                  <button
-                    className={digest.id === selectedDigest?.id ? "digest-row selected" : "digest-row"}
-                    key={digest.id}
-                    onClick={() => setSelectedDigestId(digest.id)}
-                  >
-                    <span>{digest.name}</span>
-                    <small>{digest.schedule} · {digest.sources.length} source(s)</small>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
-
-          <section className="panel issue-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Issue Preview</h3>
-                <p className="muted">{issue?.snapshot ?? "Run a digest to generate a local HTML issue."}</p>
-              </div>
-              {issue ? (
-                <button className="secondary-button" onClick={openIssuePreview}>
-                  Open Issue
-                </button>
-              ) : null}
-            </div>
-            {issueHtml ? (
-              <div
-                className="issue-preview-launcher"
-                role="button"
-                tabIndex={0}
-                aria-label="Open full issue preview in a new page"
-                onClick={openIssuePreview}
-                onKeyDown={openIssuePreviewFromKeyboard}
-              >
-                <iframe title={issue?.title ?? "Digest issue"} srcDoc={issueHtml} />
-              </div>
-            ) : (
-              <div className="empty-preview">No preview issue yet.</div>
-            )}
-          </section>
-        </div>
-      </section>
-    </main>
-  );
-}
-
-function AdminApp() {
-  const [status, setStatus] = useState<GmailAdminStatus | null>(null);
-  const [pipeline, setPipeline] = useState<AdminPipelineStatus | null>(null);
-  const [clientSecretJson, setClientSecretJson] = useState("");
-  const [callbackUrl, setCallbackUrl] = useState("");
-  const [selectedModel, setSelectedModel] = useState("");
-  const [jobModel, setJobModel] = useState("");
-  const [jobLimit, setJobLimit] = useState(100);
-  const [jobIncludeCached, setJobIncludeCached] = useState(false);
-  const [deliveryEmail, setDeliveryEmail] = useState("");
-  const [deliveryEnabled, setDeliveryEnabled] = useState(false);
-  const [podcastQuery, setPodcastQuery] = useState("AI daily brief");
-  const [podcastFeedUrl, setPodcastFeedUrl] = useState("");
-  const [podcastTitle, setPodcastTitle] = useState("");
-  const [podcastApiKey, setPodcastApiKey] = useState("");
-  const [podcastApiSecret, setPodcastApiSecret] = useState("");
-  const [podcastResults, setPodcastResults] = useState<PodcastSource[]>([]);
-  const [verificationResult, setVerificationResult] = useState<VerificationRunResult | null>(null);
-  const [agentDecisions, setAgentDecisions] = useState<AgentDecisionRecord[]>([]);
-  const [sourceScoutSources, setSourceScoutSources] = useState<RedditSource[]>([]);
-  const [sourceScoutDecisions, setSourceScoutDecisions] = useState<SourceScoutDecision[]>([]);
-  const [message, setMessage] = useState("Loading admin status...");
+function DispatchApp() {
+  const [sourceStatus, setSourceStatus] = useState<SourceStatusResponse | null>(null);
+  const [sourceSelection, setSourceSelection] = useState<Record<SourceKey, boolean>>(defaultSourceSelection);
+  const [statement, setStatement] = useState(() => loadInterestDraft());
+  const [submittedInterest, setSubmittedInterest] = useState("");
+  const [session, setSession] = useState<RefinementSession | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [topicProfile, setTopicProfile] = useState<TopicProfileResponse | null>(null);
+  const [draft, setDraft] = useState<ConfirmationDraft>(emptyDraft());
+  const [flow, setFlow] = useState<FlowState>("idle");
   const [busy, setBusy] = useState(false);
-  const modelOptions = pipeline?.model.catalog.models ?? [];
-  const modelCatalogReady = Boolean(pipeline?.model.catalog.available && modelOptions.length > 0);
-  const modelSelectionChanged = Boolean(selectedModel && selectedModel !== pipeline?.model.model);
+  const [message, setMessage] = useState("Ready");
+  const [enableSource, setEnableSource] = useState<SourceKey | null>(null);
+  const [webKey, setWebKey] = useState("");
+  const [gmailSecret, setGmailSecret] = useState("");
+  const [podcastKey, setPodcastKey] = useState("");
+  const [podcastSecret, setPodcastSecret] = useState("");
+  const [youtubeKey, setYoutubeKey] = useState("");
+  const [exploration, setExploration] = useState<Exploration | null>(null);
+  const [briefHtml, setBriefHtml] = useState("");
+  const [recentExplorations, setRecentExplorations] = useState<Exploration[]>([]);
+  const [scheduledTopics, setScheduledTopics] = useState<TopicProfileResponse[]>([]);
+  const [allTopics, setAllTopics] = useState<TopicProfileResponse[]>([]);
+  const [deliveryConfigured, setDeliveryConfigured] = useState(false);
+  const [emailSendReady, setEmailSendReady] = useState(false);
+  const [briefEmailRecipient, setBriefEmailRecipient] = useState("");
+  const [homeDeleteUndo, setHomeDeleteUndo] = useState<{ explorationId: string; title: string; until: string | null } | null>(null);
+  const [schedulePreset, setSchedulePreset] = useState<SchedulePreset>("daily");
+  const [scheduleTime, setScheduleTime] = useState("08:00");
+  const [emailOnSchedule, setEmailOnSchedule] = useState(false);
+  const [refinementProgress, setRefinementProgress] = useState<RefinementProgress | null>(null);
+  const [refinementFallbackStartedAt, setRefinementFallbackStartedAt] = useState(0);
+  const [progressNow, setProgressNow] = useState(0);
 
-  const loadAgentDecisions = useCallback(async () => {
-    try {
-      const result = await api<{ decisions: AgentDecisionRecord[] }>("/api/admin/agent-decisions");
-      setAgentDecisions(result.decisions);
-    } catch {
-      setAgentDecisions([]);
-    }
+  const topicById = useMemo(() => new Map(allTopics.map((topic) => [topic.topic_id, topic])), [allTopics]);
+  const activeDigest = scheduledTopics[0] ?? null;
+  const homeRecentItems = useMemo<HomeRecentItem[]>(() => {
+    const topicIdsWithExplorations = new Set(recentExplorations.map((item) => item.topic_id));
+    const digestTopicIds = new Set(scheduledTopics.map((topic) => topic.topic_id));
+    const explorationItems: HomeRecentItem[] = recentExplorations.map((exploration) => ({
+      kind: "exploration",
+      exploration,
+      topic: topicById.get(exploration.topic_id) ?? null,
+      digest: digestTopicIds.has(exploration.topic_id),
+    }));
+    const unbuiltTopicItems: HomeRecentItem[] = allTopics
+      .filter((topic) => !topic.profile.archived && !topic.profile.deleted)
+      .filter((topic) => !topicIdsWithExplorations.has(topic.topic_id))
+      .map((topic) => ({
+        kind: "topic",
+        topic,
+        digest: digestTopicIds.has(topic.topic_id),
+      }));
+    return [...explorationItems, ...unbuiltTopicItems]
+      .sort((a, b) => homeRecentDate(b) - homeRecentDate(a))
+      .slice(0, 5);
+  }, [allTopics, recentExplorations, scheduledTopics, topicById]);
+  const selectedEnabledSources = useMemo(
+    () => enabledSourceSelection(sourceSelection, sourceStatus),
+    [sourceSelection, sourceStatus],
+  );
+  const activeInterest = (submittedInterest || statement).trim();
+  const sourceLocked = flow === "building";
+  const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
+  const canBuild = activeInterest.length > 0 && !busy;
+  const currentIssues = [
+    ...(exploration?.progress.requested_source_issues ?? []),
+    ...(exploration?.progress.source_audit_issues ?? []),
+  ];
+  const refinementWorking = busy && !enableSource && !exploration && flow === "refining";
+  const activeRefinementProgress = useMemo<RefinementProgress | null>(() => {
+    if (refinementProgress) return refinementProgress;
+    if (!refinementWorking || !refinementFallbackStartedAt) return null;
+    return { phase: "starting", startedAt: refinementFallbackStartedAt, label: "Refining" };
+  }, [refinementFallbackStartedAt, refinementProgress, refinementWorking]);
+
+  const loadHome = useCallback(async () => {
+    const [sources, explorations, scheduled, topics, admin] = await Promise.all([
+      api<SourceStatusResponse>("/api/explore/source-status").catch(() => null),
+      api<Exploration[]>("/api/explore/explorations?limit=25").catch(() => []),
+      api<TopicProfileResponse[]>("/api/explore/scheduled-topic-profiles").catch(() => []),
+      api<TopicProfileResponse[]>("/api/explore/topic-profiles").catch(() => []),
+      api<AdminStatus>("/api/admin/status").catch(() => null),
+    ]);
+    if (sources) setSourceStatus(sources);
+    setRecentExplorations(explorations);
+    setScheduledTopics(scheduled);
+    setAllTopics(topics);
+    const email = admin?.delivery?.email;
+    const configured = Boolean(email?.enabled && email.recipient_email && email.gmail_send_ready !== false);
+    const sendReady = Boolean(email?.gmail_send_ready);
+    setDeliveryConfigured(configured);
+    setEmailSendReady(sendReady);
+    if (email?.recipient_email) setBriefEmailRecipient((current) => current || String(email.recipient_email));
+    setEmailOnSchedule(configured);
   }, []);
-
-  const loadSourceScout = useCallback(async () => {
-    try {
-      const result = await api<{ sources: RedditSource[]; decisions: SourceScoutDecision[] }>("/api/admin/source-scout");
-      setSourceScoutSources(result.sources);
-      setSourceScoutDecisions(result.decisions);
-    } catch {
-      setSourceScoutSources([]);
-      setSourceScoutDecisions([]);
-    }
-  }, []);
-
-  const loadStatus = useCallback(async () => {
-    try {
-      const result = await api<AdminPipelineStatus>("/api/admin/status");
-      setPipeline(result);
-      setStatus(result.gmail);
-      const preferredModel = result.model.model || result.model.catalog.models[0]?.id || "";
-      setSelectedModel(preferredModel);
-      setJobModel((current) => current || preferredModel);
-      setDeliveryEmail(result.delivery.email.recipient_email ?? "");
-      setDeliveryEnabled(Boolean(result.delivery.email.enabled));
-      setMessage(result.gmail.connected ? "Gmail connected" : "Gmail not connected");
-      await Promise.all([loadAgentDecisions(), loadSourceScout()]);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Admin status unavailable");
-    }
-  }, [loadAgentDecisions, loadSourceScout]);
 
   useEffect(() => {
-    void loadStatus();
-  }, [loadStatus]);
+    void loadHome();
+  }, [loadHome]);
 
-  async function saveClientSecret() {
+  useEffect(() => {
+    if (flow !== "idle") return;
+    if (!statement.trim()) {
+      clearInterestDraft();
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      clearInterestDraft();
+      setStatement("");
+      setMessage("Draft cleared after one hour of inactivity");
+    }, interestDraftTtlMs);
+    saveInterestDraft(statement);
+    return () => window.clearTimeout(timer);
+  }, [flow, statement]);
+
+  useEffect(() => {
+    if (!session) return;
+    setDraft(draftFromProfile(session.profile));
+  }, [session]);
+
+  useEffect(() => {
+    if (!activeRefinementProgress) return;
+    setProgressNow(Date.now());
+    const timer = window.setInterval(() => setProgressNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [activeRefinementProgress]);
+
+  function beginRefinementProgress(phase: RefinementProgressPhase, label: string) {
+    const now = Date.now();
+    setRefinementFallbackStartedAt(now);
+    setProgressNow(now);
+    setRefinementProgress({ phase, label, startedAt: now });
+  }
+
+  function endRefinementProgress() {
+    setRefinementProgress(null);
+    setRefinementFallbackStartedAt(0);
+    setProgressNow(Date.now());
+  }
+
+  async function startFlow(event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault();
+    if (flow !== "idle" && flow !== "ready") return;
+    if (!statement.trim()) return;
+    const blocked = firstBlockedSelectedSource(sourceSelection, sourceStatus);
+    if (blocked) {
+      setEnableSource(blocked);
+      return;
+    }
+    if (!hasEnabledSource(selectedEnabledSources)) {
+      setEnableSource("web_search");
+      return;
+    }
+    const interest = statement.trim();
+    clearInterestDraft();
+    setSubmittedInterest(interest);
+    setStatement("");
+    setFlow("refining");
     setBusy(true);
-    setMessage("Saving Google OAuth client...");
+    setMessage("Refining your interest...");
+    beginRefinementProgress("starting", "Starting refinement");
+    setBriefHtml("");
+    setExploration(null);
+    try {
+      const nextSession = await api<RefinementSession>("/api/explore/refinement-sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          statement: interest,
+          source_selection: selectedEnabledSources,
+          models: {},
+        }),
+      });
+      setSession(nextSession);
+      setDraft(draftFromProfile(nextSession.profile));
+      setFlow(nextSession.status === "finalized" ? "confirm" : "refining");
+      if (nextSession.topic_profile) setTopicProfile(nextSession.topic_profile);
+      setMessage(nextSession.status === "finalized" ? "Confirm the brief setup" : "Answer a few quick questions");
+    } catch (error) {
+      setStatement(interest);
+      saveInterestDraft(interest);
+      setSubmittedInterest("");
+      setFlow("idle");
+      setMessage(errorMessage(error, "Could not start refinement"));
+    } finally {
+      setBusy(false);
+      endRefinementProgress();
+    }
+  }
+
+  async function answerRefinement(justGoNow = false) {
+    if (!activeInterest) return;
+    if (!session && !justGoNow) return;
+    if (!justGoNow && !answer.trim()) return;
+    setBusy(true);
+    setMessage(justGoNow ? "Preparing confirmation..." : "Refining...");
+    beginRefinementProgress(justGoNow ? "confirming" : "answering", justGoNow ? "Preparing confirmation" : "Refining answer");
+    try {
+      const currentSession = session ?? await api<RefinementSession>("/api/explore/refinement-sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          statement: activeInterest,
+          source_selection: selectedEnabledSources,
+          models: {},
+        }),
+      });
+      const updated = await api<RefinementSession>(`/api/explore/refinement-sessions/${currentSession.session_id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({
+          answer: answer.trim(),
+          just_go_now: justGoNow,
+          models: {},
+        }),
+      });
+      setAnswer("");
+      setSession(updated);
+      setDraft(draftFromProfile(updated.profile));
+      if (updated.topic_profile) setTopicProfile(updated.topic_profile);
+      setFlow(updated.status === "finalized" ? "confirm" : "refining");
+      setMessage(updated.status === "finalized" ? "Confirm the brief setup" : "Refinement updated");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not update refinement"));
+    } finally {
+      setBusy(false);
+      endRefinementProgress();
+    }
+  }
+
+  function confirmedProfilePayload() {
+    const baseProfile = session?.profile ?? topicProfile?.profile;
+    const topicId = topicProfile?.topic_id ?? session?.topic_id ?? baseProfile?.topic_id;
+    const interest = activeInterest || baseProfile?.statement || "";
+    return {
+      ...(topicId ? { topic_id: topicId } : {}),
+      ...(session?.session_id ? { refinement_session_id: session.session_id } : {}),
+      statement: interest,
+      scope: draft.scope.trim() || interest,
+      depth: draft.depth,
+      recency_weighting: draft.recency_weighting,
+      exclusions: splitList(draft.exclusions),
+      source_selection: selectedEnabledSources,
+      requested_sources: baseProfile?.requested_sources ?? [],
+      subtopics: baseProfile?.subtopics ?? [],
+      keywords: baseProfile?.keywords ?? [],
+      search_queries: baseProfile?.search_queries ?? [],
+      source_queries: baseProfile?.source_queries ?? {},
+      models: {},
+    };
+  }
+
+  async function buildBrief() {
+    if (!canBuild) return;
+    const blocked = firstBlockedSelectedSource(sourceSelection, sourceStatus);
+    if (blocked) {
+      setEnableSource(blocked);
+      return;
+    }
+    setBusy(true);
+    setFlow("building");
+    setMessage("Building the brief...");
+    setBriefHtml("");
+    try {
+      const started = await api<{ topic_profile: TopicProfileResponse; exploration: Exploration }>("/api/explore/topic-profiles/build", {
+        method: "POST",
+        body: JSON.stringify({
+          ...confirmedProfilePayload(),
+          source_selection: selectedEnabledSources,
+        }),
+      });
+      setTopicProfile(started.topic_profile);
+      setSession(null);
+      setAnswer("");
+      setExploration(started.exploration);
+      const finished = await pollExploration(started.exploration.exploration_id);
+      setExploration(finished);
+      await loadBriefHtml(finished);
+      await loadHome();
+      setFlow("ready");
+      setMessage(finished.progress.built_with_issues ? "Brief ready with issues" : "Brief ready");
+    } catch (error) {
+      setFlow("confirm");
+      setMessage(errorMessage(error, "Could not build brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rebuildBrief() {
+    if (!exploration || !hasEnabledSource(selectedEnabledSources)) return;
+    setBusy(true);
+    setFlow("building");
+    setMessage("Rebuilding the brief...");
+    setBriefHtml("");
+    try {
+      const started = await api<{ exploration: Exploration }>(`/api/explore/explorations/${exploration.exploration_id}/rebuild`, {
+        method: "POST",
+        body: JSON.stringify({ source_selection: selectedEnabledSources }),
+      });
+      setExploration(started.exploration);
+      const finished = await pollExploration(started.exploration.exploration_id);
+      setExploration(finished);
+      await loadBriefHtml(finished);
+      await loadHome();
+      setFlow("ready");
+      setMessage(finished.progress.built_with_issues ? "Brief rebuilt with issues" : "Brief rebuilt");
+    } catch (error) {
+      setFlow("ready");
+      setMessage(errorMessage(error, "Could not rebuild brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pollExploration(explorationId: string): Promise<Exploration> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const next = await api<Exploration>(`/api/explore/explorations/${explorationId}`);
+      setExploration(next);
+      if (next.status !== "queued" && next.status !== "running") return next;
+      await sleep(1800);
+    }
+    throw new Error("Brief build timed out while waiting for results");
+  }
+
+  async function loadBriefHtml(record: Exploration) {
+    const path = briefPath(record);
+    if (!path) return;
+    const response = await fetch(path);
+    if (response.ok) {
+      setBriefHtml(await response.text());
+    }
+  }
+
+  async function scheduleBrief() {
+    if (!topicProfile || !exploration || exploration.status !== "complete") return;
+    setBusy(true);
+    setMessage("Scheduling digest...");
+    try {
+      const scheduled = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${topicProfile.topic_id}/schedule`, {
+        method: "POST",
+        body: JSON.stringify({
+          schedule: schedulePreset,
+          time_of_day: scheduleTime,
+          timezone: "America/Los_Angeles",
+          email_enabled: emailOnSchedule,
+        }),
+      });
+      setTopicProfile(scheduled);
+      await loadHome();
+      setFlow("ready");
+      setMessage("Digest scheduled");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not schedule digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendToInbox(recipientEmail: string) {
+    if (!exploration) return;
+    const recipient = recipientEmail.trim();
+    if (!recipient || !recipient.includes("@")) {
+      setMessage("Enter a valid email address");
+      return;
+    }
+    setBusy(true);
+    setMessage("Sending brief...");
+    try {
+      const result = await api<{ status: string; error?: string }>(`/api/explore/explorations/${exploration.exploration_id}/email`, {
+        method: "POST",
+        body: JSON.stringify({ recipient_email: recipient }),
+      });
+      if (result.status !== "sent") {
+        setMessage(result.error ?? "Email delivery skipped");
+      } else {
+        setExploration({ ...exploration, emailed: true });
+        setMessage(`Sent to ${recipient}`);
+      }
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not send brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function openBrief(record = exploration) {
+    const path = record ? briefPath(record) : null;
+    if (path) window.open(path, "_blank", "noopener,noreferrer");
+  }
+
+  async function deleteHomeExploration(item: Extract<HomeRecentItem, { kind: "exploration" }>) {
+    const title = homeRecentTitle(item);
+    setBusy(true);
+    try {
+      const result = await api<{ exploration: Exploration; undo_available_until?: string | null }>(
+        `/api/explore/explorations/${item.exploration.exploration_id}`,
+        { method: "DELETE" },
+      );
+      setRecentExplorations((current) => current.filter((record) => record.exploration_id !== item.exploration.exploration_id));
+      if (exploration?.exploration_id === item.exploration.exploration_id) {
+        resetForNewBrief();
+      }
+      await loadHome();
+      setHomeDeleteUndo({
+        explorationId: item.exploration.exploration_id,
+        title,
+        until: result.undo_available_until ?? result.exploration.delete_after ?? null,
+      });
+      setMessage("Brief deleted. You can undo for 7 days.");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not delete brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreHomeExploration() {
+    if (!homeDeleteUndo) return;
+    setBusy(true);
+    try {
+      await api(`/api/explore/explorations/${homeDeleteUndo.explorationId}/restore`, { method: "POST" });
+      setHomeDeleteUndo(null);
+      await loadHome();
+      setMessage("Brief restored");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not restore brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openHomeRecentItem(item: HomeRecentItem) {
+    if (item.kind === "topic") {
+      loadTopicForConfirmation(item.topic);
+      return;
+    }
+    if (item.exploration.status === "queued" || item.exploration.status === "running") {
+      setExploration(item.exploration);
+      setTopicProfile(item.topic);
+      if (item.topic) {
+        setStatement(item.topic.statement);
+        setDraft(draftFromProfile(item.topic.profile));
+        setSourceSelection(sourceSelectionFromRecord(item.topic.profile.source_selection));
+      }
+      setFlow("building");
+      setMessage(item.exploration.status === "queued" ? "Brief is queued..." : "Brief is still building...");
+      try {
+        const finished = await pollExploration(item.exploration.exploration_id);
+        setExploration(finished);
+        await loadBriefHtml(finished);
+        await loadHome();
+        setFlow("ready");
+        setMessage(finished.progress.built_with_issues ? "Brief ready with issues" : "Brief ready");
+      } catch (error) {
+        setMessage(errorMessage(error, "Could not refresh the building brief"));
+      }
+      return;
+    }
+    if (briefPath(item.exploration)) {
+      openBrief(item.exploration);
+      return;
+    }
+    if (item.topic) {
+      loadTopicForConfirmation(item.topic);
+      return;
+    }
+    setMessage("This brief is not ready yet");
+  }
+
+  function loadTopicForConfirmation(topic: TopicProfileResponse) {
+    clearInterestDraft();
+    setTopicProfile(topic);
+    setSession(null);
+    setExploration(null);
+    setBriefHtml("");
+    setAnswer("");
+    setStatement(topic.statement);
+    setSubmittedInterest(topic.statement);
+    setDraft(draftFromProfile(topic.profile));
+    setSourceSelection(sourceSelectionFromRecord(topic.profile.source_selection));
+    setFlow("confirm");
+    setMessage("Saved brief plan loaded");
+  }
+
+  function resetForNewBrief() {
+    clearInterestDraft();
+    setStatement("");
+    setSubmittedInterest("");
+    setSession(null);
+    setTopicProfile(null);
+    setDraft(emptyDraft());
+    setExploration(null);
+    setBriefHtml("");
+    setAnswer("");
+    endRefinementProgress();
+    setFlow("idle");
+    setSourceSelection(defaultSourceSelection);
+    setMessage("Ready");
+  }
+
+  function updateSource(key: SourceKey) {
+    if (sourceLocked) return;
+    const status = sourceStatus?.sources[key];
+    if (status && !status.enabled) {
+      setEnableSource(key);
+      return;
+    }
+    setSourceSelection((current) => ({ ...current, [key]: !current[key] }));
+  }
+
+  async function refreshSourcesAndSelect(key: SourceKey) {
+    const status = await api<SourceStatusResponse>("/api/explore/source-status");
+    setSourceStatus(status);
+    if (status.sources[key]?.enabled) {
+      setSourceSelection((current) => ({ ...current, [key]: true }));
+      setEnableSource(null);
+    }
+  }
+
+  async function saveWebKey() {
+    if (!webKey.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/web-search/credentials", {
+        method: "POST",
+        body: JSON.stringify({ provider: "tavily", api_key: webKey.trim() }),
+      });
+      setWebKey("");
+      await refreshSourcesAndSelect(enableSource === "foreign_media" ? "foreign_media" : "web_search");
+      setMessage(enableSource === "foreign_media" ? "Foreign Media connected" : "Web Search connected");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not connect Web Search"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveGmailClientSecret() {
+    if (!gmailSecret.trim()) return;
+    setBusy(true);
     try {
       await api("/api/admin/gmail/client-secret", {
         method: "POST",
-        body: JSON.stringify({ client_secret_json: clientSecretJson }),
+        body: JSON.stringify({ client_secret_json: gmailSecret.trim() }),
       });
-      setClientSecretJson("");
-      await loadStatus();
-      setMessage("Google OAuth client saved");
+      setGmailSecret("");
+      setMessage("Gmail OAuth client saved");
+      await refreshSourcesAndSelect("gmail");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not save client secret");
+      setMessage(errorMessage(error, "Could not save Gmail setup"));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function loadGmailClientFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      setGmailSecret(await file.text());
+      setMessage("Gmail OAuth client file loaded");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not read Gmail OAuth file"));
+    } finally {
+      event.target.value = "";
     }
   }
 
   async function connectGmail() {
     setBusy(true);
-    setMessage("Starting Google login...");
     try {
-      const result = await api<{ authorization_url: string }>("/api/admin/gmail/oauth/start", {
-        method: "POST",
-      });
+      const result = await api<{ authorization_url: string }>("/api/admin/gmail/oauth/start", { method: "POST" });
       window.location.href = result.authorization_url;
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not start Google login");
-      setBusy(false);
-    }
-  }
-
-  async function disconnectGmail() {
-    setBusy(true);
-    setMessage("Disconnecting Gmail...");
-    try {
-      await api("/api/admin/gmail/disconnect", { method: "POST" });
-      await loadStatus();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not disconnect Gmail");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function completeGmailFromRedirect() {
-    setBusy(true);
-    setMessage("Completing Gmail connection...");
-    try {
-      await api("/api/admin/gmail/oauth/complete", {
-        method: "POST",
-        body: JSON.stringify({ callback_url: callbackUrl.trim() }),
-      });
-      setCallbackUrl("");
-      await loadStatus();
-      setMessage("Gmail connected");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not complete Google login");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function startModelJob() {
-    setBusy(true);
-    setMessage("Starting model batch...");
-    try {
-      await api<ModelJob>("/api/admin/model/jobs", {
-        method: "POST",
-        body: JSON.stringify({
-          model_name: jobModel.trim(),
-          limit_count: jobLimit,
-          include_cached: jobIncludeCached,
-        }),
-      });
-      await loadStatus();
-      setMessage("Model batch started");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not start model batch");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveSelectedModel() {
-    if (!selectedModel.trim()) return;
-    setBusy(true);
-    setMessage("Saving model selection...");
-    try {
-      const result = await api<{ model: string }>("/api/admin/model/selection", {
-        method: "POST",
-        body: JSON.stringify({ model_name: selectedModel.trim() }),
-      });
-      setJobModel(result.model);
-      await loadStatus();
-      setMessage("Model selection saved");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not save model selection");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function runControlledVerification(publish = false, forcePodcastRefresh = false) {
-    const digest = pipeline?.digests[0];
-    if (!digest) return;
-    setBusy(true);
-    setMessage(
-      forcePodcastRefresh
-        ? "Refreshing podcasts for verification..."
-        : publish
-          ? "Publishing verified brief..."
-          : "Running controlled verification...",
-    );
-    try {
-      const params = new URLSearchParams();
-      if (publish) params.set("publish", "true");
-      if (forcePodcastRefresh) params.set("force_podcast_refresh", "true");
-      const query = params.toString() ? `?${params.toString()}` : "";
-      const result = await api<VerificationRunResult>(`/api/admin/digests/${digest.id}/verification-run${query}`, {
-        method: "POST",
-      });
-      setVerificationResult(result);
-      await loadStatus();
-      setMessage(
-        result.status === "completed"
-          ? forcePodcastRefresh
-            ? "Podcast refresh verification completed"
-            : result.published
-            ? "Verified brief published"
-            : "Controlled verification completed"
-          : result.message ?? result.status,
-      );
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Controlled verification failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function runSourceScout(liveSample = true) {
-    const digest = pipeline?.digests[0];
-    if (!digest) return;
-    setBusy(true);
-    setMessage(liveSample ? "Running Reddit Source Scout..." : "Seeding Reddit Source Scout...");
-    try {
-      const result = await api<SourceScoutResponse>(
-        `/api/admin/digests/${digest.id}/source-scout?live_sample=${liveSample ? "true" : "false"}`,
-        { method: "POST" },
-      );
-      setSourceScoutSources(result.sources);
-      setSourceScoutDecisions(result.decisions);
-      await loadStatus();
-      setMessage(result.summary ?? "Reddit Source Scout completed");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Source Scout failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveDeliverySettings() {
-    const digest = pipeline?.digests[0];
-    if (!digest) return;
-    setBusy(true);
-    setMessage("Saving delivery settings...");
-    try {
-      await api(`/api/admin/digests/${digest.id}/delivery`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          recipient_email: deliveryEmail.trim(),
-          enabled: deliveryEnabled,
-        }),
-      });
-      await loadStatus();
-      setMessage("Delivery settings saved");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not save delivery settings");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function discoverPodcasts() {
-    if (!podcastQuery.trim()) return;
-    setBusy(true);
-    setMessage("Searching podcast directory...");
-    try {
-      const result = await api<PodcastDiscoveryResponse>(
-        `/api/admin/podcasts/discover?query=${encodeURIComponent(podcastQuery.trim())}&limit=8`,
-      );
-      setPodcastResults(result.results);
-      setMessage(result.message ?? `Found ${result.results.length} podcast candidate(s)`);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Podcast search failed");
-    } finally {
+      setMessage(errorMessage(error, "Could not start Gmail connection"));
       setBusy(false);
     }
   }
 
   async function savePodcastCredentials() {
+    if (!podcastKey.trim() || !podcastSecret.trim()) return;
     setBusy(true);
-    setMessage("Saving Podcast Index credentials...");
     try {
-      await api<PodcastStatus>("/api/admin/podcasts/credentials", {
+      await api("/api/admin/podcasts/credentials", {
         method: "POST",
-        body: JSON.stringify({
-          api_key: podcastApiKey.trim(),
-          api_secret: podcastApiSecret.trim(),
-        }),
+        body: JSON.stringify({ api_key: podcastKey.trim(), api_secret: podcastSecret.trim() }),
       });
-      setPodcastApiKey("");
-      setPodcastApiSecret("");
-      await loadStatus();
-      setMessage("Podcast Index credentials saved");
+      setPodcastKey("");
+      setPodcastSecret("");
+      await refreshSourcesAndSelect("podcasts");
+      setMessage("Podcast directory connected");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not save podcast credentials");
+      setMessage(errorMessage(error, "Could not connect podcasts"));
     } finally {
       setBusy(false);
     }
   }
 
-  async function addPodcastSource(source: Partial<PodcastSource>) {
-    const digest = pipeline?.digests[0];
-    if (!digest) return;
+  async function saveYoutubeCredentials() {
+    if (!youtubeKey.trim()) return;
     setBusy(true);
-    setMessage("Adding podcast source...");
     try {
-      await api(`/api/admin/digests/${digest.id}/podcast-sources`, {
+      await api("/api/admin/youtube/credentials", {
         method: "POST",
-        body: JSON.stringify(source),
+        body: JSON.stringify({ api_key: youtubeKey.trim() }),
       });
-      setPodcastFeedUrl("");
-      setPodcastTitle("");
-      await loadStatus();
-      setMessage("Podcast source added");
+      setYoutubeKey("");
+      await refreshSourcesAndSelect("youtube");
+      setMessage("YouTube connected");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not add podcast source");
+      setMessage(errorMessage(error, "Could not connect YouTube"));
     } finally {
       setBusy(false);
     }
   }
 
-  async function addManualPodcastFeed() {
-    if (!podcastFeedUrl.trim()) return;
-    await addPodcastSource({
-      type: "podcast_rss",
-      title: podcastTitle.trim() || undefined,
-      feed_url: podcastFeedUrl.trim(),
-      transcription: "auto",
-    });
-  }
-
-  async function addPodcastSearch() {
-    if (!podcastQuery.trim()) return;
-    await addPodcastSource({
-      type: "podcast_search",
-      title: `Search: ${podcastQuery.trim()}`,
-      query: podcastQuery.trim(),
-      aggregator: "podcastindex",
-      transcription: "auto",
-    });
-  }
-
-  async function removePodcastSource(source: PodcastSource) {
-    const digest = pipeline?.digests[0];
-    if (!digest || !source.key) return;
+  async function setupCollectionsSource() {
     setBusy(true);
-    setMessage("Removing podcast source...");
     try {
-      await api(`/api/admin/digests/${digest.id}/podcast-sources/${encodeURIComponent(source.key)}`, {
-        method: "DELETE",
-      });
-      await loadStatus();
-      setMessage("Podcast source removed");
+      await api("/api/admin/collections/setup", { method: "POST" });
+      await refreshSourcesAndSelect("collections");
+      setMessage("Collections folder ready");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not remove podcast source");
+      setMessage(errorMessage(error, "Could not set up Collections"));
     } finally {
       setBusy(false);
     }
-  }
-
-  async function sendLatestDigestEmail() {
-    const digest = pipeline?.digests[0];
-    if (!digest) return;
-    setBusy(true);
-    setMessage("Sending latest digest...");
-    try {
-      await api(`/api/admin/digests/${digest.id}/delivery/send-test`, {
-        method: "POST",
-      });
-      await loadStatus();
-      setMessage("Latest digest sent");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not send latest digest");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function readClientSecretFile(file: File | undefined) {
-    if (!file) return;
-    setClientSecretJson(await file.text());
   }
 
   return (
-    <main className="admin-shell">
-      <aside className="sidebar admin-sidebar">
-        <div>
-          <p className="eyebrow">Admin</p>
-          <h1>Operations</h1>
-        </div>
-        <nav className="sidebar-nav">
-          <a href="/">Digests</a>
-          <a href="/admin">Admin</a>
-        </nav>
-        <section className="status-panel">
-          <span className={status?.connected ? "status-dot" : "status-dot warning"} />
-          <div>
-            <strong>{message}</strong>
-            <p>{status ? `Admin API: ${status.network}` : "Checking access"}</p>
-          </div>
-        </section>
-      </aside>
-
-      <section className="admin-workspace">
-        <header className="toolbar">
-          <div>
-            <p className="eyebrow">Google OAuth</p>
-            <h2>Connect Gmail</h2>
-          </div>
-          <button onClick={loadStatus} disabled={busy}>
-            Refresh
-          </button>
+    <main className="dispatch-page">
+      <section className="dispatch-frame">
+        <header className="dispatch-header">
+          <a className="brand-lockup" href="/" aria-label="Dispatch home">
+            <span className="brand-mark">◔</span>
+            <span>Dispatch</span>
+          </a>
+          <a className="icon-menu" href="/admin" aria-label="Open Admin">•••</a>
         </header>
 
-        <div className="admin-grid">
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Pipeline Status</h3>
-                <p className="muted">{pipeline?.system.public_base_url ?? "Local runtime"}</p>
-              </div>
-              <span className={pipeline?.scheduler.running ? "status-pill good" : "status-pill"}>
-                {pipeline?.scheduler.enabled ? "Scheduled" : "Manual"}
-              </span>
-            </div>
-            {pipeline?.health ? (
-              <div className={`admin-health ${pipeline.health.safe_for_overnight ? "ready" : "needs-attention"}`}>
-                <div>
-                  <span>{pipeline.health.safe_for_overnight ? "Safe" : "Attention"}</span>
-                  <strong>{pipeline.health.headline}</strong>
-                  <small>
-                    {pipeline.health.problem_count} problem(s) · {pipeline.health.warning_count} warning(s)
-                  </small>
-                </div>
-                <div className="health-checks">
-                  {pipeline.health.checks.map((check) => (
-                    <article className={`health-check ${check.status}`} key={check.name}>
-                      <strong>{check.name}</strong>
-                      <span>{check.message}</span>
-                    </article>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            <div className="metric-strip">
-              <div>
-                <span>Scheduler</span>
-                <strong>{pipeline?.scheduler.running ? "Running" : pipeline?.scheduler.enabled ? "Starting" : "Off"}</strong>
-                <small>{formatSchedulerTime(pipeline?.scheduler.daily_run_time, pipeline?.scheduler.timezone)}</small>
-              </div>
-              <div>
-                <span>Model</span>
-                <strong>{pipeline?.model.enabled ? pipeline.model.model : "Fallback"}</strong>
-                <small>{pipeline?.model.enabled ? `${pipeline.model.max_items}/run · cache reused` : "Deterministic summaries"}</small>
-              </div>
-              <div>
-                <span>Gmail Source</span>
-                <strong>
-                  {pipeline?.gmail.hosted_gmail_mcp_enabled && pipeline.gmail.hosted_gmail_mcp_ready
-                    ? "Hosted"
-                    : pipeline?.gmail.connected
-                      ? "Direct API"
-                      : "Offline"}
-                </strong>
-                <small>
-                  {pipeline?.gmail.requires_reconnect
-                    ? "Reconnect Gmail"
-                    : pipeline?.gmail.hosted_gmail_mcp_enabled && pipeline.gmail.hosted_gmail_mcp_ready
-                      ? "Google-hosted Gmail MCP ready"
-                      : "Gmail API reads newsletters directly"}
-                </small>
-              </div>
-              <div>
-                <span>Delivery</span>
-                <strong>
-                  <a href={pipeline?.delivery.latest_brief_url ?? "/brief"} target="_blank" rel="noreferrer">
-                    Latest Brief
-                  </a>
-                </strong>
-                <small>{formatDeliveryUrl(pipeline?.delivery.latest_brief_url)}</small>
-              </div>
-              <div>
-                <span>Agentic Flow</span>
-                <strong>{pipeline?.agent_decisions.record_count ?? 0}</strong>
-                <small>{formatAgentDecisionSummary(pipeline?.agent_decisions)}</small>
-              </div>
-              <div>
-                <span>Reddit Scout</span>
-                <strong>{pipeline?.source_scout.active_count ?? 0} active</strong>
-                <small>{formatSourceScoutSummary(pipeline?.source_scout)}</small>
-              </div>
-              <div>
-                <span>Podcasts</span>
-                <strong>{pipeline?.podcasts.sources.length ?? 0}</strong>
-                <small>{pipeline?.podcasts.transcription_configured ? "Transcript cache on" : "Show notes fallback"}</small>
-              </div>
-              <div>
-                <span>Cache</span>
-                <strong>{pipeline?.model_cache.record_count ?? 0}</strong>
-              </div>
-              <div>
-                <span>Last Check</span>
-                <strong>{formatDateTime(pipeline?.scheduler.last_check_at)}</strong>
-              </div>
-            </div>
-            {pipeline?.scheduler.last_error ? <p className="error-text">{pipeline.scheduler.last_error}</p> : null}
-            <div className="panel-actions">
-              <button onClick={() => runControlledVerification(false)} disabled={busy || !pipeline?.digests.length}>
-                Verify Only
-              </button>
-              <button onClick={() => runControlledVerification(true)} disabled={busy || !pipeline?.digests.length}>
-                Publish Verified Brief
-              </button>
-              <button onClick={() => runControlledVerification(false, true)} disabled={busy || !pipeline?.digests.length}>
-                Refresh Podcasts
-              </button>
-              {verificationResult ? (
-                <p className="muted">
-                  {formatVerificationResult(verificationResult)}
-                </p>
-              ) : (
-                <p className="muted">Exercises the agentic editor and critic without publishing over the live brief.</p>
-              )}
-            </div>
-            {agentDecisions.length ? (
-              <div className="decision-list">
-                {agentDecisions.slice(0, 6).map((decision) => (
-                  <article key={decision.id}>
-                    <strong>
-                      {decision.agent} · {decision.action || decision.decision}
-                    </strong>
-                    <span>{decision.reason || decision.decision}</span>
-                  </article>
-                ))}
-              </div>
-            ) : null}
-          </section>
+        <section className="dispatch-body">
+          {activeDigest ? (
+            <button className="active-digest-row" onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}>
+              <span className="live-dot" />
+              <strong>{profileName(activeDigest)}</strong>
+              <span>Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}</span>
+            </button>
+          ) : null}
 
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Digest Stats</h3>
-                <p className="muted">Clean run summary shown in the digest; unresolved details stay in Admin.</p>
-              </div>
-              <span className="status-pill">{formatDateTime(pipeline?.digest_stats.generated_at)}</span>
-            </div>
-            <div className="metric-strip">
-              <div>
-                <span>Sources</span>
-                <strong>{formatNumber(pipeline?.digest_stats.source_count)}</strong>
-                <small>Configured inputs</small>
-              </div>
-              <div>
-                <span>Newsletters</span>
-                <strong>{formatNumber(pipeline?.digest_stats.newsletter_count)}</strong>
-                <small>{formatNumber(pipeline?.digest_stats.link_count)} links extracted</small>
-              </div>
-              <div>
-                <span>Podcasts</span>
-                <strong>{formatNumber(pipeline?.digest_stats.podcast_episode_count)}</strong>
-                <small>Episodes added</small>
-              </div>
-              <div>
-                <span>Included</span>
-                <strong>{formatNumber(pipeline?.digest_stats.included_article_count)}</strong>
-                <small>{formatNumber(pipeline?.digest_stats.article_candidate_count)} candidates reviewed</small>
-              </div>
-              <div>
-                <span>Filtered</span>
-                <strong>
-                  {formatNumber((pipeline?.digest_stats.dropped_count ?? 0) + (pipeline?.digest_stats.unresolved_count ?? 0))}
-                </strong>
-                <small>{formatNumber(pipeline?.digest_stats.unresolved_count)} unresolved, admin-only</small>
-              </div>
-              <div>
-                <span>Model tokens</span>
-                <strong>{formatNumber(pipeline?.digest_stats.total_tokens)}</strong>
-                <small>
-                  {formatNumber(pipeline?.digest_stats.prompt_tokens)} prompt · {formatNumber(pipeline?.digest_stats.completion_tokens)} output
-                </small>
-              </div>
-              <div>
-                <span>Processing</span>
-                <strong>{formatSeconds(pipeline?.digest_stats.processing_seconds)}</strong>
-                <small>{formatNumber(pipeline?.digest_stats.model_call_count)} model call(s)</small>
-              </div>
-            </div>
-            <div className="stage-strip">
-              {Object.entries(pipeline?.digest_stats.stage_seconds ?? {}).map(([stage, seconds]) => (
-                <span key={stage}>
-                  {formatStageLabel(stage)}: <strong>{formatSeconds(seconds)}</strong>
-                </span>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Podcast Sources</h3>
-                <p className="muted">Episodes are summarized into the digest with a link back to the original episode.</p>
-              </div>
-              <span className={pipeline?.podcasts.aggregator_configured ? "status-pill good" : "status-pill"}>
-                {pipeline?.podcasts.aggregator_configured ? "Directory ready" : "RSS only"}
-              </span>
-            </div>
-            <div className="podcast-credentials">
-              <label>
-                Podcast Index API key
-                <input
-                  type="password"
-                  value={podcastApiKey}
-                  onChange={(event) => setPodcastApiKey(event.target.value)}
-                  placeholder={pipeline?.podcasts.aggregator_configured ? "Saved" : "Paste API key"}
-                  autoComplete="off"
-                />
-              </label>
-              <label>
-                Podcast Index API secret
-                <input
-                  type="password"
-                  value={podcastApiSecret}
-                  onChange={(event) => setPodcastApiSecret(event.target.value)}
-                  placeholder={pipeline?.podcasts.aggregator_configured ? "Saved" : "Paste API secret"}
-                  autoComplete="off"
-                />
-              </label>
-              <button
-                onClick={savePodcastCredentials}
-                disabled={busy || !podcastApiKey.trim() || !podcastApiSecret.trim()}
-              >
-                Save Directory Access
-              </button>
-            </div>
-            <div className="podcast-tools">
-              <label>
-                Search topic
-                <input
-                  value={podcastQuery}
-                  onChange={(event) => setPodcastQuery(event.target.value)}
-                  placeholder="AI daily brief"
-                />
-              </label>
-              <div className="button-row podcast-buttons">
-                <button onClick={discoverPodcasts} disabled={busy || !podcastQuery.trim() || !pipeline?.podcasts.aggregator_configured}>
-                  Search Directory
-                </button>
-                <button
-                  className="secondary-button"
-                  onClick={addPodcastSearch}
-                  disabled={busy || !podcastQuery.trim() || !pipeline?.podcasts.aggregator_configured}
-                >
-                  Watch Search
-                </button>
-              </div>
-              <label>
-                RSS feed
-                <input
-                  value={podcastFeedUrl}
-                  onChange={(event) => setPodcastFeedUrl(event.target.value)}
-                  placeholder="https://example.com/feed.xml"
-                />
-              </label>
-              <label>
-                Feed name
-                <input
-                  value={podcastTitle}
-                  onChange={(event) => setPodcastTitle(event.target.value)}
-                  placeholder="Optional"
-                />
-              </label>
-              <button onClick={addManualPodcastFeed} disabled={busy || !podcastFeedUrl.trim()}>
-                Add RSS
-              </button>
-            </div>
-            <div className="metric-strip">
-              <div>
-                <span>Tracked</span>
-                <strong>{pipeline?.podcasts.sources.length ?? 0}</strong>
-                <small>{pipeline?.podcasts.aggregator_configured ? "Podcast Index enabled" : "Manual feeds enabled"}</small>
-              </div>
-              <div>
-                <span>Transcription</span>
-                <strong>{pipeline?.podcasts.transcription_configured ? "Configured" : "Show notes"}</strong>
-                <small>Cached once available</small>
-              </div>
-              <div>
-                <span>Transcript cache</span>
-                <strong>{formatPathTail(pipeline?.podcasts.transcript_cache_dir)}</strong>
-                <small>{formatPathTail(pipeline?.podcasts.audio_cache_dir)}</small>
-              </div>
-            </div>
-            <div className="metric-strip">
-              <div>
-                <span>Telemetry rows</span>
-                <strong>{formatNumber(pipeline?.podcast_metrics.record_count)}</strong>
-                <small>{formatNumber(pipeline?.podcast_metrics.cache_hit_count)} cache hit(s)</small>
-              </div>
-              <div>
-                <span>Avg transcript</span>
-                <strong>{formatMs(pipeline?.podcast_metrics.avg_transcription_ms)}</strong>
-                <small>{formatNumber(pipeline?.podcast_metrics.transcript_words)} transcript words</small>
-              </div>
-              <div>
-                <span>Avg download</span>
-                <strong>{formatMs(pipeline?.podcast_metrics.avg_download_ms)}</strong>
-                <small>{formatBytes(pipeline?.podcast_metrics.audio_bytes)} cached audio</small>
-              </div>
-              <div>
-                <span>Latest</span>
-                <strong>{formatDateTime(pipeline?.podcast_metrics.latest_ts)}</strong>
-                <small>{formatPodcastMetricCounts(pipeline?.podcast_metrics)}</small>
-              </div>
-            </div>
-            <p className="section-label">Podcast run details</p>
-            <div className="source-list podcast-run-list">
-              {(pipeline?.podcast_metrics.recent ?? []).slice(0, 8).map((metric) => (
-                <article key={metric.id}>
-                  <div>
-                    <strong>{metric.episode_title ?? "Podcast episode"}</strong>
-                    <small>{metric.show_name ?? metric.feed_url ?? "Unknown show"}</small>
-                  </div>
-                  <span className={`source-state ${podcastMetricStateClass(metric.status)}`}>
-                    {formatStatusLabel(metric.status)}
-                  </span>
-                  <p>{formatPodcastMetricDetail(metric)}</p>
-                </article>
-              ))}
-              {(pipeline?.podcast_metrics.recent.length ?? 0) === 0 ? (
-                <article>
-                  <div>
-                    <strong>No podcast run details yet</strong>
-                    <small>The next podcast-enabled run will populate episode-level telemetry.</small>
-                  </div>
-                  <span className="source-state candidate">Waiting</span>
-                </article>
-              ) : null}
-            </div>
-            {podcastResults.length ? (
-              <>
-                <p className="section-label">Directory results</p>
-                <div className="source-list">
-                  {podcastResults.map((source) => (
-                    <article key={source.feed_url ?? source.key}>
-                      <div>
-                        <strong>{source.title ?? "Podcast"}</strong>
-                        <small>{source.author ?? source.site_url ?? source.feed_url}</small>
-                      </div>
-                      <button className="source-action" onClick={() => addPodcastSource(source)} disabled={busy}>
-                        Add
+          {homeRecentItems.length ? (
+            <div className="recent-block">
+              <p className="section-kicker">Recent Briefs</p>
+              <div className="recent-list">
+                {homeRecentItems.map((item) => (
+                  <div className="recent-pill-row" key={homeRecentKey(item)}>
+                    <button className="recent-pill" onClick={() => void openHomeRecentItem(item)}>
+                      <span>{homeRecentIcon(item)}</span>
+                      <strong>{homeRecentTitle(item)}</strong>
+                      <em>{homeRecentMeta(item)}</em>
+                      {item.digest ? <b>digest</b> : homeRecentBadge(item) ? <b>{homeRecentBadge(item)}</b> : null}
+                    </button>
+                    {item.kind === "exploration" ? (
+                      <button
+                        type="button"
+                        className="recent-delete"
+                        onClick={() => void deleteHomeExploration(item)}
+                        disabled={busy}
+                        aria-label={`Delete ${homeRecentTitle(item)}`}
+                      >
+                        Delete
                       </button>
-                      <p>{source.feed_url}</p>
-                    </article>
-                  ))}
-                </div>
-              </>
-            ) : null}
-            <p className="section-label">Tracked sources</p>
-            <div className="source-list">
-              {(pipeline?.podcasts.sources ?? []).map((source) => (
-                <article key={source.key ?? source.feed_url ?? source.query}>
-                  <div>
-                    <strong>{source.title ?? source.query ?? source.feed_url ?? "Podcast source"}</strong>
-                    <small>
-                      {source.type === "podcast_search" ? `Search: ${source.query}` : source.feed_url}
-                    </small>
+                    ) : null}
                   </div>
-                  <button className="source-action" onClick={() => removePodcastSource(source)} disabled={busy}>
-                    Remove
-                  </button>
-                  <p>{source.aggregator ?? "rss"} · {source.transcription ?? "auto"}</p>
-                </article>
-              ))}
-              {(pipeline?.podcasts.sources.length ?? 0) === 0 ? (
-                <article>
-                  <div>
-                    <strong>No podcast sources yet</strong>
-                    <small>Add a directory search or RSS feed.</small>
-                  </div>
-                  <span className="source-state candidate">New</span>
-                </article>
-              ) : null}
-            </div>
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Digest Delivery</h3>
-                <p className="muted">Sends the finished morning brief to your inbox after the scheduled run completes.</p>
-              </div>
-              <span className={pipeline?.delivery.email.enabled ? "status-pill good" : "status-pill"}>
-                {pipeline?.delivery.email.enabled ? "Enabled" : "Off"}
-              </span>
-            </div>
-            <div className="delivery-form">
-              <label>
-                Recipient email
-                <input
-                  value={deliveryEmail}
-                  onChange={(event) => setDeliveryEmail(event.target.value)}
-                  placeholder="you@example.com"
-                />
-              </label>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={deliveryEnabled}
-                  onChange={(event) => setDeliveryEnabled(event.target.checked)}
-                />
-                Send each morning
-              </label>
-              <div className="button-row">
-                <button onClick={saveDeliverySettings} disabled={busy || !pipeline?.digests.length}>
-                  Save Delivery
-                </button>
-                <button
-                  className="secondary-button"
-                  onClick={sendLatestDigestEmail}
-                  disabled={busy || !pipeline?.delivery.email.enabled || !pipeline.delivery.email.recipient_email}
-                >
-                  Send Latest Now
-                </button>
-              </div>
-            </div>
-            <dl className="status-list inline">
-              <div>
-                <dt>Gmail send</dt>
-                <dd>{pipeline?.delivery.email.gmail_send_ready ? "Ready" : "Reconnect Gmail"}</dd>
-              </div>
-              <div>
-                <dt>Last sent</dt>
-                <dd>{formatDateTime(pipeline?.delivery.email.last_delivered_at)}</dd>
-              </div>
-              <div>
-                <dt>Last status</dt>
-                <dd>{pipeline?.delivery.email.last_delivery_status ?? "Never"}</dd>
-              </div>
-            </dl>
-            {pipeline?.delivery.email.requires_gmail_reconnect ? (
-              <p className="error-text">Reconnect Gmail once so Morning Dispatch can send the brief, not just read newsletters.</p>
-            ) : null}
-            {pipeline?.delivery.email.last_error ? <p className="error-text">{pipeline.delivery.email.last_error}</p> : null}
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Unresolved Links</h3>
-                <p className="muted">Admin-only detail. These no longer appear in the digest itself.</p>
-              </div>
-              <span className={pipeline?.fetch_failures.total_count ? "status-pill" : "status-pill good"}>
-                {pipeline?.fetch_failures.total_count ?? 0} unresolved
-              </span>
-            </div>
-            <div className="metric-strip">
-              {(pipeline?.fetch_failures.groups ?? []).slice(0, 5).map((group) => (
-                <div key={group.status}>
-                  <span>{formatStatusLabel(group.status)}</span>
-                  <strong>{group.count}</strong>
-                  <small>{group.fixability}</small>
-                </div>
-              ))}
-              {(pipeline?.fetch_failures.groups.length ?? 0) === 0 ? (
-                <div>
-                  <span>Failures</span>
-                  <strong>0</strong>
-                  <small>No failed article fetches in the latest run.</small>
-                </div>
-              ) : null}
-            </div>
-            <div className="review-list">
-              {(pipeline?.fetch_failures.examples ?? []).map((item) => (
-                <article key={`${item.url ?? item.title}-${item.status}`}>
-                  <div>
-                    <strong>{item.title}</strong>
-                    <small>{item.domain ?? "unknown source"} · {formatStatusLabel(item.status)}</small>
-                  </div>
-                  <p>{item.reason}</p>
-                  {item.context ? <span>{item.context}</span> : null}
-                </article>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Brief Review</h3>
-                <p className="muted">A compact audit of what the agents included, dropped, repaired, or deduplicated.</p>
-              </div>
-              <span className="status-pill">{formatDateTime(pipeline?.brief_review.generated_at)}</span>
-            </div>
-            <div className="metric-strip">
-              <div>
-                <span>Included</span>
-                <strong>{pipeline?.brief_review.counts.included ?? 0}</strong>
-              </div>
-              <div>
-                <span>Unresolved</span>
-                <strong>{pipeline?.brief_review.counts.unresolved ?? 0}</strong>
-              </div>
-              <div>
-                <span>Dropped</span>
-                <strong>{pipeline?.brief_review.counts.dropped ?? 0}</strong>
-              </div>
-              <div>
-                <span>Duplicate</span>
-                <strong>{pipeline?.brief_review.counts.duplicate ?? 0}</strong>
-              </div>
-              <div>
-                <span>Repaired</span>
-                <strong>{pipeline?.brief_review.counts.repaired ?? 0}</strong>
-              </div>
-            </div>
-            <div className="review-columns">
-              <div>
-                <p className="section-label">Included</p>
-                <div className="review-list compact">
-                  {(pipeline?.brief_review.included ?? []).slice(0, 5).map((item) => (
-                    <article key={`${item.url ?? item.title}-included`}>
-                      <strong>{item.title}</strong>
-                      <small>{item.section ?? item.tier ?? "included"} · {formatPercent(item.score)}</small>
-                    </article>
-                  ))}
-                </div>
-              </div>
-              <div>
-                <p className="section-label">Dropped / Repaired</p>
-                <div className="review-list compact">
-                  {[...(pipeline?.brief_review.dropped ?? []), ...(pipeline?.brief_review.repaired ?? [])]
-                    .slice(0, 5)
-                    .map((item) => (
-                      <article key={`${item.target}-${item.action}-${item.created_at}`}>
-                        <strong>{item.action || item.decision}</strong>
-                        <small>{item.target}</small>
-                        <p>{item.reason ?? item.decision}</p>
-                      </article>
-                    ))}
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Reddit Source Scout</h3>
-                <p className="muted">
-                  Keeps Reddit communities aligned with the digest interest by promoting fresh sources and retiring stale ones.
-                </p>
-              </div>
-              <span className={pipeline?.source_scout.latest_run?.status === "completed" ? "status-pill good" : "status-pill"}>
-                {pipeline?.source_scout.latest_run?.status ?? "Not run"}
-              </span>
-            </div>
-            <div className="metric-strip">
-              <div>
-                <span>Tracked</span>
-                <strong>{pipeline?.source_scout.source_count ?? sourceScoutSources.length}</strong>
-                <small>{formatDateTime(pipeline?.source_scout.latest_run?.run_at)}</small>
-              </div>
-              <div>
-                <span>Active</span>
-                <strong>{pipeline?.source_scout.active_count ?? 0}</strong>
-                <small>Browsed every run</small>
-              </div>
-              <div>
-                <span>Search-only</span>
-                <strong>{pipeline?.source_scout.search_only_count ?? 0}</strong>
-                <small>Queried when keywords match</small>
-              </div>
-              <div>
-                <span>Candidate</span>
-                <strong>{pipeline?.source_scout.candidate_count ?? 0}</strong>
-                <small>Proving signal</small>
-              </div>
-              <div>
-                <span>Retired</span>
-                <strong>{pipeline?.source_scout.retired_count ?? 0}</strong>
-                <small>Kept for audit</small>
-              </div>
-            </div>
-            <div className="panel-actions">
-              <button onClick={() => runSourceScout(true)} disabled={busy || !pipeline?.digests.length}>
-                Run Scout
-              </button>
-              <button onClick={() => runSourceScout(false)} disabled={busy || !pipeline?.digests.length}>
-                Seed Only
-              </button>
-              <p className="muted">{pipeline?.source_scout.latest_run?.summary ?? "No Reddit source review has run yet."}</p>
-            </div>
-            {sourceScoutSources.length ? (
-              <div className="source-list">
-                {sourceScoutSources.slice(0, 18).map((source) => (
-                  <article key={source.id}>
-                    <div>
-                      <strong>r/{source.subreddit}</strong>
-                      <small>{source.category ?? "Uncategorized"} · score {formatPercent(source.score)}</small>
-                    </div>
-                    <span className={`source-state ${source.state}`}>{formatSourceState(source.state)}</span>
-                    <p>{source.reason ?? "No review note yet."}</p>
-                  </article>
                 ))}
               </div>
-            ) : (
-              <p className="muted">Run the scout to seed Reddit communities.</p>
-            )}
-            {sourceScoutDecisions.length ? (
-              <>
-                <p className="section-label">Recent scout decisions</p>
-                <div className="decision-list">
-                  {sourceScoutDecisions.slice(0, 5).map((decision) => (
-                    <article key={decision.id}>
-                      <strong>
-                        r/{decision.subreddit} · {decision.action || decision.decision}
-                      </strong>
-                      <span>{decision.reason || decision.decision}</span>
-                    </article>
-                  ))}
+              {homeDeleteUndo ? (
+                <div className="undo-note">
+                  <span>
+                    Deleted "{homeDeleteUndo.title}".
+                    {homeDeleteUndo.until ? ` Undo until ${formatDateTime(homeDeleteUndo.until)}.` : " Undo is available for 7 days."}
+                  </span>
+                  <button type="button" className="secondary-action" onClick={() => void restoreHomeExploration()} disabled={busy}>Undo</button>
                 </div>
-              </>
-            ) : null}
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Librarian Model</h3>
-                <p className="muted">
-                  {pipeline?.model.catalog.error ??
-                    `Using ${pipeline?.model.catalog.base_url ?? "the configured local model server"}`}
-                </p>
-              </div>
-              <span className={modelCatalogReady ? "status-pill good" : "status-pill"}>
-                {modelCatalogReady ? `${modelOptions.length} available` : "Unavailable"}
-              </span>
+              ) : null}
             </div>
-            <div className="model-picker">
+          ) : null}
+
+          {flow === "refining" || refinementProgress ? (
+            <RefinementPanel
+              session={session}
+              interest={submittedInterest || statement}
+              profile={session?.profile ?? topicProfile?.profile ?? null}
+              sourceSelection={selectedEnabledSources}
+              answer={answer}
+              busy={busy}
+              progress={activeRefinementProgress}
+              now={progressNow}
+              onAnswerChange={setAnswer}
+              onSend={() => void answerRefinement(false)}
+              onJustGo={() => void answerRefinement(true)}
+            />
+          ) : null}
+
+          {flow === "confirm" ? (
+            <ConfirmationPanel
+              draft={draft}
+              profile={session?.profile ?? topicProfile?.profile ?? null}
+              sources={sourceSelection}
+              sourceStatus={sourceStatus}
+              busy={busy}
+              onDraftChange={setDraft}
+              onSourceClick={updateSource}
+              onBuild={() => void buildBrief()}
+            />
+          ) : null}
+
+          {flow === "building" && exploration ? (
+            <ProgressPanel exploration={exploration} sourceSelection={selectedEnabledSources} />
+          ) : null}
+
+          {flow === "ready" && exploration ? (
+            <BriefReadyPanel
+              exploration={exploration}
+              issues={currentIssues}
+              html={briefHtml}
+              emailSendReady={emailSendReady}
+              emailRecipient={briefEmailRecipient}
+              busy={busy}
+              onOpen={() => openBrief()}
+              onEditSources={() => setFlow("confirm")}
+              onRebuild={() => void rebuildBrief()}
+              onSchedule={() => setFlow("schedule")}
+              onEmailRecipientChange={setBriefEmailRecipient}
+              onSend={(recipient) => void sendToInbox(recipient)}
+              onNew={resetForNewBrief}
+            />
+          ) : null}
+
+          {flow === "schedule" ? (
+            <SchedulePanel
+              preset={schedulePreset}
+              time={scheduleTime}
+              emailEnabled={emailOnSchedule}
+              deliveryConfigured={deliveryConfigured}
+              busy={busy}
+              onPresetChange={setSchedulePreset}
+              onTimeChange={setScheduleTime}
+              onEmailChange={setEmailOnSchedule}
+              onCancel={() => setFlow("ready")}
+              onSchedule={() => void scheduleBrief()}
+            />
+          ) : null}
+        </section>
+
+        {flow === "idle" || flow === "ready" ? (
+        <form className="composer" onSubmit={startFlow}>
+          <textarea
+            value={statement}
+            onChange={(event) => {
+              setStatement(event.target.value);
+              if (flow === "ready") {
+                setFlow("idle");
+                setExploration(null);
+                setBriefHtml("");
+              }
+            }}
+            onFocus={() => {
+              if (flow === "idle" && statement.trim()) saveInterestDraft(statement);
+            }}
+            placeholder="Describe what you're interested in?"
+            rows={4}
+            disabled={busy}
+          />
+          {activeRefinementProgress ? (
+            <div className="composer-progress">
+              <RefinementStatusIndicator progress={activeRefinementProgress} now={progressNow} />
+            </div>
+          ) : null}
+          <div className="composer-footer">
+            <SourceChips
+              selection={sourceSelection}
+              status={sourceStatus}
+              locked={sourceLocked}
+              onToggle={updateSource}
+            />
+            <button className="primary-action" type="submit" disabled={!canSubmitInterest}>
+              Submit
+            </button>
+          </div>
+        </form>
+        ) : null}
+      </section>
+      <p className="app-status">{message}</p>
+
+      {enableSource ? (
+        <EnableSourceModal
+          source={enableSource}
+          status={sourceStatus?.sources[enableSource]}
+          webKey={webKey}
+          gmailSecret={gmailSecret}
+          podcastKey={podcastKey}
+          podcastSecret={podcastSecret}
+          youtubeKey={youtubeKey}
+          busy={busy}
+          onClose={() => setEnableSource(null)}
+          onWebKeyChange={setWebKey}
+          onGmailSecretChange={setGmailSecret}
+          onGmailFileChange={(event) => void loadGmailClientFile(event)}
+          onPodcastKeyChange={setPodcastKey}
+          onPodcastSecretChange={setPodcastSecret}
+          onYoutubeKeyChange={setYoutubeKey}
+          onSaveWeb={() => void saveWebKey()}
+          onSaveGmailSecret={() => void saveGmailClientSecret()}
+          onConnectGmail={() => void connectGmail()}
+          onSavePodcast={() => void savePodcastCredentials()}
+          onSaveYoutube={() => void saveYoutubeCredentials()}
+          onSetupCollections={() => void setupCollectionsSource()}
+          onRetry={() => void refreshSourcesAndSelect(enableSource)}
+        />
+      ) : null}
+      {activeRefinementProgress ? (
+        <RefinementProgressOverlay
+          progress={activeRefinementProgress}
+          now={progressNow}
+          interest={submittedInterest || statement}
+        />
+      ) : null}
+    </main>
+  );
+}
+
+function RefinementPanel(props: {
+  session: RefinementSession | null;
+  interest: string;
+  profile: TopicProfile | null;
+  sourceSelection: Record<string, boolean>;
+  answer: string;
+  busy: boolean;
+  progress: RefinementProgress | null;
+  now: number;
+  onAnswerChange: (value: string) => void;
+  onSend: () => void;
+  onJustGo: () => void;
+}) {
+  return (
+    <section className="conversation-panel">
+      <div className="refinement-workspace-header">
+        <div>
+          <p className="section-kicker">Refining brief</p>
+          <h2>{props.profile?.scope || "Turning your interest into a search plan"}</h2>
+        </div>
+        <span className="status-pill good">{props.session?.status === "finalized" ? "Ready to confirm" : "In progress"}</span>
+      </div>
+      <div className="refinement-request-card">
+        <strong>You asked</strong>
+        <p>{props.interest}</p>
+        <small>{sourcePlan(props.sourceSelection)}</small>
+      </div>
+      <RefinementStatusIndicator progress={props.progress} now={props.now} />
+      <RefinementPlanPreview profile={props.profile} />
+      <div className="chat-list">
+        {(props.session?.messages ?? []).map((message, index) => (
+          <div className={`chat-bubble ${message.role}`} key={`${message.role}-${index}`}>
+            {message.content}
+          </div>
+        ))}
+        {!props.session ? (
+          <div className="chat-bubble assistant">
+            I’m preparing the first question and search strategy.
+          </div>
+        ) : null}
+      </div>
+      <div className="refinement-input">
+        <input
+          value={props.answer}
+          onChange={(event) => props.onAnswerChange(event.target.value)}
+          placeholder="Answer..."
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              props.onSend();
+            }
+          }}
+        />
+        <button type="button" onClick={props.onSend} disabled={props.busy || !props.answer.trim()}>
+          Send
+        </button>
+        <button type="button" className="secondary-action" onClick={props.onJustGo} disabled={props.busy}>
+          Just go now
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function RefinementStatusIndicator(props: { progress: RefinementProgress | null; now: number }) {
+  if (!props.progress) {
+    return (
+      <div className="refinement-status-card idle">
+        <div>
+          <strong>Waiting for your next answer</strong>
+          <p>The current search strategy is saved in this workspace.</p>
+        </div>
+      </div>
+    );
+  }
+  const state = refinementProgressState(props.progress, props.now);
+  return (
+    <div className={`refinement-status-card ${state.alert ? "alert" : ""}`}>
+      <div className="refinement-status-top">
+        <div>
+          <strong>{state.stage}</strong>
+          <p>{state.detail}</p>
+        </div>
+        <span>{formatElapsed(state.elapsedMs)}</span>
+      </div>
+      <div className="progress-track" aria-label={`Refinement progress ${state.percent}%`}>
+        <span style={{ width: `${state.percent}%` }} />
+      </div>
+      <div className="refinement-activity-row">
+        <span className="activity-pulse" />
+        <small>{state.activity}</small>
+      </div>
+    </div>
+  );
+}
+
+function RefinementProgressOverlay(props: { progress: RefinementProgress; now: number; interest: string }) {
+  return (
+    <div className="refinement-progress-backdrop" role="status" aria-live="polite">
+      <div className="refinement-progress-modal">
+        <p className="section-kicker">Refinement running</p>
+        <h2>Working on your brief plan</h2>
+        <p className="muted">{props.interest}</p>
+        <RefinementStatusIndicator progress={props.progress} now={props.now} />
+      </div>
+    </div>
+  );
+}
+
+function RefinementPlanPreview(props: { profile: TopicProfile | null }) {
+  const plan = searchPlanItems(props.profile);
+  const subtopics = props.profile?.subtopics ?? [];
+  if (!props.profile && !plan.length) return null;
+  return (
+    <div className="refinement-plan-preview">
+      <div>
+        <strong>What I’ve understood</strong>
+        <p>{props.profile?.scope || "I’m extracting the angle, sources, and search terms."}</p>
+      </div>
+      {subtopics.length ? (
+        <div className="mini-chip-row">
+          {subtopics.slice(0, 5).map((subtopic) => <span key={subtopic}>{subtopic}</span>)}
+        </div>
+      ) : null}
+      {plan.length ? (
+        <div className="mini-chip-row">
+          {plan.slice(0, 6).map((query) => <span key={query}>{query}</span>)}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ConfirmationPanel(props: {
+  draft: ConfirmationDraft;
+  profile: TopicProfile | null;
+  sources: Record<SourceKey, boolean>;
+  sourceStatus: SourceStatusResponse | null;
+  busy: boolean;
+  onDraftChange: (draft: ConfirmationDraft) => void;
+  onSourceClick: (source: SourceKey) => void;
+  onBuild: () => void;
+}) {
+  return (
+    <section className="confirmation-panel">
+      <div className="panel-title-row">
+        <div>
+          <p className="section-kicker">Confirm Setup</p>
+          <h2>{props.draft.scope || props.profile?.statement || "Brief setup"}</h2>
+        </div>
+      </div>
+      <div className="confirm-grid">
+        <label>
+          Scope
+          <input
+            value={props.draft.scope}
+            onChange={(event) => props.onDraftChange({ ...props.draft, scope: event.target.value })}
+          />
+        </label>
+        <label>
+          Depth
+          <select
+            value={props.draft.depth}
+            onChange={(event) => props.onDraftChange({ ...props.draft, depth: event.target.value as ConfirmationDraft["depth"] })}
+          >
+            <option value="informed-generalist">Informed generalist</option>
+            <option value="practitioner">Practitioner</option>
+          </select>
+        </label>
+        <label>
+          Source Scope
+          <select
+            value={props.draft.recency_weighting}
+            onChange={(event) => props.onDraftChange({ ...props.draft, recency_weighting: event.target.value as ConfirmationDraft["recency_weighting"] })}
+          >
+            <option value="breaking">Breaking News</option>
+            <option value="recent">Recent Time</option>
+            <option value="last_year">Within Last Year</option>
+            <option value="all_available">As Much as possible</option>
+          </select>
+        </label>
+        <label>
+          Exclusions
+          <input
+            value={props.draft.exclusions}
+            onChange={(event) => props.onDraftChange({ ...props.draft, exclusions: event.target.value })}
+            placeholder="Anything to avoid"
+          />
+        </label>
+      </div>
+      <SourceChips selection={props.sources} status={props.sourceStatus} locked={false} onToggle={props.onSourceClick} />
+      {props.profile?.requested_sources?.length ? (
+        <div className="requested-source-list">
+          <strong>Requested sources</strong>
+          {props.profile.requested_sources.map((source) => (
+            <span key={`${source.adapter}-${source.ref}`}>{formatSourceLabel(source.adapter)}: {source.ref}</span>
+          ))}
+        </div>
+      ) : null}
+      {searchPlanItems(props.profile).length ? (
+        <div className="search-plan-list">
+          <strong>Search plan</strong>
+          {searchPlanItems(props.profile).map((query) => (
+            <span key={query}>{query}</span>
+          ))}
+        </div>
+      ) : null}
+      <div className="confirmation-actions">
+        <button type="button" className="primary-action build-brief-action" onClick={props.onBuild} disabled={props.busy}>
+          Build brief
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function ProgressPanel(props: { exploration: Exploration; sourceSelection: Record<string, boolean> }) {
+  const pipeline = Object.entries(props.exploration.progress.pipeline ?? {});
+  const sources = Object.entries(props.exploration.progress.sources ?? {});
+  const queuedMessage = props.exploration.status === "queued"
+    ? props.exploration.progress.queue?.message ?? "Waiting for the current brief build to finish."
+    : null;
+  return (
+    <section className="progress-panel">
+      <p className="section-kicker">{sourcePlan(props.sourceSelection)}</p>
+      {queuedMessage ? <p className="queue-note">{queuedMessage}</p> : null}
+      <div className="pipeline-row">
+        {["discovery", "fetch", "summarize", "audit", "rank", "review", "done"].map((stage) => (
+          <span className={`pipeline-pill ${props.exploration.progress.pipeline?.[stage] ?? "pending"}`} key={stage}>
+            {formatStage(stage)}
+          </span>
+        ))}
+      </div>
+      {props.exploration.progress.source_audit?.message ? (
+        <p className="queue-note">{props.exploration.progress.source_audit.message}</p>
+      ) : props.exploration.progress.source_audit?.summary ? (
+        <p className="queue-note">{props.exploration.progress.source_audit.summary}</p>
+      ) : null}
+      <div className="source-progress-grid">
+        {sources.map(([source, data]) => (
+          <article className={`source-progress ${data.status}`} key={source}>
+            <strong>{formatSourceLabel(source)}</strong>
+            <span>{formatStage(data.status)}</span>
+            <small>{data.candidate_count ? `${data.candidate_count} item(s)` : data.message ?? "Waiting"}</small>
+          </article>
+        ))}
+      </div>
+      {props.exploration.progress.requested_source_issues?.length ? (
+        <div className="issue-note">
+          {props.exploration.progress.requested_source_issues.map((issue) => (
+            <p key={`${issue.source_name}-${issue.reason}`}>
+              {issue.source_name}: {issue.reason}
+            </p>
+          ))}
+        </div>
+      ) : null}
+      {props.exploration.progress.source_audit_issues?.length ? (
+        <div className="issue-note">
+          {props.exploration.progress.source_audit_issues.map((issue) => (
+            <p key={`${issue.source_name}-${issue.reason}`}>
+              {issue.source_name}: {issue.reason}
+            </p>
+          ))}
+        </div>
+      ) : null}
+      {pipeline.length ? <p className="muted">{formatPipeline(pipeline)}</p> : null}
+    </section>
+  );
+}
+
+function BriefReadyPanel(props: {
+  exploration: Exploration;
+  issues: ExplorationIssue[];
+  html: string;
+  emailSendReady: boolean;
+  emailRecipient: string;
+  busy: boolean;
+  onOpen: () => void;
+  onEditSources: () => void;
+  onRebuild: () => void;
+  onSchedule: () => void;
+  onEmailRecipientChange: (value: string) => void;
+  onSend: (recipient: string) => void;
+  onNew: () => void;
+}) {
+  return (
+    <section className="brief-ready-panel">
+      <div className="ready-footer">
+        <strong>Brief ready</strong>
+        <button type="button" onClick={props.onOpen}>Open brief</button>
+      </div>
+      {props.issues.length ? (
+        <a className="brief-issue-link" href={`/admin?tab=library&issue_run=${props.exploration.exploration_id}`}>
+          Issue Built without request sources; click here for details
+        </a>
+      ) : null}
+      <div className="ready-actions">
+        <button type="button" className="secondary-action" onClick={props.onEditSources}>Edit sources</button>
+        <button type="button" className="secondary-action" onClick={props.onRebuild} disabled={props.busy}>Rebuild</button>
+        <button type="button" className="secondary-action" onClick={props.onSchedule}>Schedule as digest</button>
+        <button type="button" className="ghost-action" onClick={props.onNew}>New brief</button>
+      </div>
+      {props.emailSendReady ? (
+        <div className="email-send-box">
+          <label>
+            Email this brief
+            <input
+              type="email"
+              value={props.emailRecipient}
+              onChange={(event) => props.onEmailRecipientChange(event.target.value)}
+              placeholder="name@example.com"
+            />
+          </label>
+          <button
+            type="button"
+            className="secondary-action"
+            onClick={() => props.onSend(props.emailRecipient)}
+            disabled={props.busy || !props.emailRecipient.trim()}
+          >
+            Send brief
+          </button>
+          {props.exploration.emailed ? <span>Sent at least once</span> : null}
+        </div>
+      ) : (
+        <p className="muted">Email sending needs Gmail send access in Admin before briefs can be sent.</p>
+      )}
+      {props.html ? (
+        <button className="brief-preview" type="button" onClick={props.onOpen} aria-label="Open generated brief">
+          <iframe title="Brief preview" srcDoc={props.html} />
+        </button>
+      ) : null}
+    </section>
+  );
+}
+
+function SchedulePanel(props: {
+  preset: SchedulePreset;
+  time: string;
+  emailEnabled: boolean;
+  deliveryConfigured: boolean;
+  busy: boolean;
+  onPresetChange: (preset: SchedulePreset) => void;
+  onTimeChange: (time: string) => void;
+  onEmailChange: (enabled: boolean) => void;
+  onCancel: () => void;
+  onSchedule: () => void;
+}) {
+  return (
+    <section className="schedule-panel">
+      <div className="panel-title-row">
+        <div>
+          <p className="section-kicker">Schedule</p>
+          <h2>Make this a digest</h2>
+        </div>
+      </div>
+      <div className="schedule-controls">
+        <div className="segmented-control">
+          {schedulePresets.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              className={props.preset === option.value ? "active" : ""}
+              onClick={() => props.onPresetChange(option.value)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <label>
+          Time
+          <input type="time" value={props.time} onChange={(event) => props.onTimeChange(event.target.value)} />
+        </label>
+        {props.deliveryConfigured ? (
+          <label className="checkbox-row">
+            <input type="checkbox" checked={props.emailEnabled} onChange={(event) => props.onEmailChange(event.target.checked)} />
+            Send by email
+          </label>
+        ) : (
+          <p className="muted">Email can be enabled later in Admin.</p>
+        )}
+      </div>
+      <div className="button-row">
+        <button type="button" className="secondary-action" onClick={props.onCancel}>Cancel</button>
+        <button type="button" className="primary-action" onClick={props.onSchedule} disabled={props.busy}>Schedule</button>
+      </div>
+    </section>
+  );
+}
+
+function SourceChips(props: {
+  selection: Record<SourceKey, boolean>;
+  status: SourceStatusResponse | null;
+  locked: boolean;
+  onToggle: (source: SourceKey) => void;
+}) {
+  return (
+    <div className="source-chips">
+      {sourceOptions.map((source) => {
+        const status = props.status?.sources[source.key];
+        const enabled = status?.enabled ?? false;
+        const selected = Boolean(props.selection[source.key] && enabled);
+        return (
+          <button
+            type="button"
+            key={source.key}
+            className={`source-chip ${selected ? "selected" : ""} ${enabled ? "" : "disabled"}`}
+            onClick={() => props.onToggle(source.key)}
+            disabled={props.locked}
+            aria-pressed={selected}
+            data-source-state={selected ? "selected" : enabled ? "available" : "disabled"}
+            title={enabled ? source.label : status?.reason ?? "Setup required"}
+          >
+            <span>{source.icon}</span>
+            {source.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function EnableSourceModal(props: {
+  source: SourceKey;
+  status?: SourceStatus;
+  webKey: string;
+  gmailSecret: string;
+  podcastKey: string;
+  podcastSecret: string;
+  youtubeKey: string;
+  busy: boolean;
+  onClose: () => void;
+  onWebKeyChange: (value: string) => void;
+  onGmailSecretChange: (value: string) => void;
+  onGmailFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onPodcastKeyChange: (value: string) => void;
+  onPodcastSecretChange: (value: string) => void;
+  onYoutubeKeyChange: (value: string) => void;
+  onSaveWeb: () => void;
+  onSaveGmailSecret: () => void;
+  onConnectGmail: () => void;
+  onSavePodcast: () => void;
+  onSaveYoutube: () => void;
+  onSetupCollections: () => void;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="enable-card">
+        <button type="button" className="modal-close" onClick={props.onClose} aria-label="Close">×</button>
+        <p className="section-kicker">Enable Source</p>
+        <h2>Connect {props.status?.label ?? formatSourceLabel(props.source)}</h2>
+        <p>{props.status?.reason ?? "This source needs setup before it can be selected."}</p>
+        {props.source === "web_search" || props.source === "foreign_media" ? (
+          <label>
+            Web Search API key
+            <input
+              type="password"
+              value={props.webKey}
+              onChange={(event) => props.onWebKeyChange(event.target.value)}
+              placeholder="Paste API key"
+            />
+            <button type="button" onClick={props.onSaveWeb} disabled={props.busy || !props.webKey.trim()}>
+              Connect {props.source === "foreign_media" ? "Foreign Media" : "Web Search"}
+            </button>
+          </label>
+        ) : null}
+        {props.source === "gmail" ? (
+          <div className="enable-stack">
+            <button type="button" onClick={props.onConnectGmail} disabled={props.busy}>Connect Gmail</button>
+            <label>
+              OAuth client JSON file
+              <input type="file" accept=".json,application/json" onChange={props.onGmailFileChange} />
+            </label>
+            <label>
+              OAuth client JSON
+              <textarea
+                value={props.gmailSecret}
+                onChange={(event) => props.onGmailSecretChange(event.target.value)}
+                rows={5}
+                placeholder='{"installed": ... }'
+              />
+              <button type="button" onClick={props.onSaveGmailSecret} disabled={props.busy || !props.gmailSecret.trim()}>
+                Save OAuth Client
+              </button>
+            </label>
+          </div>
+        ) : null}
+        {props.source === "podcasts" ? (
+          <div className="enable-stack">
+            <label>
+              Podcast Index API key
+              <input type="password" value={props.podcastKey} onChange={(event) => props.onPodcastKeyChange(event.target.value)} />
+            </label>
+            <label>
+              Podcast Index API secret
+              <input type="password" value={props.podcastSecret} onChange={(event) => props.onPodcastSecretChange(event.target.value)} />
+            </label>
+            <button type="button" onClick={props.onSavePodcast} disabled={props.busy || !props.podcastKey.trim() || !props.podcastSecret.trim()}>
+              Connect Podcasts
+            </button>
+          </div>
+        ) : null}
+        {props.source === "youtube" ? (
+          <label>
+            YouTube Data API key
+            <input
+              type="password"
+              value={props.youtubeKey}
+              onChange={(event) => props.onYoutubeKeyChange(event.target.value)}
+              placeholder="Paste API key"
+            />
+            <button type="button" onClick={props.onSaveYoutube} disabled={props.busy || !props.youtubeKey.trim()}>
+              Connect YouTube
+            </button>
+          </label>
+        ) : null}
+        {props.source === "collections" ? (
+          <div className="enable-stack">
+            <p>{props.status?.root_path ? `Folder: ${props.status.root_path}` : "Collections uses local folders on this Mac."}</p>
+            <button type="button" onClick={props.onSetupCollections} disabled={props.busy}>
+              Create Collections Folder
+            </button>
+          </div>
+        ) : null}
+        {props.source === "markets" ? (
+          <div className="enable-stack">
+            <p>Markets uses free public-market data. No API key is required for Simple mode.</p>
+            <button type="button" onClick={props.onRetry} disabled={props.busy}>Retry Markets</button>
+          </div>
+        ) : null}
+        {props.source === "reddit" ? (
+          <div className="enable-stack">
+            <p>Reddit is enabled through the local MCP connection. Retry after the connector is running.</p>
+            <button type="button" onClick={props.onRetry} disabled={props.busy}>Retry Reddit</button>
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function AdminApp() {
+  const requestedTab = new URLSearchParams(window.location.search).get("tab") ?? "status";
+  const initialTab = ["status", "sources", "library", "models"].includes(requestedTab) ? requestedTab : "status";
+  const issueRun = new URLSearchParams(window.location.search).get("issue_run");
+  const [tab, setTab] = useState(initialTab);
+  const [status, setStatus] = useState<AdminStatus | null>(null);
+  const [sources, setSources] = useState<SourceStatusResponse | null>(null);
+  const [library, setLibrary] = useState<LibraryResponse>({ explorations: [], deleted_explorations: [], topics: [], digests: [], legacy_digests: [] });
+  const [message, setMessage] = useState("Loading Admin...");
+  const [busy, setBusy] = useState(false);
+  const [explorationSort, setExplorationSort] = useState<SortMode>("recent");
+  const [digestSort, setDigestSort] = useState<SortMode>("recent");
+  const [editingDigest, setEditingDigest] = useState<{ topicId: string; preset: SchedulePreset; time: string } | null>(null);
+  const [issueDetails, setIssueDetails] = useState<{ built_with_issues: boolean; issues: ExplorationIssue[] } | null>(null);
+  const [webProvider, setWebProvider] = useState<"tavily" | "brave" | "serpapi">("tavily");
+  const [webKey, setWebKey] = useState("");
+  const [adminGmailSecret, setAdminGmailSecret] = useState("");
+  const [adminPodcastKey, setAdminPodcastKey] = useState("");
+  const [adminPodcastSecret, setAdminPodcastSecret] = useState("");
+  const [youtubeKey, setYoutubeKey] = useState("");
+  const [adminEmailRecipients, setAdminEmailRecipients] = useState<Record<string, string>>({});
+  const [selectedModel, setSelectedModel] = useState("");
+  const [jobModel, setJobModel] = useState("");
+  const [jobLimit, setJobLimit] = useState(100);
+  const [ollamaKey, setOllamaKey] = useState("");
+  const [modelRoutes, setModelRoutes] = useState<ModelRouteDraft>({});
+
+  const topicById = useMemo(() => new Map(library.topics.map((topic) => [topic.topic_id, topic])), [library.topics]);
+  const sortedExplorations = useMemo<ExplorationLibraryItem[]>(() => {
+    const explorationTopicIds = new Set(library.explorations.map((exploration) => exploration.topic_id));
+    const explorationRows: ExplorationLibraryItem[] = library.explorations.map((exploration) => ({
+      kind: "exploration",
+      exploration,
+      topic: topicById.get(exploration.topic_id) ?? null,
+    }));
+    const unbuiltTopicRows: ExplorationLibraryItem[] = library.topics
+      .filter((topic) => !topic.schedule && !explorationTopicIds.has(topic.topic_id))
+      .map((topic) => ({ kind: "topic", topic }));
+    return [...explorationRows, ...unbuiltTopicRows].sort((a, b) => {
+      if (explorationSort === "name") {
+        return explorationLibraryName(a).localeCompare(explorationLibraryName(b));
+      }
+      return explorationLibraryDate(b) - explorationLibraryDate(a);
+    });
+  }, [explorationSort, library.explorations, library.topics, topicById]);
+  const sortedDigests = useMemo<DigestLibraryItem[]>(() => {
+    const rows: DigestLibraryItem[] = [
+      ...library.digests.map((topic) => ({ kind: "topic" as const, topic })),
+      ...library.legacy_digests.map((digest) => ({ kind: "legacy" as const, digest })),
+    ];
+    return rows.sort((a, b) => {
+      if (digestSort === "name") return digestLibraryName(a).localeCompare(digestLibraryName(b));
+      return digestLibraryDate(b) - digestLibraryDate(a);
+    });
+  }, [digestSort, library.digests, library.legacy_digests]);
+  const modelOptions = status?.model?.catalog.models ?? [];
+  const cloudModelOptions = status?.model?.catalog.providers?.ollama_cloud?.models ?? [];
+
+  const loadAdmin = useCallback(async () => {
+    const [nextStatus, nextSources, nextLibrary] = await Promise.all([
+      api<AdminStatus>("/api/admin/status").catch(() => null),
+      api<SourceStatusResponse>("/api/explore/source-status").catch(() => null),
+      api<LibraryResponse>("/api/admin/library").catch(() => ({ explorations: [], deleted_explorations: [], topics: [], digests: [], legacy_digests: [] })),
+    ]);
+    setStatus(nextStatus);
+    if (nextSources) setSources(nextSources);
+    setLibrary(nextLibrary);
+    const preferredModel = nextStatus?.model?.catalog.selected_model ?? nextStatus?.model?.model ?? nextStatus?.model?.catalog.models[0]?.id ?? "";
+    setSelectedModel(preferredModel);
+    setJobModel((current) => current || preferredModel);
+    setModelRoutes(routeDraftFromStatus(nextStatus));
+    setMessage(nextStatus?.health?.headline ?? "Admin ready");
+  }, []);
+
+  useEffect(() => {
+    void loadAdmin();
+  }, [loadAdmin]);
+
+  useEffect(() => {
+    if (!issueRun) return;
+    setTab("library");
+    void api<{ built_with_issues: boolean; issues: ExplorationIssue[] }>(`/api/admin/explorations/${issueRun}/issues`)
+      .then(setIssueDetails)
+      .catch(() => setIssueDetails(null));
+  }, [issueRun]);
+
+  function changeTab(nextTab: string) {
+    setTab(nextTab);
+    const url = new URL(window.location.href);
+    url.searchParams.set("tab", nextTab);
+    window.history.replaceState(null, "", url);
+  }
+
+  async function runVerification(publish = false, forcePodcastRefresh = false) {
+    const digest = status?.digests?.[0];
+    if (!digest) return;
+    setBusy(true);
+    try {
+      const params = new URLSearchParams();
+      if (publish) params.set("publish", "true");
+      if (forcePodcastRefresh) params.set("force_podcast_refresh", "true");
+      await api(`/api/admin/digests/${digest.id}/verification-run${params.toString() ? `?${params}` : ""}`, { method: "POST" });
+      await loadAdmin();
+      setMessage(publish ? "Published verified brief" : "Verification complete");
+    } catch (error) {
+      setMessage(errorMessage(error, "Verification failed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveWebSearch() {
+    if (!webKey.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/web-search/credentials", {
+        method: "POST",
+        body: JSON.stringify({ provider: webProvider, api_key: webKey.trim() }),
+      });
+      setWebKey("");
+      await loadAdmin();
+      setMessage("Web Search saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save Web Search"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveAdminGmailClientSecret() {
+    if (!adminGmailSecret.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/gmail/client-secret", {
+        method: "POST",
+        body: JSON.stringify({ client_secret_json: adminGmailSecret.trim() }),
+      });
+      setAdminGmailSecret("");
+      await loadAdmin();
+      setMessage("Gmail OAuth client saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save Gmail setup"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadAdminGmailClientFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      setAdminGmailSecret(await file.text());
+      setMessage("Gmail OAuth client file loaded");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not read Gmail OAuth file"));
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  async function connectAdminGmail() {
+    setBusy(true);
+    try {
+      const result = await api<{ authorization_url: string }>("/api/admin/gmail/oauth/start", { method: "POST" });
+      window.location.href = result.authorization_url;
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not start Gmail connection"));
+      setBusy(false);
+    }
+  }
+
+  async function saveAdminPodcastCredentials() {
+    if (!adminPodcastKey.trim() || !adminPodcastSecret.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/podcasts/credentials", {
+        method: "POST",
+        body: JSON.stringify({ api_key: adminPodcastKey.trim(), api_secret: adminPodcastSecret.trim() }),
+      });
+      setAdminPodcastKey("");
+      setAdminPodcastSecret("");
+      await loadAdmin();
+      setMessage("Podcast Index saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save Podcast Index"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveYoutube() {
+    if (!youtubeKey.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/youtube/credentials", {
+        method: "POST",
+        body: JSON.stringify({ api_key: youtubeKey.trim() }),
+      });
+      setYoutubeKey("");
+      await loadAdmin();
+      setMessage("YouTube saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save YouTube"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setupCollections() {
+    setBusy(true);
+    try {
+      await api("/api/admin/collections/setup", { method: "POST" });
+      await loadAdmin();
+      setMessage("Collections folder ready");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not set up Collections"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveModel() {
+    if (!selectedModel.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/model/selection", {
+        method: "POST",
+        body: JSON.stringify({ model_name: selectedModel.trim() }),
+      });
+      await loadAdmin();
+      setMessage("Model saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save model"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveOllamaCloud() {
+    if (!ollamaKey.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/model/ollama-cloud/credentials", {
+        method: "POST",
+        body: JSON.stringify({ api_key: ollamaKey.trim() }),
+      });
+      setOllamaKey("");
+      await loadAdmin();
+      setMessage("Ollama Cloud saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save Ollama Cloud"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveModelRoutes() {
+    setBusy(true);
+    try {
+      await api("/api/admin/model/routes", {
+        method: "POST",
+        body: JSON.stringify({ routes: modelRoutes }),
+      });
+      await loadAdmin();
+      setMessage("Model routes saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save model routes"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function updateModelRoute(agent: string, patch: Partial<ModelRouteDraft[string]>) {
+    setModelRoutes((current) => ({
+      ...current,
+      [agent]: {
+        provider: current[agent]?.provider ?? "local",
+        model: current[agent]?.model ?? "",
+        allow_private_cloud: current[agent]?.allow_private_cloud ?? false,
+        ...patch,
+      },
+    }));
+  }
+
+  async function startModelJob() {
+    if (!jobModel.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/model/jobs", {
+        method: "POST",
+        body: JSON.stringify({ model_name: jobModel.trim(), limit_count: jobLimit, include_cached: false }),
+      });
+      await loadAdmin();
+      setMessage("Model batch started");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not start model batch"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rebuildFromAdmin(exploration: Exploration) {
+    setBusy(true);
+    try {
+      await api(`/api/explore/explorations/${exploration.exploration_id}/rebuild`, {
+        method: "POST",
+        body: JSON.stringify({ source_selection: exploration.source_selection }),
+      });
+      await loadAdmin();
+      setMessage("Rebuild started");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not rebuild"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function buildTopicFromAdmin(topic: TopicProfileResponse) {
+    setBusy(true);
+    try {
+      await api(`/api/explore/topic-profiles/${topic.topic_id}/run`, {
+        method: "POST",
+        body: JSON.stringify({ mode: "show_now", source_selection: topic.profile.source_selection }),
+      });
+      await loadAdmin();
+      setMessage("Brief build started");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not build brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rebuildLegacyDigest(digest: Digest) {
+    setBusy(true);
+    try {
+      await api(`/api/admin/digests/${digest.id}/verification-run?publish=true`, { method: "POST" });
+      await loadAdmin();
+      setMessage("Digest rebuild started");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not rebuild digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function scheduleExploration(exploration: Exploration) {
+    setBusy(true);
+    try {
+      await api(`/api/explore/topic-profiles/${exploration.topic_id}/schedule`, {
+        method: "POST",
+        body: JSON.stringify({ schedule: "daily", time_of_day: "08:00", timezone: "America/Los_Angeles" }),
+      });
+      await loadAdmin();
+      setMessage("Digest scheduled");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not schedule digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendExplorationFromAdmin(exploration: Exploration) {
+    const fallback = status?.delivery?.email.recipient_email ?? "";
+    const recipient = (adminEmailRecipients[exploration.exploration_id] || fallback || "").trim();
+    if (!recipient || !recipient.includes("@")) {
+      setMessage("Enter a valid email address");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await api<{ status: string; error?: string; recipient_email?: string }>(`/api/explore/explorations/${exploration.exploration_id}/email`, {
+        method: "POST",
+        body: JSON.stringify({ recipient_email: recipient }),
+      });
+      if (result.status !== "sent") {
+        setMessage(result.error ?? "Email delivery skipped");
+      } else {
+        await loadAdmin();
+        setMessage(`Sent to ${result.recipient_email ?? recipient}`);
+      }
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not send brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteExplorationFromAdmin(exploration: Exploration) {
+    setBusy(true);
+    try {
+      await api(`/api/explore/explorations/${exploration.exploration_id}`, { method: "DELETE" });
+      await loadAdmin();
+      setMessage("Brief deleted. Undo is available for 7 days.");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not delete brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreExplorationFromAdmin(exploration: Exploration) {
+    setBusy(true);
+    try {
+      await api(`/api/explore/explorations/${exploration.exploration_id}/restore`, { method: "POST" });
+      await loadAdmin();
+      setMessage("Brief restored");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not restore brief"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function startEditingDigest(topic: TopicProfileResponse) {
+    const config = topic.profile.schedule_config ?? {};
+    setEditingDigest({
+      topicId: topic.topic_id,
+      preset: ((topic.schedule ?? "daily") as SchedulePreset),
+      time: typeof config.time_of_day === "string" ? config.time_of_day : "08:00",
+    });
+  }
+
+  async function saveDigestSchedule(topic: TopicProfileResponse) {
+    if (!editingDigest || editingDigest.topicId !== topic.topic_id) return;
+    setBusy(true);
+    try {
+      await api(`/api/explore/topic-profiles/${topic.topic_id}/schedule`, {
+        method: "POST",
+        body: JSON.stringify({
+          schedule: editingDigest.preset,
+          time_of_day: editingDigest.time || "08:00",
+          timezone: "America/Los_Angeles",
+        }),
+      });
+      setEditingDigest(null);
+      await loadAdmin();
+      setMessage("Schedule updated");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not update schedule"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rebuildDigest(topic: TopicProfileResponse) {
+    setBusy(true);
+    try {
+      if (topic.latest_exploration) {
+        await api(`/api/explore/explorations/${topic.latest_exploration.exploration_id}/rebuild`, {
+          method: "POST",
+          body: JSON.stringify({ source_selection: topic.profile.source_selection }),
+        });
+      } else {
+        await api(`/api/explore/topic-profiles/${topic.topic_id}/run`, {
+          method: "POST",
+          body: JSON.stringify({ mode: "scheduled", source_selection: topic.profile.source_selection }),
+        });
+      }
+      await loadAdmin();
+      setMessage("Digest rebuild started");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not rebuild digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pauseDigest(topic: TopicProfileResponse) {
+    setBusy(true);
+    try {
+      await api(`/api/explore/topic-profiles/${topic.topic_id}/pause`, { method: "POST" });
+      await loadAdmin();
+      setMessage("Digest paused");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not pause digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function archiveDigest(topic: TopicProfileResponse) {
+    setBusy(true);
+    try {
+      await api(`/api/explore/topic-profiles/${topic.topic_id}/archive`, { method: "POST" });
+      await loadAdmin();
+      setMessage("Digest archived");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not archive digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteDigest(topic: TopicProfileResponse) {
+    if (!window.confirm(`Delete "${profileName(topic)}" from the library?`)) return;
+    setBusy(true);
+    try {
+      await api(`/api/explore/topic-profiles/${topic.topic_id}`, { method: "DELETE" });
+      await loadAdmin();
+      setMessage("Digest deleted");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not delete digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="admin-page">
+      <header className="admin-header">
+        <a className="brand-lockup" href="/">
+          <span className="brand-mark">◔</span>
+          <span>Dispatch Admin</span>
+        </a>
+        <a className="secondary-action" href="/">Back to Dispatch</a>
+      </header>
+      <nav className="admin-tabs">
+        {["status", "sources", "library", "models"].map((item) => (
+          <button type="button" className={tab === item ? "active" : ""} key={item} onClick={() => changeTab(item)}>
+            {formatStage(item)}
+          </button>
+        ))}
+      </nav>
+      <p className="app-status">{message}</p>
+
+      {tab === "status" ? (
+        <section className="admin-panel">
+          <div className="panel-title-row">
+            <div>
+              <p className="section-kicker">Status</p>
+              <h1>{status?.health?.headline ?? "Runtime status"}</h1>
+            </div>
+            <button type="button" onClick={() => void loadAdmin()} disabled={busy}>Refresh</button>
+          </div>
+          <div className="health-grid">
+            {(status?.health?.checks ?? []).map((check) => (
+              <article className={`health-card ${check.status}`} key={check.name}>
+                <strong>{check.name}</strong>
+                <p>{check.message}</p>
+              </article>
+            ))}
+          </div>
+          <SecretHealthPanel health={status?.secret_health} />
+          <div className="button-row">
+            <a className="secondary-action" href="/brief" target="_blank" rel="noreferrer">View latest brief</a>
+            <button type="button" onClick={() => void runVerification(false)} disabled={busy}>Verify only</button>
+            <button type="button" onClick={() => void runVerification(true)} disabled={busy}>Publish verified brief</button>
+            <button type="button" onClick={() => void runVerification(false, true)} disabled={busy}>Refresh podcasts</button>
+          </div>
+        </section>
+      ) : null}
+
+      {tab === "sources" ? (
+        <section className="admin-panel">
+          <div className="panel-title-row">
+            <div>
+              <p className="section-kicker">Sources</p>
+              <h1>Connections</h1>
+            </div>
+          </div>
+          <div className="source-admin-grid">
+            {sourceOptions.map((source) => {
+              const item = sources?.sources[source.key];
+              return (
+                <article className="source-admin-card" key={source.key}>
+                  <strong>{source.icon} {source.label}</strong>
+                  <span className={item?.enabled ? "status-pill good" : "status-pill"}>{item?.enabled ? "Enabled" : "Needs setup"}</span>
+                  <p>{item?.reason ?? "Ready for brief runs."}</p>
+                </article>
+              );
+            })}
+          </div>
+          <div className="source-setup-grid">
+            <section className="source-setup-card">
+              <h2>Web</h2>
+              <p>{sources?.sources.web_search?.enabled ? "Connected." : sources?.sources.web_search?.reason}</p>
               <label>
-                Active model
-                <select
-                  value={selectedModel}
-                  onChange={(event) => {
-                    setSelectedModel(event.target.value);
-                    setJobModel(event.target.value);
-                  }}
-                  disabled={busy || !modelCatalogReady}
-                >
-                  {modelOptions.map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.id}
-                    </option>
-                  ))}
+                Provider
+                <select value={webProvider} onChange={(event) => setWebProvider(event.target.value as "tavily" | "brave" | "serpapi")}>
+                  <option value="tavily">Tavily</option>
+                  <option value="brave">Brave</option>
+                  <option value="serpapi">SerpAPI</option>
                 </select>
               </label>
-              <dl className="compact-status-list">
-                <div>
-                  <dt>Current</dt>
-                  <dd>{pipeline?.model.model ?? "Fallback only"}</dd>
-                </div>
-                <div>
-                  <dt>Source</dt>
-                  <dd>{pipeline?.model.selection_source === "admin" ? "Admin setting" : "Launch setting"}</dd>
-                </div>
-                <div>
-                  <dt>API key</dt>
-                  <dd>{pipeline?.model.api_key_configured ? "Configured" : "Missing"}</dd>
-                </div>
-              </dl>
-              <button onClick={saveSelectedModel} disabled={busy || !modelCatalogReady || !modelSelectionChanged}>
-                Save Model
-              </button>
-            </div>
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Inference Metrics</h3>
-                <p className="muted">
-                  Model averages exclude queue wait; queue wait is stored separately. TTFT needs streaming.
-                </p>
-              </div>
-              <span className="status-pill">{pipeline?.inference_metrics.ttft_available ? "Streaming" : "Non-streaming"}</span>
-            </div>
-            <div className="metric-strip">
-              <div>
-                <span>Attempts</span>
-                <strong>{pipeline?.inference_metrics.record_count ?? 0}</strong>
-              </div>
-              <div>
-                <span>Successful</span>
-                <strong>{pipeline?.inference_metrics.success_count ?? 0}</strong>
-              </div>
-              <div>
-                <span>Fallbacks</span>
-                <strong>{pipeline?.inference_metrics.failure_count ?? 0}</strong>
-              </div>
-              <div>
-                <span>Latest</span>
-                <strong>{formatDateTime(pipeline?.inference_metrics.latest_ts)}</strong>
-              </div>
-            </div>
-            <div className="run-list metrics-list">
-              {(pipeline?.inference_metrics.models ?? []).map((model) => (
-                <article className="run-row model-row" key={`${model.model}-${model.backend ?? ""}-${model.model_tag ?? ""}`}>
-                  <div>
-                    <strong>{model.model}</strong>
-                    <small>
-                      {model.backend ?? "backend unknown"} · {model.quantization ?? model.model_tag ?? "tag unknown"} ·{" "}
-                      {model.record_count} attempt(s)
-                    </small>
-                  </div>
-                  <dl>
-                    <div>
-                      <dt>Model Avg</dt>
-                      <dd>{formatMs(model.avg_total_ms)}</dd>
-                    </div>
-                    <div>
-                      <dt>P95</dt>
-                      <dd>{formatMs(model.p95_total_ms)}</dd>
-                    </div>
-                    <div>
-                      <dt>Rate</dt>
-                      <dd>{model.articles_per_minute ? `${model.articles_per_minute}/min` : "Unknown"}</dd>
-                    </div>
-                    <div>
-                      <dt>500 Est.</dt>
-                      <dd>{formatSeconds(model.estimated_500_seconds)}</dd>
-                    </div>
-                    <div>
-                      <dt>Schema</dt>
-                      <dd>{formatPercent(model.schema_valid_rate)}</dd>
-                    </div>
-                  </dl>
-                </article>
-              ))}
-              {(pipeline?.inference_metrics.models.length ?? 0) === 0 ? (
-                <p className="muted">No model attempts have been recorded yet.</p>
-              ) : null}
-            </div>
-          </section>
-
-          <section className="panel wide-panel">
-            <div className="panel-heading">
-              <div>
-                <h3>Model Batch</h3>
-                <p className="muted">Run stored articles through a selected model and cache successful enrichments.</p>
-              </div>
-            </div>
-            <div className="job-form">
               <label>
-                Model name
-                {modelCatalogReady ? (
-                  <select value={jobModel} onChange={(event) => setJobModel(event.target.value)}>
-                    {modelOptions.map((model) => (
-                      <option key={model.id} value={model.id}>
-                        {model.id}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input value={jobModel} onChange={(event) => setJobModel(event.target.value)} />
-                )}
+                API key
+                <input type="password" value={webKey} onChange={(event) => setWebKey(event.target.value)} />
+              </label>
+              <button type="button" onClick={() => void saveWebSearch()} disabled={busy || !webKey.trim()}>Save Web Search</button>
+            </section>
+
+            <section className="source-setup-card">
+              <h2>Gmail</h2>
+              <p>
+                {status?.gmail?.connected
+                  ? "Connected."
+                  : status?.gmail?.configured
+                    ? "OAuth client saved. Finish the Gmail connection."
+                    : "Upload a Gmail OAuth client, then connect Gmail."}
+              </p>
+              <label>
+                OAuth client JSON file
+                <input type="file" accept=".json,application/json" onChange={(event) => void loadAdminGmailClientFile(event)} />
               </label>
               <label>
-                Article count
-                <input
-                  type="number"
-                  min={1}
-                  max={1000}
-                  value={jobLimit}
-                  onChange={(event) => setJobLimit(Number(event.target.value))}
-                />
-              </label>
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={jobIncludeCached}
-                  onChange={(event) => setJobIncludeCached(event.target.checked)}
-                />
-                Re-run cached articles
-              </label>
-              <button onClick={startModelJob} disabled={busy || !jobModel.trim()}>
-                Start Batch
-              </button>
-            </div>
-            <div className="run-list">
-              {(pipeline?.model_jobs ?? []).map((job) => (
-                <article className="run-row model-row" key={job.id}>
-                  <div>
-                    <strong>{job.model_name}</strong>
-                    <small>
-                      {job.status} · {formatDateTime(job.completed_at ?? job.started_at ?? job.created_at)}
-                    </small>
-                  </div>
-                  <dl>
-                    <div>
-                      <dt>Progress</dt>
-                      <dd>{job.processed_count}/{job.limit_count}</dd>
-                    </div>
-                    <div>
-                      <dt>Success</dt>
-                      <dd>{job.success_count}</dd>
-                    </div>
-                    <div>
-                      <dt>Fallback</dt>
-                      <dd>{job.failure_count}</dd>
-                    </div>
-                    <div>
-                      <dt>Throughput</dt>
-                      <dd>{formatMs(job.avg_total_ms)}</dd>
-                    </div>
-                    <div>
-                      <dt>100 Est.</dt>
-                      <dd>{formatSeconds(job.estimated_100_seconds)}</dd>
-                    </div>
-                  </dl>
-                  {job.error_detail ? <p className="error-text">{job.error_detail}</p> : null}
-                </article>
-              ))}
-              {(pipeline?.model_jobs.length ?? 0) === 0 ? <p className="muted">No model batches have run yet.</p> : null}
-            </div>
-          </section>
-
-          <section className="panel wide-panel">
-            <h3>Digest Runs</h3>
-            <div className="run-list">
-              {(pipeline?.digests ?? []).map((digest) => (
-                <article className="run-row" key={digest.id}>
-                  <div>
-                    <strong>{digest.name}</strong>
-                    <small>
-                      {digest.schedule} · {digest.source_count} source(s) · next {formatDateTime(digest.next_run_at)}
-                    </small>
-                  </div>
-                  <dl>
-                    <div>
-                      <dt>Last Run</dt>
-                      <dd>{formatDateTime(digest.latest_completed_at ?? digest.latest_run_at)}</dd>
-                    </div>
-                    <div>
-                      <dt>Items</dt>
-                      <dd>{digest.latest_item_count ?? 0}</dd>
-                    </div>
-                    <div>
-                      <dt>Articles</dt>
-                      <dd>{digest.latest_fetched_article_count ?? 0}</dd>
-                    </div>
-                    <div>
-                      <dt>Cache</dt>
-                      <dd>{digest.latest_model_cache_hit_count ?? 0}/{digest.latest_model_cache_miss_count ?? 0}</dd>
-                    </div>
-                    <div>
-                      <dt>Duration</dt>
-                      <dd>{formatSeconds(digest.latest_duration_seconds)}</dd>
-                    </div>
-                  </dl>
-                </article>
-              ))}
-              {pipeline?.digests.length === 0 ? <p className="muted">No digests configured.</p> : null}
-            </div>
-          </section>
-
-          <section className="panel">
-            <h3>Model Cache</h3>
-            <dl className="status-list">
-              <div>
-                <dt>Records</dt>
-                <dd>{pipeline?.model_cache.record_count ?? 0}</dd>
-              </div>
-              <div>
-                <dt>Latest update</dt>
-                <dd>{formatDateTime(pipeline?.model_cache.latest_updated_at)}</dd>
-              </div>
-              <div>
-                <dt>Model</dt>
-                <dd>{pipeline?.model.model ?? "Unavailable"}</dd>
-              </div>
-              <div>
-                <dt>API key</dt>
-                <dd>{pipeline?.model.api_key_configured ? "Configured" : "Missing"}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <section className="panel">
-            <h3>Status</h3>
-            <dl className="status-list">
-              <div>
-                <dt>OAuth client</dt>
-                <dd>{status?.configured ? "Configured" : "Missing"}</dd>
-              </div>
-              <div>
-                <dt>Gmail token</dt>
-                <dd>
-                  {status?.connected
-                    ? status.requires_reconnect
-                      ? "Reconnect needed"
-                      : "Connected"
-                    : "Not connected"}
-                </dd>
-              </div>
-              <div>
-                <dt>Hosted Gmail MCP</dt>
-                <dd>
-                  {status?.hosted_gmail_mcp_enabled && status.hosted_gmail_mcp_ready
-                    ? "Ready"
-                    : status?.hosted_gmail_mcp_enabled
-                      ? "Waiting for reconnect"
-                      : "Off"}
-                </dd>
-              </div>
-              <div>
-                <dt>Granted scopes</dt>
-                <dd>{status?.token_scopes?.length ? status.token_scopes.length : 0}</dd>
-              </div>
-              <div>
-                <dt>Missing scopes</dt>
-                <dd>{status?.missing_scopes?.length ? status.missing_scopes.join(", ") : "None"}</dd>
-              </div>
-              <div>
-                <dt>Redirect URI</dt>
-                <dd>{status?.redirect_uri ?? "Unavailable"}</dd>
-              </div>
-              <div>
-                <dt>Redirect readiness</dt>
-                <dd>{status?.redirect_warning ?? "Ready"}</dd>
-              </div>
-              <div>
-                <dt>Token path</dt>
-                <dd>{status?.credentials_path ?? "Unavailable"}</dd>
-              </div>
-            </dl>
-            <div className="button-row">
-              <button onClick={connectGmail} disabled={busy || !status?.configured || !status?.oauth_redirect_ready}>
-                Connect Gmail
-              </button>
-              <button className="secondary-button" onClick={disconnectGmail} disabled={busy || !status?.connected}>
-                Disconnect
-              </button>
-            </div>
-          </section>
-
-          <section className="panel">
-            <h3>OAuth Client Secret</h3>
-            <div className="create-form">
-              <label>
-                Upload JSON
-                <input
-                  type="file"
-                  accept="application/json,.json"
-                  onChange={(event) => void readClientSecretFile(event.target.files?.[0])}
-                />
-              </label>
-              <label>
-                Client secret JSON
+                OAuth client JSON
                 <textarea
-                  value={clientSecretJson}
-                  onChange={(event) => setClientSecretJson(event.target.value)}
-                  rows={8}
+                  value={adminGmailSecret}
+                  onChange={(event) => setAdminGmailSecret(event.target.value)}
+                  rows={5}
                   placeholder='{"installed": ... }'
                 />
               </label>
-              <button onClick={saveClientSecret} disabled={busy || clientSecretJson.trim().length === 0}>
-                Save OAuth Client
-              </button>
-            </div>
-          </section>
+              <div className="button-row">
+                <button type="button" onClick={() => void saveAdminGmailClientSecret()} disabled={busy || !adminGmailSecret.trim()}>
+                  Save OAuth Client
+                </button>
+                <button type="button" className="secondary-action" onClick={() => void connectAdminGmail()} disabled={busy || !status?.gmail?.configured}>
+                  Connect Gmail
+                </button>
+              </div>
+            </section>
 
-          <section className="panel">
-            <h3>Complete Redirect</h3>
-            <div className="create-form">
+            <section className="source-setup-card">
+              <h2>Podcast</h2>
+              <p>{status?.podcasts?.aggregator_configured ? "Podcast Index connected." : "Add Podcast Index credentials."}</p>
               <label>
-                Failed Google redirect URL
-                <textarea
-                  value={callbackUrl}
-                  onChange={(event) => setCallbackUrl(event.target.value)}
-                  rows={5}
-                  placeholder="https://ultras-mac-studio-2.tail4aeef0.ts.net/api/admin/gmail/oauth/callback?..."
-                />
+                Podcast Index API key
+                <input type="password" value={adminPodcastKey} onChange={(event) => setAdminPodcastKey(event.target.value)} />
               </label>
-              <button onClick={completeGmailFromRedirect} disabled={busy || callbackUrl.trim().length === 0}>
-                Complete Gmail Login
+              <label>
+                Podcast Index API secret
+                <input type="password" value={adminPodcastSecret} onChange={(event) => setAdminPodcastSecret(event.target.value)} />
+              </label>
+              <button type="button" onClick={() => void saveAdminPodcastCredentials()} disabled={busy || !adminPodcastKey.trim() || !adminPodcastSecret.trim()}>
+                Save Podcast Index
               </button>
+            </section>
+
+            <section className="source-setup-card">
+              <h2>YouTube</h2>
+              <p>{sources?.sources.youtube?.enabled ? "Connected." : sources?.sources.youtube?.reason}</p>
+              <label>
+                YouTube Data API key
+                <input type="password" value={youtubeKey} onChange={(event) => setYoutubeKey(event.target.value)} />
+              </label>
+              <button type="button" onClick={() => void saveYoutube()} disabled={busy || !youtubeKey.trim()}>Save YouTube</button>
+            </section>
+
+            <section className="source-setup-card">
+              <h2>Collections</h2>
+              <p>{sources?.sources.collections?.root_path ?? "Local folder source"}</p>
+              <button type="button" onClick={() => void setupCollections()} disabled={busy}>Create Collections Folder</button>
+            </section>
+
+            <section className="source-setup-card">
+              <h2>Markets</h2>
+              <p>Simple mode. No API key required.</p>
+            </section>
+          </div>
+        </section>
+      ) : null}
+
+      {tab === "library" ? (
+        <section className="admin-panel">
+          {issueDetails?.built_with_issues ? (
+            <div className="issue-note admin-issue-note">
+              <strong>Built with issues</strong>
+              {issueDetails.issues.map((issue) => (
+                <p key={`${issue.source_name}-${issue.reason}`}>{issue.source_name}: {issue.reason}</p>
+              ))}
             </div>
-          </section>
-        </div>
-      </section>
+          ) : null}
+          <LibrarySection
+            title="Explorations"
+            sort={explorationSort}
+            onSort={setExplorationSort}
+            count={sortedExplorations.length}
+          >
+            {sortedExplorations.map((item) => {
+              if (item.kind === "topic") {
+                return (
+                  <article className="library-row" key={`topic-${item.topic.topic_id}`}>
+                    <div>
+                      <strong>{profileName(item.topic)}</strong>
+                      <small>Ready to build · {formatDateTime(item.topic.updated_at ?? item.topic.created_at)} · {formatSourceSelection(item.topic.profile.source_selection)}</small>
+                    </div>
+                    <div className="button-row">
+                      <button type="button" className="secondary-action" onClick={() => void buildTopicFromAdmin(item.topic)} disabled={busy}>Build brief</button>
+                    </div>
+                  </article>
+                );
+              }
+              return (
+                <article className="library-row" key={item.exploration.exploration_id}>
+                  <div>
+                    <strong>{explorationLibraryName(item)}</strong>
+                    <small>{formatDateTime(item.exploration.finished_at ?? item.exploration.started_at)} · {formatSourceSelection(item.exploration.source_selection)}</small>
+                    {item.exploration.progress.built_with_issues ? <p className="warning-text">Built with source issues.</p> : null}
+                  </div>
+                  <div className="button-row">
+                    <button type="button" className="secondary-action" onClick={() => openPath(briefPath(item.exploration))} disabled={!briefPath(item.exploration)}>Open</button>
+                    <button type="button" className="secondary-action" onClick={() => void rebuildFromAdmin(item.exploration)} disabled={busy}>Rebuild</button>
+                    <button type="button" className="secondary-action" onClick={() => void scheduleExploration(item.exploration)} disabled={busy || item.exploration.status !== "complete"}>Schedule</button>
+                    <button type="button" className="secondary-action destructive" onClick={() => void deleteExplorationFromAdmin(item.exploration)} disabled={busy}>Delete</button>
+                  </div>
+                  {item.exploration.status === "complete" ? (
+                    <div className="inline-email-editor">
+                      <input
+                        type="email"
+                        value={adminEmailRecipients[item.exploration.exploration_id] ?? status?.delivery?.email.recipient_email ?? ""}
+                        onChange={(event) => setAdminEmailRecipients({
+                          ...adminEmailRecipients,
+                          [item.exploration.exploration_id]: event.target.value,
+                        })}
+                        placeholder="name@example.com"
+                        aria-label="Email recipient"
+                      />
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() => void sendExplorationFromAdmin(item.exploration)}
+                        disabled={busy || !status?.delivery?.email.gmail_send_ready}
+                      >
+                        Email brief
+                      </button>
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </LibrarySection>
+          {library.deleted_explorations.length ? (
+            <section className="library-section deleted-library-section">
+              <div className="library-section-header">
+                <div>
+                  <p className="section-kicker">{library.deleted_explorations.length} restorable</p>
+                  <h2>Recently Deleted</h2>
+                </div>
+              </div>
+              <div className="library-list">
+                {library.deleted_explorations.map((deleted) => {
+                  const item: ExplorationLibraryItem = {
+                    kind: "exploration",
+                    exploration: deleted,
+                    topic: topicById.get(deleted.topic_id) ?? null,
+                  };
+                  return (
+                    <article className="library-row deleted-row" key={`deleted-${deleted.exploration_id}`}>
+                      <div>
+                        <strong>{explorationLibraryName(item)}</strong>
+                        <small>
+                          Deleted {formatDateTime(deleted.deleted_at)}
+                          {deleted.delete_after ? ` · undo until ${formatDateTime(deleted.delete_after)}` : ""}
+                        </small>
+                      </div>
+                      <div className="button-row">
+                        <button type="button" className="secondary-action" onClick={() => void restoreExplorationFromAdmin(deleted)} disabled={busy}>Restore</button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          ) : null}
+          <LibrarySection
+            title="Digests"
+            sort={digestSort}
+            onSort={setDigestSort}
+            count={sortedDigests.length}
+          >
+            {sortedDigests.map((item) => {
+              if (item.kind === "legacy") {
+                return (
+                  <article className="library-row" key={`legacy-${item.digest.id}`}>
+                    <div>
+                      <strong>{item.digest.name}</strong>
+                      <small>Legacy digest · {formatStage(item.digest.schedule)} · {item.digest.status}</small>
+                    </div>
+                    <div className="button-row">
+                      <button type="button" className="secondary-action" onClick={() => openPath("/brief")}>Open latest</button>
+                      <button type="button" className="secondary-action" onClick={() => void rebuildLegacyDigest(item.digest)} disabled={busy}>Rebuild</button>
+                    </div>
+                  </article>
+                );
+              }
+              const topic = item.topic;
+              return (
+                <article className="library-row" key={topic.topic_id}>
+                  <div>
+                    <strong>{profileName(topic)}</strong>
+                    <small>
+                      {topic.profile.status === "paused" ? "Paused" : formatStage(topic.schedule ?? "daily")}
+                      {topic.profile.status === "paused" ? "" : ` · next ${formatDateTime(topic.next_run_at)}`}
+                    </small>
+                  </div>
+                  <div className="button-row">
+                    <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && openPath(briefPath(topic.latest_exploration))} disabled={!topic.latest_exploration}>Open latest</button>
+                    <button type="button" className="secondary-action" onClick={() => void rebuildDigest(topic)} disabled={busy}>Rebuild</button>
+                    <button type="button" className="secondary-action" onClick={() => startEditingDigest(topic)} disabled={busy}>Edit schedule</button>
+                    <button type="button" className="secondary-action" onClick={() => void pauseDigest(topic)} disabled={busy || topic.profile.status === "paused"}>Pause</button>
+                    <button type="button" className="secondary-action" onClick={() => void archiveDigest(topic)} disabled={busy}>Archive</button>
+                    <button type="button" className="secondary-action destructive" onClick={() => void deleteDigest(topic)} disabled={busy}>Delete</button>
+                  </div>
+                  {editingDigest?.topicId === topic.topic_id ? (
+                    <div className="inline-schedule-editor">
+                      <select
+                        value={editingDigest.preset}
+                        onChange={(event) => setEditingDigest({ ...editingDigest, preset: event.target.value as SchedulePreset })}
+                      >
+                        {schedulePresets.map((preset) => (
+                          <option value={preset.value} key={preset.value}>{preset.label}</option>
+                        ))}
+                      </select>
+                      <input
+                        type="time"
+                        value={editingDigest.time}
+                        onChange={(event) => setEditingDigest({ ...editingDigest, time: event.target.value })}
+                      />
+                      <button type="button" onClick={() => void saveDigestSchedule(topic)} disabled={busy}>Save</button>
+                      <button type="button" className="ghost-action" onClick={() => setEditingDigest(null)} disabled={busy}>Cancel</button>
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </LibrarySection>
+        </section>
+      ) : null}
+
+      {tab === "models" ? (
+        <section className="admin-panel">
+          <div className="panel-title-row">
+            <div>
+              <p className="section-kicker">Models</p>
+              <h1>{status?.model?.model ?? "Model settings"}</h1>
+            </div>
+          </div>
+          <div className="admin-form-grid">
+            <label>
+              Active model
+              <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} disabled={!modelOptions.length}>
+                {modelOptions.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
+              </select>
+            </label>
+            <button type="button" onClick={() => void saveModel()} disabled={busy || !selectedModel}>Save model</button>
+            <label>
+              Batch model
+              <input value={jobModel} onChange={(event) => setJobModel(event.target.value)} />
+            </label>
+            <label>
+              Article count
+              <input type="number" min={1} max={1000} value={jobLimit} onChange={(event) => setJobLimit(Number(event.target.value))} />
+            </label>
+            <button type="button" onClick={() => void startModelJob()} disabled={busy || !jobModel.trim()}>Start batch</button>
+          </div>
+          <div className="source-setup-grid model-routing-grid">
+            <section className="source-setup-card">
+              <h2>Ollama Cloud</h2>
+              <p>{status?.model?.routing?.ollama_cloud.configured ? "Connected." : "Add an Ollama API key to use cloud routes."}</p>
+              <label>
+                Ollama API key
+                <input type="password" value={ollamaKey} onChange={(event) => setOllamaKey(event.target.value)} />
+              </label>
+              <button type="button" onClick={() => void saveOllamaCloud()} disabled={busy || !ollamaKey.trim()}>Save Ollama Cloud</button>
+            </section>
+            <section className="source-setup-card model-routing-card">
+              <div className="library-section-header">
+                <div>
+                  <p className="section-kicker">Per-agent routes</p>
+                  <h2>Model routing</h2>
+                </div>
+                <button type="button" onClick={() => void saveModelRoutes()} disabled={busy}>Save routes</button>
+              </div>
+              <p className="muted">{status?.model?.routing?.privacy.rule}</p>
+              <div className="model-route-list">
+                {(status?.model?.routing?.agents ?? []).map((agent) => {
+                  const route = modelRoutes[agent.id] ?? { provider: "local", model: "", allow_private_cloud: false };
+                  const routeModels = route.provider === "ollama_cloud" ? cloudModelOptions : modelOptions;
+                  return (
+                    <article className="model-route-row" key={agent.id}>
+                      <div>
+                        <strong>{agent.label}</strong>
+                        <p>{agent.description}</p>
+                      </div>
+                      <label>
+                        Provider
+                        <select
+                          value={route.provider}
+                          onChange={(event) => updateModelRoute(agent.id, {
+                            provider: event.target.value,
+                            model: event.target.value === "ollama_cloud" ? (cloudModelOptions[0]?.id ?? "") : "",
+                          })}
+                        >
+                          <option value="local">Local</option>
+                          <option value="ollama_cloud">Ollama Cloud</option>
+                        </select>
+                      </label>
+                      <label>
+                        Model
+                        <select
+                          value={route.model}
+                          onChange={(event) => updateModelRoute(agent.id, { model: event.target.value })}
+                        >
+                          <option value="">Default</option>
+                          {routeModels.map((model) => <option key={`${agent.id}-${route.provider}-${model.id}`} value={model.id}>{model.id}</option>)}
+                        </select>
+                      </label>
+                      {route.provider === "ollama_cloud" ? (
+                        <span className="status-pill">Public sources only</span>
+                      ) : (
+                        <span className="status-pill good">Private safe</span>
+                      )}
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          </div>
+          <div className="metric-grid">
+            <article><span>Attempts</span><strong>{status?.inference_metrics?.record_count ?? 0}</strong></article>
+            <article><span>Success</span><strong>{status?.inference_metrics?.success_count ?? 0}</strong></article>
+            <article><span>Fallbacks</span><strong>{status?.inference_metrics?.failure_count ?? 0}</strong></article>
+            <article><span>Cache</span><strong>{status?.model_cache?.record_count ?? 0}</strong></article>
+          </div>
+          {status?.inference_metrics?.routes?.length ? (
+            <div className="model-route-metrics">
+              <p className="section-kicker">Recent route metrics</p>
+              {status.inference_metrics.routes.slice(0, 6).map((route) => (
+                <article key={`${route.mode}-${route.model}-${route.backend}`}>
+                  <span>{route.mode} · {route.backend ?? "unknown"}</span>
+                  <strong>{route.model}</strong>
+                  <small>{route.record_count} call(s){route.avg_total_ms ? ` · ${Math.round(route.avg_total_ms)} ms avg` : ""}</small>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
     </main>
   );
+}
+
+function SecretHealthPanel(props: { health: AdminStatus["secret_health"] | undefined }) {
+  if (!props.health) return null;
+  return (
+    <section className="secret-health-panel">
+      <div className="library-section-header">
+        <div>
+          <p className="section-kicker">
+            {props.health.summary.configured_count} configured · {props.health.summary.warning_count} warning(s)
+          </p>
+          <h2>Secret health</h2>
+        </div>
+        <span className={props.health.summary.warning_count ? "status-pill" : "status-pill good"}>
+          {props.health.summary.warning_count ? "Review" : "Owner-only"}
+        </span>
+      </div>
+      <p className="muted">Secrets folder: {props.health.secrets_dir}</p>
+      <div className="health-grid secret-health-grid">
+        <article className={`health-card ${props.health.directory_permissions.status === "ok" ? "ok" : "warning"}`}>
+          <strong>Folder permissions</strong>
+          <p>
+            {props.health.directory_permissions.status === "ok"
+              ? "Owner-only access."
+              : `Review folder mode ${props.health.directory_permissions.mode ?? "unknown"}.`}
+          </p>
+        </article>
+        {props.health.items.map((item) => (
+          <article className={`health-card ${item.status}`} key={item.id}>
+            <strong>{item.label}</strong>
+            <p>{item.configured ? item.storage : item.message}</p>
+            {item.path ? <small>{item.path}</small> : null}
+          </article>
+        ))}
+      </div>
+      {props.health.external_plaintext.length ? (
+        <div className="issue-note">
+          <strong>Plaintext MCP config to review</strong>
+          {props.health.external_plaintext.map((item) => (
+            <p key={`${item.server}-${item.location}-${item.key}`}>
+              {item.server}: {item.location}.{item.key} in {item.path}
+            </p>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function LibrarySection(props: {
+  title: string;
+  sort: SortMode;
+  onSort: (sort: SortMode) => void;
+  count: number;
+  children: ReactNode;
+}) {
+  return (
+    <section className="library-section">
+      <div className="library-section-header">
+        <div>
+          <p className="section-kicker">{props.count} total</p>
+          <h2>{props.title}</h2>
+        </div>
+        <div className="segmented-control">
+          <button type="button" className={props.sort === "recent" ? "active" : ""} onClick={() => props.onSort("recent")}>Recent</button>
+          <button type="button" className={props.sort === "name" ? "active" : ""} onClick={() => props.onSort("name")}>Name</button>
+        </div>
+      </div>
+      <div className="library-list">{props.children}</div>
+    </section>
+  );
+}
+
+function emptyDraft(): ConfirmationDraft {
+  return {
+    scope: "",
+    depth: "informed-generalist",
+    recency_weighting: "recent",
+    exclusions: "",
+  };
+}
+
+function draftFromProfile(profile: TopicProfile): ConfirmationDraft {
+  return {
+    scope: profile.scope || profile.statement || "",
+    depth: profile.depth === "practitioner" ? "practitioner" : "informed-generalist",
+    recency_weighting: normalizeSourceScope(profile.recency_weighting),
+    exclusions: (profile.exclusions ?? []).join(", "),
+  };
+}
+
+function normalizeSourceScope(value: string | undefined): SourceScope {
+  if (value === "breaking") return "breaking";
+  if (value === "last_year") return "last_year";
+  if (value === "all_available" || value === "evergreen") return "all_available";
+  return "recent";
+}
+
+function searchPlanItems(profile: TopicProfile | null): string[] {
+  if (!profile) return [];
+  const items: string[] = [];
+  const sourceSelection = profile.source_selection ?? {};
+  const hasSourceSelection = Object.keys(sourceSelection).length > 0;
+  for (const query of profile.search_queries ?? []) {
+    if (query.trim()) items.push(query.trim());
+  }
+  for (const [source, queries] of Object.entries(profile.source_queries ?? {})) {
+    if (hasSourceSelection && !sourceSelection[source]) continue;
+    for (const query of queries) {
+      const cleaned = query.trim();
+      if (cleaned) items.push(`${formatSourceLabel(source)}: ${cleaned}`);
+    }
+  }
+  for (const item of profile.foreign_language_plan ?? []) {
+    if (item.native_query?.trim()) items.push(`${item.name || item.code}: ${item.native_query.trim()}`);
+  }
+  return Array.from(new Set(items)).slice(0, 8);
+}
+
+function splitList(value: string): string[] {
+  return value.split(/[,;\n]/).map((item) => item.trim()).filter(Boolean);
+}
+
+function enabledSourceSelection(selection: Record<SourceKey, boolean>, status: SourceStatusResponse | null): Record<SourceKey, boolean> {
+  return {
+    web_search: Boolean(selection.web_search && status?.sources.web_search?.enabled),
+    foreign_media: Boolean(selection.foreign_media && status?.sources.foreign_media?.enabled),
+    gmail: Boolean(selection.gmail && status?.sources.gmail?.enabled),
+    reddit: Boolean(selection.reddit && status?.sources.reddit?.enabled),
+    podcasts: Boolean(selection.podcasts && status?.sources.podcasts?.enabled),
+    youtube: Boolean(selection.youtube && status?.sources.youtube?.enabled),
+    collections: Boolean(selection.collections && status?.sources.collections?.enabled),
+    markets: Boolean(selection.markets && status?.sources.markets?.enabled),
+  };
+}
+
+function firstBlockedSelectedSource(selection: Record<SourceKey, boolean>, status: SourceStatusResponse | null): SourceKey | null {
+  for (const source of sourceOptions) {
+    if (selection[source.key] && status && !status.sources[source.key]?.enabled) return source.key;
+  }
+  return null;
+}
+
+function hasEnabledSource(selection: Record<string, boolean>): boolean {
+  return Object.values(selection).some(Boolean);
+}
+
+function briefPath(record: Exploration | null): string | null {
+  if (!record) return null;
+  if (record.progress.brief?.html_path) return record.progress.brief.html_path;
+  if (record.brief_ref) return `/api/explore/explorations/${record.exploration_id}/brief/html`;
+  return null;
+}
+
+function openPath(path: string | null) {
+  if (path) window.open(path, "_blank", "noopener,noreferrer");
+}
+
+function sourceSelectionFromRecord(selection: Record<string, boolean> | undefined): Record<SourceKey, boolean> {
+  return sourceOptions.reduce<Record<SourceKey, boolean>>((result, source) => {
+    result[source.key] = Boolean(selection?.[source.key]);
+    return result;
+  }, { ...defaultSourceSelection });
+}
+
+function profileName(topic: TopicProfileResponse): string {
+  return topic.profile.scope || topic.statement || "Untitled brief";
+}
+
+function homeRecentKey(item: HomeRecentItem): string {
+  if (item.kind === "topic") return `topic-${item.topic.topic_id}`;
+  return `exploration-${item.exploration.exploration_id}`;
+}
+
+function homeRecentTitle(item: HomeRecentItem): string {
+  if (item.kind === "topic") return profileName(item.topic);
+  return item.topic ? profileName(item.topic) : item.exploration.progress.brief?.title ?? "Brief";
+}
+
+function homeRecentDate(item: HomeRecentItem): number {
+  if (item.kind === "topic") return dateValue(item.topic.updated_at ?? item.topic.created_at);
+  return dateValue(item.exploration.finished_at ?? item.exploration.started_at);
+}
+
+function homeRecentMeta(item: HomeRecentItem): string {
+  if (item.kind === "topic") return relativeDate(item.topic.updated_at ?? item.topic.created_at);
+  if (item.exploration.status === "queued") return "queued";
+  if (item.exploration.status === "running") return "building";
+  if (item.exploration.status === "failed") return "failed";
+  return relativeDate(item.exploration.finished_at ?? item.exploration.started_at);
+}
+
+function homeRecentBadge(item: HomeRecentItem): string | null {
+  if (item.kind === "topic") return "plan";
+  if (item.exploration.status === "queued") return "queued";
+  if (item.exploration.status === "running") return "building";
+  if (item.exploration.status === "failed") return "failed";
+  return null;
+}
+
+function homeRecentIcon(item: HomeRecentItem): string {
+  if (item.kind === "topic") return "◇";
+  if (item.exploration.status === "queued") return "◌";
+  if (item.exploration.status === "running") return "◌";
+  if (item.exploration.status === "failed") return "!";
+  return "⌕";
+}
+
+function explorationLibraryName(item: ExplorationLibraryItem): string {
+  if (item.kind === "topic") return profileName(item.topic);
+  return item.topic?.profile.scope
+    ?? item.topic?.statement
+    ?? item.exploration.progress.brief?.title
+    ?? "Brief";
+}
+
+function explorationLibraryDate(item: ExplorationLibraryItem): number {
+  if (item.kind === "topic") return dateValue(item.topic.updated_at ?? item.topic.created_at);
+  return dateValue(item.exploration.finished_at ?? item.exploration.started_at);
+}
+
+function digestLibraryName(item: DigestLibraryItem): string {
+  if (item.kind === "topic") return profileName(item.topic);
+  return item.digest.name || item.digest.interest || "Digest";
+}
+
+function digestLibraryDate(item: DigestLibraryItem): number {
+  if (item.kind === "topic") return dateValue(item.topic.updated_at ?? item.topic.created_at);
+  return dateValue(item.digest.updated_at ?? item.digest.created_at);
+}
+
+function formatSourceLabel(source: string): string {
+  if (source === "web_search") return "Web";
+  if (source === "foreign_media") return "Foreign Media";
+  if (source === "gmail") return "Gmail";
+  if (source === "reddit") return "Reddit";
+  if (source === "podcasts") return "Podcast";
+  if (source === "youtube") return "YouTube";
+  if (source === "collections") return "Collections";
+  if (source === "markets") return "Markets";
+  return source.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatSourceSelection(selection: Record<string, boolean>): string {
+  const enabled = sourceOptions.filter((source) => selection[source.key]).map((source) => source.label);
+  return enabled.length ? enabled.join(", ") : "No sources";
+}
+
+function sourcePlan(selection: Record<string, boolean>): string {
+  const enabled = sourceOptions.filter((source) => selection[source.key]).map((source) => source.label);
+  const disabled = sourceOptions.filter((source) => !selection[source.key]).map((source) => source.label);
+  if (!enabled.length) return "No sources selected";
+  return disabled.length ? `Running: ${enabled.join(", ")} (${disabled.join(", ")} excluded)` : `Running: ${enabled.join(", ")}`;
+}
+
+function formatPipeline(pipeline: Array<[string, string]>): string {
+  const running = pipeline.find(([, status]) => status === "running");
+  if (running) return `${formatStage(running[0])} running`;
+  const failed = pipeline.find(([, status]) => status === "failed");
+  if (failed) return `${formatStage(failed[0])} failed`;
+  return "Ready";
+}
+
+function formatStage(value: string): string {
+  return value.split("_").filter(Boolean).map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(" ");
 }
 
 function formatDateTime(value: string | null | undefined): string {
@@ -2086,144 +2931,121 @@ function formatDateTime(value: string | null | undefined): string {
   const date = new Date(value);
   if (Number.isNaN(date.valueOf())) return "Unknown";
   return new Intl.DateTimeFormat(undefined, {
-    month: "short",
+    month: "numeric",
     day: "numeric",
+    year: "2-digit",
     hour: "numeric",
     minute: "2-digit",
   }).format(date);
 }
 
-function formatSchedulerTime(timeValue: string | null | undefined, timezone: string | null | undefined): string {
-  if (!timeValue) return "No fixed time";
-  const [hourText, minuteText = "00"] = timeValue.split(":");
-  const hour = Number(hourText);
-  const minute = Number(minuteText);
-  if (Number.isNaN(hour) || Number.isNaN(minute)) return timeValue;
-  const period = hour >= 12 ? "PM" : "AM";
-  const displayHour = hour % 12 || 12;
-  const zone = timezone === "America/Los_Angeles" ? "Pacific" : timezone;
-  return `${displayHour}:${String(minute).padStart(2, "0")} ${period}${zone ? ` ${zone}` : ""}`;
+function relativeDate(value: string | null | undefined): string {
+  if (!value) return "never";
+  const delta = Date.now() - new Date(value).valueOf();
+  if (Number.isNaN(delta)) return "unknown";
+  const days = Math.floor(delta / 86400000);
+  if (days <= 0) return "today";
+  if (days === 1) return "1d ago";
+  return `${days}d ago`;
 }
 
-function formatStatusLabel(value: string | null | undefined): string {
-  if (!value) return "Unknown";
-  return value
-    .split("_")
-    .filter(Boolean)
-    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
-    .join(" ");
+function dateValue(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = new Date(value).valueOf();
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function formatDeliveryUrl(value: string | null | undefined): string {
-  if (!value) return "Available after status refresh";
-  try {
-    const url = new URL(value);
-    return `${url.host}${url.pathname}`;
-  } catch {
-    return value;
+function routeDraftFromStatus(status: AdminStatus | null): ModelRouteDraft {
+  const routes = status?.model?.routing?.routes ?? {};
+  const draft: ModelRouteDraft = {};
+  Object.entries(routes).forEach(([agent, route]) => {
+    draft[agent] = {
+      provider: route.provider || "local",
+      model: route.model ?? "",
+      allow_private_cloud: Boolean(route.allow_private_cloud),
+    };
+  });
+  return draft;
+}
+
+type RefinementProgressState = {
+  stage: string;
+  detail: string;
+  activity: string;
+  percent: number;
+  elapsedMs: number;
+  alert: boolean;
+};
+
+function refinementProgressState(progress: RefinementProgress, now: number): RefinementProgressState {
+  const elapsedMs = Math.max(0, now - progress.startedAt);
+  const seconds = elapsedMs / 1000;
+  let stage = "Preparing request";
+  let detail = "Packaging your interest, selected sources, and the current refinement state.";
+  let activity = "Local request is active.";
+  let percent = 14;
+
+  if (seconds >= 1.5) {
+    stage = "Calling oMLX";
+    detail = "Sending the refinement prompt to the local model.";
+    percent = 30;
   }
-}
-
-function formatAgentDecisionSummary(status: AgentDecisionsStatus | null | undefined): string {
-  if (!status || status.record_count === 0) return "No agent reviews yet";
-  const editorial = status.agent_counts.editorial ?? 0;
-  const critic = status.agent_counts.critic ?? 0;
-  const podcast = status.agent_counts.podcast_scout ?? 0;
-  return `${editorial} editorial · ${critic} critic · ${podcast} podcast`;
-}
-
-function formatSourceScoutSummary(status: SourceScoutStatus | null | undefined): string {
-  if (!status || status.source_count === 0) return "Not seeded yet";
-  return `${status.search_only_count} search-only · ${status.candidate_count} candidate`;
-}
-
-function formatSourceState(value: RedditSource["state"]): string {
-  if (value === "search_only") return "Search-only";
-  return value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-function formatVerificationResult(result: VerificationRunResult): string {
-  if (result.status !== "completed") return result.message ?? result.status;
-  const reviewed = result.reviewed_article_count ?? 0;
-  const podcasts = result.podcast_episode_count ?? 0;
-  const decisions = result.decision_count ?? 0;
-  const decisionVerb = result.stored_decision_count === 0 && decisions > 0 ? "made" : "saved";
-  const dropped = result.dropped_count ?? 0;
-  const lead = result.lead_title ? ` · lead: ${result.lead_title}` : "";
-  const prefix = result.published ? "Published" : "Reviewed";
-  if (result.mode === "podcast_refresh") {
-    return `${prefix} ${podcasts} podcast episode(s), reviewed ${reviewed}, ${decisionVerb} ${decisions} decision(s), dropped ${dropped}${lead}`;
+  if (seconds >= 4) {
+    stage = "Waiting for model";
+    detail = "oMLX may be loading the model or allocating memory.";
+    activity = "Waiting for the model response.";
+    percent = 48;
   }
-  return `${prefix} ${reviewed} article(s), ${decisionVerb} ${decisions} decision(s), dropped ${dropped}${lead}`;
+  if (seconds >= 9) {
+    stage = "Generating response";
+    detail = "Waiting for the model to return the refined profile and next question.";
+    activity = "Token-level progress is not exposed for this blocking call yet.";
+    percent = 68;
+  }
+  if (seconds >= 20) {
+    stage = "Still waiting on oMLX";
+    detail = "No response yet. The model may still be loading, but this is the point to watch.";
+    activity = "No server response yet; elapsed time is still updating.";
+    percent = 82;
+  }
+  if (seconds >= 45) {
+    stage = "Possibly hung";
+    detail = "This is taking longer than expected. You can keep waiting, retry, or refresh.";
+    percent = 90;
+  }
+  if (progress.phase === "answering" && seconds < 4) {
+    stage = "Updating search strategy";
+    detail = "Applying your answer and deciding the next refinement question.";
+    percent = Math.max(percent, 34);
+  }
+  if (progress.phase === "confirming" && seconds < 4) {
+    stage = "Preparing confirmation";
+    detail = "Finalizing the profile so you can review it before building.";
+    percent = Math.max(percent, 38);
+  }
+
+  return {
+    stage,
+    detail,
+    activity,
+    percent,
+    elapsedMs,
+    alert: seconds >= 20,
+  };
 }
 
-function formatSeconds(value: number | null | undefined): string {
-  if (value === null || value === undefined) return "0s";
-  if (value < 60) return `${Math.round(value)}s`;
-  return `${Math.floor(value / 60)}m ${Math.round(value % 60)}s`;
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}m ${seconds}s`;
 }
 
-function formatNumber(value: number | null | undefined): string {
-  return new Intl.NumberFormat().format(value ?? 0);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-function formatStageLabel(value: string): string {
-  return value
-    .split("_")
-    .filter(Boolean)
-    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
-    .join(" ");
-}
-
-function formatMs(value: number | null | undefined): string {
-  if (value === null || value === undefined) return "Unknown";
-  if (value < 1000) return `${Math.round(value)}ms`;
-  return formatSeconds(value / 1000);
-}
-
-function formatBytes(value: number | null | undefined): string {
-  const bytes = value ?? 0;
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function formatPodcastMetricCounts(status: PodcastMetricsStatus | null | undefined): string {
-  if (!status || status.record_count === 0) return "No podcast telemetry yet";
-  const success = status.status_counts.success ?? 0;
-  const failed = Object.entries(status.status_counts)
-    .filter(([key]) => key !== "success")
-    .reduce((total, [, count]) => total + count, 0);
-  return `${success} success · ${failed} issue(s)`;
-}
-
-function formatPodcastMetricDetail(metric: PodcastMetricRecord): string {
-  const parts = [
-    `Source: ${formatStatusLabel(metric.transcript_source ?? "not_processed")}`,
-    metric.feed_fetch_ms !== null ? `Feed ${formatMs(metric.feed_fetch_ms)}` : null,
-    metric.audio_download_ms !== null ? `Download ${formatMs(metric.audio_download_ms)}` : null,
-    metric.transcription_ms !== null ? `Transcript ${formatMs(metric.transcription_ms)}` : null,
-    metric.transcript_words ? `${formatNumber(metric.transcript_words)} words` : null,
-    metric.cache_hit ? "Cache hit" : null,
-    metric.error_detail ? `Error: ${metric.error_detail}` : null,
-  ].filter(Boolean);
-  return parts.join(" · ");
-}
-
-function podcastMetricStateClass(status: string): string {
-  if (status === "success") return "active";
-  if (status === "already_seen" || status === "low_score") return "candidate";
-  return "retired";
-}
-
-function formatPercent(value: number | null | undefined): string {
-  if (value === null || value === undefined) return "Unknown";
-  return `${Math.round(value * 100)}%`;
-}
-
-function formatPathTail(value: string | null | undefined): string {
-  if (!value) return "Not set";
-  const parts = value.split("/").filter(Boolean);
-  return parts.slice(-2).join("/") || value;
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }

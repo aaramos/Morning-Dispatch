@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections import Counter
@@ -9,6 +10,7 @@ from time import perf_counter
 from typing import Iterable
 from urllib.parse import urlparse
 
+from backend.agents.discovery.language_support import trusted_script_language_patterns
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClient, ModelClientConfig, ModelClientError
 from backend.app.core.config import DEFAULT_LIBRARIAN_MODEL, get_settings
@@ -35,7 +37,10 @@ async def enrich_articles(
     model_result_ids = _model_candidate_ids(result_list, max_items) if client is not None else set()
     enriched: list[ArticleFetchResult] = []
     tasks = [
-        enrich_article_with_model(result, model_client=client if id(result) in model_result_ids else None)
+        enrich_article_with_model(
+            result,
+            model_client=client if id(result) in model_result_ids or _needs_metadata_translation(result) else None,
+        )
         for result in result_list
     ]
     for enriched_result in await asyncio.gather(*tasks):
@@ -46,6 +51,19 @@ async def enrich_articles(
 
 
 def enrich_article(result: ArticleFetchResult) -> ArticleFetchResult:
+    if result.payload.source_type == "market_snapshot":
+        source_text = _market_snapshot_text(result)
+        keywords = extract_keywords(source_text, result.title)
+        return replace(
+            result,
+            text=source_text,
+            excerpt=source_text,
+            editor_summary=source_text,
+            keywords=tuple(keywords),
+            content_type="market",
+            enrichment_source="deterministic",
+        )
+
     source_text = _clean_article_text(result.title, result.text or result.excerpt or fallback_text(result))
     keywords = extract_keywords(source_text, result.title)
     summary = summarize(result.title, source_text, set(keywords))
@@ -78,6 +96,9 @@ async def enrich_article_with_model(
         return result
 
     deterministic = enrich_article(result)
+    if _needs_metadata_translation(deterministic):
+        return await _translate_foreign_metadata(deterministic, model_client=model_client)
+
     if model_client is None or deterministic.tier == "dropped" or not deterministic.fetched:
         return deterministic
 
@@ -252,17 +273,210 @@ async def refine_ranked_articles_with_model(
     settings = get_settings()
     client = model_client if model_client is not None else ModelClient.from_settings(settings)
     max_items = settings.librarian_model_max_items if model_max_items is None else max(0, model_max_items)
-    tasks = [
-        enrich_article_with_model(
-            result,
-            model_client=client if client is not None and index < max_items else None,
-            metrics_context=_metrics_context_for_result(result, inference_run_id, metrics_mode)
-            if client is not None and index < max_items and inference_run_id
-            else None,
+    tasks = []
+    for index, result in enumerate(result_list):
+        needs_translation = _needs_metadata_translation(result)
+        use_client = client is not None and (index < max_items or needs_translation)
+        tasks.append(
+            enrich_article_with_model(
+                result,
+                model_client=client if use_client else None,
+                metrics_context=_metrics_context_for_result(result, inference_run_id, metrics_mode)
+                if use_client and inference_run_id
+                else None,
+            )
         )
-        for index, result in enumerate(result_list)
-    ]
     return list(await asyncio.gather(*tasks))
+
+
+async def _translate_foreign_metadata(
+    result: ArticleFetchResult,
+    *,
+    model_client: ModelClient | None,
+) -> ArticleFetchResult:
+    source_language = _source_language(result)
+    source_language_name = _source_language_name(result)
+    original_title = _original_title(result)
+    original_summary = _original_summary(result)
+    translation_base = {
+        "translated": False,
+        "source_language": source_language,
+        "source_language_name": source_language_name,
+        "translator": _model_name(model_client) if model_client is not None else None,
+        "mode": "fast",
+        "stage": "metadata",
+        "original_title": original_title,
+        "original_summary": original_summary,
+    }
+    if model_client is None:
+        return _mark_translation_unavailable(
+            result,
+            {**translation_base, "error": "translation model unavailable"},
+        )
+
+    prompt = json.dumps(
+        {
+            "task": "Translate foreign media metadata into concise English for a Morning Dispatch brief.",
+            "source_language": source_language_name or source_language,
+            "title": original_title,
+            "summary": original_summary,
+            "url": result.final_url or result.original_url,
+            "rules": [
+                "Preserve company names, tickers, product names, and factual claims.",
+                "Do not add facts that are not present.",
+                "Keep summary under 70 words.",
+                "Return strict JSON only.",
+            ],
+            "schema": {
+                "title_en": "English title",
+                "summary_en": "English summary",
+                "quality": "high|medium|low",
+            },
+        },
+        ensure_ascii=False,
+    )
+    try:
+        payload = await model_client.complete_json(
+            system="You translate public foreign-language media metadata into English. Return strict JSON only.",
+            prompt=prompt,
+            max_tokens=420,
+        )
+    except Exception as exc:
+        logger.info("Foreign metadata translation failed for %s: %s", result.original_url, exc)
+        fallback = await _translate_foreign_metadata_text_fallback(
+            result,
+            model_client=model_client,
+            source_language=source_language,
+            source_language_name=source_language_name,
+            original_title=original_title,
+            original_summary=original_summary,
+            translation_base=translation_base,
+        )
+        if fallback is not None:
+            return fallback
+        return _mark_translation_unavailable(result, {**translation_base, "error": str(exc)[:220]})
+
+    if not isinstance(payload, dict):
+        payload = {}
+    translated_title = _clean_model_text(str(payload.get("title_en") or ""), max_chars=220)
+    translated_summary = _clean_model_text(str(payload.get("summary_en") or ""), max_chars=900)
+    title = translated_title or result.title
+    summary = translated_summary or result.editor_summary or result.excerpt
+    translated_ok = bool(translated_title or translated_summary)
+    quality = str(payload.get("quality") or "").strip().lower()
+    if quality not in {"high", "medium", "low"}:
+        quality = "medium"
+    translation = {
+        **translation_base,
+        "translated": translated_ok,
+        "translator": _model_name(model_client),
+        "quality": quality,
+    }
+    if not translated_ok:
+        return _mark_translation_unavailable(result, translation)
+    return replace(
+        result,
+        title=title,
+        excerpt=summary,
+        editor_summary=summary,
+        metadata={**dict(result.metadata or {}), "translation": translation},
+        enrichment_source="model",
+    )
+
+
+async def _translate_foreign_metadata_text_fallback(
+    result: ArticleFetchResult,
+    *,
+    model_client: ModelClient,
+    source_language: str,
+    source_language_name: str,
+    original_title: str,
+    original_summary: str,
+    translation_base: dict[str, object],
+) -> ArticleFetchResult | None:
+    try:
+        response = await model_client.complete(
+            system="You translate public foreign-language media metadata into concise English.",
+            prompt=_metadata_text_translation_prompt(
+                source_language=source_language_name or source_language,
+                title=original_title,
+                summary=original_summary,
+            ),
+            max_tokens=320,
+        )
+    except Exception as exc:
+        logger.info("Foreign metadata fallback translation failed for %s: %s", result.original_url, exc)
+        return None
+    parsed = _parse_metadata_text_translation(response)
+    translated_title = _clean_model_text(parsed.get("title", ""), max_chars=220)
+    translated_summary = _clean_model_text(parsed.get("summary", ""), max_chars=900)
+    if not translated_title and not translated_summary:
+        return None
+    summary = translated_summary or result.editor_summary or result.excerpt
+    return replace(
+        result,
+        title=translated_title or result.title,
+        excerpt=summary,
+        editor_summary=summary,
+        metadata={
+            **dict(result.metadata or {}),
+            "translation": {
+                **translation_base,
+                "translated": True,
+                "translator": _model_name(model_client),
+                "quality": "medium",
+                "mode": "fallback_text",
+            },
+        },
+        enrichment_source="model",
+    )
+
+
+def _metadata_text_translation_prompt(*, source_language: str, title: str, summary: str) -> str:
+    return (
+        f"Translate this {source_language} article metadata to English.\n"
+        "Return exactly two lines:\n"
+        "Title: <English title>\n"
+        "Summary: <English summary under 70 words>\n\n"
+        f"Title: {title}\n"
+        f"Summary: {summary}"
+    )
+
+
+def _parse_metadata_text_translation(value: str) -> dict[str, str]:
+    result = {"title": "", "summary": ""}
+    for line in str(value or "").splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        if cleaned.lower().startswith("title:"):
+            result["title"] = cleaned.split(":", 1)[1].strip()
+        elif cleaned.lower().startswith("summary:"):
+            result["summary"] = cleaned.split(":", 1)[1].strip()
+    if not result["title"] and not result["summary"]:
+        parts = [part.strip() for part in re.split(r"\n{2,}", str(value or "")) if part.strip()]
+        if parts:
+            result["title"] = parts[0]
+        if len(parts) > 1:
+            result["summary"] = parts[1]
+    return result
+
+
+def _mark_translation_unavailable(
+    result: ArticleFetchResult,
+    translation: dict[str, object],
+) -> ArticleFetchResult:
+    tier = result.tier
+    section = result.section
+    if tier not in {"dropped", "lower_confidence"}:
+        tier = "lower_confidence"
+        section = "Needs Translation"
+    return replace(
+        result,
+        tier=tier,
+        section=section,
+        metadata={**dict(result.metadata or {}), "translation": translation},
+    )
 
 
 def summarize(title: str, text: str, signal_words: set[str]) -> str:
@@ -361,6 +575,146 @@ def fallback_summary(result: ArticleFetchResult) -> str:
     title = result.title or str((result.payload.metadata or {}).get("link_text") or domain)
     source = result.payload.source_name or "an approved newsletter"
     return f"{title} was surfaced by {source}, but the article page could not be fully read ({reason})."
+
+
+def _market_snapshot_text(result: ArticleFetchResult) -> str:
+    metadata = {**dict(result.payload.metadata or {}), **dict(result.metadata or {})}
+    ticker = str(metadata.get("ticker") or "").strip()
+    company = str(metadata.get("company_name") or result.title or result.payload.source_name or ticker or "this company").strip()
+    if ticker and ticker not in company:
+        company = f"{company} ({ticker})"
+    parts = [f"Public-market snapshot for {company}."]
+    price = _market_number(metadata.get("current_price"))
+    currency = str(metadata.get("currency") or "").strip()
+    if price is not None:
+        parts.append(f"Latest price: {price:.2f}{f' {currency}' if currency else ''}.")
+    changes = []
+    for label, key in (("1d", "change_1d_pct"), ("7d", "change_7d_pct"), ("30d", "change_30d_pct")):
+        value = _market_number(metadata.get(key))
+        if value is not None:
+            changes.append(f"{label}: {value:+.2f}%")
+    if changes:
+        parts.append(f"Recent movement: {'; '.join(changes)}.")
+    market_cap = _market_number(metadata.get("market_cap"))
+    if market_cap is not None:
+        parts.append(f"Market cap: {_format_market_cap(market_cap)}.")
+    analyst_rating = str(metadata.get("analyst_rating") or "").strip()
+    if analyst_rating:
+        parts.append(f"Analyst rating: {analyst_rating}.")
+    sector = str(metadata.get("sector") or "").strip()
+    if sector:
+        parts.append(f"Sector: {sector}.")
+    news = metadata.get("recent_news")
+    if isinstance(news, list):
+        titles = [
+            str(item.get("title") or "").strip()
+            for item in news
+            if isinstance(item, dict) and str(item.get("title") or "").strip()
+        ]
+        if titles:
+            parts.append(f"Recent news: {'; '.join(titles[:3])}.")
+    if len(parts) == 1:
+        parts.append("Use the linked quote page for live price, valuation, and recent market news.")
+    return " ".join(parts)
+
+
+def _market_number(value: object) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result else None
+
+
+def _format_market_cap(value: float) -> str:
+    if value >= 1_000_000_000_000:
+        return f"${value / 1_000_000_000_000:.2f}T"
+    if value >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.1f}B"
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.1f}M"
+    return f"${value:,.0f}"
+
+
+def _needs_metadata_translation(result: ArticleFetchResult) -> bool:
+    metadata = _translation_source_metadata(result)
+    if result.payload.source_type == "foreign_web":
+        return True
+    return bool(metadata.get("needs_translation") and metadata.get("source_language"))
+
+
+def _source_language(result: ArticleFetchResult) -> str:
+    metadata = _translation_source_metadata(result)
+    return str(metadata.get("source_language") or "").strip().lower()
+
+
+def _source_language_name(result: ArticleFetchResult) -> str:
+    metadata = _translation_source_metadata(result)
+    return str(metadata.get("source_language_name") or _source_language(result)).strip()
+
+
+def _original_title(result: ArticleFetchResult) -> str:
+    metadata = _translation_source_metadata(result)
+    return str(metadata.get("original_search_title") or result.title or result.payload.source_name or "").strip()
+
+
+def _original_summary(result: ArticleFetchResult) -> str:
+    metadata = _translation_source_metadata(result)
+    return str(
+        metadata.get("original_search_summary")
+        or result.editor_summary
+        or result.excerpt
+        or result.text
+        or result.payload.raw_text
+        or ""
+    ).strip()[:1200]
+
+
+def _translation_source_metadata(result: ArticleFetchResult) -> dict[str, object]:
+    metadata = {
+        **dict(result.payload.metadata or {}),
+        **dict(result.metadata or {}),
+    }
+    if metadata.get("needs_translation") and metadata.get("source_language"):
+        return metadata
+    detected = _detect_non_english_script(result)
+    if detected is None:
+        return metadata
+    language_code, language_name = detected
+    return {
+        **metadata,
+        "needs_translation": True,
+        "source_language": language_code,
+        "source_language_name": language_name,
+        "original_search_title": metadata.get("original_search_title") or result.title,
+        "original_search_summary": metadata.get("original_search_summary")
+        or result.editor_summary
+        or result.excerpt
+        or result.payload.raw_text
+        or result.text,
+    }
+
+
+def _detect_non_english_script(result: ArticleFetchResult) -> tuple[str, str] | None:
+    if result.payload.source_type in {"podcast_episode", "youtube_video", "collection_chunk", "market_snapshot"}:
+        return None
+    text = " ".join(
+        str(part or "")
+        for part in (
+            result.title,
+            result.editor_summary,
+            result.excerpt,
+            result.payload.raw_text,
+            result.text[:1200],
+        )
+    )
+    if not text.strip():
+        return None
+    for code, name, _script, pattern in trusted_script_language_patterns():
+        matches = pattern.findall(text)
+        if len(matches) >= 4:
+            return code, name
+    return None
 
 
 def _librarian_prompt(result: ArticleFetchResult) -> str:
@@ -547,7 +901,7 @@ def _record_model_metric(
             "classification_confidence": classification_confidence,
             "schema_valid": schema_valid,
             "summary_word_count": summary_word_count,
-            "fallback_triggered": fallback_triggered,
+            "fallback_triggered": fallback_triggered or bool(getattr(model_client, "fallback_triggered", False)),
             "status": status,
             "error_detail": _truncate(error_detail, 600) if error_detail else None,
         }
@@ -562,6 +916,9 @@ def _model_name(model_client: object) -> str:
 
 def _backend_name(model_client: object) -> str:
     config = getattr(model_client, "config", None)
+    provider = str(getattr(config, "provider", "") or "")
+    if provider:
+        return provider
     base_url = str(getattr(config, "base_url", None) or get_settings().model_base_url or "").lower()
     if "ollama" in base_url or ":11434" in base_url:
         return "ollama"

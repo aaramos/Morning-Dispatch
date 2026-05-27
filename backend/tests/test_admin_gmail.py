@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from fastapi.testclient import TestClient
 
@@ -18,6 +19,7 @@ def configure_runtime(monkeypatch, tmp_path):
         str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
     )
     monkeypatch.setenv("MORNING_DISPATCH_PUBLIC_BASE_URL", "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000")
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
     return runtime
 
 
@@ -139,3 +141,58 @@ def test_gmail_admin_can_complete_from_pasted_redirect_url(monkeypatch, tmp_path
     assert complete.status_code == 200
     assert (runtime / "secrets" / "gmail" / "gmail_credentials.json").exists()
     assert not (runtime / "secrets" / "gmail" / "oauth_state.json").exists()
+
+
+def test_gmail_oauth_accepts_extra_returned_scopes(monkeypatch, tmp_path):
+    runtime = configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("OAUTHLIB_RELAX_TOKEN_SCOPE", "previous-value")
+    required_scopes = set(admin_api.required_scopes(hosted_mcp_enabled=False))
+
+    class FakeCredentials:
+        granted_scopes = list(
+            required_scopes
+            | {
+                "https://mail.google.com/",
+                "https://www.googleapis.com/auth/gmail.modify",
+            }
+        )
+
+        def to_json(self):
+            return json.dumps(
+                {
+                    "token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "scopes": list(required_scopes),
+                }
+            )
+
+    class FakeFlow:
+        credentials = FakeCredentials()
+        code_verifier = "saved-code-verifier"
+
+        def authorization_url(self, **_kwargs):
+            return ("https://accounts.google.com/o/oauth2/auth?state=known-state", "known-state")
+
+        def fetch_token(self, authorization_response):
+            assert os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] == "1"
+            assert "code=returned-code" in authorization_response
+
+    monkeypatch.setattr(admin_api, "_oauth_flow", lambda *_args, **_kwargs: FakeFlow())
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        client.post("/api/admin/gmail/client-secret", json={"client_secret_json": client_secret_json()})
+        start = client.post("/api/admin/gmail/oauth/start")
+        complete = client.post(
+            "/api/admin/gmail/oauth/complete",
+            json={
+                "callback_url": (
+                    "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000"
+                    "/api/admin/gmail/oauth/callback?state=known-state&code=returned-code"
+                )
+            },
+        )
+
+    assert start.status_code == 200
+    assert complete.status_code == 200
+    assert os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] == "previous-value"
+    assert (runtime / "secrets" / "gmail" / "gmail_credentials.json").exists()

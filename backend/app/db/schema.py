@@ -14,13 +14,86 @@ CREATE TABLE IF NOT EXISTS digests (
   profile_id   TEXT NOT NULL REFERENCES profiles(id),
   name         TEXT NOT NULL,
   interest     TEXT NOT NULL,
-  schedule     TEXT NOT NULL CHECK(schedule IN ('hourly','daily','weekly','monthly')),
+  schedule     TEXT NOT NULL CHECK(schedule IN ('hourly','daily','weekdays','weekly','monthly')),
   sources      TEXT NOT NULL,
   status       TEXT DEFAULT 'active',
   threshold    REAL DEFAULT 0.45,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS topic_profiles (
+  topic_id        TEXT PRIMARY KEY,
+  statement       TEXT NOT NULL,
+  profile_json    TEXT NOT NULL,
+  schedule        TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS refinement_sessions (
+  session_id     TEXT PRIMARY KEY,
+  statement      TEXT NOT NULL,
+  profile_json   TEXT NOT NULL,
+  messages_json  TEXT NOT NULL,
+  pending_field  TEXT,
+  turn_count     INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL CHECK(status IN ('active','finalized')),
+  topic_id       TEXT REFERENCES topic_profiles(topic_id),
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS explorations (
+  exploration_id         TEXT PRIMARY KEY,
+  topic_id               TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+  mode                   TEXT NOT NULL CHECK(mode IN ('show_now','scheduled')),
+  source_selection_json  TEXT NOT NULL,
+  progress_json          TEXT NOT NULL DEFAULT '{}',
+  status                 TEXT NOT NULL CHECK(status IN ('queued','running','complete','failed')),
+  brief_ref              TEXT,
+  emailed                INTEGER NOT NULL DEFAULT 0,
+  started_at             TEXT NOT NULL,
+  finished_at            TEXT,
+  deleted_at             TEXT,
+  delete_after           TEXT,
+  purged_at              TEXT
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS promoted_sources (
+  id          TEXT PRIMARY KEY,
+  topic_id    TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+  adapter     TEXT NOT NULL,
+  ref         TEXT NOT NULL,
+  has_feed    INTEGER NOT NULL DEFAULT 0,
+  feed_url    TEXT,
+  created_at  TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS collection_files (
+  id                TEXT PRIMARY KEY,
+  collection_name   TEXT NOT NULL,
+  file_path         TEXT NOT NULL UNIQUE,
+  relative_path     TEXT NOT NULL,
+  file_type         TEXT NOT NULL,
+  last_modified     REAL NOT NULL,
+  last_indexed      REAL,
+  status            TEXT NOT NULL CHECK(status IN ('pending','indexed','failed','unsupported')),
+  error_message     TEXT,
+  chunk_count       INTEGER NOT NULL DEFAULT 0,
+  updated_at        TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS collection_chunks (
+  id                TEXT PRIMARY KEY,
+  file_id           TEXT NOT NULL REFERENCES collection_files(id) ON DELETE CASCADE,
+  collection_name   TEXT NOT NULL,
+  file_path         TEXT NOT NULL,
+  relative_path     TEXT NOT NULL,
+  chunk_index       INTEGER NOT NULL,
+  text              TEXT NOT NULL,
+  created_at        TEXT NOT NULL
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS digest_runs (
   id              TEXT PRIMARY KEY,
@@ -206,6 +279,12 @@ CREATE TABLE IF NOT EXISTS podcast_metrics (
   cache_hit             INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS youtube_quota_usage (
+  usage_date       TEXT PRIMARY KEY,
+  units_used       INTEGER NOT NULL DEFAULT 0,
+  updated_at       TEXT NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS digest_issues (
   id           TEXT PRIMARY KEY,
   run_id       TEXT NOT NULL REFERENCES digest_runs(id),
@@ -297,6 +376,14 @@ CREATE TABLE IF NOT EXISTS source_scout_decisions (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_digests_profile_id ON digests(profile_id);
+CREATE INDEX IF NOT EXISTS idx_topic_profiles_updated_at ON topic_profiles(updated_at);
+CREATE INDEX IF NOT EXISTS idx_refinement_sessions_updated_at ON refinement_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_explorations_topic_id ON explorations(topic_id);
+CREATE INDEX IF NOT EXISTS idx_explorations_status ON explorations(status);
+CREATE INDEX IF NOT EXISTS idx_promoted_sources_topic_id ON promoted_sources(topic_id);
+CREATE INDEX IF NOT EXISTS idx_collection_files_collection ON collection_files(collection_name);
+CREATE INDEX IF NOT EXISTS idx_collection_files_status ON collection_files(status);
+CREATE INDEX IF NOT EXISTS idx_collection_chunks_collection ON collection_chunks(collection_name);
 CREATE INDEX IF NOT EXISTS idx_digest_runs_digest_id ON digest_runs(digest_id);
 CREATE INDEX IF NOT EXISTS idx_inference_metrics_run_id ON inference_metrics(run_id);
 CREATE INDEX IF NOT EXISTS idx_inference_metrics_article_id ON inference_metrics(article_id);

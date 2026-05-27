@@ -1,0 +1,1290 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+import logging
+from time import monotonic
+from typing import Any
+
+from backend.agents.brief_quality import apply_brief_quality_checks
+from backend.agents.critic import apply_critic_repairs
+from backend.agents.discovery import (
+    DiscoveryRunner,
+    DiscoveryResult,
+    SourceAdapterContext,
+    TopicProfile,
+    default_source_registry,
+)
+from backend.agents.digestor.base import NormalizedPayload
+from backend.app.services import mcp_status, model_routing
+from backend.agents.editor import prepare_issue_articles
+from backend.agents.editorial_decisions import apply_editorial_decisions
+from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
+from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
+from backend.agents.source_audit import apply_source_audit
+from backend.app.core.config import ensure_runtime_dirs, get_settings
+from backend.app.db import database
+from backend.agents.discovery.collections_source import collections_status, setup_collections_root
+from backend.agents.discovery.markets import markets_available
+
+
+logger = logging.getLogger(__name__)
+
+_BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
+_BUILD_QUEUE_EVENT: asyncio.Event | None = None
+_PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
+_EXPLORE_MODEL_REFINEMENT_LIMIT = 24
+
+
+async def start_build_queue() -> None:
+    global _BUILD_QUEUE_TASK, _BUILD_QUEUE_EVENT
+    requeued = database.requeue_running_explorations()
+    if requeued:
+        logger.info("Requeued %s interrupted exploration build(s)", requeued)
+    if _BUILD_QUEUE_TASK is None or _BUILD_QUEUE_TASK.done():
+        _BUILD_QUEUE_EVENT = asyncio.Event()
+        _BUILD_QUEUE_TASK = asyncio.create_task(_build_queue_worker())
+    _BUILD_QUEUE_EVENT.set()
+
+
+async def stop_build_queue() -> None:
+    global _BUILD_QUEUE_TASK, _BUILD_QUEUE_EVENT
+    if _BUILD_QUEUE_TASK is None:
+        _BUILD_QUEUE_EVENT = None
+        return
+    _BUILD_QUEUE_TASK.cancel()
+    with suppress(asyncio.CancelledError):
+        await _BUILD_QUEUE_TASK
+    _BUILD_QUEUE_TASK = None
+    _BUILD_QUEUE_EVENT = None
+
+
+def _signal_build_queue() -> None:
+    if _BUILD_QUEUE_EVENT is not None:
+        _BUILD_QUEUE_EVENT.set()
+
+
+async def _build_queue_worker() -> None:
+    while True:
+        if _BUILD_QUEUE_EVENT is None:
+            await asyncio.sleep(0.5)
+            continue
+        await _BUILD_QUEUE_EVENT.wait()
+        _BUILD_QUEUE_EVENT.clear()
+        while True:
+            exploration = database.claim_next_queued_exploration()
+            if exploration is None:
+                break
+            progress = dict(exploration.get("progress") or {})
+            queue_options = dict(progress.get("queue_options") or {})
+            try:
+                await _run_exploration(
+                    str(exploration["topic_id"]),
+                    mode=str(exploration.get("mode") or "show_now"),
+                    source_selection=dict(exploration.get("source_selection") or {}),
+                    candidate_limit=int(queue_options.get("candidate_limit") or 80),
+                    lookback_hours=int(queue_options.get("lookback_hours") or 24),
+                    existing_exploration=exploration,
+                )
+            except Exception:
+                logger.exception(
+                    "Queued exploration %s failed",
+                    exploration.get("exploration_id"),
+                )
+
+
+def save_topic_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    profile = TopicProfile.from_dict(payload)
+    return database.upsert_topic_profile(profile.to_dict())
+
+
+async def source_status() -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        mcp = await mcp_status.status(settings)
+    except Exception:
+        mcp = {}
+    web_enabled = bool(
+        settings.web_search_tavily_api_key
+        or settings.web_search_brave_api_key
+        or settings.web_search_serpapi_api_key
+    )
+    gmail_enabled = bool(settings.gmail_credentials_path.exists())
+    gmail_reason = None
+    if not gmail_enabled:
+        if not settings.gmail_client_secret_path.exists():
+            gmail_reason = "Upload a Gmail OAuth client in Admin Sources, then connect Gmail."
+        else:
+            gmail_reason = "Finish the Gmail connection in Admin Sources."
+    reddit_enabled = bool((mcp.get("reddit") or {}).get("connected"))
+    podcast_sources = _all_configured_podcast_sources()
+    podcast_enabled = bool(
+        settings.podcastindex_api_key
+        and settings.podcastindex_api_secret
+    ) or bool(podcast_sources)
+    youtube_quota = database.youtube_quota_summary()
+    youtube_units = int(youtube_quota.get("units_used") or 0)
+    youtube_enabled = bool(settings.youtube_api_key)
+    youtube_reason = None
+    if not youtube_enabled:
+        youtube_reason = "Add a YouTube Data API key in Admin Sources."
+    elif youtube_units >= 8000:
+        youtube_reason = f"YouTube quota is high today ({youtube_units}/10000 units used)."
+    collections = collections_status(settings.collections_root)
+    collections_enabled = bool(collections.get("root_exists")) and int(collections.get("collection_count") or 0) > 0
+    if not collections.get("root_exists"):
+        collections_reason = "Create the Collections folder to use local files."
+    elif int(collections.get("collection_count") or 0) <= 0:
+        collections_reason = "Add a top-level folder inside Collections."
+    elif int(collections.get("indexed_count") or 0) <= 0:
+        collections_reason = "Ready. Add text or markdown files to improve results."
+    else:
+        collections_reason = None
+    market_enabled = markets_available()
+    market_reason = None if market_enabled else "Install yfinance to use free market data."
+    return {
+        "sources": {
+            "web_search": {
+                "label": "Web",
+                "enabled": web_enabled,
+                "setup_required": not web_enabled,
+                "reason": None if web_enabled else "Add a Brave, Tavily, or SerpAPI key in Admin Sources.",
+            },
+            "foreign_media": {
+                "label": "Foreign Media",
+                "enabled": web_enabled,
+                "setup_required": not web_enabled,
+                "reason": None if web_enabled else "Foreign media uses Web Search. Add a Brave, Tavily, or SerpAPI key in Admin Sources.",
+            },
+            "gmail": {
+                "label": "Gmail",
+                "enabled": gmail_enabled,
+                "setup_required": not gmail_enabled,
+                "reason": gmail_reason,
+            },
+            "reddit": {
+                "label": "Reddit",
+                "enabled": reddit_enabled,
+                "setup_required": not reddit_enabled,
+                "reason": None if reddit_enabled else "Reddit MCP is not connected.",
+            },
+            "podcasts": {
+                "label": "Podcast",
+                "enabled": podcast_enabled,
+                "setup_required": not podcast_enabled,
+                "reason": None if podcast_enabled else "Add Podcast Index credentials in Admin Sources.",
+            },
+            "youtube": {
+                "label": "YouTube",
+                "enabled": youtube_enabled,
+                "setup_required": not youtube_enabled,
+                "reason": youtube_reason,
+            },
+            "collections": {
+                "label": "Collections",
+                "enabled": collections_enabled,
+                "setup_required": not bool(collections.get("root_exists")),
+                "reason": collections_reason,
+                "root_path": collections.get("root_path"),
+                "collection_count": collections.get("collection_count", 0),
+                "indexed_count": collections.get("indexed_count", 0),
+                "unsupported_count": collections.get("unsupported_count", 0),
+                "failed_count": collections.get("failed_count", 0),
+            },
+            "markets": {
+                "label": "Markets",
+                "enabled": market_enabled,
+                "setup_required": not market_enabled,
+                "reason": market_reason,
+                "mode": settings.markets_mode,
+                "max_core_companies": settings.markets_max_core_companies,
+                "max_related_companies": settings.markets_max_related_companies,
+            },
+        }
+    }
+
+
+def save_web_search_credentials(*, provider: str, api_key: str) -> dict[str, Any]:
+    settings = get_settings()
+    clean_provider = provider.strip().lower()
+    folder_map = {
+        "tavily": "tavily",
+        "brave": "brave",
+        "serpapi": "serpapi",
+    }
+    folder = folder_map.get(clean_provider)
+    if folder is None:
+        raise ValueError("Unsupported web-search provider")
+    path = settings.secrets_dir / folder / "api_key"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path.parent)
+    path.write_text(api_key.strip() + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path)
+    return {
+        "provider": clean_provider,
+        "configured": True,
+    }
+
+
+def save_youtube_credentials(*, api_key: str) -> dict[str, Any]:
+    settings = get_settings()
+    path = settings.secrets_dir / "youtube" / "api_key"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path.parent)
+    path.write_text(api_key.strip() + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path)
+    return {
+        "configured": True,
+    }
+
+
+def setup_collections() -> dict[str, Any]:
+    settings = get_settings()
+    if settings.collections_root is None:
+        raise ValueError("Collections root is not configured")
+    return setup_collections_root(settings.collections_root)
+
+
+def cleanup_expired_exploration_briefs(retention_days: int = 90) -> int:
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, retention_days))
+    return database.clear_expired_exploration_briefs(
+        before_started_at=cutoff.isoformat(timespec="seconds")
+    )
+
+
+def purge_expired_deleted_explorations() -> int:
+    return database.purge_expired_deleted_explorations()
+
+
+async def run_discovery(
+    topic_id: str,
+    *,
+    mode: str = "show_now",
+    source_selection: dict[str, bool] | None = None,
+    candidate_limit: int = 80,
+    lookback_hours: int = 24,
+) -> dict[str, Any] | None:
+    record = database.get_topic_profile(topic_id)
+    if record is None:
+        return None
+
+    profile = TopicProfile.from_dict(record["profile"])
+    merged_selection = _merged_source_selection(profile, source_selection)
+    exploration = database.create_exploration(
+        topic_id=topic_id,
+        mode=mode,
+        source_selection=merged_selection,
+    )
+    try:
+        context = SourceAdapterContext(
+            exploration_id=str(exploration["exploration_id"]),
+            candidate_limit=candidate_limit,
+            lookback_hours=lookback_hours,
+        )
+        result = await DiscoveryRunner(default_source_registry()).run(
+            profile,
+            source_selection=merged_selection,
+            context=context,
+        )
+        completed = database.update_exploration_status(
+            str(exploration["exploration_id"]),
+            status="complete",
+        )
+        return {
+            "exploration": completed or exploration,
+            "discovery": result.to_dict(),
+        }
+    except Exception as exc:  # pragma: no cover - important path for production reliability.
+        logger.exception(
+            "Exploration discovery %s failed for topic profile %s",
+            exploration["exploration_id"],
+            topic_id,
+        )
+        database.update_exploration_status(
+            str(exploration["exploration_id"]),
+            status="failed",
+        )
+        raise
+
+
+async def run_show_now(
+    topic_id: str,
+    *,
+    source_selection: dict[str, bool] | None = None,
+    candidate_limit: int = 80,
+    lookback_hours: int = 24,
+) -> dict[str, Any] | None:
+    return await _run_exploration(
+        topic_id,
+        mode="show_now",
+        source_selection=source_selection,
+        candidate_limit=candidate_limit,
+        lookback_hours=lookback_hours,
+    )
+
+
+def start_show_now(
+    topic_id: str,
+    *,
+    mode: str = "show_now",
+    source_selection: dict[str, bool] | None = None,
+    candidate_limit: int = 80,
+    lookback_hours: int = 24,
+) -> dict[str, Any] | None:
+    record = database.get_topic_profile(topic_id)
+    if record is None:
+        return None
+
+    profile = TopicProfile.from_dict(record["profile"])
+    merged_selection = _merged_source_selection(profile, source_selection)
+    exploration = database.create_exploration(
+        topic_id=topic_id,
+        mode=mode,
+        source_selection=merged_selection,
+        status="queued",
+    )
+    initial_progress = _initial_progress(merged_selection)
+    initial_progress["queue"] = {
+        "status": "queued",
+        "message": "Waiting for the current brief build to finish.",
+    }
+    initial_progress["queue_options"] = {
+        "candidate_limit": candidate_limit,
+        "lookback_hours": lookback_hours,
+    }
+    database.update_exploration_progress(
+        str(exploration["exploration_id"]),
+        progress=initial_progress,
+    )
+    _signal_build_queue()
+    return database.get_exploration(exploration["exploration_id"])
+
+
+def start_rebuild(
+    exploration_id: str,
+    *,
+    source_selection: dict[str, bool] | None = None,
+    candidate_limit: int = 80,
+    lookback_hours: int = 24,
+) -> dict[str, Any] | None:
+    exploration = database.get_exploration(exploration_id)
+    if exploration is None or exploration.get("deleted_at"):
+        return None
+    topic_id = str(exploration["topic_id"])
+    topic = database.get_topic_profile(topic_id)
+    if topic is None:
+        return None
+    profile = TopicProfile.from_dict(topic["profile"])
+    merged_selection = _merged_source_selection(profile, source_selection or exploration.get("source_selection"))
+    progress = _initial_progress(merged_selection)
+    progress["queue"] = {
+        "status": "queued",
+        "message": "Waiting for the current brief build to finish.",
+    }
+    progress["queue_options"] = {
+        "candidate_limit": candidate_limit,
+        "lookback_hours": lookback_hours,
+    }
+    rebuilt = database.reset_exploration_for_rebuild(
+        exploration_id,
+        source_selection=merged_selection,
+        progress=progress,
+    )
+    if rebuilt is None:
+        return None
+    _signal_build_queue()
+    return database.get_exploration(exploration_id)
+
+
+async def run_scheduled(
+    topic_id: str,
+    *,
+    source_selection: dict[str, bool] | None = None,
+    candidate_limit: int = 80,
+    lookback_hours: int = 24,
+) -> dict[str, Any] | None:
+    return await _run_exploration(
+        topic_id,
+        mode="scheduled",
+        source_selection=source_selection,
+        candidate_limit=candidate_limit,
+        lookback_hours=lookback_hours,
+    )
+
+
+async def _run_exploration(
+    topic_id: str,
+    *,
+    mode: str,
+    source_selection: dict[str, bool] | None,
+    candidate_limit: int,
+    lookback_hours: int,
+    existing_exploration: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    started_at = monotonic()
+    record = database.get_topic_profile(topic_id)
+    if record is None:
+        return None
+
+    profile = TopicProfile.from_dict(record["profile"])
+    merged_selection = _merged_source_selection(profile, source_selection)
+
+    exploration = existing_exploration
+    if exploration is None:
+        exploration = database.create_exploration(
+            topic_id=topic_id,
+            mode=mode,
+            source_selection=merged_selection,
+        )
+
+    exploration_id = str(exploration["exploration_id"])
+    database.update_exploration_status(exploration_id, status="running")
+    progress = _initial_progress(merged_selection)
+    progress["queue"] = {
+        "status": "running",
+        "message": "Building now.",
+    }
+    database.update_exploration_progress(exploration_id, progress=progress)
+
+    registry = default_source_registry()
+    _set_pipeline_stage(progress, "discovery", "running")
+    _persist_progress(exploration_id, progress)
+    try:
+        context = SourceAdapterContext(
+            exploration_id=exploration_id,
+            candidate_limit=candidate_limit,
+            lookback_hours=lookback_hours,
+        )
+
+        def on_adapter_status(status) -> None:
+            _set_source_status(progress, status)
+            _persist_progress(exploration_id, progress)
+
+        discovery = await DiscoveryRunner(registry).run(
+            profile,
+            source_selection=merged_selection,
+            context=context,
+            on_adapter_status=on_adapter_status,
+        )
+        _set_pipeline_stage(progress, "discovery", "done")
+        _set_exclusion_reasons(progress, discovery.exclusions)
+        _set_requested_source_issues(progress, _requested_source_issues(profile, discovery, merged_selection))
+        _persist_progress(exploration_id, progress)
+
+        for status in discovery.statuses:
+            _set_source_status(progress, status)
+        _set_candidate_count(progress, len(discovery.payloads()))
+
+        payloads = discovery.payloads()
+        stage_seconds: dict[str, float] = {"discovery": round(monotonic() - started_at, 3)}
+        _set_pipeline_stage(progress, "fetch", "running")
+        _persist_progress(exploration_id, progress)
+
+        stage_started = monotonic()
+        fetched_articles = await fetch_articles_for_payloads(payloads)
+        stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
+        _set_pipeline_stage(progress, "fetch", "done")
+        _persist_progress(exploration_id, progress)
+
+        stage_started = monotonic()
+        article_results = await _run_digest_core(
+            profile=profile,
+            payloads=payloads,
+            fetched_articles=fetched_articles,
+            lookback_hours=lookback_hours,
+            inference_run_id=exploration_id,
+            progress=progress,
+            persist=lambda: _persist_progress(exploration_id, progress),
+        )
+        stage_seconds["editorial"] = _elapsed_stage_seconds(stage_started)
+        if mode == "scheduled":
+            _promote_explore_sources(topic_id=topic_id, discovery=discovery, article_results=article_results)
+        _set_pipeline_stage(progress, "done", "running")
+        _set_candidate_count(progress, len(payloads))
+
+        stage_started = monotonic()
+        title = _brief_title(profile)
+        configured_source_count = _selected_source_count(discovery, merged_selection)
+        snapshot = database.ingested_snapshot(payloads, configured_source_count, article_results)
+        newsletter_source_notes = _newsletter_source_notes_for_brief(payloads, article_results)
+
+        def build_stats() -> dict[str, Any]:
+            stats = database.build_digest_stats(
+                configured_source_count=configured_source_count,
+                newsletter_count=len(newsletter_source_notes),
+                link_count=sum(1 for payload in payloads if payload.source_type == "gmail_link"),
+                podcast_episode_count=sum(1 for payload in payloads if payload.source_type == "podcast_episode"),
+                article_results=article_results,
+                duration_seconds=round(monotonic() - started_at, 3),
+                inference_run_id=exploration_id,
+                stage_seconds=stage_seconds,
+            )
+            stats["search_strategy"] = _brief_search_strategy(profile, merged_selection, lookback_hours)
+            return stats
+
+        digest_stats = build_stats()
+        html = database.render_ingested_issue(
+            title,
+            snapshot,
+            payloads,
+            article_results,
+            lookback_hours,
+            generated_at=database.utc_now(),
+            issue_id=exploration_id,
+            digest_stats=digest_stats,
+            newsletter_payloads=newsletter_source_notes,
+        )
+        brief_ref = _write_exploration_brief(exploration_id, html)
+        stage_seconds["publishing"] = _elapsed_stage_seconds(stage_started)
+        digest_stats = build_stats()
+        html = database.render_ingested_issue(
+            title,
+            snapshot,
+            payloads,
+            article_results,
+            lookback_hours,
+            generated_at=database.utc_now(),
+            issue_id=exploration_id,
+            digest_stats=digest_stats,
+            newsletter_payloads=newsletter_source_notes,
+        )
+        brief_ref = _write_exploration_brief(exploration_id, html)
+
+        progress["brief"] = {
+            "title": title,
+            "html_path": f"/api/explore/explorations/{exploration_id}/brief/html",
+            "snapshot": snapshot,
+            "stats": digest_stats,
+            "candidate_count": len(payloads),
+        }
+        if progress.get("requested_source_issues"):
+            progress["built_with_issues"] = True
+        _set_pipeline_stage(progress, "done", "done")
+        _persist_progress(exploration_id, progress)
+
+        completed = database.update_exploration_status(
+            exploration_id,
+            status="complete",
+            brief_ref=brief_ref,
+        )
+        return {
+            "exploration": completed or exploration,
+            "discovery": discovery.to_dict(),
+            "brief": {
+                "title": title,
+                "html_path": f"/api/explore/explorations/{exploration_id}/brief/html",
+                "snapshot": snapshot,
+                "stats": digest_stats,
+            },
+        }
+    except Exception as exc:  # pragma: no cover - important path for production reliability.
+        logger.exception(
+            "Exploration %s failed for topic profile %s",
+            exploration_id,
+            topic_id,
+        )
+        _set_pipeline_stage(progress, "done", "failed")
+        progress["error"] = str(exc)
+        database.update_exploration_progress(exploration_id, progress=progress)
+        database.update_exploration_status(
+            exploration_id,
+            status="failed",
+        )
+        raise
+
+
+def _promote_explore_sources(
+    *,
+    topic_id: str,
+    discovery: DiscoveryResult,
+    article_results: list[ArticleFetchResult],
+) -> None:
+    kept_payloads = [
+        result.payload
+        for result in article_results
+        if result.tier != "dropped" and result.status == "fetched"
+    ]
+    if not kept_payloads:
+        return
+
+    payload_adapters: dict[str, str] = {
+        candidate.payload.id: candidate.adapter
+        for candidate in discovery.candidates
+    }
+    promoted: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, bool, str | None]] = set()
+    for payload in kept_payloads:
+        adapter = payload_adapters.get(payload.id) or _infer_payload_adapter(payload)
+        source = _extract_promoted_source(adapter=adapter, payload=payload)
+        if source is None:
+            continue
+        key = (
+            source["adapter"],
+            source["ref"],
+            source["has_feed"],
+            source.get("feed_url"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        promoted.append(source)
+
+    if not promoted:
+        return
+
+    for source in promoted:
+        try:
+            database.add_promoted_source(
+                topic_id=topic_id,
+                adapter=source["adapter"],
+                ref=source["ref"],
+                has_feed=source["has_feed"],
+                feed_url=source.get("feed_url"),
+            )
+        except Exception:
+            logger.exception("Failed to persist explore promoted source for topic %s", topic_id)
+
+    topic = database.get_topic_profile(topic_id)
+    if topic is None:
+        return
+    refreshed = _normalize_promoted_sources(
+        [*database.list_promoted_sources(topic_id), *topic["profile"].get("promoted_sources", [])],
+    )
+    profile = dict(topic["profile"])
+    profile["promoted_sources"] = refreshed
+    profile["topic_id"] = topic_id
+    profile["statement"] = str(topic.get("statement") or profile.get("statement") or "")
+    profile["schedule"] = topic.get("schedule")
+    database.upsert_topic_profile(profile)
+
+
+def _all_configured_podcast_sources() -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for digest in database.list_digests(include_archived=False):
+        for source in digest.get("sources", []):
+            if not isinstance(source, dict) or source.get("type") not in {"podcast_rss", "podcast_search"}:
+                continue
+            key = str(source.get("feed_url") or source.get("query") or source.get("title") or "").strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            sources.append(dict(source))
+    return sources
+
+
+def _infer_payload_adapter(payload: Any) -> str | None:
+    if not isinstance(payload, ArticleFetchResult):
+        source_type = str(payload.source_type).strip()
+        metadata = dict(getattr(payload, "metadata", {}))
+    else:
+        source_type = str(payload.payload.source_type).strip()
+        metadata = dict(payload.payload.metadata)
+    if source_type == "podcast_episode":
+        return "podcasts"
+    if source_type == "youtube_video":
+        return "youtube"
+    if source_type == "foreign_web":
+        return "foreign_media"
+    if source_type == "collection_chunk":
+        return "collections"
+    if source_type == "market_snapshot":
+        return "markets"
+    if source_type == "reddit_thread":
+        return "reddit"
+    if source_type in {"gmail", "gmail_link"}:
+        if metadata.get("search_query") or metadata.get("search_provider"):
+            return "web_search"
+        return "gmail"
+    return None
+
+
+def _extract_promoted_source(*, adapter: str | None, payload: Any) -> dict[str, Any] | None:
+    if not adapter:
+        return None
+    normalized_adapter = str(adapter).strip()
+    if not normalized_adapter:
+        return None
+
+    if isinstance(payload, ArticleFetchResult):
+        payload_obj = payload.payload
+    else:
+        payload_obj = payload
+    metadata = dict(payload_obj.metadata)
+    source_name = str(payload_obj.source_name).strip()
+
+    if normalized_adapter == "gmail":
+        ref = str(metadata.get("sender_email") or source_name).strip()
+        if not ref:
+            return None
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    if normalized_adapter == "reddit":
+        ref = str(metadata.get("subreddit") or source_name).strip()
+        if not ref:
+            return None
+        if source_name and not ref.lower().startswith("r/"):
+            ref = f"r/{ref}"
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    if normalized_adapter == "podcasts":
+        ref = str(metadata.get("podcast_title") or metadata.get("podcast") or source_name).strip()
+        if not ref:
+            return None
+        feed_url = str(metadata.get("feed_url") or "").strip() or None
+        return {
+            "adapter": normalized_adapter,
+            "ref": ref,
+            "has_feed": bool(feed_url),
+            "feed_url": feed_url,
+        }
+
+    if normalized_adapter == "web_search":
+        ref = str(metadata.get("search_query") or payload_obj.original_url or source_name).strip()
+        if not ref:
+            return None
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    if normalized_adapter == "youtube":
+        ref = str(metadata.get("channel_name") or source_name).strip()
+        if not ref:
+            return None
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    if normalized_adapter == "collections":
+        ref = str(metadata.get("collection_name") or source_name).strip()
+        if not ref:
+            return None
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    if normalized_adapter == "markets":
+        ref = str(metadata.get("ticker") or source_name).strip()
+        if not ref:
+            return None
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    return None
+
+
+def _normalize_promoted_sources(values: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, bool, str | None]] = set()
+    for value in values:
+        if isinstance(value, dict):
+            candidate = value
+            adapter = str(candidate.get("adapter") or "").strip()
+            ref = str(candidate.get("ref") or "").strip()
+            if not adapter or not ref:
+                continue
+            has_feed = bool(candidate.get("has_feed"))
+            feed_url = str(candidate.get("feed_url") or "").strip() or None
+        elif isinstance(value, tuple) and len(value) >= 2:
+            adapter = str(value[0]).strip()
+            ref = str(value[1]).strip()
+            if not adapter or not ref:
+                continue
+            has_feed = False
+            feed_url = None
+        else:
+            continue
+
+        key = (adapter, ref, has_feed, feed_url)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "adapter": adapter,
+            "ref": ref,
+            "has_feed": has_feed,
+            "feed_url": feed_url,
+        })
+    return normalized
+
+
+def read_brief_html(exploration_id: str) -> str | None:
+    exploration = database.get_exploration(exploration_id)
+    if exploration is None or exploration.get("deleted_at") or not exploration.get("brief_ref"):
+        return None
+    path = Path(str(exploration["brief_ref"]))
+    settings = get_settings()
+    output_dir = (settings.data_dir / "digest-output").resolve()
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        return None
+    if output_dir not in (resolved_path, *resolved_path.parents):
+        return None
+    try:
+        return resolved_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+async def _run_digest_core(
+    *,
+    profile: TopicProfile,
+    payloads: list[Any],
+    fetched_articles: list[ArticleFetchResult],
+    lookback_hours: int = 24,
+    inference_run_id: str,
+    progress: dict[str, Any],
+    persist: Callable[[], None],
+) -> list[ArticleFetchResult]:
+    digest = {
+        "id": profile.topic_id,
+        "name": _brief_title(profile),
+        "interest": profile.search_text(),
+        "threshold": 0.45,
+    }
+    _set_pipeline_stage(progress, "summarize", "running")
+    persist()
+
+    enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
+    enriched_articles = database.apply_feedback_to_candidates(profile.topic_id, enriched_articles)
+    ranked_articles = prepare_issue_articles(digest, enriched_articles)
+
+    _set_pipeline_stage(progress, "summarize", "done")
+    _set_pipeline_stage(progress, "rank", "running")
+    persist()
+
+    settings = get_settings()
+    brief_model = profile.models.get("brief")
+    librarian_resolution = model_routing.client_for_agent(
+        "librarian",
+        settings=settings,
+        items=ranked_articles,
+        model_override=brief_model,
+    )
+    librarian_client = librarian_resolution.client
+
+    if librarian_client is not None:
+        ranked_articles = database.apply_cached_model_enrichments(
+            ranked_articles,
+            model_name=_model_client_name(librarian_client, settings.librarian_model),
+            limit=settings.librarian_model_max_items,
+        )
+
+    article_results = await refine_ranked_articles_with_model(
+        ranked_articles,
+        model_client=librarian_client,
+        model_max_items=min(settings.librarian_model_max_items, _EXPLORE_MODEL_REFINEMENT_LIMIT),
+        inference_run_id=inference_run_id,
+        metrics_mode="single",
+    )
+    _set_pipeline_stage(progress, "audit", "running")
+    progress["source_audit"] = {
+        "status": "running",
+        "message": "Auditing candidate sources for freshness, fit, and source quality.",
+    }
+    persist()
+    audit_client = model_routing.client_for_agent(
+        "source_audit",
+        settings=settings,
+        items=article_results,
+        model_override=brief_model,
+    ).client
+    article_results, audit_decisions, audit_summary = await apply_source_audit(
+        profile,
+        article_results,
+        lookback_hours=lookback_hours,
+        model_client=audit_client,
+        inference_run_id=inference_run_id,
+    )
+    progress["source_audit"] = audit_summary
+    if audit_summary.get("issues"):
+        progress["source_audit_issues"] = list(audit_summary.get("issues") or [])
+        progress["built_with_issues"] = True
+    _set_pipeline_stage(progress, "audit", "done" if audit_summary.get("status") != "failed" else "failed")
+    persist()
+    _init_reasoning_bucket(progress, "editorial", persist)
+    _init_reasoning_bucket(progress, "critic", persist)
+    _set_pipeline_stage(progress, "rank", "done")
+    _set_pipeline_stage(progress, "review", "running")
+    persist()
+
+    flush_reasoning = _reasoning_flusher(progress, persist)
+
+    editorial_client = model_routing.client_for_agent(
+        "editorial",
+        settings=settings,
+        items=article_results,
+        model_override=brief_model,
+    ).client
+    article_results, _editorial_decisions = await apply_editorial_decisions(
+        digest,
+        article_results,
+        model_client=editorial_client,
+        reasoning_callback=flush_reasoning("editorial"),
+        inference_run_id=inference_run_id,
+    )
+    critic_client = model_routing.client_for_agent(
+        "critic",
+        settings=settings,
+        items=article_results,
+        model_override=brief_model,
+    ).client
+    article_results, _critic_decisions = await apply_critic_repairs(
+        digest,
+        payloads,
+        article_results,
+        model_client=critic_client,
+        reasoning_callback=flush_reasoning("critic"),
+        inference_run_id=inference_run_id,
+    )
+    article_results, _quality_decisions = apply_brief_quality_checks(article_results)
+    _set_pipeline_stage(progress, "review", "done")
+
+    if librarian_client is not None:
+        database.cache_model_enrichments(article_results, model_name=_model_client_name(librarian_client, settings.librarian_model))
+    return article_results
+
+
+def _newsletter_source_notes_for_brief(
+    payloads: list[NormalizedPayload],
+    article_results: list[ArticleFetchResult],
+) -> list[NormalizedPayload]:
+    kept_gmail_links = [
+        result.payload
+        for result in article_results
+        if result.fetched and result.tier != "dropped" and result.payload.source_type == "gmail_link"
+    ]
+    if not kept_gmail_links:
+        return []
+
+    kept_message_ids = {
+        str(payload.metadata.get("gmail_message_id") or "").strip()
+        for payload in kept_gmail_links
+        if str(payload.metadata.get("gmail_message_id") or "").strip()
+    }
+    kept_sources = {
+        str(payload.source_name or payload.metadata.get("sender_email") or "").strip().lower()
+        for payload in kept_gmail_links
+        if str(payload.source_name or payload.metadata.get("sender_email") or "").strip()
+    }
+
+    notes: list[NormalizedPayload] = []
+    seen: set[str] = set()
+    for payload in payloads:
+        if payload.source_type != "gmail":
+            continue
+        message_id = str(payload.metadata.get("gmail_message_id") or "").strip()
+        source_name = str(payload.source_name or payload.metadata.get("sender_email") or "").strip().lower()
+        if message_id and message_id in kept_message_ids:
+            key = f"message:{message_id}"
+        elif source_name and source_name in kept_sources:
+            key = f"source:{source_name}"
+        else:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        notes.append(payload)
+    return notes
+
+
+def _model_client_name(model_client: Any, fallback: str | None) -> str:
+    config = getattr(model_client, "config", None)
+    model = getattr(config, "model", None)
+    return str(model or fallback or "unknown")
+
+
+def _write_exploration_brief(exploration_id: str, html: str) -> str:
+    settings = get_settings()
+    ensure_runtime_dirs(settings)
+    output_dir = settings.data_dir / "digest-output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"exploration-{exploration_id}.html"
+    path.write_text(html, encoding="utf-8")
+    return str(path)
+
+
+def _initial_progress(
+    source_selection: dict[str, bool],
+    source_names: list[str] | None = None,
+) -> dict[str, Any]:
+    if source_names is None:
+        source_names = sorted(default_source_registry().names())
+    progress_sources = {
+        name: {"status": "disabled", "candidate_count": 0}
+        if not bool(source_selection.get(name, False))
+        else {"status": "pending", "candidate_count": 0}
+        for name in source_names
+    }
+    return {
+        "pipeline": {stage: "pending" for stage in _PIPELINE_STAGES},
+        "sources": progress_sources,
+        "candidate_count": 0,
+        "exclusions": [],
+    }
+
+
+def _set_pipeline_stage(progress: dict[str, Any], stage: str, value: str) -> None:
+    pipeline = dict(progress.get("pipeline", {}))
+    pipeline[stage] = value
+    progress["pipeline"] = pipeline
+
+
+def _set_source_status(progress: dict[str, Any], adapter_status: Any) -> None:
+    sources = dict(progress.get("sources", {}))
+    sources[adapter_status.name] = {
+        "status": adapter_status.status,
+        "candidate_count": adapter_status.candidate_count,
+        "message": adapter_status.message,
+        "elapsed_ms": adapter_status.elapsed_ms,
+        "timeout_seconds": adapter_status.timeout_seconds,
+    }
+    progress["sources"] = sources
+
+
+def _init_reasoning_bucket(progress: dict[str, Any], stage: str, persist: Callable[[], None]) -> None:
+    reasoning = dict(progress.get("reasoning", {}))
+    if reasoning.get(stage) is None:
+        reasoning[stage] = ""
+        progress["reasoning"] = reasoning
+        persist()
+
+
+def _reasoning_flusher(progress: dict[str, Any], persist: Callable[[], None]) -> Callable[[str], Callable[[str], None]]:
+    from time import monotonic
+
+    state: dict[str, dict[str, Any]] = {
+        "editorial": {"len": 0, "last_flush": monotonic()},
+        "critic": {"len": 0, "last_flush": monotonic()},
+    }
+
+    def _make_callback(stage: str) -> Callable[[str], None]:
+        def _callback(chunk: str) -> None:
+            if not chunk:
+                return
+            reasoning = dict(progress.get("reasoning", {}))
+            current = str(reasoning.get(stage, ""))
+            current += chunk
+            reasoning[stage] = current
+            progress["reasoning"] = reasoning
+            now = monotonic()
+            state_info = state.get(stage)
+            if state_info is None:
+                state[stage] = {"len": len(current), "last_flush": now}
+                persist()
+                return
+            if len(current) - int(state_info["len"]) >= 240 or now - float(state_info["last_flush"]) >= 0.35:
+                state_info["len"] = len(current)
+                state_info["last_flush"] = now
+                persist()
+
+        return _callback
+
+    return _make_callback
+
+
+def _set_candidate_count(progress: dict[str, Any], value: int) -> None:
+    progress["candidate_count"] = value
+
+
+def _set_exclusion_reasons(progress: dict[str, Any], reasons: Any) -> None:
+    if not reasons:
+        return
+    progress["exclusions"] = list(reasons)
+
+
+def _set_requested_source_issues(progress: dict[str, Any], issues: list[dict[str, str]]) -> None:
+    progress["requested_source_issues"] = issues
+    progress["built_with_issues"] = bool(issues)
+
+
+def exploration_requested_source_issues(exploration: dict[str, Any]) -> list[dict[str, str]]:
+    return exploration_build_issues(exploration, include_source_audit=False)
+
+
+def exploration_build_issues(
+    exploration: dict[str, Any],
+    *,
+    include_source_audit: bool = True,
+) -> list[dict[str, str]]:
+    progress = exploration.get("progress")
+    if not isinstance(progress, dict):
+        return []
+    raw_issues: list[Any] = []
+    requested = progress.get("requested_source_issues")
+    if isinstance(requested, list):
+        raw_issues.extend(requested)
+    if include_source_audit:
+        audit = progress.get("source_audit_issues")
+        if isinstance(audit, list):
+            raw_issues.extend(audit)
+    issues: list[dict[str, str]] = []
+    for issue in raw_issues:
+        if not isinstance(issue, dict):
+            continue
+        source_name = str(issue.get("source_name") or issue.get("ref") or "").strip()
+        reason = str(issue.get("reason") or "").strip()
+        if source_name and reason:
+            issues.append({"source_name": source_name, "reason": reason})
+    return issues
+
+
+def _requested_source_issues(
+    profile: TopicProfile,
+    discovery: DiscoveryResult,
+    source_selection: dict[str, bool],
+) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for requested in profile.requested_sources:
+        adapter = str(requested.get("adapter") or "").strip()
+        source_name = str(requested.get("ref") or requested.get("source_name") or "").strip()
+        if not adapter or not source_name:
+            continue
+        if source_selection.get(adapter) is False:
+            issues.append({
+                "source_name": source_name,
+                "reason": f"{_adapter_label(adapter)} was not selected for this brief.",
+            })
+            continue
+        if _requested_source_found(adapter=adapter, source_name=source_name, discovery=discovery):
+            continue
+        status = next((item for item in discovery.statuses if item.name == adapter), None)
+        if status and status.message:
+            reason = status.message
+        elif status and status.status in {"timed_out", "failed", "skipped"}:
+            reason = f"{_adapter_label(adapter)} {status.status.replace('_', ' ')}."
+        else:
+            reason = "Source could not be found or returned no usable items."
+        issues.append({"source_name": source_name, "reason": reason})
+    return issues
+
+
+def _requested_source_found(*, adapter: str, source_name: str, discovery: DiscoveryResult) -> bool:
+    needle = source_name.strip().lower()
+    if not needle:
+        return False
+    for candidate in discovery.candidates:
+        if candidate.adapter != adapter:
+            continue
+        payload = candidate.payload
+        haystack_parts = [
+            payload.source_name,
+            payload.original_url,
+            *[str(value) for value in payload.metadata.values() if isinstance(value, (str, int, float))],
+        ]
+        haystack = " ".join(haystack_parts).lower()
+        if needle in haystack or haystack in needle:
+            return True
+    return False
+
+
+def _adapter_label(adapter: str) -> str:
+    labels = {
+        "web_search": "Web Search",
+        "foreign_media": "Foreign Media",
+        "gmail": "Gmail",
+        "reddit": "Reddit",
+        "podcasts": "Podcast",
+        "youtube": "YouTube",
+        "collections": "Collections",
+        "markets": "Markets",
+    }
+    return labels.get(adapter, adapter.replace("_", " ").title())
+
+
+def _brief_search_strategy(
+    profile: TopicProfile,
+    source_selection: dict[str, bool],
+    lookback_hours: int,
+) -> dict[str, Any]:
+    selected_sources = [
+        _adapter_label(name)
+        for name, enabled in source_selection.items()
+        if enabled
+    ]
+    queries = _strategy_queries(profile)
+    exclusions = [item for item in profile.exclusions[:3] if item]
+    scope = _source_scope_label(lookback_hours)
+    summary_parts = [
+        f"Focused on {profile.scope or profile.statement}",
+        f"searched {', '.join(selected_sources[:5])}" if selected_sources else "",
+        f"with a {scope} source scope",
+    ]
+    if queries:
+        summary_parts.append(f"using queries like \"{queries[0]}\"")
+    if exclusions:
+        summary_parts.append("excluding " + ", ".join(exclusions))
+    return {
+        "summary": "; ".join(part for part in summary_parts if part) + ".",
+        "queries": queries,
+        "sources": selected_sources,
+        "source_scope": scope,
+        "exclusions": exclusions,
+    }
+
+
+def _strategy_queries(profile: TopicProfile) -> list[str]:
+    queries: list[str] = []
+    for query in profile.search_queries:
+        if query and query not in queries:
+            queries.append(query)
+        if len(queries) >= 3:
+            return queries
+    for adapter_queries in profile.source_queries.values():
+        for query in adapter_queries:
+            if query and query not in queries:
+                queries.append(query)
+            if len(queries) >= 3:
+                return queries
+    if not queries and profile.keywords:
+        queries.append(" ".join(profile.keywords[:8]))
+    return queries[:3]
+
+
+def _source_scope_label(lookback_hours: int) -> str:
+    try:
+        hours = max(1, int(lookback_hours))
+    except (TypeError, ValueError):
+        hours = 24
+    if hours % 24 == 0:
+        days = hours // 24
+        return "last 24 hours" if days == 1 else f"last {days} days"
+    return "last hour" if hours == 1 else f"last {hours} hours"
+
+
+def _persist_progress(exploration_id: str, progress: dict[str, Any]) -> None:
+    database.update_exploration_progress(
+        exploration_id,
+        progress=dict(progress),
+    )
+
+
+def _elapsed_stage_seconds(started_at: float) -> float:
+    return round(max(0.001, monotonic() - started_at), 3)
+
+
+def _brief_title(profile: TopicProfile) -> str:
+    scope = profile.scope or profile.statement or "Explore"
+    return f"{scope[:96]} - Morning Dispatch Issue"
+
+
+def _selected_source_count(discovery: DiscoveryResult, source_selection: dict[str, bool]) -> int:
+    discovered_names = {status.name for status in discovery.statuses}
+    selected = [name for name, enabled in source_selection.items() if enabled and name in discovered_names]
+    return len(selected)
+
+
+def _merged_source_selection(
+    profile: TopicProfile,
+    source_selection: dict[str, bool] | None,
+) -> dict[str, bool]:
+    return {**profile.source_selection, **(source_selection or {})}

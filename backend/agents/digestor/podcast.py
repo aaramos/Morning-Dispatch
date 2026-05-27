@@ -27,7 +27,7 @@ from backend.db.queries import get_watermark, upsert_watermark
 
 logger = logging.getLogger(__name__)
 
-MAX_PODCAST_EPISODES = 4
+MAX_PODCAST_EPISODES = 8
 MAX_DISCOVERED_FEEDS = 3
 REQUEST_TIMEOUT_SECONDS = 20
 MIN_EPISODE_SCORE = 0.22
@@ -46,6 +46,7 @@ class PodcastEpisode:
     audio_url: str | None
     duration_seconds: int | None = None
     apple_podcasts_url: str | None = None
+    image_url: str | None = None
 
 
 async def fetch_podcast_episodes(
@@ -252,6 +253,7 @@ async def _fetch_podcast_episodes(
                 "apple_podcasts_url": episode.apple_podcasts_url,
                 "audio_url": episode.audio_url,
                 "episode_url": episode.episode_url,
+                "image_url": episode.image_url,
                 "duration_seconds": episode.duration_seconds,
                 "episode_quality_score": score,
                 "transcript_source": transcript_source,
@@ -418,6 +420,7 @@ def parse_podcast_feed(xml_text: str, *, feed_url: str, fallback_show_name: str 
     if channel is None:
         return []
     show_name = _child_text(channel, "title") or fallback_show_name
+    show_image_url = _image_url(channel)
     episodes: list[PodcastEpisode] = []
     for item in channel.findall("item"):
         title = _clean_text(_child_text(item, "title") or "Podcast episode")
@@ -438,6 +441,7 @@ def parse_podcast_feed(xml_text: str, *, feed_url: str, fallback_show_name: str 
                 episode_url=episode_url,
                 audio_url=audio_url,
                 duration_seconds=_duration_seconds(_child_text(item, "duration")),
+                image_url=_image_url(item) or show_image_url,
             )
         )
     return episodes
@@ -571,6 +575,7 @@ def _podcast_metric_base(
         "audio_url": episode.audio_url,
         "episode_url": episode.episode_url,
         "apple_podcasts_url": episode.apple_podcasts_url,
+        "image_url": episode.image_url,
         "published_at": episode.published_at,
         "duration_seconds": episode.duration_seconds,
         "quality_score": score,
@@ -846,6 +851,19 @@ def _enclosure_url(item: ElementTree.Element) -> str | None:
             url = str(child.attrib.get("url") or "").strip()
             if url:
                 return url
+    return None
+
+
+def _image_url(element: ElementTree.Element) -> str | None:
+    for child in element.iter():
+        if _local_name(child.tag).lower() != "image":
+            continue
+        href = str(child.attrib.get("href") or child.attrib.get("url") or "").strip()
+        if href.startswith(("http://", "https://")):
+            return href
+        nested_url = _child_text(child, "url")
+        if nested_url and nested_url.startswith(("http://", "https://")):
+            return nested_url
     return None
 
 

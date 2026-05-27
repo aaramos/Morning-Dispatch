@@ -11,21 +11,23 @@ from backend.agents.librarian.text_utils import fallback_text, keyword_set
 
 
 def prepare_issue_articles(digest: dict[str, Any], results: Iterable[ArticleFetchResult]) -> list[ArticleFetchResult]:
-    interest_tokens = _filtered_interest_tokens(str(digest.get("interest") or ""))
+    interest = str(digest.get("interest") or "")
+    interest_tokens = _filtered_interest_tokens(interest)
+    exclusion_phrases = _exclusion_phrases(interest)
     threshold = float(digest.get("threshold") or 0.45)
     prepared: list[ArticleFetchResult] = []
 
     for result in results:
         if result.tier == "dropped":
             continue
-        enriched = _prepare_result(result, interest_tokens, threshold)
+        enriched = _prepare_result(result, interest_tokens, threshold, exclusion_phrases)
         if enriched.tier == "dropped":
             continue
         prepared.append(enriched)
 
     prepared.sort(key=_sort_key, reverse=True)
     for index, result in enumerate(prepared):
-        if index == 0 and result.fetched:
+        if result.fetched and result.tier != "lower_confidence":
             prepared[index] = replace(result, tier="lead", section=result.section or "Lead Story")
             break
     return prepared
@@ -62,6 +64,7 @@ def _prepare_result(
     result: ArticleFetchResult,
     interest_tokens: set[str],
     threshold: float,
+    exclusion_phrases: tuple[str, ...] = (),
 ) -> ArticleFetchResult:
     source_text = result.text or result.excerpt or fallback_text(result)
     keywords = list(result.keywords)
@@ -70,13 +73,18 @@ def _prepare_result(
     elif result.payload.source_type == "podcast_episode":
         section = "Podcast Signals"
     else:
-        section = _section_for(result.title, source_text, keywords)
+        section = _section_for(result.title, source_text, keywords, interest_tokens)
     relevance = _relevance_score(result, interest_tokens, keywords)
     topic_signal = _has_ai_topic_signal(result)
     if topic_signal and result.payload.source_type == "gmail_link":
         relevance = min(1.0, relevance + 0.18)
 
-    if (
+    if _matches_exclusion(result, source_text, exclusion_phrases):
+        tier = "dropped"
+    elif _translation_unavailable(result):
+        tier = "lower_confidence"
+        section = "Needs Translation"
+    elif (
         _requires_ai_topic_gate(interest_tokens)
         and result.payload.source_type == "gmail_link"
         and not topic_signal
@@ -116,6 +124,16 @@ def _prepare_result(
     )
 
 
+def _translation_unavailable(result: ArticleFetchResult) -> bool:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    payload_metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    translation = metadata.get("translation") or payload_metadata.get("translation")
+    if not isinstance(translation, dict):
+        return False
+    source_language = str(translation.get("source_language") or payload_metadata.get("source_language") or "").strip()
+    return bool(source_language and not translation.get("translated"))
+
+
 def _relevance_score(result: ArticleFetchResult, interest_tokens: set[str], keywords: list[str]) -> float:
     haystack = keyword_set(" ".join([result.title, result.text, result.excerpt, fallback_text(result)]))
     if not haystack:
@@ -135,7 +153,48 @@ def _relevance_score(result: ArticleFetchResult, interest_tokens: set[str], keyw
 
 
 def _filtered_interest_tokens(interest: str) -> set[str]:
-    return keyword_set(interest) - GENERIC_INTEREST_TOKENS
+    return keyword_set(_positive_interest_text(interest)) - GENERIC_INTEREST_TOKENS
+
+
+def _positive_interest_text(interest: str) -> str:
+    return re.split(r"\bAvoid:\s*", interest, maxsplit=1, flags=re.IGNORECASE)[0]
+
+
+def _exclusion_phrases(interest: str) -> tuple[str, ...]:
+    parts = re.split(r"\bAvoid:\s*", interest, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) < 2:
+        return ()
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[,;\n]+|\bor\b", parts[1], flags=re.IGNORECASE):
+        phrase = re.sub(r"\s+", " ", raw.strip().lower())
+        if len(phrase) <= 2 or phrase in seen:
+            continue
+        phrases.append(phrase)
+        seen.add(phrase)
+    return tuple(phrases)
+
+
+def _matches_exclusion(
+    result: ArticleFetchResult,
+    source_text: str,
+    exclusion_phrases: tuple[str, ...],
+) -> bool:
+    if not exclusion_phrases:
+        return False
+    metadata = result.payload.metadata or {}
+    haystack = " ".join(
+        str(value or "")
+        for value in (
+            result.title,
+            result.excerpt,
+            result.editor_summary,
+            source_text[:2000],
+            metadata.get("link_text"),
+            metadata.get("title"),
+        )
+    ).lower()
+    return any(phrase in haystack for phrase in exclusion_phrases)
 
 
 def _requires_ai_topic_gate(interest_tokens: set[str]) -> bool:
@@ -159,9 +218,10 @@ def _has_ai_topic_signal(result: ArticleFetchResult) -> bool:
     return len(list(AI_TOPIC_RE.finditer(summary_context))) >= 2
 
 
-def _section_for(title: str, text: str, keywords: list[str]) -> str:
+def _section_for(title: str, text: str, keywords: list[str], interest_tokens: set[str]) -> str:
     haystack = " ".join([title, text, " ".join(keywords)]).lower()
-    for section, markers in SECTION_MARKERS:
+    markers_by_section = AI_SECTION_MARKERS if _requires_ai_topic_gate(interest_tokens) else GENERAL_SECTION_MARKERS
+    for section, markers in markers_by_section:
         if any(marker in haystack for marker in markers):
             return section
     return "Noteworthy"
@@ -196,13 +256,23 @@ def _sort_key(result: ArticleFetchResult) -> tuple[float, float, float]:
     return (fetched, score, recency)
 
 
-SECTION_MARKERS = (
+AI_SECTION_MARKERS = (
     ("Models & Labs", ("model", "gemini", "gpt", "claude", "openai", "anthropic", "llama", "qwen")),
     ("Agents & Developer Tools", ("agent", "codex", "mcp", "sdk", "api", "developer", "workflow", "automation")),
     ("AI Infrastructure", ("gpu", "compute", "nvidia", "capacity", "training", "inference", "mlx", "cluster")),
     ("Business & Markets", ("enterprise", "business", "market", "investor", "revenue", "startup", "acquires")),
     ("Security & Policy", ("security", "privacy", "copyright", "regulation", "provenance", "policy")),
     ("Product & Work", ("product", "search", "workflow", "customer", "operator", "dashboard")),
+)
+
+
+GENERAL_SECTION_MARKERS = (
+    ("Food & Drink", ("food", "restaurant", "taco", "market", "culinary", "eat", "dining", "coffee", "cafe")),
+    ("Culture & History", ("museum", "history", "historic", "art", "culture", "gallery", "archaeology", "anthropology")),
+    ("Neighborhoods & Walking", ("walk", "walking", "neighborhood", "tour", "street", "district", "itinerary")),
+    ("Outdoors & Movement", ("bike", "biking", "hike", "hiking", "park", "trail", "outdoor")),
+    ("Practical Planning", ("hotel", "stay", "transit", "airport", "safety", "reservation", "planning")),
+    ("Shopping", ("shopping", "shop", "boutique", "store")),
 )
 
 

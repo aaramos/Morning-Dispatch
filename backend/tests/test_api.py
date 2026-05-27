@@ -106,6 +106,10 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert run.status_code == 202
         assert run.json()["status"] == "completed"
 
+        custom_window_run = client.post(f"/api/digests/{digest['id']}/run?lookback_hours=48")
+        assert custom_window_run.status_code == 202
+        assert custom_window_run.json()["lookback_days"] == 2
+
         issue = client.get(f"/api/digests/{digest['id']}/issues/latest")
         assert issue.status_code == 200
         issue_id = issue.json()["id"]
@@ -122,14 +126,24 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "2026-05-20T12:00:00+00:00" not in html.text
         assert "05/20/2026" in html.text
         assert re.search(r"Generated \d{2}/\d{2}/\d{4} ", html.text)
+        assert re.search(r"Generated \d{2}/\d{2}/\d{4} .* Source scope: last 24 hours", html.text)
+        assert "Last 24 hours" not in html.text
         assert "https://example.com/model-release" in html.text
-        assert "Fetched Articles" in html.text
-        assert "Digest Stats" in html.text
-        assert "Model tokens" in html.text
+        assert "Ranked stories" in html.text
+        assert "Fetched Articles" not in html.text
+        assert "Digest Stats" not in html.text
+        assert "brief-sidebar" in html.text
+        assert "How this was made" in html.text
+        assert "Provenance" not in html.text
+        assert "AI tokens" in html.text
+        assert "AI calls" in html.text
+        assert "Model tokens" not in html.text
         assert "Unresolved Links" not in html.text
         assert "data-feedback-signal" in html.text
         assert "overflow-x: hidden" in html.text
         assert "overflow-wrap: anywhere" in html.text
+        assert "-webkit-line-clamp: 4" in html.text
+        assert "font-size: clamp(2.8rem, 8vw, 6.4rem)" not in html.text
 
         feedback = client.post(
             "/api/feedback",
@@ -296,6 +310,10 @@ def test_issue_renderer_includes_all_ranked_articles_and_newsletters():
                 tier="lead" if index == 0 else "main" if index < 18 else "lower_confidence",
                 section="Models & Labs",
                 relevance_score=0.9,
+                metadata={
+                    "image_url": f"https://images.example.com/article-{index}.jpg",
+                    "image_source": "og:image",
+                } if index < 3 else {},
             )
         )
 
@@ -308,9 +326,130 @@ def test_issue_renderer_includes_all_ranked_articles_and_newsletters():
     )
     soup = BeautifulSoup(html, "html.parser")
 
-    assert len(soup.select("article.article-card")) == 30
+    assert len(soup.select(".lead-block")) == 1
+    assert len(soup.select("article.story-row")) == 17
+    assert len(soup.select("article.low-conf-row")) == 12
+    assert len(soup.select(".img-strip img")) == 3
     assert len(soup.select("article.newsletter")) == 10
     assert "additional fetched article" not in html
+
+
+def test_issue_renderer_can_hide_scanned_newsletters_from_topic_brief():
+    newsletters = [
+        NormalizedPayload(
+            source_type="gmail",
+            source_name="ai-news@example.com",
+            raw_text="This newsletter is about model releases, AI tools, and coding agents.",
+            published_at="2026-05-20T12:00:00+00:00",
+            metadata={"subject": "AI newsletter"},
+        )
+    ]
+    article_result = ArticleFetchResult(
+        payload=NormalizedPayload(
+            source_type="web_search",
+            source_name="Web",
+            original_url="https://travel.example.com/mexico-city",
+            raw_text="Mexico City travel guide.",
+        ),
+        original_url="https://travel.example.com/mexico-city",
+        final_url="https://travel.example.com/mexico-city",
+        title="Mexico City Travel Guide",
+        text="A useful Mexico City travel guide.",
+        excerpt="A useful Mexico City travel guide.",
+        domain="travel.example.com",
+        status="fetched",
+        tier="lead",
+    )
+
+    html = database.render_ingested_issue(
+        "Mexico City Brief",
+        "A topic brief should not show unrelated scanned newsletters.",
+        newsletters,
+        [article_result],
+        lookback_hours=24,
+        newsletter_payloads=[],
+    )
+    soup = BeautifulSoup(html, "html.parser")
+
+    assert soup.select("article.newsletter") == []
+    assert soup.select("details.source-notes") == []
+    assert "model releases" not in html
+    assert "No newsletter bodies were available" not in html
+    assert "Mexico City Travel Guide" in html
+
+
+def test_issue_renderer_flags_incomplete_ai_token_counts():
+    article_result = ArticleFetchResult(
+        payload=NormalizedPayload(
+            source_type="web_search",
+            source_name="Web",
+            original_url="https://markets.example.com/memory",
+            raw_text="Memory market story.",
+        ),
+        original_url="https://markets.example.com/memory",
+        final_url="https://markets.example.com/memory",
+        title="Memory market story",
+        text="A useful memory market story.",
+        excerpt="A useful memory market story.",
+        domain="markets.example.com",
+        status="fetched",
+        tier="lead",
+    )
+
+    html = database.render_ingested_issue(
+        "Memory Brief",
+        "A topic brief about memory markets.",
+        [],
+        [article_result],
+        lookback_hours=72,
+        digest_stats={
+            "source_count": 1,
+            "newsletter_count": 0,
+            "link_count": 1,
+            "podcast_episode_count": 0,
+            "article_candidate_count": 1,
+            "included_article_count": 1,
+            "unresolved_count": 0,
+            "dropped_count": 0,
+            "prompt_tokens": 14808,
+            "completion_tokens": 0,
+            "total_tokens": 14808,
+            "model_call_count": 20,
+            "model_success_count": 0,
+            "model_failure_count": 20,
+            "completion_unavailable_count": 20,
+            "model_usage": [
+                {
+                    "model": "Gemma4-MTP-26B-BF16",
+                    "mode": "single",
+                    "call_count": 20,
+                    "success_count": 0,
+                    "failure_count": 20,
+                }
+            ],
+            "search_strategy": {
+                "summary": "Focused on memory supplier performance; searched Web Search and Markets with a last 3 days source scope.",
+            },
+            "processing_seconds": 60,
+            "stage_seconds": {"editorial": 0},
+        },
+    )
+
+    assert "Search strategy" in html
+    assert "Focused on memory supplier performance" in html
+    assert "AI used" in html
+    assert "Gemma4-MTP-26B-BF16 supported article summaries; 0/20 calls completed." in html
+    assert "AI tokens" in html
+    assert "AI calls" in html
+    assert "0/20 ok" in html
+    assert "Source scope: last 3 days" in html
+    assert "Token detail: 14,808 prompt tokens recorded; completion tokens unavailable." in html
+    assert "14,808 prompt + 0 completion" not in html
+    assert "AI warning: 20 model call(s) failed before completion" in html
+    assert "Completion tokens were unavailable for 20 failed call(s)." in html
+    assert "Editorial + review: not measured" in html
+    assert "Editorial: 0 ms" not in html
+    assert "Model tokens" not in html
 
 
 def test_admin_reports_fetch_failures_and_review_counts(monkeypatch, tmp_path):
@@ -386,7 +525,9 @@ def test_admin_reports_fetch_failures_and_review_counts(monkeypatch, tmp_path):
         html = client.get(f"/api/issues/{issue.json()['id']}/html")
         assert "Unresolved Links" not in html.text
         assert "Blocked local model article" not in html.text
-        assert "Digest Stats" in html.text
+        assert "How this was made" in html.text
+        assert "Provenance" not in html.text
+        assert "Digest Stats" not in html.text
 
 
 def test_archived_digests_are_hidden_from_default_lists(monkeypatch, tmp_path):
@@ -514,7 +655,8 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
                 source_name="AI Daily Brief",
                 raw_text=(
                     "Agentic AI workflows for product teams. Podcast: AI Daily Brief. "
-                    "Show notes: OpenAI agents, local LLM infrastructure, and product strategy."
+                    "Transcript: OpenAI agents, local LLM infrastructure, and product strategy. "
+                    "Teams are moving from prompt experiments into agentic workflows."
                 ),
                 original_url="https://podcasts.example.com/agentic-ai-workflows",
                 published_at="2026-05-22T12:00:00+00:00",
@@ -525,8 +667,9 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
                     "feed_url": "https://feeds.example.com/ai-daily.xml",
                     "episode_url": "https://podcasts.example.com/agentic-ai-workflows",
                     "audio_url": "https://cdn.example.com/audio.mp3",
+                    "image_url": "https://podcasts.example.com/artwork.jpg",
                     "episode_quality_score": 0.76,
-                    "transcript_source": "show_notes",
+                    "transcript_source": "transcript",
                 },
             )
         ], [
@@ -585,7 +728,14 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
         assert "https://podcasts.example.com/agentic-ai-workflows" in html.text
         assert "via AI Daily Brief" in html.text
         assert "05/22/2026" in html.text
-        assert "Podcast episodes" in html.text
+        assert "Watch & listen" in html.text
+        assert "Listen" in html.text
+        assert "media-card" in html.text
+        assert "podcast-modal" in html.text
+        assert "https://cdn.example.com/audio.mp3" in html.text
+        assert "https://podcasts.example.com/artwork.jpg" in html.text
+        assert "Transcript" in html.text
+        assert "Teams are moving from prompt experiments" in html.text
 
         admin_status = client.get("/api/admin/status").json()
         assert admin_status["digest_stats"]["podcast_episode_count"] == 1
@@ -669,8 +819,12 @@ def test_digest_run_reuses_cached_model_enrichment(monkeypatch, tmp_path):
             )
         ]
 
+    async def fake_source_audit(_digest, results, **_kwargs):
+        return results, [], {"status": "skipped", "candidate_count": len(results)}
+
     monkeypatch.setattr(digest_runner, "fetch_newsletters", fake_fetch_newsletters)
     monkeypatch.setattr(digest_runner, "fetch_articles_for_payloads", fake_fetch_articles)
+    monkeypatch.setattr(digest_runner, "apply_source_audit", fake_source_audit)
     monkeypatch.setattr(enrichment.ModelClient, "from_settings", staticmethod(lambda _settings: model_client))
 
     with TestClient(create_app()) as client:

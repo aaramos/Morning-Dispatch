@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
-from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -14,7 +14,7 @@ from backend.agents.digestor.base import NormalizedPayload
 
 logger = logging.getLogger(__name__)
 
-MAX_ARTICLE_FETCHES = 120
+MAX_ARTICLE_FETCHES = 250
 MIN_ARTICLE_TEXT_CHARS = 450
 MIN_CONTEXT_FALLBACK_CHARS = 180
 REQUEST_TIMEOUT_SECONDS = 12
@@ -41,6 +41,7 @@ class ArticleFetchResult:
     keywords: tuple[str, ...] = ()
     content_type: str = "article"
     enrichment_source: str = "raw"
+    metadata: dict[str, object] = field(default_factory=dict)
 
     @property
     def fetched(self) -> bool:
@@ -51,7 +52,7 @@ async def fetch_articles_for_payloads(
     payloads: Iterable[NormalizedPayload],
     *,
     max_articles: int = MAX_ARTICLE_FETCHES,
-    concurrency: int = 8,
+    concurrency: int = 10,
 ) -> list[ArticleFetchResult]:
     payload_list = list(payloads)
     direct_results = direct_article_results(payload_list)
@@ -83,12 +84,15 @@ async def fetch_articles_for_payloads(
 def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[ArticleFetchResult]:
     results: list[ArticleFetchResult] = []
     for payload in payloads:
-        if payload.source_type not in {"reddit_thread", "podcast_episode"} or not payload.original_url:
+        if payload.source_type not in {"reddit_thread", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot"} or not payload.original_url:
             continue
         canonical_url = canonicalize_url(payload.original_url)
         title = _payload_title(payload) or payload.source_name or "Direct source"
         text = _clean_text(payload.raw_text)
         is_podcast = payload.source_type == "podcast_episode"
+        is_youtube = payload.source_type == "youtube_video"
+        is_collection = payload.source_type == "collection_chunk"
+        is_market = payload.source_type == "market_snapshot"
         results.append(
             ArticleFetchResult(
                 payload=payload,
@@ -103,10 +107,34 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                 link_score=float(
                     (payload.metadata or {}).get("episode_quality_score")
                     or (payload.metadata or {}).get("thread_quality_score")
+                    or (payload.metadata or {}).get("youtube_quality_score")
+                    or (payload.metadata or {}).get("collection_quality_score")
+                    or (payload.metadata or {}).get("market_quality_score")
                     or 0.65
                 ),
-                section="Podcast Signals" if is_podcast else "Reddit Threads",
-                content_type="podcast" if is_podcast else "reddit_thread",
+                section=(
+                    "Podcast Signals"
+                    if is_podcast
+                    else "YouTube Videos"
+                    if is_youtube
+                    else "Collections"
+                    if is_collection
+                    else "Markets"
+                    if is_market
+                    else "Reddit Threads"
+                ),
+                content_type=(
+                    "podcast"
+                    if is_podcast
+                    else "video"
+                    if is_youtube
+                    else "collection"
+                    if is_collection
+                    else "market"
+                    if is_market
+                    else "reddit_thread"
+                ),
+                metadata=_direct_result_metadata(payload),
             )
         )
     return results
@@ -119,7 +147,7 @@ def select_article_payloads(
 ) -> list[NormalizedPayload]:
     candidates: dict[str, tuple[float, NormalizedPayload]] = {}
     for payload in payloads:
-        if payload.source_type != "gmail_link" or not payload.original_url:
+        if payload.source_type not in {"gmail_link", "foreign_web"} or not payload.original_url:
             continue
         canonical_url = canonicalize_url(unwrap_redirect_url(payload.original_url))
         score = score_link_candidate(canonical_url, _payload_title(payload))
@@ -258,6 +286,7 @@ async def _fetch_one(
                         status="fetched",
                         link_score=link_score,
                         enrichment_source="newsletter_context",
+                        metadata=_article_result_metadata(article),
                     )
                 text = article.text or context
                 excerpt = _truncate(context or article.excerpt or article.text, 520)
@@ -273,6 +302,7 @@ async def _fetch_one(
                     status="no_content",
                     error=f"Readable article text was too short ({len(article.text)} chars)",
                     link_score=link_score,
+                    metadata=_article_result_metadata(article),
                 )
             return ArticleFetchResult(
                 payload=payload,
@@ -285,6 +315,7 @@ async def _fetch_one(
                 domain=_domain(final_url),
                 status="fetched",
                 link_score=link_score,
+                metadata=_article_result_metadata(article),
             )
         except Exception as exc:
             logger.info("Article fetch failed for %s: %s", original_url, exc)
@@ -296,10 +327,13 @@ class ExtractedArticle:
     title: str
     text: str
     excerpt: str
+    image_url: str = ""
+    image_source: str = ""
 
 
 def extract_article(html: str, url: str, *, fallback_title: str = "") -> ExtractedArticle:
     soup = BeautifulSoup(html, "html.parser")
+    image_url, image_source = _extract_image(soup, url)
     for tag in soup(["script", "style", "noscript", "svg", "canvas", "form", "iframe"]):
         tag.decompose()
     for selector in ("nav", "header", "footer", "aside", "[role='navigation']", ".sidebar", ".newsletter"):
@@ -312,7 +346,7 @@ def extract_article(html: str, url: str, *, fallback_title: str = "") -> Extract
     if len(text) < MIN_ARTICLE_TEXT_CHARS and root is not soup.body and soup.body:
         text = _extract_text(soup.body)
     excerpt = _truncate(text, 520)
-    return ExtractedArticle(title=title, text=text, excerpt=excerpt)
+    return ExtractedArticle(title=title, text=text, excerpt=excerpt, image_url=image_url, image_source=image_source)
 
 
 def _best_content_root(soup: BeautifulSoup):
@@ -345,6 +379,23 @@ def _extract_title(soup: BeautifulSoup, *, fallback_title: str, url: str) -> str
         return fallback_title
     parsed = urlparse(url)
     return parsed.netloc.removeprefix("www.") or "Article"
+
+
+def _extract_image(soup: BeautifulSoup, url: str) -> tuple[str, str]:
+    for selector, attr, source in (
+        ("meta[property='og:image']", "content", "og:image"),
+        ("meta[property='og:image:url']", "content", "og:image"),
+        ("meta[name='twitter:image']", "content", "twitter:image"),
+        ("meta[name='twitter:image:src']", "content", "twitter:image"),
+    ):
+        tag = soup.select_one(selector)
+        value = tag.get(attr) if tag else None
+        if not value:
+            continue
+        resolved = urljoin(url, str(value).strip())
+        if resolved.startswith(("http://", "https://")):
+            return resolved, source
+    return "", ""
 
 
 def _extract_text(root) -> str:
@@ -387,6 +438,28 @@ def _payload_title(payload: NormalizedPayload) -> str:
         or metadata.get("subject")
         or ""
     )
+
+
+def _article_result_metadata(article: ExtractedArticle) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    if article.image_url:
+        metadata["image_url"] = article.image_url
+        metadata["image_source"] = article.image_source
+    return metadata
+
+
+def _direct_result_metadata(payload: NormalizedPayload) -> dict[str, object]:
+    metadata = dict(payload.metadata or {})
+    if payload.source_type == "youtube_video":
+        thumbnail_url = str(metadata.get("thumbnail_url") or "").strip()
+        if thumbnail_url:
+            metadata.setdefault("image_url", thumbnail_url)
+            metadata.setdefault("image_source", "youtube")
+    elif payload.source_type == "podcast_episode":
+        image_url = str(metadata.get("image_url") or "").strip()
+        if image_url:
+            metadata.setdefault("image_source", "podcast")
+    return metadata
 
 
 def _failed(
