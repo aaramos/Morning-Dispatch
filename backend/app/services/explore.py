@@ -277,7 +277,7 @@ async def run_discovery(
     mode: str = "show_now",
     source_selection: dict[str, bool] | None = None,
     candidate_limit: int = 80,
-    lookback_hours: int = 24,
+    lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     record = database.get_topic_profile(topic_id)
     if record is None:
@@ -285,6 +285,7 @@ async def run_discovery(
 
     profile = TopicProfile.from_dict(record["profile"])
     merged_selection = _merged_source_selection(profile, source_selection)
+    resolved_lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
     exploration = database.create_exploration(
         topic_id=topic_id,
         mode=mode,
@@ -294,7 +295,7 @@ async def run_discovery(
         context = SourceAdapterContext(
             exploration_id=str(exploration["exploration_id"]),
             candidate_limit=candidate_limit,
-            lookback_hours=lookback_hours,
+            lookback_hours=resolved_lookback_hours,
         )
         result = await DiscoveryRunner(default_source_registry()).run(
             profile,
@@ -327,7 +328,7 @@ async def run_show_now(
     *,
     source_selection: dict[str, bool] | None = None,
     candidate_limit: int = 80,
-    lookback_hours: int = 24,
+    lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     return await _run_exploration(
         topic_id,
@@ -344,7 +345,7 @@ def start_show_now(
     mode: str = "show_now",
     source_selection: dict[str, bool] | None = None,
     candidate_limit: int = 80,
-    lookback_hours: int = 24,
+    lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     record = database.get_topic_profile(topic_id)
     if record is None:
@@ -352,6 +353,7 @@ def start_show_now(
 
     profile = TopicProfile.from_dict(record["profile"])
     merged_selection = _merged_source_selection(profile, source_selection)
+    resolved_lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
     exploration = database.create_exploration(
         topic_id=topic_id,
         mode=mode,
@@ -361,11 +363,12 @@ def start_show_now(
     initial_progress = _initial_progress(merged_selection)
     initial_progress["queue"] = {
         "status": "queued",
-        "message": "Waiting for the current brief build to finish.",
+        "message": "Build queued. Waiting for the current brief build to finish.",
+        "action": "build",
     }
     initial_progress["queue_options"] = {
         "candidate_limit": candidate_limit,
-        "lookback_hours": lookback_hours,
+        "lookback_hours": resolved_lookback_hours,
     }
     database.update_exploration_progress(
         str(exploration["exploration_id"]),
@@ -380,7 +383,7 @@ def start_rebuild(
     *,
     source_selection: dict[str, bool] | None = None,
     candidate_limit: int = 80,
-    lookback_hours: int = 24,
+    lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     exploration = database.get_exploration(exploration_id)
     if exploration is None or exploration.get("deleted_at"):
@@ -391,14 +394,16 @@ def start_rebuild(
         return None
     profile = TopicProfile.from_dict(topic["profile"])
     merged_selection = _merged_source_selection(profile, source_selection or exploration.get("source_selection"))
+    resolved_lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
     progress = _initial_progress(merged_selection)
     progress["queue"] = {
         "status": "queued",
-        "message": "Waiting for the current brief build to finish.",
+        "message": "Rebuild queued. The full pipeline will run again.",
+        "action": "rebuild",
     }
     progress["queue_options"] = {
         "candidate_limit": candidate_limit,
-        "lookback_hours": lookback_hours,
+        "lookback_hours": resolved_lookback_hours,
     }
     rebuilt = database.reset_exploration_for_rebuild(
         exploration_id,
@@ -416,7 +421,7 @@ async def run_scheduled(
     *,
     source_selection: dict[str, bool] | None = None,
     candidate_limit: int = 80,
-    lookback_hours: int = 24,
+    lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     return await _run_exploration(
         topic_id,
@@ -433,7 +438,7 @@ async def _run_exploration(
     mode: str,
     source_selection: dict[str, bool] | None,
     candidate_limit: int,
-    lookback_hours: int,
+    lookback_hours: int | None,
     existing_exploration: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     started_at = monotonic()
@@ -443,6 +448,7 @@ async def _run_exploration(
 
     profile = TopicProfile.from_dict(record["profile"])
     merged_selection = _merged_source_selection(profile, source_selection)
+    lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
 
     exploration = existing_exploration
     if exploration is None:
@@ -455,9 +461,14 @@ async def _run_exploration(
     exploration_id = str(exploration["exploration_id"])
     database.update_exploration_status(exploration_id, status="running")
     progress = _initial_progress(merged_selection)
+    prior_progress = existing_exploration.get("progress") if existing_exploration else {}
+    queue_action = ""
+    if isinstance(prior_progress, dict):
+        queue_action = str((prior_progress.get("queue") or {}).get("action") or "")
     progress["queue"] = {
         "status": "running",
-        "message": "Building now.",
+        "message": "Running the full pipeline now." if queue_action == "rebuild" else "Building now.",
+        "action": queue_action or "build",
     }
     database.update_exploration_progress(exploration_id, progress=progress)
 
@@ -1185,6 +1196,26 @@ def _requested_source_found(*, adapter: str, source_name: str, discovery: Discov
         if needle in haystack or haystack in needle:
             return True
     return False
+
+
+def _resolve_lookback_hours(profile: TopicProfile, lookback_hours: int | None) -> int:
+    if lookback_hours is not None:
+        return _bounded_lookback_hours(lookback_hours)
+    if profile.lookback_hours is not None:
+        return _bounded_lookback_hours(profile.lookback_hours)
+    if profile.recency_weighting in {"last_year", "all_available"}:
+        return 8760
+    if profile.recency_weighting == "recent":
+        return 72
+    return 24
+
+
+def _bounded_lookback_hours(value: int) -> int:
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        return 24
+    return min(8760, max(1, hours))
 
 
 def _adapter_label(adapter: str) -> str:

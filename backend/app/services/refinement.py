@@ -310,14 +310,40 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
 
 def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
     statement = str(payload.get("statement") or "").strip()
+    topic_id = str(payload.get("topic_id") or "").strip()
+    existing_profile: dict[str, Any] | None = None
+    if topic_id:
+        record = database.get_topic_profile(topic_id)
+        if record is not None and isinstance(record.get("profile"), dict):
+            existing_profile = dict(record["profile"])
+            statement = statement or str(record.get("statement") or existing_profile.get("statement") or "").strip()
     source_selection = payload.get("source_selection")
     if not isinstance(source_selection, dict):
-        source_selection = dict(DEFAULT_EXPLORE_SOURCE_SELECTION)
+        source_selection = dict(existing_profile.get("source_selection") or DEFAULT_EXPLORE_SOURCE_SELECTION) if existing_profile else dict(DEFAULT_EXPLORE_SOURCE_SELECTION)
     selected_sources = {
         str(key): bool(value)
         for key, value in source_selection.items()
     }
+    if existing_profile is not None:
+        profile = _coerce_profile(
+            {
+                **existing_profile,
+                "topic_id": topic_id,
+                "statement": statement,
+                "source_selection": {**existing_profile.get("source_selection", {}), **selected_sources},
+                "models": {**(existing_profile.get("models") or {}), **_models(payload.get("models"))},
+            }
+        )
+        if payload.get("revisit"):
+            profile = {
+                **profile,
+                "_revisit_existing": True,
+                "related_interests_answered": False,
+                "requested_sources_answered": False,
+            }
+        return profile
     requested_sources = _extract_requested_sources(statement)
+    lookback_hours = _extract_lookback_hours(statement)
     return {
         "topic_id": database.new_id(),
         "statement": statement,
@@ -329,6 +355,7 @@ def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "foreign_language_plan": [],
         "depth": "",
         "recency_weighting": "",
+        "lookback_hours": lookback_hours,
         "exclusions": [],
         "source_selection": {**DEFAULT_EXPLORE_SOURCE_SELECTION, **selected_sources},
         "requested_sources": requested_sources,
@@ -437,6 +464,7 @@ def _build_refinement_agent_prompt(
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
         "depth": _normalize_depth(profile.get("depth")),
         "recency_weighting": _normalize_recency(profile.get("recency_weighting")),
+        "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
         "exclusions": _string_list(profile.get("exclusions")),
         "source_selection": _source_selection_dict(profile.get("source_selection")),
         "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
@@ -486,6 +514,10 @@ def _build_refinement_agent_prompt(
                 "defaults. min_turns is a floor on quality: if intent is already clear, ask a "
                 "concrete confirmation or constraint question rather than a generic form question."
             ),
+            "revisit_policy": (
+                "If this is an existing profile being revisited, ask how to sharpen the search plan "
+                "or what would make the rebuilt brief more useful before marking ready."
+            ) if profile.get("_revisit_existing") and messages == [] and turn_count == 0 else "",
         },
         ensure_ascii=False,
     )
@@ -557,6 +589,9 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
     recency = _normalize_recency(patch.get("recency_weighting"))
     if recency:
         updated["recency_weighting"] = recency
+    lookback_hours = _coerce_lookback_hours(patch.get("lookback_hours"))
+    if lookback_hours:
+        updated["lookback_hours"] = lookback_hours
 
     if "source_queries" in patch:
         updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), patch.get("source_queries"))
@@ -897,6 +932,18 @@ def _normalize_recency(value: Any) -> str:
     return ""
 
 
+def _coerce_lookback_hours(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        return None
+    if hours < 1:
+        return None
+    return min(hours, 8760)
+
+
 def _build_refinement_prompt(*, field: str, answer: str, profile: dict[str, Any]) -> str:
     profile_snapshot = {
         "statement": str(profile.get("statement") or ""),
@@ -1139,6 +1186,9 @@ def _seed_profile_with_hints(profile: dict[str, Any]) -> dict[str, Any]:
     if not updated.get("depth") and _contains(text, DEPTH_PRACTITIONER_TOKENS):
         updated["depth"] = "practitioner"
     lookback = _extract_lookback_constraint(statement)
+    lookback_hours = _extract_lookback_hours(statement)
+    if lookback_hours:
+        updated["lookback_hours"] = lookback_hours
     if lookback:
         updated["recency_weighting"] = "breaking"
         updated["source_scope_answered"] = True
@@ -1210,6 +1260,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
         "depth": str(profile.get("depth") or ""),
         "recency_weighting": str(profile.get("recency_weighting") or ""),
+        "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
         "exclusions": _string_list(profile.get("exclusions")),
         "source_selection": selected_sources,
         "requested_sources": requested_sources,
@@ -1218,6 +1269,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "depth_answered": bool(profile.get("depth_answered")),
         "source_scope_answered": bool(profile.get("source_scope_answered")),
         "exclusions_answered": bool(profile.get("exclusions_answered")),
+        "_revisit_existing": bool(profile.get("_revisit_existing")),
         "promoted_sources": [
             dict(source)
             for source in (profile.get("promoted_sources") or [])
@@ -1251,6 +1303,7 @@ def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
     companies = _extract_market_entities(statement)
     return {
         "lookback_window": _extract_lookback_constraint(statement),
+        "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")) or _extract_lookback_hours(statement),
         "recency_already_answered": bool(profile.get("source_scope_answered")) or bool(_normalize_recency(profile.get("recency_weighting"))),
         "excluded_publishers_or_source_types": _string_list(profile.get("exclusions")),
         "exclusions_already_answered": bool(profile.get("exclusions_answered")) or bool(_string_list(profile.get("exclusions"))),
@@ -1276,6 +1329,26 @@ def _extract_lookback_constraint(text: str) -> str:
     if re.search(r"\b(today|latest|breaking|current|this week)\b", lowered):
         return "current/latest"
     return ""
+
+
+def _extract_lookback_hours(text: str) -> int | None:
+    lowered = str(text or "").lower()
+    match = re.search(r"\b(?:previous|past|last|within)\s+(\d{1,3})\s+(hour|hours|day|days|week|weeks|month|months)\b", lowered)
+    if not match:
+        if re.search(r"\b(today|latest|breaking|current)\b", lowered):
+            return 24
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("hour"):
+        hours = amount
+    elif unit.startswith("day"):
+        hours = amount * 24
+    elif unit.startswith("week"):
+        hours = amount * 7 * 24
+    else:
+        hours = amount * 30 * 24
+    return _coerce_lookback_hours(hours)
 
 
 def _extract_exclusion_hints(text: str) -> list[str]:

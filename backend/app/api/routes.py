@@ -49,6 +49,7 @@ class TopicProfileCreate(BaseModel):
     source_queries: dict[str, list[str]] = Field(default_factory=dict)
     depth: Literal["practitioner", "informed-generalist"] = "informed-generalist"
     recency_weighting: Literal["breaking", "recent", "last_year", "all_available", "balanced", "evergreen"] = "recent"
+    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
     exclusions: list[str] = Field(default_factory=list)
     source_selection: dict[str, bool] = Field(default_factory=dict)
     requested_sources: list[dict[str, Any]] = Field(default_factory=list)
@@ -63,13 +64,18 @@ class ExplorationCreate(BaseModel):
     mode: Literal["show_now", "scheduled"] = "show_now"
     source_selection: dict[str, bool] = Field(default_factory=dict)
     candidate_limit: int = Field(default=80, ge=1, le=250)
-    lookback_hours: int = Field(default=24, ge=1, le=720)
+    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
+
+
+class ExplorationRebuildCreate(ExplorationCreate):
+    topic_profile: TopicProfileCreate | None = None
+    refinement_session_id: str | None = None
 
 
 class TopicProfileBuildCreate(TopicProfileCreate):
     mode: Literal["show_now", "scheduled"] = "show_now"
     candidate_limit: int = Field(default=80, ge=1, le=250)
-    lookback_hours: int = Field(default=24, ge=1, le=720)
+    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
     refinement_session_id: str | None = None
 
 
@@ -89,6 +95,8 @@ class ForeignArticleTranslationCreate(BaseModel):
 
 class RefinementStart(BaseModel):
     statement: str = Field(min_length=1)
+    topic_id: str | None = None
+    revisit: bool = False
     source_selection: dict[str, bool] = Field(default_factory=dict)
     models: dict[str, Any] = Field(default_factory=dict)
 
@@ -189,6 +197,8 @@ async def create_topic_profile_and_queue_build(payload: TopicProfileBuildCreate)
     candidate_limit = data.pop("candidate_limit")
     lookback_hours = data.pop("lookback_hours")
     refinement_session_id = data.pop("refinement_session_id", None)
+    if lookback_hours is not None:
+        data["lookback_hours"] = lookback_hours
     try:
         topic_profile = explore.save_topic_profile(data)
     except ValueError as exc:
@@ -368,10 +378,24 @@ def exploration_brief_html(exploration_id: str) -> HTMLResponse:
 
 
 @router.post("/explore/explorations/{exploration_id}/rebuild", status_code=202)
-async def rebuild_exploration(exploration_id: str, payload: ExplorationCreate) -> dict[str, Any]:
+async def rebuild_exploration(exploration_id: str, payload: ExplorationRebuildCreate) -> dict[str, Any]:
+    if payload.topic_profile is not None:
+        existing = database.get_exploration(exploration_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Exploration not found")
+        profile_data = payload.topic_profile.model_dump()
+        profile_data["topic_id"] = profile_data.get("topic_id") or existing["topic_id"]
+        if str(profile_data["topic_id"]) != str(existing["topic_id"]):
+            raise HTTPException(status_code=400, detail="Refined profile does not match this exploration")
+        try:
+            explore.save_topic_profile(profile_data)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if payload.refinement_session_id:
+            database.delete_refinement_session(payload.refinement_session_id)
     result = explore.start_rebuild(
         exploration_id,
-        source_selection=payload.source_selection,
+        source_selection=payload.topic_profile.source_selection if payload.topic_profile is not None else payload.source_selection,
         candidate_limit=payload.candidate_limit,
         lookback_hours=payload.lookback_hours,
     )

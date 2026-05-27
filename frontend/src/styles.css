@@ -633,9 +633,32 @@ label {
 
 .pipeline-row {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 18px;
+}
+
+.pipeline-row.compact {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  margin-bottom: 0;
+}
+
+.progress-heading,
+.library-progress-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.progress-heading {
+  margin-bottom: 14px;
+}
+
+.progress-heading h2 {
+  margin: 0;
+  font-size: clamp(1.35rem, 2.4vw, 2rem);
+  line-height: 1.15;
 }
 
 .pipeline-pill,
@@ -1073,6 +1096,44 @@ label {
   border: 1px solid #d8d7cf;
   border-radius: 8px;
   background: #fdfdfb;
+}
+
+.library-progress {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #fffdf5;
+}
+
+.library-progress p {
+  margin: 0;
+  color: #5f5d57;
+  font-weight: 700;
+}
+
+.library-progress-top span {
+  color: #77756f;
+  font-size: 0.86rem;
+  font-weight: 850;
+}
+
+.library-source-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.library-source-row span {
+  padding: 5px 8px;
+  border: 1px solid #d8d7cf;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #5f5d57;
+  font-size: 0.78rem;
+  font-weight: 800;
 }
 
 .library-row strong,

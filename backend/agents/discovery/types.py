@@ -61,6 +61,7 @@ class TopicProfile:
     foreign_language_plan: tuple[dict[str, Any], ...] = ()
     depth: Depth = "informed-generalist"
     recency_weighting: RecencyWeighting = "recent"
+    lookback_hours: int | None = None
     exclusions: tuple[str, ...] = ()
     source_selection: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_SOURCE_SELECTION))
     requested_sources: tuple[dict[str, Any], ...] = ()
@@ -88,6 +89,7 @@ class TopicProfile:
             foreign_language_plan=tuple(_dict_list(payload.get("foreign_language_plan"))),
             depth=depth,
             recency_weighting=recency,
+            lookback_hours=_lookback_hours(payload.get("lookback_hours")),
             exclusions=tuple(_string_list(payload.get("exclusions"))),
             source_selection=_source_selection(payload.get("source_selection")),
             requested_sources=tuple(_dict_list(payload.get("requested_sources"))),
@@ -110,6 +112,7 @@ class TopicProfile:
             "foreign_language_plan": [dict(item) for item in self.foreign_language_plan],
             "depth": self.depth,
             "recency_weighting": self.recency_weighting,
+            "lookback_hours": self.lookback_hours,
             "exclusions": list(self.exclusions),
             "source_selection": dict(self.source_selection),
             "requested_sources": [dict(source) for source in self.requested_sources],
@@ -306,6 +309,18 @@ def _recency(value: Any) -> RecencyWeighting:
     if cleaned == "evergreen":
         return "all_available"
     return "recent"
+
+
+def _lookback_hours(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        return None
+    if hours < 1:
+        return None
+    return min(hours, 8760)
 
 
 def _optional_model_name(value: Any) -> str | None:

@@ -38,6 +38,7 @@ type TopicProfile = {
   foreign_language_plan?: Array<{ code: string; name: string; native_query: string; reason?: string }>;
   depth?: string;
   recency_weighting?: string;
+  lookback_hours?: number | null;
   exclusions?: string[];
   source_selection: Record<string, boolean>;
   requested_sources?: Array<{ adapter: string; ref: string }>;
@@ -70,6 +71,27 @@ type RefinementSession = {
   profile: TopicProfile;
   topic_id: string | null;
   topic_profile?: TopicProfileResponse;
+};
+
+type ConfirmedProfilePayload = {
+  topic_id?: string;
+  refinement_session_id?: string;
+  statement: string;
+  scope: string;
+  depth: ConfirmationDraft["depth"];
+  recency_weighting: SourceScope;
+  lookback_hours?: number;
+  exclusions: string[];
+  source_selection: Record<string, boolean>;
+  requested_sources: Array<{ adapter: string; ref: string }>;
+  subtopics: string[];
+  keywords: string[];
+  search_queries: string[];
+  source_queries: Record<string, string[]>;
+  models: Record<string, never>;
+  schedule?: string | null;
+  schedule_config?: Record<string, unknown>;
+  delivery_config?: Record<string, unknown>;
 };
 
 type ExplorationIssue = {
@@ -378,6 +400,17 @@ function DispatchApp() {
   const [emailOnSchedule, setEmailOnSchedule] = useState(false);
   const [refinementProgress, setRefinementProgress] = useState<RefinementProgress | null>(null);
   const [refinementFallbackStartedAt, setRefinementFallbackStartedAt] = useState(0);
+  const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(null);
+  const [initialRefineExplorationId, setInitialRefineExplorationId] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const refineExplorationId = params.get("refine_exploration");
+    if (refineExplorationId) {
+      params.delete("refine_exploration");
+      const nextUrl = `${window.location.pathname}${params.toString() ? `?${params}` : ""}`;
+      window.history.replaceState(null, "", nextUrl);
+    }
+    return refineExplorationId;
+  });
   const [progressNow, setProgressNow] = useState(0);
 
   const topicById = useMemo(() => new Map(allTopics.map((topic) => [topic.topic_id, topic])), [allTopics]);
@@ -474,18 +507,18 @@ function DispatchApp() {
     return () => window.clearInterval(timer);
   }, [activeRefinementProgress]);
 
-  function beginRefinementProgress(phase: RefinementProgressPhase, label: string) {
+  const beginRefinementProgress = useCallback((phase: RefinementProgressPhase, label: string) => {
     const now = Date.now();
     setRefinementFallbackStartedAt(now);
     setProgressNow(now);
     setRefinementProgress({ phase, label, startedAt: now });
-  }
+  }, []);
 
-  function endRefinementProgress() {
+  const endRefinementProgress = useCallback(() => {
     setRefinementProgress(null);
     setRefinementFallbackStartedAt(0);
     setProgressNow(Date.now());
-  }
+  }, []);
 
   async function startFlow(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
@@ -503,6 +536,7 @@ function DispatchApp() {
     const interest = statement.trim();
     clearInterestDraft();
     setSubmittedInterest(interest);
+    setRefinementTargetExplorationId(null);
     setStatement("");
     setFlow("refining");
     setBusy(true);
@@ -574,10 +608,11 @@ function DispatchApp() {
     }
   }
 
-  function confirmedProfilePayload() {
+  function confirmedProfilePayload(): ConfirmedProfilePayload {
     const baseProfile = session?.profile ?? topicProfile?.profile;
     const topicId = topicProfile?.topic_id ?? session?.topic_id ?? baseProfile?.topic_id;
     const interest = activeInterest || baseProfile?.statement || "";
+    const lookbackHours = lookbackHoursForBuild(baseProfile, draft);
     return {
       ...(topicId ? { topic_id: topicId } : {}),
       ...(session?.session_id ? { refinement_session_id: session.session_id } : {}),
@@ -585,6 +620,7 @@ function DispatchApp() {
       scope: draft.scope.trim() || interest,
       depth: draft.depth,
       recency_weighting: draft.recency_weighting,
+      ...(lookbackHours ? { lookback_hours: lookbackHours } : {}),
       exclusions: splitList(draft.exclusions),
       source_selection: selectedEnabledSources,
       requested_sources: baseProfile?.requested_sources ?? [],
@@ -593,6 +629,9 @@ function DispatchApp() {
       search_queries: baseProfile?.search_queries ?? [],
       source_queries: baseProfile?.source_queries ?? {},
       models: {},
+      schedule: baseProfile?.schedule ?? null,
+      schedule_config: baseProfile?.schedule_config ?? {},
+      delivery_config: baseProfile?.delivery_config ?? {},
     };
   }
 
@@ -608,14 +647,26 @@ function DispatchApp() {
     setMessage("Building the brief...");
     setBriefHtml("");
     try {
-      const started = await api<{ topic_profile: TopicProfileResponse; exploration: Exploration }>("/api/explore/topic-profiles/build", {
-        method: "POST",
-        body: JSON.stringify({
-          ...confirmedProfilePayload(),
-          source_selection: selectedEnabledSources,
-        }),
-      });
-      setTopicProfile(started.topic_profile);
+      const profilePayload = {
+        ...confirmedProfilePayload(),
+        source_selection: selectedEnabledSources,
+      };
+      const started = refinementTargetExplorationId
+        ? await api<{ exploration: Exploration }>(`/api/explore/explorations/${refinementTargetExplorationId}/rebuild`, {
+          method: "POST",
+          body: JSON.stringify({
+            topic_profile: profilePayload,
+            refinement_session_id: session?.session_id,
+            source_selection: selectedEnabledSources,
+            lookback_hours: profilePayload.lookback_hours,
+          }),
+        })
+        : await api<{ topic_profile: TopicProfileResponse; exploration: Exploration }>("/api/explore/topic-profiles/build", {
+          method: "POST",
+          body: JSON.stringify(profilePayload),
+        });
+      const returnedTopic = (started as { topic_profile?: TopicProfileResponse }).topic_profile;
+      if (returnedTopic) setTopicProfile(returnedTopic);
       setSession(null);
       setAnswer("");
       setExploration(started.exploration);
@@ -624,7 +675,8 @@ function DispatchApp() {
       await loadBriefHtml(finished);
       await loadHome();
       setFlow("ready");
-      setMessage(finished.progress.built_with_issues ? "Brief ready with issues" : "Brief ready");
+      setRefinementTargetExplorationId(null);
+      setMessage(finished.progress.built_with_issues ? "Brief ready with issues" : refinementTargetExplorationId ? "Refined brief rebuilt" : "Brief ready");
     } catch (error) {
       setFlow("confirm");
       setMessage(errorMessage(error, "Could not build brief"));
@@ -642,7 +694,10 @@ function DispatchApp() {
     try {
       const started = await api<{ exploration: Exploration }>(`/api/explore/explorations/${exploration.exploration_id}/rebuild`, {
         method: "POST",
-        body: JSON.stringify({ source_selection: selectedEnabledSources }),
+        body: JSON.stringify({
+          source_selection: selectedEnabledSources,
+          lookback_hours: lookbackHoursForBuild(topicProfile?.profile ?? session?.profile, draft),
+        }),
       });
       setExploration(started.exploration);
       const finished = await pollExploration(started.exploration.exploration_id);
@@ -658,6 +713,48 @@ function DispatchApp() {
       setBusy(false);
     }
   }
+
+  const startRefineExisting = useCallback(async (targetExploration = exploration) => {
+    if (!targetExploration) return;
+    setBusy(true);
+    setFlow("refining");
+    setMessage("Reopening refinement...");
+    beginRefinementProgress("starting", "Reopening refinement");
+    try {
+      const topic = topicProfile?.topic_id === targetExploration.topic_id
+        ? topicProfile
+        : await api<TopicProfileResponse>(`/api/explore/topic-profiles/${targetExploration.topic_id}`);
+      const nextSession = await api<RefinementSession>("/api/explore/refinement-sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          statement: topic.statement,
+          topic_id: topic.topic_id,
+          revisit: true,
+          source_selection: targetExploration.source_selection,
+          models: {},
+        }),
+      });
+      clearInterestDraft();
+      setRefinementTargetExplorationId(targetExploration.exploration_id);
+      setTopicProfile(topic);
+      setSubmittedInterest(topic.statement);
+      setStatement("");
+      setSourceSelection(sourceSelectionFromRecord(targetExploration.source_selection));
+      setSession(nextSession);
+      setDraft(draftFromProfile(nextSession.profile));
+      setAnswer("");
+      setBriefHtml("");
+      if (nextSession.topic_profile) setTopicProfile(nextSession.topic_profile);
+      setFlow(nextSession.status === "finalized" ? "confirm" : "refining");
+      setMessage(nextSession.status === "finalized" ? "Confirm the refined setup" : "Refine the brief before rebuilding");
+    } catch (error) {
+      setFlow(targetExploration.status === "complete" ? "ready" : "idle");
+      setMessage(errorMessage(error, "Could not reopen refinement"));
+    } finally {
+      setBusy(false);
+      endRefinementProgress();
+    }
+  }, [beginRefinementProgress, endRefinementProgress, exploration, topicProfile]);
 
   async function pollExploration(explorationId: string): Promise<Exploration> {
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -816,6 +913,7 @@ function DispatchApp() {
 
   function loadTopicForConfirmation(topic: TopicProfileResponse) {
     clearInterestDraft();
+    setRefinementTargetExplorationId(null);
     setTopicProfile(topic);
     setSession(null);
     setExploration(null);
@@ -831,6 +929,7 @@ function DispatchApp() {
 
   function resetForNewBrief() {
     clearInterestDraft();
+    setRefinementTargetExplorationId(null);
     setStatement("");
     setSubmittedInterest("");
     setSession(null);
@@ -974,6 +1073,61 @@ function DispatchApp() {
     }
   }
 
+  useEffect(() => {
+    if (!initialRefineExplorationId) return;
+    let cancelled = false;
+    setInitialRefineExplorationId(null);
+    setBusy(true);
+    setFlow("refining");
+    setMessage("Loading brief to refine...");
+    const now = Date.now();
+    setRefinementFallbackStartedAt(now);
+    setProgressNow(now);
+    setRefinementProgress({ phase: "starting", label: "Reopening refinement", startedAt: now });
+    void (async () => {
+      try {
+        const target = await api<Exploration>(`/api/explore/explorations/${initialRefineExplorationId}`);
+        const topic = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${target.topic_id}`);
+        const nextSession = await api<RefinementSession>("/api/explore/refinement-sessions", {
+          method: "POST",
+          body: JSON.stringify({
+            statement: topic.statement,
+            topic_id: topic.topic_id,
+            revisit: true,
+            source_selection: target.source_selection,
+            models: {},
+          }),
+        });
+        if (cancelled) return;
+        clearInterestDraft();
+        setExploration(target);
+        setRefinementTargetExplorationId(target.exploration_id);
+        setTopicProfile(topic);
+        setSubmittedInterest(topic.statement);
+        setStatement("");
+        setSourceSelection(sourceSelectionFromRecord(target.source_selection));
+        setSession(nextSession);
+        setDraft(draftFromProfile(nextSession.profile));
+        setAnswer("");
+        setBriefHtml("");
+        setFlow(nextSession.status === "finalized" ? "confirm" : "refining");
+        setMessage(nextSession.status === "finalized" ? "Confirm the refined setup" : "Refine the brief before rebuilding");
+      } catch (error) {
+        if (!cancelled) setMessage(errorMessage(error, "Could not load brief to refine"));
+      } finally {
+        if (!cancelled) {
+          setBusy(false);
+          setRefinementProgress(null);
+          setRefinementFallbackStartedAt(0);
+          setProgressNow(Date.now());
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [initialRefineExplorationId]);
+
   return (
     <main className="dispatch-page">
       <section className="dispatch-frame">
@@ -1075,6 +1229,7 @@ function DispatchApp() {
               busy={busy}
               onOpen={() => openBrief()}
               onEditSources={() => setFlow("confirm")}
+              onRefine={() => void startRefineExisting()}
               onRebuild={() => void rebuildBrief()}
               onSchedule={() => setFlow("schedule")}
               onEmailRecipientChange={setBriefEmailRecipient}
@@ -1109,6 +1264,7 @@ function DispatchApp() {
                 setFlow("idle");
                 setExploration(null);
                 setBriefHtml("");
+                setRefinementTargetExplorationId(null);
               }
             }}
             onFocus={() => {
@@ -1400,6 +1556,14 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
     : null;
   return (
     <section className="progress-panel">
+      <div className="progress-heading">
+        <div>
+          <p className="section-kicker">{props.exploration.status === "queued" ? "Queued" : "Full pipeline running"}</p>
+          <h2>{progressHeadline(props.exploration)}</h2>
+        </div>
+        <span className={`status-pill ${props.exploration.status === "running" ? "good" : ""}`}>{formatStage(props.exploration.status)}</span>
+      </div>
+      <p className="queue-note">{progressDetail(props.exploration)}</p>
       <p className="section-kicker">{sourcePlan(props.sourceSelection)}</p>
       {queuedMessage ? <p className="queue-note">{queuedMessage}</p> : null}
       <div className="pipeline-row">
@@ -1446,6 +1610,35 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
   );
 }
 
+function LibraryBuildProgress(props: { exploration: Exploration }) {
+  const sources = Object.entries(props.exploration.progress.sources ?? {})
+    .filter(([, data]) => data.status !== "disabled")
+    .slice(0, 6);
+  return (
+    <div className="library-progress">
+      <div className="library-progress-top">
+        <strong>{progressHeadline(props.exploration)}</strong>
+        <span>{formatStage(props.exploration.status)}</span>
+      </div>
+      <p>{progressDetail(props.exploration)}</p>
+      <div className="pipeline-row compact">
+        {["discovery", "fetch", "summarize", "audit", "rank", "review", "done"].map((stage) => (
+          <span className={`pipeline-pill ${props.exploration.progress.pipeline?.[stage] ?? "pending"}`} key={stage}>
+            {formatStage(stage)}
+          </span>
+        ))}
+      </div>
+      {sources.length ? (
+        <div className="library-source-row">
+          {sources.map(([source, data]) => (
+            <span key={source}>{formatSourceLabel(source)}: {formatStage(data.status)}</span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function BriefReadyPanel(props: {
   exploration: Exploration;
   issues: ExplorationIssue[];
@@ -1455,6 +1648,7 @@ function BriefReadyPanel(props: {
   busy: boolean;
   onOpen: () => void;
   onEditSources: () => void;
+  onRefine: () => void;
   onRebuild: () => void;
   onSchedule: () => void;
   onEmailRecipientChange: (value: string) => void;
@@ -1474,6 +1668,7 @@ function BriefReadyPanel(props: {
       ) : null}
       <div className="ready-actions">
         <button type="button" className="secondary-action" onClick={props.onEditSources}>Edit sources</button>
+        <button type="button" className="secondary-action" onClick={props.onRefine} disabled={props.busy}>Refine</button>
         <button type="button" className="secondary-action" onClick={props.onRebuild} disabled={props.busy}>Rebuild</button>
         <button type="button" className="secondary-action" onClick={props.onSchedule}>Schedule as digest</button>
         <button type="button" className="ghost-action" onClick={props.onNew}>New brief</button>
@@ -1774,6 +1969,14 @@ function AdminApp() {
   }, [digestSort, library.digests, library.legacy_digests]);
   const modelOptions = status?.model?.catalog.models ?? [];
   const cloudModelOptions = status?.model?.catalog.providers?.ollama_cloud?.models ?? [];
+  const hasActiveLibraryBuilds = useMemo(() => {
+    const activeExploration = library.explorations.some((item) => item.status === "queued" || item.status === "running");
+    const activeDigest = library.digests.some((topic) => {
+      const latest = topic.latest_exploration;
+      return latest?.status === "queued" || latest?.status === "running";
+    });
+    return activeExploration || activeDigest;
+  }, [library.digests, library.explorations]);
 
   const loadAdmin = useCallback(async () => {
     const [nextStatus, nextSources, nextLibrary] = await Promise.all([
@@ -1794,6 +1997,14 @@ function AdminApp() {
   useEffect(() => {
     void loadAdmin();
   }, [loadAdmin]);
+
+  useEffect(() => {
+    if (!hasActiveLibraryBuilds) return;
+    const timer = window.setInterval(() => {
+      void loadAdmin();
+    }, 2200);
+    return () => window.clearInterval(timer);
+  }, [hasActiveLibraryBuilds, loadAdmin]);
 
   useEffect(() => {
     if (!issueRun) return;
@@ -2026,7 +2237,7 @@ function AdminApp() {
         body: JSON.stringify({ source_selection: exploration.source_selection }),
       });
       await loadAdmin();
-      setMessage("Rebuild started");
+      setMessage("Rebuild queued. Progress is shown in the row.");
     } catch (error) {
       setMessage(errorMessage(error, "Could not rebuild"));
     } finally {
@@ -2034,12 +2245,20 @@ function AdminApp() {
     }
   }
 
+  function refineFromAdmin(exploration: Exploration) {
+    window.location.href = `/?refine_exploration=${encodeURIComponent(exploration.exploration_id)}`;
+  }
+
   async function buildTopicFromAdmin(topic: TopicProfileResponse) {
     setBusy(true);
     try {
       await api(`/api/explore/topic-profiles/${topic.topic_id}/run`, {
         method: "POST",
-        body: JSON.stringify({ mode: "show_now", source_selection: topic.profile.source_selection }),
+        body: JSON.stringify({
+          mode: "show_now",
+          source_selection: topic.profile.source_selection,
+          lookback_hours: lookbackHoursForBuild(topic.profile),
+        }),
       });
       await loadAdmin();
       setMessage("Brief build started");
@@ -2055,7 +2274,7 @@ function AdminApp() {
     try {
       await api(`/api/admin/digests/${digest.id}/verification-run?publish=true`, { method: "POST" });
       await loadAdmin();
-      setMessage("Digest rebuild started");
+      setMessage("Digest rebuild queued. Progress is shown in the row.");
     } catch (error) {
       setMessage(errorMessage(error, "Could not rebuild digest"));
     } finally {
@@ -2168,16 +2387,23 @@ function AdminApp() {
       if (topic.latest_exploration) {
         await api(`/api/explore/explorations/${topic.latest_exploration.exploration_id}/rebuild`, {
           method: "POST",
-          body: JSON.stringify({ source_selection: topic.profile.source_selection }),
+          body: JSON.stringify({
+            source_selection: topic.profile.source_selection,
+            lookback_hours: lookbackHoursForBuild(topic.profile),
+          }),
         });
       } else {
         await api(`/api/explore/topic-profiles/${topic.topic_id}/run`, {
           method: "POST",
-          body: JSON.stringify({ mode: "scheduled", source_selection: topic.profile.source_selection }),
+          body: JSON.stringify({
+            mode: "scheduled",
+            source_selection: topic.profile.source_selection,
+            lookback_hours: lookbackHoursForBuild(topic.profile),
+          }),
         });
       }
       await loadAdmin();
-      setMessage("Digest rebuild started");
+      setMessage("Digest rebuild queued. Progress is shown in the row.");
     } catch (error) {
       setMessage(errorMessage(error, "Could not rebuild digest"));
     } finally {
@@ -2420,10 +2646,14 @@ function AdminApp() {
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => openPath(briefPath(item.exploration))} disabled={!briefPath(item.exploration)}>Open</button>
+                    <button type="button" className="secondary-action" onClick={() => refineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildFromAdmin(item.exploration)} disabled={busy}>Rebuild</button>
                     <button type="button" className="secondary-action" onClick={() => void scheduleExploration(item.exploration)} disabled={busy || item.exploration.status !== "complete"}>Schedule</button>
                     <button type="button" className="secondary-action destructive" onClick={() => void deleteExplorationFromAdmin(item.exploration)} disabled={busy}>Delete</button>
                   </div>
+                  {item.exploration.status === "queued" || item.exploration.status === "running" ? (
+                    <LibraryBuildProgress exploration={item.exploration} />
+                  ) : null}
                   {item.exploration.status === "complete" ? (
                     <div className="inline-email-editor">
                       <input
@@ -2516,12 +2746,16 @@ function AdminApp() {
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && openPath(briefPath(topic.latest_exploration))} disabled={!topic.latest_exploration}>Open latest</button>
+                    <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && refineFromAdmin(topic.latest_exploration)} disabled={busy || !topic.latest_exploration || topic.latest_exploration.status === "queued" || topic.latest_exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildDigest(topic)} disabled={busy}>Rebuild</button>
                     <button type="button" className="secondary-action" onClick={() => startEditingDigest(topic)} disabled={busy}>Edit schedule</button>
                     <button type="button" className="secondary-action" onClick={() => void pauseDigest(topic)} disabled={busy || topic.profile.status === "paused"}>Pause</button>
                     <button type="button" className="secondary-action" onClick={() => void archiveDigest(topic)} disabled={busy}>Archive</button>
                     <button type="button" className="secondary-action destructive" onClick={() => void deleteDigest(topic)} disabled={busy}>Delete</button>
                   </div>
+                  {topic.latest_exploration?.status === "queued" || topic.latest_exploration?.status === "running" ? (
+                    <LibraryBuildProgress exploration={topic.latest_exploration} />
+                  ) : null}
                   {editingDigest?.topicId === topic.topic_id ? (
                     <div className="inline-schedule-editor">
                       <select
@@ -2750,6 +2984,15 @@ function draftFromProfile(profile: TopicProfile): ConfirmationDraft {
   };
 }
 
+function lookbackHoursForBuild(profile: TopicProfile | null | undefined, draft?: ConfirmationDraft): number {
+  const explicit = Number(profile?.lookback_hours ?? 0);
+  if (Number.isFinite(explicit) && explicit >= 1) return Math.min(8760, Math.floor(explicit));
+  const sourceScope = draft?.recency_weighting ?? normalizeSourceScope(profile?.recency_weighting);
+  if (sourceScope === "last_year" || sourceScope === "all_available") return 8760;
+  if (sourceScope === "recent") return 72;
+  return 24;
+}
+
 function normalizeSourceScope(value: string | undefined): SourceScope {
   if (value === "breaking") return "breaking";
   if (value === "last_year") return "last_year";
@@ -2920,6 +3163,42 @@ function formatPipeline(pipeline: Array<[string, string]>): string {
   const failed = pipeline.find(([, status]) => status === "failed");
   if (failed) return `${formatStage(failed[0])} failed`;
   return "Ready";
+}
+
+function progressHeadline(exploration: Exploration): string {
+  if (exploration.status === "queued") return "Waiting its turn";
+  if (exploration.status === "failed") return "Build failed";
+  const running = Object.entries(exploration.progress.pipeline ?? {}).find(([, status]) => status === "running");
+  if (!running) return exploration.status === "complete" ? "Brief ready" : "Preparing build";
+  const labels: Record<string, string> = {
+    discovery: "Discovering sources",
+    fetch: "Fetching source content",
+    summarize: "Enriching and translating items",
+    audit: "Auditing source fit",
+    rank: "Ranking the complete set",
+    review: "Reviewing the brief",
+    done: "Rendering the brief",
+  };
+  return labels[running[0]] ?? `${formatStage(running[0])} running`;
+}
+
+function progressDetail(exploration: Exploration): string {
+  if (exploration.status === "queued") {
+    return exploration.progress.queue?.message ?? "Queued behind another brief. It will start automatically.";
+  }
+  if (exploration.status === "failed") return exploration.progress.error ?? "The build stopped before the brief was ready.";
+  if (exploration.progress.source_audit?.message) return exploration.progress.source_audit.message;
+  if (exploration.progress.source_audit?.summary) return exploration.progress.source_audit.summary;
+  const candidateCount = exploration.progress.candidate_count ?? 0;
+  const running = Object.entries(exploration.progress.pipeline ?? {}).find(([, status]) => status === "running")?.[0];
+  if (running === "discovery") return "Searching every selected source from scratch.";
+  if (running === "fetch") return `Fetching full content for ${candidateCount || "the discovered"} candidate items.`;
+  if (running === "summarize") return "Cleaning, summarizing, and translating usable source material.";
+  if (running === "audit") return "Checking whether the retrieved sources match the requested strategy.";
+  if (running === "rank") return "Comparing all candidates together before choosing the lead stories.";
+  if (running === "review") return "The critic is checking quality, cuts, and adherence before publish.";
+  if (running === "done") return "Writing the finished brief HTML.";
+  return "Preparing the full rebuild pipeline.";
 }
 
 function formatStage(value: string): string {

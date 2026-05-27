@@ -348,6 +348,98 @@ def test_create_topic_profile_and_queue_build_is_atomic(monkeypatch, tmp_path) -
         assert database.get_refinement_session(refinement["session_id"]) is None
 
 
+def test_rebuild_preserves_topic_profile_lookback(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = database.upsert_topic_profile(
+        {
+            "statement": "Track memory stocks over three days",
+            "scope": "Memory stock catalysts",
+            "lookback_hours": 72,
+            "source_selection": {"gmail": False, "reddit": False, "podcasts": False, "web_search": False},
+        }
+    )
+    exploration = database.create_exploration(
+        topic_id=topic["topic_id"],
+        mode="show_now",
+        source_selection=topic["profile"]["source_selection"],
+        status="complete",
+    )
+
+    rebuilt = explore.start_rebuild(exploration["exploration_id"])
+
+    assert rebuilt is not None
+    assert rebuilt["status"] == "queued"
+    assert rebuilt["progress"]["queue"]["action"] == "rebuild"
+    assert rebuilt["progress"]["queue_options"]["lookback_hours"] == 72
+
+
+def test_refined_rebuild_updates_same_topic_and_clears_session(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = database.upsert_topic_profile(
+        {
+            "statement": "Track memory stocks",
+            "scope": "Memory stock catalysts",
+            "source_selection": {"gmail": False, "reddit": False, "podcasts": False, "web_search": False},
+        }
+    )
+    exploration = database.create_exploration(
+        topic_id=topic["topic_id"],
+        mode="show_now",
+        source_selection=topic["profile"]["source_selection"],
+        status="complete",
+    )
+    session = refinement.start_session(
+        {
+            "statement": topic["statement"],
+            "topic_id": topic["topic_id"],
+            "revisit": True,
+            "source_selection": topic["profile"]["source_selection"],
+        }
+    )
+    assert session["profile"]["topic_id"] == topic["topic_id"]
+    assert session["status"] == "active"
+    observed: dict[str, Any] = {}
+
+    def fake_start_rebuild(exploration_id: str, **kwargs: Any) -> dict[str, Any]:
+        observed["exploration_id"] = exploration_id
+        observed.update(kwargs)
+        return {
+            **exploration,
+            "status": "queued",
+            "progress": {"queue": {"action": "rebuild"}},
+        }
+
+    monkeypatch.setattr(explore, "start_rebuild", fake_start_rebuild)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        response = client.post(
+            f"/api/explore/explorations/{exploration['exploration_id']}/rebuild",
+            json={
+                "source_selection": topic["profile"]["source_selection"],
+                "lookback_hours": 96,
+                "refinement_session_id": session["session_id"],
+                "topic_profile": {
+                    "topic_id": topic["topic_id"],
+                    "statement": topic["statement"],
+                    "scope": "Memory stock catalysts with supplier checks",
+                    "lookback_hours": 96,
+                    "source_selection": topic["profile"]["source_selection"],
+                },
+            },
+        )
+
+    assert response.status_code == 202
+    assert observed["exploration_id"] == exploration["exploration_id"]
+    assert observed["lookback_hours"] == 96
+    saved = database.get_topic_profile(topic["topic_id"])
+    assert saved is not None
+    assert saved["profile"]["scope"] == "Memory stock catalysts with supplier checks"
+    assert saved["profile"]["lookback_hours"] == 96
+    assert database.get_refinement_session(session["session_id"]) is None
+
+
 def test_scheduled_run_promotes_kept_sources(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
