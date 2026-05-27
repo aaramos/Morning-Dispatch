@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -78,6 +79,11 @@ class TopicProfile:
         scope = _clean_text(payload.get("scope")) or statement
         depth = _depth(payload.get("depth"))
         recency = _recency(payload.get("recency_weighting"))
+        lookback_hours = (
+            _lookback_hours(payload.get("lookback_hours"))
+            or _lookback_hours_from_text(statement)
+            or _lookback_hours_from_text(scope)
+        )
         return cls(
             topic_id=topic_id,
             statement=statement,
@@ -89,7 +95,7 @@ class TopicProfile:
             foreign_language_plan=tuple(_dict_list(payload.get("foreign_language_plan"))),
             depth=depth,
             recency_weighting=recency,
-            lookback_hours=_lookback_hours(payload.get("lookback_hours")),
+            lookback_hours=lookback_hours,
             exclusions=tuple(_string_list(payload.get("exclusions"))),
             source_selection=_source_selection(payload.get("source_selection")),
             requested_sources=tuple(_dict_list(payload.get("requested_sources"))),
@@ -321,6 +327,30 @@ def _lookback_hours(value: Any) -> int | None:
     if hours < 1:
         return None
     return min(hours, 8760)
+
+
+def _lookback_hours_from_text(value: Any) -> int | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    match = re.search(
+        r"\b(?:last|past|previous|prior|trailing|within)\s+(\d{1,3})\s+"
+        r"(hour|hours|hr|hrs|day|days|week|weeks|month|months)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    multiplier = 1
+    if unit.startswith("day"):
+        multiplier = 24
+    elif unit.startswith("week"):
+        multiplier = 24 * 7
+    elif unit.startswith("month"):
+        multiplier = 24 * 30
+    return _lookback_hours(amount * multiplier)
 
 
 def _optional_model_name(value: Any) -> str | None:

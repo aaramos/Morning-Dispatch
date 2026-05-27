@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from datetime import UTC, datetime
 from html import unescape
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from backend.agents.agentic import AgentDecision
-from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.articles import ArticleFetchResult
 
 RAW_URL_RE = re.compile(r"https?://[^\s<>)\"']+", re.IGNORECASE)
@@ -87,17 +85,6 @@ def apply_brief_quality_checks(
                 )
                 continue
 
-        payload = _payload_with_date(result.payload)
-        if payload is not result.payload:
-            decisions.append(
-                _decision(
-                    target=target,
-                    decision="missing_date",
-                    action="repair_article",
-                    reason="Filled a missing article date from the fetch timestamp.",
-                )
-            )
-
         if url_key:
             seen_urls.add(url_key)
         if title_key:
@@ -105,7 +92,7 @@ def apply_brief_quality_checks(
         cleaned_results.append(
             replace(
                 result,
-                payload=payload,
+                payload=result.payload,
                 title=title,
                 excerpt=summary or result.excerpt,
                 editor_summary=summary or result.editor_summary,
@@ -126,13 +113,6 @@ def clean_display_text(value: str | None) -> str:
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip(" -|")
-
-
-def _payload_with_date(payload: NormalizedPayload) -> NormalizedPayload:
-    if payload.published_at:
-        return payload
-    fallback_date = payload.fetched_at or datetime.now(UTC).isoformat(timespec="seconds")
-    return replace(payload, published_at=fallback_date)
 
 
 def _is_http_url(url: str | None) -> bool:

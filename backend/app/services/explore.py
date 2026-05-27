@@ -4,8 +4,10 @@ import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import logging
+import re
 from time import monotonic
 from typing import Any
 
@@ -37,6 +39,40 @@ _BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
 _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 24
+_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web"}
+_DATE_METADATA_KEYS = (
+    "published_at",
+    "published",
+    "publication_date",
+    "date",
+    "pub_date",
+    "created_at",
+    "updated_at",
+    "search_result_date",
+)
+_URL_DATE_RE = re.compile(
+    r"(?:^|[^\d])(?P<year>20\d{2})[/-](?P<month>0?[1-9]|1[0-2])"
+    r"(?:[/-](?P<day>0?[1-9]|[12]\d|3[01]))?(?:[^\d]|$)"
+)
+_TEXT_DATE_RE = re.compile(
+    r"\b(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(?P<day>0?[1-9]|[12]\d|3[01]),\s+(?P<year>20\d{2})\b",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
 
 
 async def start_build_queue() -> None:
@@ -509,6 +545,22 @@ async def _run_exploration(
         stage_started = monotonic()
         fetched_articles = await fetch_articles_for_payloads(payloads)
         stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
+        fetched_articles, source_window_issues = _apply_source_window_filter(
+            profile,
+            fetched_articles,
+            lookback_hours=lookback_hours,
+        )
+        progress["source_window"] = {
+            "status": "completed",
+            "source_scope": _source_scope_label(lookback_hours),
+            "excluded_count": len(source_window_issues),
+        }
+        if source_window_issues:
+            progress["source_audit_issues"] = [
+                *list(progress.get("source_audit_issues") or []),
+                *source_window_issues,
+            ]
+            progress["built_with_issues"] = True
         _set_pipeline_stage(progress, "fetch", "done")
         _persist_progress(exploration_id, progress)
 
@@ -918,7 +970,10 @@ async def _run_digest_core(
     )
     progress["source_audit"] = audit_summary
     if audit_summary.get("issues"):
-        progress["source_audit_issues"] = list(audit_summary.get("issues") or [])
+        progress["source_audit_issues"] = [
+            *list(progress.get("source_audit_issues") or []),
+            *list(audit_summary.get("issues") or []),
+        ]
         progress["built_with_issues"] = True
     _set_pipeline_stage(progress, "audit", "done" if audit_summary.get("status") != "failed" else "failed")
     persist()
@@ -963,6 +1018,173 @@ async def _run_digest_core(
     if librarian_client is not None:
         database.cache_model_enrichments(article_results, model_name=_model_client_name(librarian_client, settings.librarian_model))
     return article_results
+
+
+def _apply_source_window_filter(
+    profile: TopicProfile,
+    article_results: list[ArticleFetchResult],
+    *,
+    lookback_hours: int,
+) -> tuple[list[ArticleFetchResult], list[dict[str, str]]]:
+    if profile.lookback_hours is None:
+        return article_results, []
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    kept: list[ArticleFetchResult] = []
+    issues: list[dict[str, str]] = []
+    for result in article_results:
+        reason = _source_window_rejection_reason(result, cutoff)
+        if reason:
+            issues.append(
+                {
+                    "source_name": _source_window_issue_name(result),
+                    "reason": reason,
+                }
+            )
+            continue
+        kept.append(result)
+    return kept, issues
+
+
+def _source_window_rejection_reason(result: ArticleFetchResult, cutoff: datetime) -> str:
+    source_type = str(result.payload.source_type or "")
+    published = _article_published_at(result)
+    if published is not None:
+        if published < cutoff:
+            return f"Published outside the requested source window ({_format_window_cutoff(cutoff)} or newer required)."
+        return ""
+
+    hinted_date = _article_text_or_url_date(result)
+    if hinted_date is not None:
+        if hinted_date < cutoff:
+            return f"Date hints place it outside the requested source window ({_format_window_cutoff(cutoff)} or newer required)."
+        return ""
+
+    if source_type in _STRICT_SOURCE_WINDOW_TYPES:
+        return "No reliable publish date was available for the requested source window."
+    return ""
+
+
+def _article_published_at(result: ArticleFetchResult) -> datetime | None:
+    values: list[Any] = [result.payload.published_at]
+    for metadata in (result.payload.metadata, result.metadata):
+        if not isinstance(metadata, dict):
+            continue
+        for key in _DATE_METADATA_KEYS:
+            values.append(metadata.get(key))
+    for value in values:
+        parsed = _parse_datetime_hint(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _article_text_or_url_date(result: ArticleFetchResult) -> datetime | None:
+    for value in (result.final_url, result.original_url, result.payload.original_url):
+        parsed = _date_from_url(value)
+        if parsed is not None:
+            return parsed
+    text_sample = " ".join(
+        part
+        for part in (
+            result.title,
+            result.excerpt,
+            result.editor_summary,
+            result.payload.raw_text,
+        )
+        if part
+    )
+    return _date_from_text(text_sample[:4000])
+
+
+def _parse_datetime_hint(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        parsed = datetime.fromtimestamp(float(value), tz=UTC)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        parsed = _parse_datetime_string(text)
+        if parsed is None:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _parse_datetime_string(text: str) -> datetime | None:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    with suppress(ValueError):
+        normalized = cleaned.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    with suppress(Exception):
+        parsed = parsedate_to_datetime(cleaned)
+        if parsed is not None:
+            return parsed
+    date_match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", cleaned)
+    if date_match:
+        with suppress(ValueError):
+            return datetime(
+                int(date_match.group(1)),
+                int(date_match.group(2)),
+                int(date_match.group(3)),
+                23,
+                59,
+                59,
+                tzinfo=UTC,
+            )
+    return _date_from_text(cleaned)
+
+
+def _date_from_url(value: str | None) -> datetime | None:
+    text = str(value or "")
+    match = _URL_DATE_RE.search(text)
+    if not match:
+        return None
+    year = int(match.group("year"))
+    month = int(match.group("month"))
+    day = int(match.group("day") or 1)
+    hour = 23 if match.group("day") else 0
+    minute = 59 if match.group("day") else 0
+    second = 59 if match.group("day") else 0
+    with suppress(ValueError):
+        return datetime(year, month, day, hour, minute, second, tzinfo=UTC)
+    return None
+
+
+def _date_from_text(value: str | None) -> datetime | None:
+    text = str(value or "")
+    match = _TEXT_DATE_RE.search(text)
+    if not match:
+        return None
+    month = _MONTHS.get(match.group("month").lower())
+    if month is None:
+        return None
+    with suppress(ValueError):
+        return datetime(
+            int(match.group("year")),
+            month,
+            int(match.group("day")),
+            23,
+            59,
+            59,
+            tzinfo=UTC,
+        )
+    return None
+
+
+def _source_window_issue_name(result: ArticleFetchResult) -> str:
+    title = (result.title or result.payload.source_name or result.original_url or "Source").strip()
+    return title[:120]
+
+
+def _format_window_cutoff(cutoff: datetime) -> str:
+    return cutoff.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _newsletter_source_notes_for_brief(

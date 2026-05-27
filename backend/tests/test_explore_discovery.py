@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 import time
 from typing import Any
 import pytest
@@ -44,6 +45,35 @@ class SlowAdapter(FakeAdapter):
         return self._candidates
 
 
+def article_for_window(
+    *,
+    title: str,
+    url: str,
+    published_at: str | None = None,
+    source_type: str = "gmail_link",
+    summary: str = "Fresh enough coverage of the requested topic.",
+) -> ArticleFetchResult:
+    payload = NormalizedPayload(
+        source_type=source_type,
+        source_name=title,
+        original_url=url,
+        raw_text=summary,
+        published_at=published_at,
+    )
+    return ArticleFetchResult(
+        payload=payload,
+        original_url=url,
+        final_url=url,
+        canonical_url=url,
+        title=title,
+        text=summary,
+        excerpt=summary,
+        editor_summary=summary,
+        domain="example.com",
+        status="fetched",
+    )
+
+
 def configure_runtime(monkeypatch, tmp_path) -> None:
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
@@ -55,6 +85,71 @@ def configure_runtime(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "false")
     monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
+
+
+def test_topic_profile_infers_numeric_lookback_from_interest_text() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track Micron, Hynix, Kioxia and Sandisk news from the previous 3 days.",
+            "scope": "Memory company performance",
+        }
+    )
+
+    assert profile.lookback_hours == 72
+
+
+def test_source_window_filter_drops_stale_and_undated_web_results() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track Micron, Hynix, Kioxia and Sandisk news from the previous 3 days.",
+            "scope": "Memory company performance",
+        }
+    )
+    fresh = article_for_window(
+        title="Fresh Micron catalyst",
+        url="https://example.com/news/fresh-micron",
+        published_at=(datetime.now(UTC) - timedelta(hours=2)).isoformat(timespec="seconds"),
+    )
+    stale_url = article_for_window(
+        title="Old Kioxia roadmap",
+        url="https://example.com/news/2025/09/16/kioxia-roadmap",
+        summary="An old Kioxia roadmap story.",
+    )
+    undated = article_for_window(
+        title="Undated Hynix market note",
+        url="https://example.com/news/hynix-market-note",
+        summary="No publish date is available on this search result.",
+    )
+
+    kept, issues = explore._apply_source_window_filter(
+        profile,
+        [fresh, stale_url, undated],
+        lookback_hours=72,
+    )
+
+    assert kept == [fresh]
+    assert len(issues) == 2
+    assert "outside the requested source window" in issues[0]["reason"]
+    assert "No reliable publish date" in issues[1]["reason"]
+
+
+def test_source_window_filter_leaves_default_recency_unrestricted() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track local AI tooling news.",
+            "scope": "Local AI tooling",
+            "recency_weighting": "breaking",
+        }
+    )
+    undated = article_for_window(
+        title="Undated local AI story",
+        url="https://example.com/news/local-ai-story",
+    )
+
+    kept, issues = explore._apply_source_window_filter(profile, [undated], lookback_hours=24)
+
+    assert kept == [undated]
+    assert issues == []
 
 
 class _TestStreamingModelClient:

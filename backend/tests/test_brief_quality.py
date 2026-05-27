@@ -49,7 +49,7 @@ def test_brief_quality_drops_duplicate_articles() -> None:
     assert decisions[0].action == "drop_article"
 
 
-def test_brief_quality_repairs_noisy_text_and_missing_date() -> None:
+def test_brief_quality_repairs_noisy_text_and_preserves_missing_date() -> None:
     result = article_result(
         title="<b>OpenAI update</b>",
         summary='**[Read more](https://example.com/read)** View image: (https://img.example.com/a.png) <i>Big shift</i>',
@@ -61,8 +61,8 @@ def test_brief_quality_repairs_noisy_text_and_missing_date() -> None:
     assert cleaned[0].title == "OpenAI update"
     assert "https://" not in cleaned[0].editor_summary
     assert "View image" not in cleaned[0].editor_summary
-    assert cleaned[0].payload.published_at == "2026-05-22T13:00:00+00:00"
-    assert any(decision.decision == "missing_date" for decision in decisions)
+    assert cleaned[0].payload.published_at is None
+    assert not any(decision.decision == "missing_date" for decision in decisions)
 
 
 def test_brief_quality_drops_broken_fetched_link() -> None:
