@@ -16,8 +16,42 @@ from backend.agents.model.metrics import record_model_error_metric, record_model
 from backend.app.core.config import get_settings
 
 MAX_AUDIT_CANDIDATES = 28
-RETRY_AUDIT_CANDIDATES = 10
+RETRY_AUDIT_CANDIDATES = 4
 URL_DATE_RE = re.compile(r"/(20\d{2})[/-](0[1-9]|1[0-2])(?:[/-]([0-3]\d))?")
+SYNDICATED_AGGREGATOR_DOMAINS = {
+    "finance.yahoo.com",
+    "news.yahoo.com",
+    "yahoo.com",
+    "msn.com",
+    "marketbeat.com",
+}
+LOW_QUALITY_DOMAINS = {
+    "blog.maxthon.com",
+    "katacoto.com",
+    "marketgrowthreports.com",
+}
+SOCIAL_OR_VIDEO_DOMAINS = {
+    "instagram.com",
+    "threads.net",
+    "youtube.com",
+    "youtu.be",
+}
+MARKET_REPORT_PHRASES = (
+    "market size",
+    "market share",
+    "market report",
+    "market growth",
+    "industry analysis",
+    "forecast",
+)
+ENTITY_ALIASES = {
+    "micron": ("micron", "mu"),
+    "hynix": ("hynix", "sk hynix", "sk하이닉스", "하이닉스"),
+    "kioxia": ("kioxia", "キオクシア"),
+    "sandisk": ("sandisk", "sndk", "san disk"),
+    "samsung": ("samsung", "samsung electronics", "삼성전자"),
+    "tsmc": ("tsmc", "taiwan semiconductor", "台積電", "台积电"),
+}
 
 
 async def apply_source_audit(
@@ -85,7 +119,8 @@ async def apply_source_audit(
                     compact=True,
                 )
             except ModelClientError as retry_error:
-                return _failed_audit_result(
+                return _heuristic_audit_result(
+                    profile,
                     result_list,
                     candidates,
                     model_name=model_name,
@@ -93,7 +128,7 @@ async def apply_source_audit(
                     first_error=first_error,
                 )
         else:
-            return _failed_audit_result(result_list, candidates, model_name=model_name, error=first_error)
+            return _heuristic_audit_result(profile, result_list, candidates, model_name=model_name, error=first_error)
 
     updated, decisions, audit_summary = _apply_audit_payload(
         result_list,
@@ -215,13 +250,105 @@ def _failed_audit_result(
     }
 
 
+def _heuristic_audit_result(
+    profile: TopicProfile | dict[str, Any],
+    result_list: list[ArticleFetchResult],
+    candidates: list[int],
+    *,
+    model_name: str | None,
+    error: ModelClientError,
+    first_error: ModelClientError | None = None,
+) -> tuple[list[ArticleFetchResult], list[AgentDecision], dict[str, Any]]:
+    profile_record = _profile_record(profile)
+    updated = list(result_list)
+    decisions: list[AgentDecision] = []
+    issues: list[dict[str, str]] = []
+    included_count = 0
+    excluded_count = 0
+    context_count = 0
+
+    for index in candidates:
+        result = updated[index]
+        reason = _heuristic_exclusion_reason(profile_record, result)
+        if reason:
+            updated[index] = replace(
+                result,
+                tier="dropped",
+                metadata={
+                    **dict(result.metadata or {}),
+                    "source_audit": {
+                        "decision": "exclude",
+                        "confidence": 0.72,
+                        "constraint_failures": ["source_quality"],
+                        "reason": reason,
+                        "mode": "deterministic_fallback",
+                    },
+                },
+            )
+            excluded_count += 1
+            issues.append({"source_name": result.title[:120], "reason": reason})
+            decisions.append(
+                AgentDecision(
+                    agent="source_audit",
+                    target=_target_for(result),
+                    decision="exclude",
+                    action="drop_article",
+                    confidence=0.72,
+                    reason=reason,
+                    model_name=model_name,
+                    metadata={"index": index, "mode": "deterministic_fallback"},
+                )
+            )
+        else:
+            included_count += 1
+
+    friendly_reason = _friendly_model_error(error)
+    metadata: dict[str, Any] = {
+        "status": error.status,
+        "reason": friendly_reason,
+        "candidate_count": len(candidates),
+        "mode": "deterministic_fallback",
+        "excluded_count": excluded_count,
+    }
+    if first_error is not None:
+        metadata["first_attempt_status"] = first_error.status
+        metadata["first_attempt_reason"] = _friendly_model_error(first_error)
+    decisions.append(
+        AgentDecision(
+            agent="source_audit",
+            target="candidate_pool",
+            decision="fallback",
+            action="pre_rank_audit",
+            reason=(
+                "Model audit could not complete, so deterministic source-quality checks "
+                f"excluded {excluded_count} obvious low-quality item(s)."
+            ),
+            model_name=model_name,
+            metadata=metadata,
+        )
+    )
+    return updated, decisions, {
+        "status": "fallback",
+        "candidate_count": len(candidates),
+        "included_count": included_count,
+        "excluded_count": excluded_count,
+        "context_count": context_count,
+        "issues": issues,
+        "summary": (
+            "Model audit could not complete; deterministic source-quality checks were applied "
+            f"and excluded {excluded_count} obvious low-quality item(s)."
+        ),
+        "model_issue": friendly_reason,
+    }
+
+
 def _friendly_model_error(exc: ModelClientError) -> str:
     text = str(exc).strip()
     lowered = text.lower()
     if "401" in text or "unauthorized" in lowered:
         return "Ollama Cloud rejected the model request; check the cloud API key or route this agent local-only."
     if "peer closed connection" in lowered or "incomplete chunked read" in lowered:
-        return "The local model connection closed before the audit finished. The audit was retried with a smaller batch."
+        return "The local model connection closed before the audit finished."
     if exc.status == "parse_error":
         return "The model returned text that was not valid audit JSON."
     if exc.status == "timeout":
@@ -241,6 +368,88 @@ def _retry_candidate_indexes(results: list[ArticleFetchResult], candidates: list
         reverse=True,
     )
     return ranked[: min(RETRY_AUDIT_CANDIDATES, len(ranked))]
+
+
+def _heuristic_exclusion_reason(profile_record: dict[str, Any], result: ArticleFetchResult) -> str | None:
+    metadata = dict(result.payload.metadata or {})
+    url = result.final_url or result.original_url or result.payload.original_url or ""
+    host = (result.domain or urlparse(url).netloc.lower().removeprefix("www.")).lower()
+    host = host.removeprefix("www.")
+    title = str(result.title or result.payload.source_name or "")
+    title_lower = title.casefold()
+    url_lower = str(url or "").casefold()
+    text_lower = " ".join(
+        [
+            str(profile_record.get("statement") or ""),
+            str(profile_record.get("scope") or ""),
+            " ".join(str(item) for item in profile_record.get("search_queries") or []),
+            " ".join(str(item) for item in profile_record.get("exclusions") or []),
+            title,
+            result.editor_summary or "",
+            result.excerpt or "",
+        ]
+    ).casefold()
+    source_type = result.payload.source_type
+
+    if _host_matches(host, LOW_QUALITY_DOMAINS):
+        return "Excluded by deterministic fallback because this domain is a low-quality blog or SEO source."
+    if (
+        source_type != "market_snapshot"
+        and _host_matches(host, SYNDICATED_AGGREGATOR_DOMAINS)
+        and _profile_discourages_aggregators(text_lower)
+    ):
+        return "Excluded by deterministic fallback because the brief asked to avoid Yahoo/MSN-like syndicated sources."
+    if source_type == "foreign_web" and _host_matches(host, SOCIAL_OR_VIDEO_DOMAINS):
+        return "Excluded by deterministic fallback because Foreign Media should not rank social or video pages as article coverage."
+    if "/tag/" in url_lower or title_lower.startswith("tag ") or title_lower == "tag - blocksandfiles":
+        return "Excluded by deterministic fallback because tag/archive pages are not article coverage."
+    if any(phrase in title_lower for phrase in MARKET_REPORT_PHRASES):
+        return "Excluded by deterministic fallback because generic market-report pages are low-signal for a current news brief."
+    if source_type == "market_snapshot" and not _matches_requested_entity(text_lower, result):
+        return "Excluded by deterministic fallback because the market snapshot does not match the requested companies."
+    if source_type == "foreign_web" and _looks_like_english_page_for_foreign_result(metadata, title, result.excerpt or ""):
+        return "Excluded by deterministic fallback because the result is not native-language foreign coverage."
+    return None
+
+
+def _host_matches(host: str, domains: set[str]) -> bool:
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
+
+def _profile_discourages_aggregators(text: str) -> bool:
+    return any(marker in text for marker in ("yahoo", "msn", "aggregator", "syndicated", "not like msn", "not like yahoo"))
+
+
+def _matches_requested_entity(profile_text: str, result: ArticleFetchResult) -> bool:
+    requested_groups = [
+        aliases
+        for key, aliases in ENTITY_ALIASES.items()
+        if key in profile_text or any(alias in profile_text for alias in aliases)
+    ]
+    if not requested_groups:
+        return True
+    result_text = " ".join(
+        [
+            result.title,
+            result.payload.source_name,
+            result.domain or "",
+            result.editor_summary or "",
+            result.excerpt or "",
+        ]
+    ).casefold()
+    return any(any(alias.casefold() in result_text for alias in aliases) for aliases in requested_groups)
+
+
+def _looks_like_english_page_for_foreign_result(metadata: dict[str, Any], title: str, summary: str) -> bool:
+    source_language = str(metadata.get("source_language") or "").strip().lower()
+    if not source_language or source_language == "en":
+        return False
+    combined = f"{title} {summary}"
+    if "(english)" in combined.casefold() or " united states (english)" in combined.casefold():
+        return True
+    letters = re.findall(r"[A-Za-z]", combined)
+    non_ascii = re.findall(r"[^\x00-\x7f]", combined)
+    return len(letters) > 120 and len(non_ascii) < 4
 
 
 def _audit_prompt(

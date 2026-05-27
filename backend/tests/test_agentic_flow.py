@@ -313,10 +313,10 @@ def test_source_audit_records_failed_model_attempts(monkeypatch, tmp_path):
 
     token_summary = database.inference_token_summary("audit-failure-run")
     assert updated[0].tier != "dropped"
-    assert summary["status"] == "failed"
-    assert summary["issues"][0]["reason"].startswith("Audit could not complete:")
-    assert "model_error" not in summary["issues"][0]["reason"]
-    assert any(decision.agent == "source_audit" and decision.action == "pass_through" for decision in decisions)
+    assert summary["status"] == "fallback"
+    assert summary["issues"] == []
+    assert "model stopped before completing" in summary["model_issue"]
+    assert any(decision.agent == "source_audit" and decision.action == "pre_rank_audit" for decision in decisions)
     assert token_summary["model_call_count"] == 1
     assert token_summary["model_failure_count"] == 1
     assert token_summary["completion_unavailable_count"] == 1
@@ -359,6 +359,94 @@ def test_source_audit_retries_with_smaller_batch_after_model_drop(monkeypatch, t
     assert len(model.prompts) == 2
     assert len(model.prompts[1]) < len(model.prompts[0])
     assert token_summary["model_failure_count"] == 1
+
+
+def test_source_audit_fallback_drops_obvious_low_quality_sources(monkeypatch, tmp_path):
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(tmp_path))
+    database.init_database()
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="SanDisk-Kioxia Alliance Through 2034 - Maxthon",
+        original_url="https://blog.maxthon.com/2026/02/08/sandisk-kioxia-alliance-through-2034",
+    )
+    low_quality = ArticleFetchResult(
+        payload=payload,
+        original_url=str(payload.original_url),
+        final_url=str(payload.original_url),
+        canonical_url=str(payload.original_url),
+        title="SanDisk-Kioxia Alliance Through 2034 - Maxthon | Privacy Private Browser",
+        text="SanDisk Kioxia NAND analysis from a low quality blog.",
+        excerpt="SanDisk Kioxia NAND analysis from a low quality blog.",
+        domain="blog.maxthon.com",
+        status="fetched",
+        link_score=0.9,
+        relevance_score=0.9,
+        tier="main",
+        section="Noteworthy",
+        editor_summary="SanDisk Kioxia NAND analysis from a low quality blog.",
+    )
+
+    updated, decisions, summary = asyncio.run(
+        apply_source_audit(
+            {
+                "statement": "Track Micron, Hynix, Kioxia, and SanDisk; avoid sites like MSN or Yahoo News.",
+                "scope": "Memory company performance",
+            },
+            [low_quality],
+            lookback_hours=72,
+            model_client=FailingModelClient({}),
+            inference_run_id="audit-heuristic-fallback-run",
+        )
+    )
+
+    assert summary["status"] == "fallback"
+    assert summary["excluded_count"] == 1
+    assert updated[0].tier == "dropped"
+    assert "low-quality blog" in summary["issues"][0]["reason"]
+    assert any(decision.agent == "source_audit" and decision.action == "drop_article" for decision in decisions)
+
+
+def test_source_audit_fallback_uses_company_fit_for_market_snapshots(monkeypatch, tmp_path):
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(tmp_path))
+    database.init_database()
+    payload = NormalizedPayload(
+        source_type="market_snapshot",
+        source_name="Ford Motor Company (F)",
+        original_url="https://finance.yahoo.com/quote/F",
+    )
+    market_snapshot = ArticleFetchResult(
+        payload=payload,
+        original_url=str(payload.original_url),
+        final_url=str(payload.original_url),
+        canonical_url=str(payload.original_url),
+        title="Ford Motor Company (F)",
+        text="Ford stock snapshot.",
+        excerpt="Ford stock snapshot.",
+        domain="finance.yahoo.com",
+        status="fetched",
+        link_score=0.8,
+        relevance_score=0.8,
+        tier="main",
+        section="Markets",
+        editor_summary="Ford stock snapshot.",
+    )
+
+    updated, _decisions, summary = asyncio.run(
+        apply_source_audit(
+            {
+                "statement": "Track Micron, Hynix, Kioxia, and SanDisk; avoid Yahoo-like syndicated news.",
+                "scope": "Memory company performance",
+            },
+            [market_snapshot],
+            lookback_hours=72,
+            model_client=FailingModelClient({}),
+            inference_run_id="audit-market-fallback-run",
+        )
+    )
+
+    assert summary["status"] == "fallback"
+    assert updated[0].tier == "dropped"
+    assert "market snapshot does not match" in summary["issues"][0]["reason"]
 
 
 def test_digest_runner_uses_langgraph_orchestration():
