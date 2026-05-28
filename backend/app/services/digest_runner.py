@@ -19,7 +19,7 @@ from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_a
 from backend.agents.source_audit import apply_source_audit
 from backend.app.core.config import get_settings
 from backend.app.db import database
-from backend.app.services import model_routing
+from backend.app.services import brief_settings, model_routing
 from langgraph.graph import END, START, StateGraph
 
 LOOKBACK_HOURS_BY_SCHEDULE = {
@@ -195,7 +195,12 @@ async def _ingest_podcast(state: DigestGraphState) -> DigestGraphState:
 
 
 async def _fetch_articles(state: DigestGraphState) -> DigestGraphState:
-    fetched_articles = await fetch_articles_for_payloads(state.get("payloads", []))
+    pipeline_limits = brief_settings.load_pipeline_limits(get_settings())
+    fetched_articles = await fetch_articles_for_payloads(
+        state.get("payloads", []),
+        max_articles=pipeline_limits["article_fetches"],
+        concurrency=pipeline_limits["article_fetch_concurrency"],
+    )
     stage_seconds = dict(state.get("stage_seconds", {}))
     stage_started = _mark_stage(stage_seconds, "fetching", state["stage_started"])
     return {
@@ -239,6 +244,7 @@ async def _rank_articles(state: DigestGraphState) -> DigestGraphState:
 
 async def _refine_with_model(state: DigestGraphState) -> DigestGraphState:
     settings = get_settings()
+    pipeline_limits = brief_settings.load_pipeline_limits(settings)
     librarian_client = model_routing.client_for_agent(
         "librarian",
         settings=settings,
@@ -247,6 +253,7 @@ async def _refine_with_model(state: DigestGraphState) -> DigestGraphState:
     article_results = await refine_ranked_articles_with_model(
         state.get("ranked_articles", []),
         model_client=librarian_client,
+        model_max_items=min(settings.librarian_model_max_items, pipeline_limits["model_refinement_items"]),
         inference_run_id=state["inference_run_id"],
         metrics_mode="batch" if state.get("trigger") == "scheduled" else "single",
     )
@@ -262,6 +269,7 @@ async def _refine_with_model(state: DigestGraphState) -> DigestGraphState:
 async def _review_quality(state: DigestGraphState) -> DigestGraphState:
     digest = state["digest"]
     settings = get_settings()
+    pipeline_limits = brief_settings.load_pipeline_limits(settings)
     source_audit_client = model_routing.client_for_agent(
         "source_audit",
         settings=settings,
@@ -273,6 +281,7 @@ async def _review_quality(state: DigestGraphState) -> DigestGraphState:
         lookback_hours=state["lookback_hours"],
         model_client=source_audit_client,
         inference_run_id=state["inference_run_id"],
+        max_candidates=pipeline_limits["source_audit_candidates"],
     )
     editorial_client = model_routing.client_for_agent(
         "editorial",
@@ -284,6 +293,7 @@ async def _review_quality(state: DigestGraphState) -> DigestGraphState:
         article_results,
         model_client=editorial_client,
         inference_run_id=state["inference_run_id"],
+        max_candidates=pipeline_limits["editorial_candidates"],
     )
     critic_client = model_routing.client_for_agent(
         "critic",
@@ -296,6 +306,8 @@ async def _review_quality(state: DigestGraphState) -> DigestGraphState:
         article_results,
         model_client=critic_client,
         inference_run_id=state["inference_run_id"],
+        max_articles=pipeline_limits["critic_articles"],
+        max_newsletter_records=pipeline_limits["critic_newsletter_records"],
     )
     article_results, quality_decisions = apply_brief_quality_checks(article_results)
     stage_seconds = dict(state.get("stage_seconds", {}))

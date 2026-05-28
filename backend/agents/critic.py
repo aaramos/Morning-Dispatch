@@ -29,6 +29,8 @@ async def apply_critic_repairs(
     model_client: ModelClient | None = None,
     reasoning_callback: Callable[[str], None] | None = None,
     inference_run_id: str | None = None,
+    max_articles: int | None = None,
+    max_newsletter_records: int | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision]]:
     result_list = _deterministic_repairs(list(results))
     active_count = sum(1 for result in result_list if result.tier != "dropped")
@@ -60,7 +62,13 @@ async def apply_critic_repairs(
             )
         ]
 
-    prompt = _critic_prompt(digest, payloads, result_list)
+    prompt = _critic_prompt(
+        digest,
+        payloads,
+        result_list,
+        max_articles=max_articles,
+        max_newsletter_records=max_newsletter_records,
+    )
     started_at = perf_counter()
     try:
         if hasattr(client, "complete_json_with_metrics"):
@@ -132,7 +140,12 @@ def _critic_prompt(
     digest: dict[str, Any],
     payloads: list[NormalizedPayload],
     results: list[ArticleFetchResult],
+    *,
+    max_articles: int | None = None,
+    max_newsletter_records: int | None = None,
 ) -> str:
+    article_limit = _prompt_limit(max_articles, MAX_CRITIC_ARTICLES, minimum=1)
+    newsletter_limit = _prompt_limit(max_newsletter_records, MAX_NEWSLETTER_RECORDS, minimum=0)
     newsletter_records = [
         {
             "sender": payload.source_name,
@@ -141,7 +154,7 @@ def _critic_prompt(
         }
         for payload in payloads
         if payload.source_type == "gmail"
-    ][:MAX_NEWSLETTER_RECORDS]
+    ][:newsletter_limit]
     article_records = [
         {
             "index": index,
@@ -153,7 +166,7 @@ def _critic_prompt(
             "status": result.status,
             "score": result.relevance_score,
         }
-        for index, result in enumerate(results[:MAX_CRITIC_ARTICLES])
+        for index, result in enumerate(results[:article_limit])
         if result.tier != "dropped"
     ]
     return json.dumps(
@@ -185,6 +198,15 @@ def _critic_prompt(
         },
         ensure_ascii=False,
     )
+
+
+def _prompt_limit(value: int | None, maximum: int, *, minimum: int) -> int:
+    if value is None:
+        return maximum
+    try:
+        return max(minimum, min(int(value), maximum))
+    except (TypeError, ValueError):
+        return maximum
 
 
 def _apply_critic_payload(

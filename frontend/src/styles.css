@@ -655,10 +655,151 @@ label {
   background: #f7f7f4;
 }
 
+.brief-controls-panel {
+  display: grid;
+  gap: 14px;
+}
+
 .content-limit-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-tabs button {
+  padding: 10px 14px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #f7f7f4;
+  font-weight: 800;
+}
+
+.settings-tabs button.active {
+  background: #171717;
+  color: #ffffff;
+  border-color: #171717;
+}
+
+.settings-subsection {
+  margin-top: 26px;
+  padding-top: 22px;
+  border-top: 1px solid #d8d7cf;
+}
+
+.compact-title-row {
+  margin-bottom: 14px;
+}
+
+.system-limits-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.pipeline-limits-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.pipeline-limit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pipeline-limit-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #fbfaf7;
+}
+
+.pipeline-limit-card > div {
+  display: grid;
+  gap: 5px;
+}
+
+.pipeline-limit-card span,
+.system-limit-card span {
+  color: #68655d;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.pipeline-limit-card strong {
+  font-size: 1.1rem;
+}
+
+.pipeline-limit-card p {
+  margin: 0;
+  color: #706d66;
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+
+.pipeline-limit-card .number-stepper {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.advanced-system-limits {
+  display: grid;
+  gap: 18px;
+}
+
+.system-limit-group {
+  display: grid;
+  gap: 10px;
+}
+
+.system-limit-group h3 {
+  margin: 0;
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #5d5b55;
+}
+
+.system-limit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.system-limit-card {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #f7f7f4;
+}
+
+.system-limit-card span {
+  color: #5d5b55;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.system-limit-card strong {
+  font-size: 1.12rem;
+}
+
+.system-limit-card p {
+  margin: 0;
+  color: #77756f;
+  font-size: 0.9rem;
+  line-height: 1.35;
 }
 
 .source-limit-list {
@@ -766,6 +907,116 @@ label {
 .search-plan-list span {
   max-width: 100%;
   overflow-wrap: anywhere;
+}
+
+.strategy-review-card {
+  margin-top: 18px;
+  padding: 16px 18px;
+  border: 1px solid #d8d7cf;
+  border-radius: 14px;
+  background: #f7f7f4;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.strategy-review-summary {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #2b2b27;
+}
+
+.strategy-review-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+}
+
+.strategy-review-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 160px;
+}
+
+.strategy-review-block strong {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b6b63;
+}
+
+.strategy-review-block span {
+  color: #2b2b27;
+  overflow-wrap: anywhere;
+}
+
+.strategy-review-queries {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.strategy-review-queries li {
+  overflow-wrap: anywhere;
+}
+
+.gmail-allowlist-card {
+  grid-column: 1 / -1;
+}
+
+.gmail-allowlist-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+  margin-bottom: 8px;
+}
+
+.gmail-allowlist-group {
+  margin-top: 12px;
+}
+
+.gmail-allowlist-group-title {
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.gmail-allowlist-empty {
+  margin: 0;
+}
+
+.gmail-allowlist-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gmail-allowlist-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid #d8d7cf;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.gmail-allowlist-sender {
+  display: flex;
+  flex-direction: column;
+  overflow-wrap: anywhere;
+}
+
+.gmail-allowlist-email {
+  font-size: 12px;
 }
 
 .pipeline-row {
@@ -1297,6 +1548,15 @@ label {
   font-size: 0.92rem;
 }
 
+.screen-reader-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
 .muted {
   color: #77756f;
 }
@@ -1497,6 +1757,8 @@ label {
   .active-digest-row,
   .confirm-grid,
   .content-limit-grid,
+  .pipeline-limit-grid,
+  .system-limit-grid,
   .admin-form-grid,
   .schedule-controls,
   .email-send-box,

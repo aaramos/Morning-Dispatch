@@ -14,7 +14,9 @@ from backend.agents.editor import prepare_issue_articles
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
 from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
+from backend.app.core.config import get_settings
 from backend.app.db import database
+from backend.app.services import brief_settings
 
 
 async def run_controlled_verification(
@@ -54,8 +56,19 @@ async def run_controlled_verification(
         after_critic = _apply_stored_decisions(source_articles, reused_decision_records)
         decisions = _records_to_decisions(reused_decision_records)
     else:
-        after_editorial, editorial_decisions = await apply_editorial_decisions(digest, source_articles)
-        after_critic, critic_decisions = await apply_critic_repairs(digest, source_payloads, after_editorial)
+        pipeline_limits = brief_settings.load_pipeline_limits(get_settings())
+        after_editorial, editorial_decisions = await apply_editorial_decisions(
+            digest,
+            source_articles,
+            max_candidates=pipeline_limits["editorial_candidates"],
+        )
+        after_critic, critic_decisions = await apply_critic_repairs(
+            digest,
+            source_payloads,
+            after_editorial,
+            max_articles=pipeline_limits["critic_articles"],
+            max_newsletter_records=pipeline_limits["critic_newsletter_records"],
+        )
         decisions = editorial_decisions + critic_decisions
     after_quality, quality_decisions = apply_brief_quality_checks(after_critic)
     decisions = decisions + quality_decisions
@@ -176,19 +189,35 @@ async def _run_controlled_podcast_refresh(
             "message": "Podcast refresh ran, but no matching episodes were selected.",
         }
 
-    fetched_articles = await fetch_articles_for_payloads(podcast_payloads)
+    pipeline_limits = brief_settings.load_pipeline_limits(get_settings())
+    fetched_articles = await fetch_articles_for_payloads(
+        podcast_payloads,
+        max_articles=pipeline_limits["article_fetches"],
+        concurrency=pipeline_limits["article_fetch_concurrency"],
+    )
     stage_started = _mark_stage(stage_seconds, "fetching", stage_started)
     enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
     ranked_articles = prepare_issue_articles(digest, enriched_articles)
     article_results = await refine_ranked_articles_with_model(
         ranked_articles,
+        model_max_items=pipeline_limits["model_refinement_items"],
         inference_run_id=inference_run_id,
         metrics_mode="single",
     )
     stage_started = _mark_stage(stage_seconds, "classification", stage_started)
 
-    after_editorial, editorial_decisions = await apply_editorial_decisions(digest, article_results)
-    after_critic, critic_decisions = await apply_critic_repairs(digest, podcast_payloads, after_editorial)
+    after_editorial, editorial_decisions = await apply_editorial_decisions(
+        digest,
+        article_results,
+        max_candidates=pipeline_limits["editorial_candidates"],
+    )
+    after_critic, critic_decisions = await apply_critic_repairs(
+        digest,
+        podcast_payloads,
+        after_editorial,
+        max_articles=pipeline_limits["critic_articles"],
+        max_newsletter_records=pipeline_limits["critic_newsletter_records"],
+    )
     after_quality, quality_decisions = apply_brief_quality_checks(after_critic)
     _mark_stage(stage_seconds, "editorial", stage_started)
     decisions = podcast_decisions + editorial_decisions + critic_decisions + quality_decisions

@@ -61,9 +61,10 @@ async def apply_source_audit(
     lookback_hours: int,
     model_client: ModelClient | None = None,
     inference_run_id: str | None = None,
+    max_candidates: int | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision], dict[str, Any]]:
     result_list = list(results)
-    candidates = _candidate_indexes(result_list)
+    candidates = _candidate_indexes(result_list, max_candidates=max_candidates)
     summary = {
         "status": "skipped",
         "candidate_count": len(candidates),
@@ -478,9 +479,13 @@ def _audit_prompt(
                     "essential background must be include_as_context, never ranked as fresh news."
                 ),
             },
+            "coverage_goal": _coverage_goal(profile),
             "exclusions": profile_record["exclusions"],
             "instructions": (
                 "Make judgment calls about freshness, topic fit, originality, and source quality. "
+                "For broad landscape or learning briefs, do not collapse the issue to only a few articles: "
+                "when the candidate pool is below the desired item count, prefer include_as_context for useful "
+                "but overlapping background and exclude only stale, off-topic, inaccessible, or clearly promotional items. "
                 "Treat provider dates as weak evidence when URL paths, snippets, or article text imply an older date. "
                 "Treat MSN/Yahoo-like instructions as a request to avoid syndicated aggregator reposts, even on adjacent domains. "
                 "Translated foreign-media items are allowed; judge them on the translated summary and provenance quality, "
@@ -522,12 +527,42 @@ def _profile_record(profile: TopicProfile | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _candidate_indexes(results: list[ArticleFetchResult]) -> list[int]:
+def _coverage_goal(profile: TopicProfile | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(profile, TopicProfile):
+        limits = profile.content_limits
+    else:
+        limits = profile.get("content_limits")
+    desired_items = None
+    if isinstance(limits, dict):
+        try:
+            desired_items = int(limits.get("target_items") or limits.get("total_items"))
+        except (TypeError, ValueError):
+            desired_items = None
+    return {
+        "desired_items": desired_items,
+        "instruction": (
+            "The final brief should approach this count when enough relevant candidates exist; "
+            "source audit should remove genuine bad fits, not enforce a tiny shortlist."
+        ),
+    }
+
+
+def _candidate_indexes(results: list[ArticleFetchResult], *, max_candidates: int | None = None) -> list[int]:
+    limit = _candidate_limit(max_candidates, MAX_AUDIT_CANDIDATES)
     return [
         index
-        for index, result in enumerate(results[:MAX_AUDIT_CANDIDATES])
+        for index, result in enumerate(results[:limit])
         if result.tier != "dropped" and (result.fetched or result.link_score >= 0.55)
     ]
+
+
+def _candidate_limit(value: int | None, maximum: int) -> int:
+    if value is None:
+        return maximum
+    try:
+        return max(1, min(int(value), maximum))
+    except (TypeError, ValueError):
+        return maximum
 
 
 def _article_record(index: int, result: ArticleFetchResult, *, compact: bool = False) -> dict[str, Any]:

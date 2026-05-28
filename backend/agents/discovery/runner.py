@@ -164,7 +164,11 @@ class DiscoveryRunner:
             [candidate for adapter_candidates, _status in results for candidate in adapter_candidates],
         )
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
-        candidates = _apply_source_limits(profile, candidates)
+        candidates = _apply_source_limits(
+            profile,
+            candidates,
+            target_limit=_explicit_total_limit(profile),
+        )
         candidates = _dedupe_candidates(
             candidates,
             limit=context.candidate_limit,
@@ -247,24 +251,49 @@ def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candi
     return deduped
 
 
-def _apply_source_limits(profile: TopicProfile, candidates: list[Candidate]) -> list[Candidate]:
+def _apply_source_limits(profile: TopicProfile, candidates: list[Candidate], *, target_limit: int | None = None) -> list[Candidate]:
     per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else None
     if not isinstance(per_source, dict) or not per_source:
         return candidates
 
     counts: dict[str, int] = {}
     kept: list[Candidate] = []
-    for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
+    ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
+    kept_ids: set[int] = set()
+    for candidate in ranked:
         limit = _source_limit(per_source.get(candidate.adapter))
         if limit is None:
             kept.append(candidate)
+            kept_ids.add(id(candidate))
             continue
         current = counts.get(candidate.adapter, 0)
         if current >= limit:
             continue
         counts[candidate.adapter] = current + 1
         kept.append(candidate)
+        kept_ids.add(id(candidate))
+
+    if target_limit is not None and len(kept) < target_limit:
+        for candidate in ranked:
+            if id(candidate) in kept_ids:
+                continue
+            kept.append(candidate)
+            kept_ids.add(id(candidate))
+            if len(kept) >= target_limit:
+                break
     return kept
+
+
+def _explicit_total_limit(profile: TopicProfile) -> int | None:
+    if not isinstance(profile.content_limits, dict) or "total_items" not in profile.content_limits:
+        return None
+    try:
+        total = int(profile.content_limits.get("total_items"))
+    except (TypeError, ValueError):
+        return None
+    if total < 1:
+        return None
+    return min(total, 250)
 
 
 def _source_limit(value: Any) -> int | None:

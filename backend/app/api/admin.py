@@ -20,6 +20,8 @@ from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
 from backend.app.db import database
 from backend.app.services import (
     email_delivery,
+    brief_settings,
+    gmail_allowlist,
     mcp_status,
     model_catalog,
     model_jobs,
@@ -76,6 +78,21 @@ class DeliverySettingsPayload(BaseModel):
     enabled: bool = False
 
 
+class BriefDefaultsPayload(BaseModel):
+    lookback_hours: int = Field(default=72, ge=1, le=8760)
+    content_limits: dict[str, Any] = Field(default_factory=dict)
+
+
+class PipelineLimitsPayload(BaseModel):
+    article_fetches: int = Field(default=brief_settings.MAX_ARTICLE_FETCHES, ge=1, le=brief_settings.MAX_ARTICLE_FETCHES)
+    article_fetch_concurrency: int = Field(default=10, ge=1, le=brief_settings.MAX_ARTICLE_FETCH_CONCURRENCY)
+    model_refinement_items: int = Field(default=brief_settings.MODEL_REFINEMENT_LIMIT, ge=0, le=brief_settings.MODEL_REFINEMENT_LIMIT)
+    source_audit_candidates: int = Field(default=brief_settings.MAX_AUDIT_CANDIDATES, ge=1, le=brief_settings.MAX_AUDIT_CANDIDATES)
+    editorial_candidates: int = Field(default=brief_settings.MAX_EDITORIAL_CANDIDATES, ge=1, le=brief_settings.MAX_EDITORIAL_CANDIDATES)
+    critic_articles: int = Field(default=brief_settings.MAX_CRITIC_ARTICLES, ge=1, le=brief_settings.MAX_CRITIC_ARTICLES)
+    critic_newsletter_records: int = Field(default=brief_settings.MAX_NEWSLETTER_RECORDS, ge=0, le=brief_settings.MAX_NEWSLETTER_RECORDS)
+
+
 class PodcastSourcePayload(BaseModel):
     type: str = Field(default="podcast_rss")
     title: str | None = Field(default=None, max_length=180)
@@ -90,6 +107,11 @@ class PodcastSourcePayload(BaseModel):
 class PodcastCredentialsPayload(BaseModel):
     api_key: str = Field(min_length=1, max_length=1000)
     api_secret: str = Field(min_length=1, max_length=1000)
+
+
+class GmailSenderPayload(BaseModel):
+    sender: str = Field(min_length=3, max_length=254)
+    sender_name: str | None = Field(default=None, max_length=120)
 
 
 def require_admin_network(request: Request) -> None:
@@ -137,6 +159,21 @@ def gmail_status(request: Request) -> dict[str, Any]:
         "redirect_warning": redirect_warning,
         "network": "loopback-or-tailscale",
     }
+
+
+@router.get("/brief-settings")
+def brief_settings_status() -> dict[str, Any]:
+    return brief_settings.brief_settings_status(_settings())
+
+
+@router.put("/brief-settings/defaults")
+def update_brief_defaults(payload: BriefDefaultsPayload) -> dict[str, Any]:
+    return brief_settings.save_brief_defaults(_settings(), payload.model_dump())
+
+
+@router.put("/brief-settings/pipeline-limits")
+def update_pipeline_limits(payload: PipelineLimitsPayload) -> dict[str, Any]:
+    return brief_settings.save_pipeline_limits(_settings(), payload.model_dump())
 
 
 @router.get("/status")
@@ -522,6 +559,43 @@ def list_source_scout() -> dict[str, Any]:
         "sources": database.list_reddit_sources(include_retired=True),
         "decisions": database.list_source_scout_decisions(limit=60),
     }
+
+
+@router.get("/gmail/allowlist")
+def list_gmail_allowlist() -> dict[str, Any]:
+    return gmail_allowlist.allowlist_status()
+
+
+@router.post("/gmail/allowlist")
+def add_gmail_allowlist_sender(payload: GmailSenderPayload) -> dict[str, Any]:
+    try:
+        return gmail_allowlist.add_sender(payload.sender, sender_name=payload.sender_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/gmail/allowlist/{sender}/approve")
+def approve_gmail_allowlist_sender(sender: str) -> dict[str, Any]:
+    try:
+        return gmail_allowlist.approve_sender(sender)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/gmail/allowlist/{sender}/reject")
+def reject_gmail_allowlist_sender(sender: str) -> dict[str, Any]:
+    try:
+        return gmail_allowlist.reject_sender(sender)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/gmail/allowlist/{sender}")
+def remove_gmail_allowlist_sender(sender: str) -> dict[str, Any]:
+    try:
+        return gmail_allowlist.remove_sender(sender)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/digests/{digest_id}/source-scout")

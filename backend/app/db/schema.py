@@ -376,6 +376,20 @@ CREATE TABLE IF NOT EXISTS source_scout_decisions (
   created_at       TEXT NOT NULL
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS gmail_senders (
+  id           TEXT PRIMARY KEY,
+  sender       TEXT NOT NULL UNIQUE,
+  sender_name  TEXT,
+  state        TEXT NOT NULL CHECK(state IN ('approved','candidate','rejected')),
+  reason       TEXT,
+  source       TEXT,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  last_seen_at TEXT,
+  metadata     TEXT NOT NULL DEFAULT '{}',
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS served_undated_items (
   id              TEXT PRIMARY KEY,
   topic_id        TEXT NOT NULL,
@@ -416,4 +430,5 @@ CREATE INDEX IF NOT EXISTS idx_reddit_sources_state ON reddit_sources(state);
 CREATE INDEX IF NOT EXISTS idx_source_scout_runs_digest_id ON source_scout_runs(digest_id);
 CREATE INDEX IF NOT EXISTS idx_source_scout_decisions_digest_id ON source_scout_decisions(digest_id);
 CREATE INDEX IF NOT EXISTS idx_served_undated_items_topic ON served_undated_items(topic_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_senders_state ON gmail_senders(state);
 """

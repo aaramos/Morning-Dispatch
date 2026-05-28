@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.core.config import get_settings
 from backend.app.db import database
-from backend.app.services import digest_runner, email_delivery, explore, foreign_article_translation, refinement, scheduler
+from backend.app.services import brief_settings, digest_runner, email_delivery, explore, foreign_article_translation, refinement, scheduler
 
 router = APIRouter(prefix="/api")
 delivery_router = APIRouter()
@@ -118,6 +118,8 @@ class TopicProfileSchedule(BaseModel):
 
 class TopicProfileContentLimitsUpdate(BaseModel):
     content_limits: dict[str, Any] = Field(default_factory=dict)
+    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
+    pipeline_limits: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceSetupPayload(BaseModel):
@@ -273,8 +275,14 @@ def update_topic_profile_content_limits(topic_id: str, payload: TopicProfileCont
         **record["profile"],
         "topic_id": topic_id,
         "statement": record["statement"],
-        "content_limits": payload.content_limits,
+        "content_limits": brief_settings.normalize_content_limits(payload.content_limits),
     }
+    if payload.pipeline_limits:
+        profile["pipeline_limits"] = brief_settings.normalize_pipeline_limits(payload.pipeline_limits)
+    elif record["profile"].get("pipeline_limits"):
+        profile["pipeline_limits"] = brief_settings.normalize_pipeline_limits(record["profile"].get("pipeline_limits"))
+    if payload.lookback_hours is not None:
+        profile["lookback_hours"] = payload.lookback_hours
     try:
         return explore.save_topic_profile(profile)
     except ValueError as exc:

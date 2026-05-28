@@ -29,6 +29,7 @@ class Settings:
     gmail_credentials_path: Path
     gmail_oauth_state_path: Path
     model_settings_path: Path
+    brief_settings_path: Path
     google_cloud_project_id: str | None = None
     gmail_remote_mcp_enabled: bool = False
     public_base_url: str | None = None
@@ -225,6 +226,10 @@ def get_settings() -> Settings:
         "MORNING_DISPATCH_MODEL_SETTINGS_PATH",
         data_dir / "model-settings.json",
     )
+    brief_settings_path = _path_from_env(
+        "MORNING_DISPATCH_BRIEF_SETTINGS_PATH",
+        data_dir / "brief-settings.json",
+    )
     model_api_key = (
         os.environ.get("MORNING_DISPATCH_MODEL_API_KEY")
         or os.environ.get("OMLX_API_KEY")
@@ -301,6 +306,7 @@ def get_settings() -> Settings:
         google_cloud_project_id=os.environ.get("MORNING_DISPATCH_GOOGLE_CLOUD_PROJECT_ID"),
         gmail_remote_mcp_enabled=_bool_from_env("MORNING_DISPATCH_GMAIL_REMOTE_MCP_ENABLED", False),
         model_settings_path=model_settings_path,
+        brief_settings_path=brief_settings_path,
         public_base_url=os.environ.get("MORNING_DISPATCH_PUBLIC_BASE_URL"),
         environment=os.environ.get("MORNING_DISPATCH_ENV", "development"),
         podcastindex_api_key=podcastindex_api_key,

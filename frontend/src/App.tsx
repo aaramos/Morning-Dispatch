@@ -53,6 +53,7 @@ type TopicProfile = {
   schedule_config?: Record<string, unknown>;
   delivery_config?: Record<string, unknown>;
   content_limits?: Partial<ContentLimitsDraft>;
+  pipeline_limits?: Partial<PipelineLimitsDraft>;
   status?: string;
   archived?: boolean;
   deleted?: boolean;
@@ -69,6 +70,25 @@ type TopicProfileResponse = {
   next_run_at?: string | null;
 };
 
+type StrategyPreview = {
+  statement: string;
+  scope: string;
+  looks_at: string[];
+  ignores: string[];
+  search_queries: string[];
+  per_source: Array<{
+    source: string;
+    key: string;
+    queries: string[];
+    approved_senders?: string[];
+    note?: string;
+  }>;
+  lookback_hours: number | null;
+  recency_weighting: string;
+  exclusions: string[];
+  reasoning_summary: string;
+};
+
 type RefinementSession = {
   session_id: string;
   statement: string;
@@ -78,6 +98,8 @@ type RefinementSession = {
   profile: TopicProfile;
   topic_id: string | null;
   topic_profile?: TopicProfileResponse;
+  reasoning_summary?: string;
+  strategy_preview?: StrategyPreview;
 };
 
 type ConfirmedProfilePayload = {
@@ -332,9 +354,36 @@ type ConfirmationDraft = {
 
 type ContentLimitsDraft = {
   total_items: number;
+  target_items: number;
   lead_items: number;
   per_source: Partial<Record<SourceKey, number>>;
   quality_floor: "standard" | "strong";
+};
+
+type BriefControlsDraft = {
+  lookback_hours: number;
+  content_limits: ContentLimitsDraft;
+};
+
+type SystemLimitGroup = {
+  group: string;
+  items: Array<{ label: string; value: string; note?: string }>;
+};
+
+type PipelineLimitsDraft = {
+  article_fetches: number;
+  article_fetch_concurrency: number;
+  model_refinement_items: number;
+  source_audit_candidates: number;
+  editorial_candidates: number;
+  critic_articles: number;
+  critic_newsletter_records: number;
+};
+
+type BriefSettingsResponse = {
+  defaults: BriefControlsDraft;
+  pipeline_limits: PipelineLimitsDraft;
+  system_limits: SystemLimitGroup[];
 };
 
 type RefinementProgress = {
@@ -343,7 +392,7 @@ type RefinementProgress = {
   label: string;
 };
 
-type AdminTab = "status" | "sources" | "library" | "models" | "metrics";
+type AdminTab = "status" | "sources" | "library" | "settings" | "models" | "metrics";
 
 const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
   { key: "web_search", label: "Web", icon: "🌐" },
@@ -366,22 +415,103 @@ const defaultSourceSelection: Record<SourceKey, boolean> = {
   collections: false,
   markets: false,
 };
+const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
+  web_search: true,
+  foreign_media: true,
+  gmail: true,
+  reddit: true,
+  podcasts: true,
+  youtube: true,
+  collections: true,
+  markets: true,
+};
 
 const defaultContentLimits: ContentLimitsDraft = {
-  total_items: 12,
+  total_items: 40,
+  target_items: 12,
   lead_items: 3,
   per_source: {
-    web_search: 6,
+    web_search: 15,
     foreign_media: 4,
     gmail: 4,
-    reddit: 3,
-    podcasts: 2,
-    youtube: 2,
+    reddit: 15,
+    podcasts: 5,
+    youtube: 5,
     collections: 4,
     markets: 2,
   },
   quality_floor: "standard",
 };
+const defaultBriefControls: BriefControlsDraft = {
+  lookback_hours: 72,
+  content_limits: defaultContentLimits,
+};
+const defaultPipelineLimits: PipelineLimitsDraft = {
+  article_fetches: 250,
+  article_fetch_concurrency: 10,
+  model_refinement_items: 150,
+  source_audit_candidates: 28,
+  editorial_candidates: 150,
+  critic_articles: 50,
+  critic_newsletter_records: 20,
+};
+const pipelineLimitFields: Array<{
+  key: keyof PipelineLimitsDraft;
+  label: string;
+  min: number;
+  max: number;
+  note: string;
+}> = [
+  {
+    key: "article_fetches",
+    label: "Article fetches",
+    min: 1,
+    max: 250,
+    note: "Maximum article URLs the fetch step will retrieve.",
+  },
+  {
+    key: "article_fetch_concurrency",
+    label: "Fetch concurrency",
+    min: 1,
+    max: 20,
+    note: "Parallel article fetches during extraction.",
+  },
+  {
+    key: "model_refinement_items",
+    label: "Model-enriched items",
+    min: 0,
+    max: 150,
+    note: "Candidate summaries/refinements sent through the model.",
+  },
+  {
+    key: "source_audit_candidates",
+    label: "Source audit candidates",
+    min: 1,
+    max: 28,
+    note: "Candidates reviewed in the pre-ranking source audit.",
+  },
+  {
+    key: "editorial_candidates",
+    label: "Editorial candidates",
+    min: 1,
+    max: 150,
+    note: "Candidates the editorial model can sort and include.",
+  },
+  {
+    key: "critic_articles",
+    label: "Critic articles",
+    min: 1,
+    max: 50,
+    note: "Draft articles reviewed by the critic pass.",
+  },
+  {
+    key: "critic_newsletter_records",
+    label: "Newsletter samples",
+    min: 0,
+    max: 20,
+    note: "Gmail newsletter samples visible to the critic pass.",
+  },
+];
 
 const schedulePresets: Array<{ value: SchedulePreset; label: string }> = [
   { value: "daily", label: "Daily" },
@@ -392,7 +522,7 @@ const schedulePresets: Array<{ value: SchedulePreset; label: string }> = [
 const interestDraftCookieName = "morning_dispatch_interest_draft";
 const interestDraftTtlSeconds = 60 * 60;
 const interestDraftTtlMs = interestDraftTtlSeconds * 1000;
-const adminTabOptions: AdminTab[] = ["status", "sources", "library", "models", "metrics"];
+const adminTabOptions: AdminTab[] = ["status", "sources", "library", "settings", "models", "metrics"];
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -494,6 +624,7 @@ function DispatchApp() {
   const [refinementProgress, setRefinementProgress] = useState<RefinementProgress | null>(null);
   const [refinementFallbackStartedAt, setRefinementFallbackStartedAt] = useState(0);
   const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(null);
+  const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
   const [initialRefineExplorationId] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     const refineExplorationId = params.get("refine_exploration");
@@ -533,6 +664,7 @@ function DispatchApp() {
     () => enabledSourceSelection(sourceSelection, sourceStatus),
     [sourceSelection, sourceStatus],
   );
+  const defaultControls = briefSettings?.defaults ?? defaultBriefControls;
   const activeInterest = (submittedInterest || statement).trim();
   const sourceLocked = flow === "building";
   const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
@@ -546,14 +678,16 @@ function DispatchApp() {
   }, [refinementFallbackStartedAt, refinementProgress, refinementWorking]);
 
   const loadHome = useCallback(async () => {
-    const [sources, explorations, scheduled, topics, admin] = await Promise.all([
+    const [sources, explorations, scheduled, topics, admin, settings] = await Promise.all([
       api<SourceStatusResponse>("/api/explore/source-status").catch(() => null),
       api<Exploration[]>("/api/explore/explorations?limit=25").catch(() => []),
       api<TopicProfileResponse[]>("/api/explore/scheduled-topic-profiles").catch(() => []),
       api<TopicProfileResponse[]>("/api/explore/topic-profiles").catch(() => []),
       api<AdminStatus>("/api/admin/status").catch(() => null),
+      api<BriefSettingsResponse>("/api/admin/brief-settings").catch(() => null),
     ]);
     if (sources) setSourceStatus(sources);
+    if (settings) setBriefSettings(settings);
     setRecentExplorations(explorations);
     setScheduledTopics(scheduled);
     setAllTopics(topics);
@@ -591,8 +725,8 @@ function DispatchApp() {
 
   useEffect(() => {
     if (!session) return;
-    setDraft(draftFromProfile(session.profile));
-  }, [session]);
+    setDraft(draftFromProfile(session.profile, defaultControls.content_limits));
+  }, [defaultControls.content_limits, session]);
 
   useEffect(() => {
     if (!activeRefinementProgress) return;
@@ -648,7 +782,7 @@ function DispatchApp() {
         }),
       });
       setSession(nextSession);
-      setDraft(draftFromProfile(nextSession.profile));
+      setDraft(draftFromProfile(nextSession.profile, defaultControls.content_limits));
       setFlow(nextSession.status === "finalized" ? "confirm" : "refining");
       if (nextSession.topic_profile) setTopicProfile(nextSession.topic_profile);
       setMessage(nextSession.status === "finalized" ? "Confirm the brief setup" : "Answer a few quick questions");
@@ -690,7 +824,7 @@ function DispatchApp() {
       });
       setAnswer("");
       setSession(updated);
-      setDraft(draftFromProfile(updated.profile));
+      setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
       if (updated.topic_profile) setTopicProfile(updated.topic_profile);
       setFlow(updated.status === "finalized" ? "confirm" : "refining");
       setMessage(updated.status === "finalized" ? "Confirm the brief setup" : "Refinement updated");
@@ -706,7 +840,7 @@ function DispatchApp() {
     const baseProfile = session?.profile ?? topicProfile?.profile;
     const topicId = topicProfile?.topic_id ?? session?.topic_id ?? baseProfile?.topic_id;
     const interest = activeInterest || baseProfile?.statement || "";
-    const lookbackHours = lookbackHoursForConfirmedDraft(baseProfile, draft);
+    const lookbackHours = lookbackHoursForConfirmedDraft(baseProfile, draft, defaultControls.lookback_hours);
     return {
       ...(topicId ? { topic_id: topicId } : {}),
       ...(session?.session_id ? { refinement_session_id: session.session_id } : {}),
@@ -795,7 +929,7 @@ function DispatchApp() {
         body: JSON.stringify({
           source_selection: selectedEnabledSources,
           candidate_limit: draft.content_limits.total_items,
-          lookback_hours: lookbackHoursForBuild(topicProfile?.profile ?? session?.profile, draft),
+          lookback_hours: lookbackHoursForBuild(topicProfile?.profile ?? session?.profile, draft, defaultControls.lookback_hours),
         }),
       });
       setExploration(started.exploration);
@@ -840,7 +974,7 @@ function DispatchApp() {
       setStatement("");
       setSourceSelection(sourceSelectionFromRecord(targetExploration.source_selection));
       setSession(nextSession);
-      setDraft(draftFromProfile(nextSession.profile));
+      setDraft(draftFromProfile(nextSession.profile, defaultControls.content_limits));
       setAnswer("");
       setBriefHtml("");
       if (nextSession.topic_profile) setTopicProfile(nextSession.topic_profile);
@@ -853,7 +987,7 @@ function DispatchApp() {
       setBusy(false);
       endRefinementProgress();
     }
-  }, [beginRefinementProgress, endRefinementProgress, exploration, topicProfile]);
+  }, [beginRefinementProgress, defaultControls.content_limits, endRefinementProgress, exploration, topicProfile]);
 
   async function pollExploration(explorationId: string): Promise<Exploration> {
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -928,7 +1062,7 @@ function DispatchApp() {
 
   function openBrief(record = exploration) {
     const path = record ? briefPath(record) : null;
-    if (path) window.open(path, "_blank", "noopener,noreferrer");
+    openPath(path);
   }
 
   async function deleteHomeExploration(item: Extract<HomeRecentItem, { kind: "exploration" }>) {
@@ -982,7 +1116,7 @@ function DispatchApp() {
       setTopicProfile(item.topic);
       if (item.topic) {
         setStatement(item.topic.statement);
-        setDraft(draftFromProfile(item.topic.profile));
+        setDraft(draftFromProfile(item.topic.profile, defaultControls.content_limits));
         setSourceSelection(sourceSelectionFromRecord(item.topic.profile.source_selection));
       }
       setFlow("building");
@@ -1020,7 +1154,7 @@ function DispatchApp() {
     setAnswer("");
     setStatement(topic.statement);
     setSubmittedInterest(topic.statement);
-    setDraft(draftFromProfile(topic.profile));
+    setDraft(draftFromProfile(topic.profile, defaultControls.content_limits));
     setSourceSelection(sourceSelectionFromRecord(topic.profile.source_selection));
     setFlow("confirm");
     setMessage("Saved brief plan loaded");
@@ -1323,8 +1457,10 @@ function DispatchApp() {
             <ConfirmationPanel
               draft={draft}
               profile={session?.profile ?? topicProfile?.profile ?? null}
+              strategyPreview={session?.strategy_preview ?? null}
               sources={sourceSelection}
               sourceStatus={sourceStatus}
+              defaultContentLimits={defaultControls.content_limits}
               busy={busy}
               onDraftChange={setDraft}
               onSourceClick={updateSource}
@@ -1410,8 +1546,7 @@ function DispatchApp() {
         </form>
         ) : null}
       </section>
-      <p className="app-status">{message}</p>
-
+      <p className="screen-reader-status" aria-live="polite">{message}</p>
       {enableSource ? (
         <EnableSourceModal
           source={enableSource}
@@ -1642,11 +1777,64 @@ function RefinementPlanPreview(props: { profile: TopicProfile | null }) {
   );
 }
 
+function StrategyReviewCard(props: { preview: StrategyPreview }) {
+  const { preview } = props;
+  return (
+    <div className="strategy-review-card">
+      {preview.reasoning_summary ? (
+        <p className="strategy-review-summary">{preview.reasoning_summary}</p>
+      ) : null}
+      <div className="strategy-review-row">
+        {preview.looks_at.length ? (
+          <div className="strategy-review-block">
+            <strong>Looks at</strong>
+            <span>{preview.looks_at.join(", ")}</span>
+          </div>
+        ) : null}
+        {preview.ignores.length ? (
+          <div className="strategy-review-block">
+            <strong>Ignores</strong>
+            <span>{preview.ignores.join(", ")}</span>
+          </div>
+        ) : null}
+        {preview.exclusions.length ? (
+          <div className="strategy-review-block">
+            <strong>Avoids</strong>
+            <span>{preview.exclusions.join(", ")}</span>
+          </div>
+        ) : null}
+      </div>
+      {preview.search_queries.length ? (
+        <div className="strategy-review-block">
+          <strong>Searches it will run</strong>
+          <ul className="strategy-review-queries">
+            {preview.search_queries.map((query) => (
+              <li key={query}>{query}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {preview.per_source.some((entry) => entry.approved_senders?.length) ? (
+        <div className="strategy-review-block">
+          <strong>Approved Gmail newsletters</strong>
+          {preview.per_source
+            .filter((entry) => entry.approved_senders?.length)
+            .map((entry) => (
+              <span key={entry.key}>{entry.approved_senders!.join(", ")}</span>
+            ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ConfirmationPanel(props: {
   draft: ConfirmationDraft;
   profile: TopicProfile | null;
+  strategyPreview: StrategyPreview | null;
   sources: Record<SourceKey, boolean>;
   sourceStatus: SourceStatusResponse | null;
+  defaultContentLimits: ContentLimitsDraft;
   busy: boolean;
   onDraftChange: (draft: ConfirmationDraft) => void;
   onSourceClick: (source: SourceKey) => void;
@@ -1666,6 +1854,7 @@ function ConfirmationPanel(props: {
           <h2>{props.draft.scope || props.profile?.statement || "Brief setup"}</h2>
         </div>
       </div>
+      {props.strategyPreview ? <StrategyReviewCard preview={props.strategyPreview} /> : null}
       <div className="confirm-grid">
         <label>
           Scope
@@ -1743,6 +1932,7 @@ function ConfirmationPanel(props: {
         {advancedOpen ? (
           <ContentLimitsPanel
             limits={props.draft.content_limits}
+            defaults={props.defaultContentLimits}
             sourceSelection={props.sources}
             resetLabel="Use system defaults"
             onChange={updateContentLimits}
@@ -1761,14 +1951,18 @@ function ConfirmationPanel(props: {
 function ContentLimitsPanel(props: {
   limits: ContentLimitsDraft;
   sourceSelection: Record<SourceKey, boolean>;
+  defaults?: ContentLimitsDraft;
   resetLabel?: string;
   showReset?: boolean;
   onChange: (limits: ContentLimitsDraft) => void;
 }) {
   const selectedSources = sourceOptions.filter((source) => props.sourceSelection[source.key]);
+  const defaults = props.defaults ?? defaultContentLimits;
 
-  function updateNumber(key: "total_items" | "lead_items", value: number) {
-    const nextValue = clampContentLimit(value, key === "total_items" ? 1 : 0, key === "total_items" ? 250 : 20);
+  function updateNumber(key: "total_items" | "target_items" | "lead_items", value: number) {
+    const max = key === "lead_items" ? 20 : 250;
+    const min = key === "lead_items" ? 0 : 1;
+    const nextValue = clampContentLimit(value, min, max);
     props.onChange({ ...props.limits, [key]: nextValue });
   }
 
@@ -1786,11 +1980,18 @@ function ContentLimitsPanel(props: {
     <div className="content-limits-panel">
       <div className="content-limit-grid">
         <NumberStepper
-          label="Total brief size"
+          label="Candidate budget"
           value={props.limits.total_items}
           min={1}
           max={250}
           onChange={(value) => updateNumber("total_items", value)}
+        />
+        <NumberStepper
+          label="Target visible stories"
+          value={props.limits.target_items}
+          min={1}
+          max={250}
+          onChange={(value) => updateNumber("target_items", value)}
         />
         <NumberStepper
           label="Lead stories"
@@ -1817,7 +2018,7 @@ function ContentLimitsPanel(props: {
             <NumberStepper
               key={source.key}
               label={source.label}
-              value={props.limits.per_source[source.key] ?? defaultContentLimits.per_source[source.key] ?? 3}
+              value={props.limits.per_source[source.key] ?? defaults.per_source[source.key] ?? 3}
               min={1}
               max={100}
               compact
@@ -1827,12 +2028,116 @@ function ContentLimitsPanel(props: {
         </div>
       ) : null}
       {props.showReset !== false ? (
-        <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(defaultContentLimits)}>
+        <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(defaults)}>
           {props.resetLabel ?? "Reset to defaults"}
         </button>
       ) : null}
     </div>
   );
+}
+
+function BriefControlsPanel(props: {
+  controls: BriefControlsDraft;
+  defaults: BriefControlsDraft;
+  sourceSelection: Record<SourceKey, boolean>;
+  showReset?: boolean;
+  onChange: (controls: BriefControlsDraft) => void;
+}) {
+  return (
+    <div className="brief-controls-panel">
+      <div className="content-limit-grid">
+        <NumberStepper
+          label="Source window (hours)"
+          value={props.controls.lookback_hours}
+          min={1}
+          max={8760}
+          onChange={(lookback_hours) => props.onChange({ ...props.controls, lookback_hours })}
+        />
+      </div>
+      <ContentLimitsPanel
+        limits={props.controls.content_limits}
+        defaults={props.defaults.content_limits}
+        sourceSelection={props.sourceSelection}
+        showReset={false}
+        onChange={(content_limits) => props.onChange({ ...props.controls, content_limits })}
+      />
+      {props.showReset !== false ? (
+        <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(props.defaults)}>
+          Reset to defaults
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function SystemLimitsPanel(props: { groups: SystemLimitGroup[] }) {
+  return (
+    <div className="system-limits-panel">
+      {props.groups.map((group) => (
+        <section className="system-limit-group" key={group.group}>
+          <h3>{group.group}</h3>
+          <div className="system-limit-grid">
+            {group.items.map((item) => (
+              <article className="system-limit-card" key={`${group.group}-${item.label}`}>
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
+                {item.note ? <p>{item.note}</p> : null}
+              </article>
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function PipelineLimitsPanel(props: {
+  limits: PipelineLimitsDraft;
+  defaults?: PipelineLimitsDraft;
+  onChange?: (limits: PipelineLimitsDraft) => void;
+  showReset?: boolean;
+}) {
+  const defaults = props.defaults ?? defaultPipelineLimits;
+  const editable = Boolean(props.onChange);
+  const updateLimit = (key: keyof PipelineLimitsDraft, value: number, min: number, max: number) => {
+    if (!props.onChange) return;
+    props.onChange({ ...props.limits, [key]: clampNumber(value, min, max) });
+  };
+  return (
+    <div className="pipeline-limits-panel">
+      <div className="pipeline-limit-grid">
+        {pipelineLimitFields.map((field) => (
+          <article className={editable ? "pipeline-limit-card editable" : "pipeline-limit-card"} key={field.key}>
+            {editable ? (
+              <NumberStepper
+                label={field.label}
+                value={props.limits[field.key] ?? defaults[field.key]}
+                min={field.min}
+                max={field.max}
+                onChange={(value) => updateLimit(field.key, value, field.min, field.max)}
+              />
+            ) : (
+              <div>
+                <span>{field.label}</span>
+                <strong>{props.limits[field.key] ?? defaults[field.key]}</strong>
+              </div>
+            )}
+            <p>{field.note}</p>
+          </article>
+        ))}
+      </div>
+      {editable && props.showReset !== false ? (
+        <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange?.(defaults)}>
+          Reset to system limits
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
 }
 
 function NumberStepper(props: {
@@ -1843,11 +2148,12 @@ function NumberStepper(props: {
   compact?: boolean;
   onChange: (value: number) => void;
 }) {
+  const changeValue = (value: number) => props.onChange(clampNumber(value, props.min, props.max));
   return (
     <label className={props.compact ? "number-stepper compact" : "number-stepper"}>
       {props.label}
       <span>
-        <button type="button" onClick={() => props.onChange(props.value - 1)} disabled={props.value <= props.min} aria-label={`Decrease ${props.label}`}>
+        <button type="button" onClick={() => changeValue(props.value - 1)} disabled={props.value <= props.min} aria-label={`Decrease ${props.label}`}>
           -
         </button>
         <input
@@ -1855,9 +2161,9 @@ function NumberStepper(props: {
           min={props.min}
           max={props.max}
           value={props.value}
-          onChange={(event) => props.onChange(Number(event.target.value))}
+          onChange={(event) => changeValue(Number(event.target.value))}
         />
-        <button type="button" onClick={() => props.onChange(props.value + 1)} disabled={props.value >= props.max} aria-label={`Increase ${props.label}`}>
+        <button type="button" onClick={() => changeValue(props.value + 1)} disabled={props.value >= props.max} aria-label={`Increase ${props.label}`}>
           +
         </button>
       </span>
@@ -2249,6 +2555,69 @@ function EnableSourceModal(props: {
   );
 }
 
+type GmailAllowlistAction = "approve" | "reject" | "remove";
+
+function GmailAllowlistGroup(props: {
+  title: string;
+  senders: GmailSenderRecord[];
+  busy: boolean;
+  actions: { label: string; action: GmailAllowlistAction }[];
+  onAction: (sender: string, action: GmailAllowlistAction) => void;
+  emptyLabel: string;
+}) {
+  return (
+    <div className="gmail-allowlist-group">
+      <p className="gmail-allowlist-group-title">
+        {props.title} <span className="muted">({props.senders.length})</span>
+      </p>
+      {props.senders.length === 0 ? (
+        <p className="muted gmail-allowlist-empty">{props.emptyLabel}</p>
+      ) : (
+        <ul className="gmail-allowlist-list">
+          {props.senders.map((record) => (
+            <li key={record.sender} className="gmail-allowlist-item">
+              <div className="gmail-allowlist-sender">
+                <span className="gmail-allowlist-name">{record.sender_name || record.sender}</span>
+                {record.sender_name ? <span className="muted gmail-allowlist-email">{record.sender}</span> : null}
+              </div>
+              <div className="button-row">
+                {props.actions.map((entry) => (
+                  <button
+                    key={entry.action}
+                    type="button"
+                    className="secondary-action"
+                    disabled={props.busy}
+                    onClick={() => props.onAction(record.sender, entry.action)}
+                  >
+                    {entry.label}
+                  </button>
+                ))}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+type GmailSenderRecord = {
+  sender: string;
+  sender_name?: string | null;
+  state: "approved" | "candidate" | "rejected";
+  reason?: string | null;
+  source?: string | null;
+  message_count?: number;
+  last_seen_at?: string | null;
+};
+
+type GmailAllowlistResponse = {
+  summary: { sender_count: number; approved_count: number; candidate_count: number; rejected_count: number };
+  approved: GmailSenderRecord[];
+  candidates: GmailSenderRecord[];
+  rejected: GmailSenderRecord[];
+};
+
 function AdminApp() {
   const requestedTab = new URLSearchParams(window.location.search).get("tab") ?? "status";
   const initialTab = adminTabOptions.includes(requestedTab as AdminTab) ? (requestedTab as AdminTab) : "status";
@@ -2264,12 +2633,20 @@ function AdminApp() {
   const [editingDigest, setEditingDigest] = useState<{ topicId: string; preset: SchedulePreset; time: string } | null>(null);
   const [editingAdvancedSettings, setEditingAdvancedSettings] = useState<{
     topic: TopicProfileResponse;
-    limits: ContentLimitsDraft;
+    controls: BriefControlsDraft;
+    pipelineLimits: PipelineLimitsDraft;
+    tab: "brief" | "system";
   } | null>(null);
+  const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
+  const [defaultControlsDraft, setDefaultControlsDraft] = useState<BriefControlsDraft>(defaultBriefControls);
+  const [pipelineLimitsDraft, setPipelineLimitsDraft] = useState<PipelineLimitsDraft>(defaultPipelineLimits);
   const [issueDetails, setIssueDetails] = useState<{ built_with_issues: boolean; issues: ExplorationIssue[] } | null>(null);
   const [webProvider, setWebProvider] = useState<"tavily" | "brave" | "serpapi">("tavily");
   const [webKey, setWebKey] = useState("");
   const [adminGmailSecret, setAdminGmailSecret] = useState("");
+  const [gmailAllowlist, setGmailAllowlist] = useState<GmailAllowlistResponse | null>(null);
+  const [newGmailSender, setNewGmailSender] = useState("");
+  const [newGmailSenderName, setNewGmailSenderName] = useState("");
   const [adminPodcastKey, setAdminPodcastKey] = useState("");
   const [adminPodcastSecret, setAdminPodcastSecret] = useState("");
   const [youtubeKey, setYoutubeKey] = useState("");
@@ -2326,13 +2703,21 @@ function AdminApp() {
   }, [library.digests, library.explorations]);
 
   const loadAdmin = useCallback(async () => {
-    const [nextStatus, nextSources, nextLibrary] = await Promise.all([
+    const [nextStatus, nextSources, nextLibrary, nextBriefSettings, nextAllowlist] = await Promise.all([
       api<AdminStatus>("/api/admin/status").catch(() => null),
       api<SourceStatusResponse>("/api/explore/source-status").catch(() => null),
       api<LibraryResponse>("/api/admin/library").catch(() => ({ explorations: [], deleted_explorations: [], topics: [], digests: [], legacy_digests: [] })),
+      api<BriefSettingsResponse>("/api/admin/brief-settings").catch(() => null),
+      api<GmailAllowlistResponse>("/api/admin/gmail/allowlist").catch(() => null),
     ]);
     setStatus(nextStatus);
     if (nextSources) setSources(nextSources);
+    if (nextAllowlist) setGmailAllowlist(nextAllowlist);
+    if (nextBriefSettings) {
+      setBriefSettings(nextBriefSettings);
+      setDefaultControlsDraft(nextBriefSettings.defaults);
+      setPipelineLimitsDraft(nextBriefSettings.pipeline_limits ?? defaultPipelineLimits);
+    }
     setLibrary(nextLibrary);
     const preferredLocalModel = nextStatus?.model?.catalog.selected_local_model
       ?? nextStatus?.model?.local_model
@@ -2466,6 +2851,40 @@ function AdminApp() {
       window.location.href = result.authorization_url;
     } catch (error) {
       setMessage(errorMessage(error, "Could not start Gmail connection"));
+      setBusy(false);
+    }
+  }
+
+  async function addGmailAllowlistSender() {
+    const sender = newGmailSender.trim();
+    if (!sender) return;
+    setBusy(true);
+    try {
+      const next = await api<GmailAllowlistResponse>("/api/admin/gmail/allowlist", {
+        method: "POST",
+        body: JSON.stringify({ sender, sender_name: newGmailSenderName.trim() || null }),
+      });
+      setGmailAllowlist(next);
+      setNewGmailSender("");
+      setNewGmailSenderName("");
+      setMessage(`Approved ${sender}`);
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not add sender"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateGmailAllowlistSender(sender: string, action: "approve" | "reject" | "remove") {
+    setBusy(true);
+    try {
+      const path = `/api/admin/gmail/allowlist/${encodeURIComponent(sender)}${action === "remove" ? "" : `/${action}`}`;
+      const next = await api<GmailAllowlistResponse>(path, { method: action === "remove" ? "DELETE" : "POST" });
+      setGmailAllowlist(next);
+      setMessage(action === "remove" ? `Removed ${sender}` : `${action === "approve" ? "Approved" : "Rejected"} ${sender}`);
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not update sender"));
+    } finally {
       setBusy(false);
     }
   }
@@ -2622,7 +3041,7 @@ function AdminApp() {
         method: "POST",
         body: JSON.stringify({
           source_selection: exploration.source_selection,
-          candidate_limit: topic ? contentLimitsFromProfile(topic.profile).total_items : undefined,
+          candidate_limit: topic ? contentLimitsFromProfile(topic.profile, defaultControlsDraft.content_limits).total_items : undefined,
         }),
       });
       await loadAdmin();
@@ -2639,9 +3058,12 @@ function AdminApp() {
   }
 
   function openAdvancedSettings(topic: TopicProfileResponse) {
+    const systemDefaults = briefSettings?.pipeline_limits ?? defaultPipelineLimits;
     setEditingAdvancedSettings({
       topic,
-      limits: contentLimitsFromProfile(topic.profile),
+      controls: briefControlsFromProfile(topic.profile, defaultControlsDraft),
+      pipelineLimits: pipelineLimitsFromProfile(topic.profile, systemDefaults),
+      tab: "brief",
     });
   }
 
@@ -2651,7 +3073,11 @@ function AdminApp() {
     try {
       const saved = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${editingAdvancedSettings.topic.topic_id}/content-limits`, {
         method: "POST",
-        body: JSON.stringify({ content_limits: editingAdvancedSettings.limits }),
+        body: JSON.stringify({
+          content_limits: editingAdvancedSettings.controls.content_limits,
+          lookback_hours: editingAdvancedSettings.controls.lookback_hours,
+          pipeline_limits: editingAdvancedSettings.pipelineLimits,
+        }),
       });
       setEditingAdvancedSettings(null);
       await loadAdmin();
@@ -2663,8 +3089,44 @@ function AdminApp() {
     }
   }
 
+  async function saveDefaultBriefSettings() {
+    setBusy(true);
+    try {
+      const saved = await api<BriefSettingsResponse>("/api/admin/brief-settings/defaults", {
+        method: "PUT",
+        body: JSON.stringify(defaultControlsDraft),
+      });
+      setBriefSettings(saved);
+      setDefaultControlsDraft(saved.defaults);
+      await loadAdmin();
+      setMessage("Default brief settings saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save default brief settings"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function savePipelineLimits() {
+    setBusy(true);
+    try {
+      const saved = await api<BriefSettingsResponse>("/api/admin/brief-settings/pipeline-limits", {
+        method: "PUT",
+        body: JSON.stringify(pipelineLimitsDraft),
+      });
+      setBriefSettings(saved);
+      setPipelineLimitsDraft(saved.pipeline_limits);
+      await loadAdmin();
+      setMessage("Pipeline limits saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save pipeline limits"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function buildTopicFromAdmin(topic: TopicProfileResponse) {
-    const limits = contentLimitsFromProfile(topic.profile);
+    const limits = contentLimitsFromProfile(topic.profile, defaultControlsDraft.content_limits);
     setBusy(true);
     try {
       await api(`/api/explore/topic-profiles/${topic.topic_id}/run`, {
@@ -2673,7 +3135,7 @@ function AdminApp() {
           mode: "show_now",
           source_selection: topic.profile.source_selection,
           candidate_limit: limits.total_items,
-          lookback_hours: lookbackHoursForBuild(topic.profile),
+          lookback_hours: lookbackHoursForBuild(topic.profile, undefined, defaultControlsDraft.lookback_hours),
         }),
       });
       await loadAdmin();
@@ -2798,7 +3260,7 @@ function AdminApp() {
   }
 
   async function rebuildDigest(topic: TopicProfileResponse) {
-    const limits = contentLimitsFromProfile(topic.profile);
+    const limits = contentLimitsFromProfile(topic.profile, defaultControlsDraft.content_limits);
     setBusy(true);
     try {
       if (topic.latest_exploration) {
@@ -2807,7 +3269,7 @@ function AdminApp() {
           body: JSON.stringify({
             source_selection: topic.profile.source_selection,
             candidate_limit: limits.total_items,
-            lookback_hours: lookbackHoursForBuild(topic.profile),
+            lookback_hours: lookbackHoursForBuild(topic.profile, undefined, defaultControlsDraft.lookback_hours),
           }),
         });
       } else {
@@ -2817,7 +3279,7 @@ function AdminApp() {
             mode: "scheduled",
             source_selection: topic.profile.source_selection,
             candidate_limit: limits.total_items,
-            lookback_hours: lookbackHoursForBuild(topic.profile),
+            lookback_hours: lookbackHoursForBuild(topic.profile, undefined, defaultControlsDraft.lookback_hours),
           }),
         });
       }
@@ -3001,6 +3463,70 @@ function AdminApp() {
                       Connect Gmail
                     </button>
                   </div>
+                </section>
+
+                <section className="source-setup-card gmail-allowlist-card">
+                  <h2>Gmail Allowlist</h2>
+                  <p>
+                    Only approved senders are ever read into a brief. Newsletters suggested during topic
+                    refinement land here as candidates for you to approve.
+                  </p>
+                  <div className="gmail-allowlist-add">
+                    <label>
+                      Sender email
+                      <input
+                        type="email"
+                        value={newGmailSender}
+                        onChange={(event) => setNewGmailSender(event.target.value)}
+                        placeholder="newsletter@example.com"
+                      />
+                    </label>
+                    <label>
+                      Name (optional)
+                      <input
+                        type="text"
+                        value={newGmailSenderName}
+                        onChange={(event) => setNewGmailSenderName(event.target.value)}
+                        placeholder="Example Weekly"
+                      />
+                    </label>
+                    <button type="button" onClick={() => void addGmailAllowlistSender()} disabled={busy || !newGmailSender.trim()}>
+                      Approve Sender
+                    </button>
+                  </div>
+                  <GmailAllowlistGroup
+                    title="Approved"
+                    senders={gmailAllowlist?.approved ?? []}
+                    busy={busy}
+                    actions={[
+                      { label: "Reject", action: "reject" },
+                      { label: "Remove", action: "remove" },
+                    ]}
+                    onAction={(sender, action) => void updateGmailAllowlistSender(sender, action)}
+                    emptyLabel="No approved senders yet."
+                  />
+                  <GmailAllowlistGroup
+                    title="Pending approval"
+                    senders={gmailAllowlist?.candidates ?? []}
+                    busy={busy}
+                    actions={[
+                      { label: "Approve", action: "approve" },
+                      { label: "Reject", action: "reject" },
+                    ]}
+                    onAction={(sender, action) => void updateGmailAllowlistSender(sender, action)}
+                    emptyLabel="No candidates waiting."
+                  />
+                  <GmailAllowlistGroup
+                    title="Rejected"
+                    senders={gmailAllowlist?.rejected ?? []}
+                    busy={busy}
+                    actions={[
+                      { label: "Approve", action: "approve" },
+                      { label: "Remove", action: "remove" },
+                    ]}
+                    onAction={(sender, action) => void updateGmailAllowlistSender(sender, action)}
+                    emptyLabel="Nothing rejected."
+                  />
                 </section>
 
                 <section className="source-setup-card">
@@ -3240,6 +3766,54 @@ function AdminApp() {
         </section>
       ) : null}
 
+      {tab === "settings" ? (
+        <section className="admin-panel">
+          <div className="panel-title-row">
+            <div>
+              <p className="section-kicker">Settings</p>
+              <h1>Brief defaults</h1>
+              <p className="muted">These defaults apply to new briefs and to any saved brief that is reset to system defaults.</p>
+            </div>
+            <button type="button" className="primary-action" onClick={() => void saveDefaultBriefSettings()} disabled={busy}>
+              Save defaults
+            </button>
+          </div>
+          <BriefControlsPanel
+            controls={defaultControlsDraft}
+            defaults={defaultBriefControls}
+            sourceSelection={defaultSourceSelectionForControls}
+            onChange={setDefaultControlsDraft}
+          />
+          <section className="settings-subsection">
+            <div className="panel-title-row compact-title-row">
+              <div>
+                <p className="section-kicker">System limits</p>
+                <h2>Configurable pipeline limits</h2>
+                <p className="muted">These defaults apply to every brief build unless a lower per-brief content limit is set.</p>
+              </div>
+              <button type="button" className="primary-action" onClick={() => void savePipelineLimits()} disabled={busy}>
+                Save pipeline limits
+              </button>
+            </div>
+            <PipelineLimitsPanel
+              limits={pipelineLimitsDraft}
+              defaults={defaultPipelineLimits}
+              onChange={setPipelineLimitsDraft}
+            />
+          </section>
+          <section className="settings-subsection">
+            <div className="panel-title-row compact-title-row">
+              <div>
+                <p className="section-kicker">Hard caps</p>
+                <h2>System ceilings</h2>
+                <p className="muted">These are the built-in maximums the app will not exceed.</p>
+              </div>
+            </div>
+            <SystemLimitsPanel groups={briefSettings?.system_limits ?? []} />
+          </section>
+        </section>
+      ) : null}
+
       {tab === "models" ? (
         <section className="admin-panel">
           <div className="panel-title-row">
@@ -3451,15 +4025,66 @@ function AdminApp() {
               <p className="section-kicker">Brief settings</p>
               <h2 id="advanced-settings-title">{profileName(editingAdvancedSettings.topic)}</h2>
             </div>
-            <ContentLimitsPanel
-              limits={editingAdvancedSettings.limits}
-              sourceSelection={sourceSelectionFromRecord(editingAdvancedSettings.topic.profile.source_selection)}
-              showReset={false}
-              onChange={(limits) => setEditingAdvancedSettings({ ...editingAdvancedSettings, limits })}
-            />
+            <div className="settings-tabs">
+              <button
+                type="button"
+                className={editingAdvancedSettings.tab === "brief" ? "active" : ""}
+                onClick={() => setEditingAdvancedSettings({ ...editingAdvancedSettings, tab: "brief" })}
+              >
+                Brief controls
+              </button>
+              <button
+                type="button"
+                className={editingAdvancedSettings.tab === "system" ? "active" : ""}
+                onClick={() => setEditingAdvancedSettings({ ...editingAdvancedSettings, tab: "system" })}
+              >
+                System limits
+              </button>
+            </div>
+            {editingAdvancedSettings.tab === "brief" ? (
+              <BriefControlsPanel
+                controls={editingAdvancedSettings.controls}
+                defaults={defaultControlsDraft}
+                sourceSelection={sourceSelectionFromRecord(editingAdvancedSettings.topic.profile.source_selection)}
+                showReset={false}
+                onChange={(controls) => setEditingAdvancedSettings({ ...editingAdvancedSettings, controls })}
+              />
+            ) : (
+              <div className="advanced-system-limits">
+                <section>
+                  <div className="compact-title-row">
+                    <p className="section-kicker">Configured pipeline limits</p>
+                    <h3>This brief</h3>
+                    <p className="muted">Use these when this saved brief runs.</p>
+                  </div>
+                  <PipelineLimitsPanel
+                    limits={editingAdvancedSettings.pipelineLimits}
+                    defaults={briefSettings?.pipeline_limits ?? defaultPipelineLimits}
+                    onChange={(pipelineLimits) => setEditingAdvancedSettings({ ...editingAdvancedSettings, pipelineLimits })}
+                  />
+                </section>
+                <section>
+                  <div className="compact-title-row">
+                    <p className="section-kicker">Hard caps</p>
+                    <h3>System ceilings</h3>
+                  </div>
+                  <SystemLimitsPanel groups={briefSettings?.system_limits ?? []} />
+                </section>
+              </div>
+            )}
             <div className="modal-actions">
               <button type="button" className="ghost-action" onClick={() => setEditingAdvancedSettings(null)} disabled={busy}>Cancel</button>
-              <button type="button" className="secondary-action" onClick={() => setEditingAdvancedSettings({ ...editingAdvancedSettings, limits: defaultContentLimits })} disabled={busy}>
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => setEditingAdvancedSettings({
+                  ...editingAdvancedSettings,
+                  controls: defaultControlsDraft,
+                  pipelineLimits: briefSettings?.pipeline_limits ?? defaultPipelineLimits,
+                  tab: "brief",
+                })}
+                disabled={busy}
+              >
                 Use system defaults
               </button>
               <button type="button" className="primary-action" onClick={() => void saveAdvancedSettings()} disabled={busy}>
@@ -3565,38 +4190,62 @@ function DisclosureButton(props: { expanded: boolean; label: string; onToggle: (
   );
 }
 
-function emptyDraft(): ConfirmationDraft {
+function emptyDraft(defaults = defaultContentLimits): ConfirmationDraft {
   return {
     scope: "",
     depth: "informed-generalist",
     recency_weighting: "recent",
     exclusions: "",
-    content_limits: defaultContentLimits,
+    content_limits: defaults,
     sourceScopeTouched: false,
   };
 }
 
-function draftFromProfile(profile: TopicProfile): ConfirmationDraft {
+function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits): ConfirmationDraft {
   return {
     scope: profile.scope || profile.statement || "",
     depth: profile.depth === "practitioner" ? "practitioner" : "informed-generalist",
     recency_weighting: sourceScopeFromProfile(profile),
     exclusions: (profile.exclusions ?? []).join(", "),
-    content_limits: contentLimitsFromProfile(profile),
+    content_limits: contentLimitsFromProfile(profile, defaults),
     sourceScopeTouched: false,
   };
 }
 
-function contentLimitsFromProfile(profile: TopicProfile): ContentLimitsDraft {
+function briefControlsFromProfile(profile: TopicProfile, defaults = defaultBriefControls): BriefControlsDraft {
+  const explicit = Number(profile.lookback_hours ?? 0);
+  return {
+    lookback_hours: Number.isFinite(explicit) && explicit >= 1
+      ? Math.min(8760, Math.floor(explicit))
+      : defaults.lookback_hours,
+    content_limits: contentLimitsFromProfile(profile, defaults.content_limits),
+  };
+}
+
+function contentLimitsFromProfile(profile: TopicProfile, defaults = defaultContentLimits): ContentLimitsDraft {
   const saved = profile.content_limits ?? {};
   return {
-    total_items: clampContentLimit(Number(saved.total_items ?? defaultContentLimits.total_items), 1, 250),
-    lead_items: clampContentLimit(Number(saved.lead_items ?? defaultContentLimits.lead_items), 0, 20),
+    total_items: clampContentLimit(Number(saved.total_items ?? defaults.total_items), 1, 250),
+    target_items: clampContentLimit(Number(saved.target_items ?? defaults.target_items), 1, 250),
+    lead_items: clampContentLimit(Number(saved.lead_items ?? defaults.lead_items), 0, 20),
     per_source: {
-      ...defaultContentLimits.per_source,
+      ...defaults.per_source,
       ...(saved.per_source ?? {}),
     },
     quality_floor: saved.quality_floor === "strong" ? "strong" : "standard",
+  };
+}
+
+function pipelineLimitsFromProfile(profile: TopicProfile, defaults = defaultPipelineLimits): PipelineLimitsDraft {
+  const saved = profile.pipeline_limits ?? {};
+  return {
+    article_fetches: clampContentLimit(Number(saved.article_fetches ?? defaults.article_fetches), 1, 250),
+    article_fetch_concurrency: clampContentLimit(Number(saved.article_fetch_concurrency ?? defaults.article_fetch_concurrency), 1, 20),
+    model_refinement_items: clampContentLimit(Number(saved.model_refinement_items ?? defaults.model_refinement_items), 0, 150),
+    source_audit_candidates: clampContentLimit(Number(saved.source_audit_candidates ?? defaults.source_audit_candidates), 1, 28),
+    editorial_candidates: clampContentLimit(Number(saved.editorial_candidates ?? defaults.editorial_candidates), 1, 150),
+    critic_articles: clampContentLimit(Number(saved.critic_articles ?? defaults.critic_articles), 1, 50),
+    critic_newsletter_records: clampContentLimit(Number(saved.critic_newsletter_records ?? defaults.critic_newsletter_records), 0, 20),
   };
 }
 
@@ -3605,14 +4254,17 @@ function clampContentLimit(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)));
 }
 
-function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft): number {
+function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number {
   if (draft.sourceScopeTouched) return lookbackHoursFromSourceScope(draft.recency_weighting);
-  return lookbackHoursForBuild(profile, draft);
+  return lookbackHoursForBuild(profile, draft, defaultLookbackHours);
 }
 
-function lookbackHoursForBuild(profile: TopicProfile | null | undefined, draft?: ConfirmationDraft): number {
+function lookbackHoursForBuild(profile: TopicProfile | null | undefined, draft?: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number {
   const explicit = Number(profile?.lookback_hours ?? 0);
   if (Number.isFinite(explicit) && explicit >= 1) return Math.min(8760, Math.floor(explicit));
+  if (!draft && Number.isFinite(defaultLookbackHours) && defaultLookbackHours >= 1) {
+    return Math.min(8760, Math.floor(defaultLookbackHours));
+  }
   return lookbackHoursFromSourceScope(draft?.recency_weighting ?? normalizeSourceScope(profile?.recency_weighting));
 }
 
@@ -3703,7 +4355,7 @@ function briefPath(record: Exploration | null): string | null {
 }
 
 function openPath(path: string | null) {
-  if (path) window.open(path, "_blank", "noopener,noreferrer");
+  if (path) window.location.assign(path);
 }
 
 function sourceSelectionFromRecord(selection: Record<string, boolean> | undefined): Record<SourceKey, boolean> {

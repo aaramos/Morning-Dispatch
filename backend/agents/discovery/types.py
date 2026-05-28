@@ -73,6 +73,7 @@ class TopicProfile:
     schedule_config: dict[str, Any] = field(default_factory=dict)
     delivery_config: dict[str, Any] = field(default_factory=dict)
     content_limits: dict[str, Any] = field(default_factory=dict)
+    pipeline_limits: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> TopicProfile:
@@ -108,6 +109,7 @@ class TopicProfile:
             schedule_config=_dict(payload.get("schedule_config")),
             delivery_config=_dict(payload.get("delivery_config")),
             content_limits=_content_limits(payload.get("content_limits")),
+            pipeline_limits=_dict(payload.get("pipeline_limits")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -133,6 +135,7 @@ class TopicProfile:
             "schedule_config": dict(self.schedule_config),
             "delivery_config": dict(self.delivery_config),
             "content_limits": dict(self.content_limits),
+            "pipeline_limits": dict(self.pipeline_limits),
         }
 
     def search_text(self) -> str:
@@ -298,6 +301,9 @@ def _content_limits(value: Any) -> dict[str, Any]:
     total_items = _positive_int(value.get("total_items"), maximum=250)
     if total_items is not None:
         limits["total_items"] = total_items
+    target_items = _positive_int(value.get("target_items"), maximum=250)
+    if target_items is not None:
+        limits["target_items"] = target_items
     lead_items = _positive_int(value.get("lead_items"), maximum=20, allow_zero=True)
     if lead_items is not None:
         limits["lead_items"] = lead_items

@@ -31,18 +31,14 @@ class GmailSourceAdapter:
     good_for = ("newsletters", "primary_sources", "curated_links")
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
-        senders = _merge_unique(
-            _approved_gmail_senders(),
-            _gmail_rule_senders(profile),
-            _requested_refs(profile, "gmail"),
-        )
+        # Strict allowlist: only senders explicitly approved in the managed store are ever fetched.
+        senders = _approved_gmail_senders()
         if not senders:
             return []
-        lookback_hours = _gmail_rule_lookback(profile) or context.lookback_hours
         payloads = await fetch_newsletters(
             digest_id=context.exploration_id,
             sender_allowlist=senders,
-            lookback_hours=lookback_hours,
+            lookback_hours=context.lookback_hours,
             db_path=str(database.database_path()),
         )
         return [
@@ -269,17 +265,7 @@ class MarketsSourceAdapter:
 
 
 def _approved_gmail_senders() -> list[str]:
-    senders: list[str] = []
-    seen: set[str] = set()
-    for digest in database.list_digests(include_archived=False):
-        for source in _sources(digest):
-            if source.get("type") not in {"gmail", "gmail_newsletter"}:
-                continue
-            sender = str(source.get("sender") or "").strip().lower()
-            if sender and sender not in seen:
-                senders.append(sender)
-                seen.add(sender)
-    return senders
+    return database.approved_gmail_senders()
 
 
 def _digest_id_with_reddit_sources() -> str | None:
@@ -322,38 +308,6 @@ def _requested_refs(profile: TopicProfile, adapter: str) -> list[str]:
             refs.append(ref)
             seen.add(key)
     return refs
-
-
-def _gmail_rule_senders(profile: TopicProfile) -> list[str]:
-    rules = profile.gmail_rules if isinstance(profile.gmail_rules, dict) else {}
-    senders = rules.get("include_senders")
-    if not isinstance(senders, list):
-        return []
-    return [str(sender).strip().lower() for sender in senders if str(sender).strip()]
-
-
-def _gmail_rule_lookback(profile: TopicProfile) -> int | None:
-    rules = profile.gmail_rules if isinstance(profile.gmail_rules, dict) else {}
-    try:
-        hours = int(rules.get("lookback_hours"))
-    except (TypeError, ValueError):
-        return None
-    if hours < 1:
-        return None
-    return min(hours, 8760)
-
-
-def _merge_unique(*groups: list[str]) -> list[str]:
-    values: list[str] = []
-    seen: set[str] = set()
-    for group in groups:
-        for value in group:
-            clean = str(value or "").strip()
-            key = clean.lower()
-            if clean and key not in seen:
-                values.append(clean)
-                seen.add(key)
-    return values
 
 
 def _payload_score(metadata: dict[str, Any] | None) -> float:

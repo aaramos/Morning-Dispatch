@@ -39,7 +39,7 @@ class FakeAdapter:
         return candidate.payload
 
 
-def test_rebuild_strengthens_market_profile_from_statement():
+def test_rebuild_repairs_exclusions_without_fabricating_entities():
     profile = TopicProfile.from_dict(
         {
             "topic_id": "topic-memory",
@@ -48,21 +48,19 @@ def test_rebuild_strengthens_market_profile_from_statement():
                 "Track news from the previous 3 days and avoid MSN or Yahoo news."
             ),
             "scope": "Track company performance.",
-            "search_queries": ["an coming company days focus hynix in intrested"],
+            "search_queries": ["memory market company performance"],
             "source_selection": {"web_search": True, "markets": True},
         }
     )
 
     strengthened = explore._strengthen_profile_for_run(profile)
 
-    assert "MU" in strengthened.source_queries["markets"]
-    assert "000660.KS" in strengthened.source_queries["markets"]
-    assert "285A.T" in strengthened.source_queries["markets"]
-    assert "SNDK" in strengthened.source_queries["markets"]
-    assert "Micron Technology MU" in strengthened.search_queries[0]
-    assert "Micron Technology MU" in strengthened.source_queries["web_search"][0]
+    # Generic, source-agnostic repair: excluded publishers are detected from the statement.
     assert "MSN" in strengthened.exclusions
     assert "Yahoo News" in strengthened.exclusions
+    # No hardcoded tickers or company names are fabricated.
+    assert "markets" not in strengthened.source_queries
+    assert strengthened.search_queries == profile.search_queries
 
 
 class SlowAdapter(FakeAdapter):
@@ -562,9 +560,20 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
             json={
                 "content_limits": {
                     "total_items": 9,
+                    "target_items": 6,
                     "lead_items": 2,
                     "per_source": {"web_search": 5, "reddit": 2},
                     "quality_floor": "strong",
+                },
+                "lookback_hours": 168,
+                "pipeline_limits": {
+                    "article_fetches": 90,
+                    "article_fetch_concurrency": 4,
+                    "model_refinement_items": 30,
+                    "source_audit_candidates": 10,
+                    "editorial_candidates": 40,
+                    "critic_articles": 15,
+                    "critic_newsletter_records": 5,
                 },
             },
         )
@@ -572,9 +581,29 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         assert updated.status_code == 200
         assert updated.json()["profile"]["content_limits"] == {
             "lead_items": 2,
-            "per_source": {"reddit": 2, "web_search": 5},
+            "per_source": {
+                "collections": 4,
+                "foreign_media": 4,
+                "gmail": 4,
+                "markets": 2,
+                "podcasts": 5,
+                "reddit": 2,
+                "web_search": 5,
+                "youtube": 5,
+            },
             "quality_floor": "strong",
+            "target_items": 6,
             "total_items": 9,
+        }
+        assert updated.json()["profile"]["lookback_hours"] == 168
+        assert updated.json()["profile"]["pipeline_limits"] == {
+            "article_fetches": 90,
+            "article_fetch_concurrency": 4,
+            "model_refinement_items": 30,
+            "source_audit_candidates": 10,
+            "editorial_candidates": 40,
+            "critic_articles": 15,
+            "critic_newsletter_records": 5,
         }
 
 
@@ -990,6 +1019,45 @@ def test_discovery_runner_applies_per_source_content_limits() -> None:
         "https://example.com/mail-1",
         "https://example.com/web-1",
         "https://example.com/web-2",
+    ]
+
+
+def test_discovery_runner_backfills_unused_source_limit_capacity() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "AI agents for local infrastructure",
+            "scope": "Practical agent workflows",
+            "source_selection": {"gmail": True, "web_search": True},
+            "content_limits": {"total_items": 4, "per_source": {"gmail": 2, "web_search": 1}},
+        }
+    )
+    registry = SourceRegistry(
+        [
+            FakeAdapter("gmail", []),
+            FakeAdapter(
+                "web_search",
+                [
+                    candidate("web_search", "https://example.com/web-1", 0.9),
+                    candidate("web_search", "https://example.com/web-2", 0.8),
+                    candidate("web_search", "https://example.com/web-3", 0.7),
+                    candidate("web_search", "https://example.com/web-4", 0.6),
+                ],
+            ),
+        ]
+    )
+
+    result = asyncio.run(
+        DiscoveryRunner(registry).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="explore-1", candidate_limit=4),
+        )
+    )
+
+    assert [candidate.payload.original_url for candidate in result.candidates] == [
+        "https://example.com/web-1",
+        "https://example.com/web-2",
+        "https://example.com/web-3",
+        "https://example.com/web-4",
     ]
 
 
@@ -1625,18 +1693,10 @@ def test_refinement_agent_does_not_reask_stated_market_recency_and_exclusions(mo
     assert body["profile"]["source_scope_answered"] is True
     assert "MSN" in body["profile"]["exclusions"]
     assert "Yahoo News" in body["profile"]["exclusions"]
-    assert {"adapter": "markets", "ref": "MU"} in body["profile"]["requested_sources"]
-    assert {"adapter": "markets", "ref": "000660.KS"} in body["profile"]["requested_sources"]
-    assert {"adapter": "markets", "ref": "285A.T"} in body["profile"]["requested_sources"]
-    assert {"adapter": "markets", "ref": "SNDK"} in body["profile"]["requested_sources"]
-    assert body["profile"]["source_queries"]["markets"] == ["MU", "000660.KS", "285A.T", "SNDK"]
-    assert "MU" in body["profile"]["keywords"]
-    assert "000660.KS" in body["profile"]["keywords"]
     prompt_payload = model_client.calls[0]["prompt"]
     assert isinstance(prompt_payload, str)
     assert "already_inferred" in prompt_payload
     assert "previous 3 days" in prompt_payload
-    assert "SK Hynix (000660.KS)" in prompt_payload
 
 
 def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None:
@@ -2500,6 +2560,7 @@ def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> 
             model_client=None,
             reasoning_callback=None,
             inference_run_id=None,
+            max_candidates=None,
     ):
         observed["editorial_model"] = getattr(getattr(model_client, "config", None), "model", None)
         return results, []
@@ -2512,6 +2573,8 @@ def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> 
             model_client=None,
             reasoning_callback=None,
             inference_run_id=None,
+            max_articles=None,
+            max_newsletter_records=None,
     ):
         observed["critic_model"] = getattr(getattr(model_client, "config", None), "model", None)
         return results, []

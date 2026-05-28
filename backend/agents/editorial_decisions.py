@@ -32,9 +32,10 @@ async def apply_editorial_decisions(
     model_client: ModelClient | None = None,
     reasoning_callback: Callable[[str], None] | None = None,
     inference_run_id: str | None = None,
+    max_candidates: int | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision]]:
     result_list = list(results)
-    candidates = _candidate_indexes(result_list)
+    candidates = _candidate_indexes(result_list, max_candidates=max_candidates)
     if not candidates:
         return result_list, []
     if len(candidates) < 2:
@@ -120,12 +121,22 @@ async def apply_editorial_decisions(
     return _normalize_lead(updated), decisions
 
 
-def _candidate_indexes(results: list[ArticleFetchResult]) -> list[int]:
+def _candidate_indexes(results: list[ArticleFetchResult], *, max_candidates: int | None = None) -> list[int]:
+    limit = _candidate_limit(max_candidates, MAX_EDITORIAL_CANDIDATES)
     return [
         index
-        for index, result in enumerate(results[:MAX_EDITORIAL_CANDIDATES])
+        for index, result in enumerate(results[:limit])
         if result.tier != "dropped" and (result.fetched or result.link_score >= 0.55)
     ]
+
+
+def _candidate_limit(value: int | None, maximum: int) -> int:
+    if value is None:
+        return maximum
+    try:
+        return max(1, min(int(value), maximum))
+    except (TypeError, ValueError):
+        return maximum
 
 
 def _editorial_prompt(digest: dict[str, Any], results: list[ArticleFetchResult], indexes: list[int]) -> str:
@@ -134,9 +145,11 @@ def _editorial_prompt(digest: dict[str, Any], results: list[ArticleFetchResult],
         {
             "digest_name": digest.get("name"),
             "digest_interest": digest.get("interest"),
+            "coverage_goal": _coverage_goal(digest.get("content_limits")),
             "instructions": (
                 "Choose the best Morning Dispatch issue from these already-approved sources. "
                 "Prefer concrete, timely, high-signal AI/product/infrastructure stories. "
+                "Aim for the requested visible story count when enough relevant candidates exist. "
                 "Reject ads, signup pages, thin promos, duplicates, and weakly related items. "
                 "Return JSON only."
             ),
@@ -157,6 +170,20 @@ def _editorial_prompt(digest: dict[str, Any], results: list[ArticleFetchResult],
         },
         ensure_ascii=False,
     )
+
+
+def _coverage_goal(content_limits: Any) -> dict[str, Any]:
+    if not isinstance(content_limits, dict):
+        return {"target_visible_items": None}
+    try:
+        target = int(content_limits.get("target_items") or content_limits.get("total_items"))
+    except (TypeError, ValueError):
+        target = None
+    return {
+        "target_visible_items": target,
+        "lead_items": content_limits.get("lead_items"),
+        "quality_floor": content_limits.get("quality_floor"),
+    }
 
 
 def _article_record(index: int, result: ArticleFetchResult) -> dict[str, Any]:

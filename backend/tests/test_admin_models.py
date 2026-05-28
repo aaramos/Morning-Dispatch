@@ -50,6 +50,68 @@ def test_admin_rejects_invalid_ollama_cloud_api_key(monkeypatch, tmp_path):
     )
 
 
+def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
+    runtime = configure_runtime(monkeypatch, tmp_path)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        initial = client.get("/api/admin/brief-settings")
+        updated = client.put(
+            "/api/admin/brief-settings/defaults",
+            json={
+                "lookback_hours": 168,
+                "content_limits": {
+                    "total_items": 80,
+                    "target_items": 18,
+                    "lead_items": 4,
+                    "quality_floor": "strong",
+                    "per_source": {"web_search": 30, "reddit": 20},
+                },
+            },
+        )
+
+    assert initial.status_code == 200
+    assert initial.json()["defaults"]["content_limits"]["total_items"] == 40
+    assert initial.json()["pipeline_limits"]["article_fetches"] == 250
+    assert any(group["group"] == "AI review caps" for group in initial.json()["system_limits"])
+    assert updated.status_code == 200
+    defaults = updated.json()["defaults"]
+    assert defaults["lookback_hours"] == 168
+    assert defaults["content_limits"]["total_items"] == 80
+    assert defaults["content_limits"]["target_items"] == 18
+    assert defaults["content_limits"]["lead_items"] == 4
+    assert defaults["content_limits"]["quality_floor"] == "strong"
+    assert defaults["content_limits"]["per_source"]["web_search"] == 30
+    assert defaults["content_limits"]["per_source"]["reddit"] == 20
+    payload = json.loads((runtime / "data" / "brief-settings.json").read_text(encoding="utf-8"))
+    assert payload["brief_defaults"]["content_limits"]["total_items"] == 80
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        pipeline_updated = client.put(
+            "/api/admin/brief-settings/pipeline-limits",
+            json={
+                "article_fetches": 120,
+                "article_fetch_concurrency": 6,
+                "model_refinement_items": 60,
+                "source_audit_candidates": 12,
+                "editorial_candidates": 80,
+                "critic_articles": 25,
+                "critic_newsletter_records": 8,
+            },
+        )
+
+    assert pipeline_updated.status_code == 200
+    limits = pipeline_updated.json()["pipeline_limits"]
+    assert limits["article_fetches"] == 120
+    assert limits["article_fetch_concurrency"] == 6
+    assert limits["model_refinement_items"] == 60
+    assert limits["source_audit_candidates"] == 12
+    assert limits["editorial_candidates"] == 80
+    assert limits["critic_articles"] == 25
+    assert limits["critic_newsletter_records"] == 8
+    payload = json.loads((runtime / "data" / "brief-settings.json").read_text(encoding="utf-8"))
+    assert payload["pipeline_limits"]["source_audit_candidates"] == 12
+
+
 def test_admin_status_includes_omlx_model_catalog(monkeypatch, tmp_path):
     configure_runtime(monkeypatch, tmp_path)
     monkeypatch.setattr(admin_api.model_catalog, "fetch_available_models", fake_available_models)

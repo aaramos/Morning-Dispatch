@@ -23,7 +23,7 @@ from backend.agents.discovery import (
     default_source_registry,
 )
 from backend.agents.digestor.base import NormalizedPayload
-from backend.app.services import mcp_status, model_routing
+from backend.app.services import brief_settings, mcp_status, model_routing
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
@@ -75,14 +75,6 @@ _MONTHS = {
     "november": 11,
     "december": 12,
 }
-_MARKET_ENTITY_ALIASES: tuple[tuple[str, str, str], ...] = (
-    ("Micron Technology", "MU", r"\bmicron\b|\bmicron technology\b|\bmu\b"),
-    ("SK Hynix", "000660.KS", r"\b(?:sk\s+)?hynix\b|\b000660(?:\.ks)?\b"),
-    ("Kioxia", "285A.T", r"\bkioxia\b|\b285a(?:\.t)?\b|\bkxhcf\b"),
-    ("SanDisk", "SNDK", r"\bsandisk\b|\bsndk\b"),
-)
-
-
 async def start_build_queue() -> None:
     global _BUILD_QUEUE_TASK, _BUILD_QUEUE_EVENT
     requeued = database.requeue_running_explorations()
@@ -556,7 +548,12 @@ async def _run_exploration(
         _persist_progress(exploration_id, progress)
 
         stage_started = monotonic()
-        fetched_articles = await fetch_articles_for_payloads(payloads)
+        pipeline_limits = brief_settings.pipeline_limits_for_profile(get_settings(), profile)
+        fetched_articles = await fetch_articles_for_payloads(
+            payloads,
+            max_articles=pipeline_limits["article_fetches"],
+            concurrency=pipeline_limits["article_fetch_concurrency"],
+        )
         stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
         fetched_articles, source_window_issues = _apply_source_window_filter(
             profile,
@@ -966,6 +963,7 @@ async def _run_digest_core(
         "name": _brief_title(profile),
         "interest": profile.search_text(),
         "threshold": 0.45,
+        "content_limits": dict(profile.content_limits),
     }
     _set_pipeline_stage(progress, "summarize", "running")
     persist()
@@ -979,6 +977,7 @@ async def _run_digest_core(
     persist()
 
     settings = get_settings()
+    pipeline_limits = brief_settings.pipeline_limits_for_profile(settings, profile)
     brief_model = profile.models.get("brief")
     librarian_resolution = model_routing.client_for_agent(
         "librarian",
@@ -998,7 +997,11 @@ async def _run_digest_core(
     article_results = await refine_ranked_articles_with_model(
         ranked_articles,
         model_client=librarian_client,
-        model_max_items=min(settings.librarian_model_max_items, _EXPLORE_MODEL_REFINEMENT_LIMIT),
+        model_max_items=min(
+            settings.librarian_model_max_items,
+            pipeline_limits["model_refinement_items"],
+            _EXPLORE_MODEL_REFINEMENT_LIMIT,
+        ),
         inference_run_id=inference_run_id,
         metrics_mode="single",
     )
@@ -1020,6 +1023,7 @@ async def _run_digest_core(
         lookback_hours=lookback_hours,
         model_client=audit_client,
         inference_run_id=inference_run_id,
+        max_candidates=pipeline_limits["source_audit_candidates"],
     )
     progress["source_audit"] = audit_summary
     if audit_summary.get("issues"):
@@ -1057,6 +1061,7 @@ async def _run_digest_core(
         model_client=editorial_client,
         reasoning_callback=flush_reasoning("editorial"),
         inference_run_id=inference_run_id,
+        max_candidates=pipeline_limits["editorial_candidates"],
     )
     critic_client = model_routing.client_for_agent(
         "critic",
@@ -1071,6 +1076,8 @@ async def _run_digest_core(
         model_client=critic_client,
         reasoning_callback=flush_reasoning("critic"),
         inference_run_id=inference_run_id,
+        max_articles=pipeline_limits["critic_articles"],
+        max_newsletter_records=pipeline_limits["critic_newsletter_records"],
     )
     article_results, _quality_decisions = apply_brief_quality_checks(article_results)
     _set_pipeline_stage(progress, "review", "done")
@@ -1578,73 +1585,14 @@ def _resolve_candidate_limit(profile: TopicProfile, candidate_limit: int | None)
 
 
 def _strengthen_profile_for_run(profile: TopicProfile) -> TopicProfile:
-    """Repair older saved profiles with deterministic facts from the user's statement."""
-    entities = _market_entities_from_text(" ".join([profile.statement, profile.scope]))
-    if not entities:
+    """Repair older saved profiles with deterministic, source-agnostic facts from the statement."""
+    detected = _exclusions_from_text(" ".join([profile.statement, profile.scope]))
+    if not detected:
         return profile
-
-    lookback_label = _source_scope_label(_resolve_lookback_hours(profile, None))
-    exclusions = tuple(_merge_terms(profile.exclusions, _exclusions_from_text(profile.statement)))
-    entity_terms = [f"{name} {ticker}" for name, ticker in entities]
-    tickers = [ticker for _, ticker in entities]
-    market_queries = _market_queries_for_entities(entity_terms, lookback_label, exclusions)
-    source_queries = _merge_source_query_terms(
-        {
-            "web_search": tuple(market_queries),
-            "markets": tuple(tickers),
-            "reddit": (f"{' '.join(entity_terms)} memory stocks analysis", "DRAM NAND HBM stock discussion"),
-            "youtube": (f"{' '.join(entity_terms)} stock analysis memory market", "DRAM NAND HBM market analysis"),
-        },
-        {key: tuple(value) for key, value in profile.source_queries.items()},
-    )
-    requested_sources = tuple(
-        _dedupe_dict_sources(
-            [
-                *profile.requested_sources,
-                *({"adapter": "markets", "ref": ticker} for ticker in tickers),
-            ]
-        )
-    )
-    keywords = tuple(_merge_terms(profile.keywords, [item for entity in entities for item in entity]))
-    subtopics = tuple(
-        _merge_terms(
-            profile.subtopics,
-            [
-                "company performance and catalysts",
-                "memory pricing and supply-demand signals",
-                "competitive positioning across memory and storage suppliers",
-            ],
-        )
-    )
-    search_queries = tuple(_merge_terms(market_queries, profile.search_queries, limit=20))
-    source_selection = dict(profile.source_selection)
-    if source_selection.get("markets"):
-        source_selection["markets"] = True
-
-    return replace(
-        profile,
-        keywords=keywords,
-        subtopics=subtopics,
-        search_queries=search_queries,
-        source_queries=source_queries,
-        exclusions=exclusions,
-        requested_sources=requested_sources,
-        source_selection=source_selection,
-    )
-
-
-def _market_entities_from_text(text: str) -> list[tuple[str, str]]:
-    entities: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for name, ticker, pattern in _MARKET_ENTITY_ALIASES:
-        if not re.search(pattern, text, flags=re.IGNORECASE):
-            continue
-        key = ticker.lower()
-        if key in seen:
-            continue
-        entities.append((name, ticker))
-        seen.add(key)
-    return entities
+    exclusions = tuple(_merge_terms(profile.exclusions, detected))
+    if exclusions == profile.exclusions:
+        return profile
+    return replace(profile, exclusions=exclusions)
 
 
 def _exclusions_from_text(text: str) -> list[str]:
@@ -1659,22 +1607,6 @@ def _exclusions_from_text(text: str) -> list[str]:
     return exclusions
 
 
-def _market_queries_for_entities(terms: list[str], lookback_label: str, exclusions: tuple[str, ...]) -> list[str]:
-    if not terms:
-        return []
-    company_group = " ".join(terms)
-    exclude_phrase = " ".join(
-        f"-{term.replace(' ', '')}"
-        for term in exclusions
-        if term.lower() in {"msn", "yahoo news"}
-    )
-    return [
-        f"{company_group} memory chip news {lookback_label} {exclude_phrase}".strip(),
-        f"{company_group} earnings guidance NAND DRAM HBM pricing {lookback_label} {exclude_phrase}".strip(),
-        f"{company_group} supply demand capacity capex customer wins {lookback_label} {exclude_phrase}".strip(),
-    ]
-
-
 def _merge_terms(existing: tuple[str, ...] | list[str], incoming: list[str] | tuple[str, ...], *, limit: int = 16) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
@@ -1687,32 +1619,6 @@ def _merge_terms(existing: tuple[str, ...] | list[str], incoming: list[str] | tu
         seen.add(key)
         if len(merged) >= limit:
             break
-    return merged
-
-
-def _merge_source_query_terms(
-    existing: dict[str, tuple[str, ...]],
-    incoming: dict[str, tuple[str, ...]],
-) -> dict[str, tuple[str, ...]]:
-    merged = dict(existing)
-    for source, queries in incoming.items():
-        merged[source] = tuple(_merge_terms(merged.get(source, ()), queries, limit=20))
-    return merged
-
-
-def _dedupe_dict_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for source in sources:
-        adapter = str(source.get("adapter") or "").strip()
-        ref = str(source.get("ref") or "").strip()
-        if not adapter or not ref:
-            continue
-        key = (adapter, ref.lower())
-        if key in seen:
-            continue
-        merged.append({"adapter": adapter, "ref": ref})
-        seen.add(key)
     return merged
 
 

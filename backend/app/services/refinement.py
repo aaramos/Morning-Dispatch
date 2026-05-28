@@ -14,7 +14,7 @@ from backend.agents.librarian.text_utils import keyword_set
 from backend.agents.model import ModelClient
 from backend.app.core.config import get_settings
 from backend.app.db import database
-from backend.app.services import explore, model_routing
+from backend.app.services import explore, gmail_allowlist, model_routing
 
 logger = logging.getLogger(__name__)
 
@@ -96,12 +96,24 @@ You are an expert interviewer, not a form. Think first, ask second.
 
 == HOW TO ASK ==
 
+- Sound like a sharp human collaborator, not a setup wizard. Talk the way a
+  great researcher would when sketching out a brief with a colleague: warm,
+  curious, specific. Vary your phrasing turn to turn; never reuse a template.
 - Speak the user's language, never the schema's. The user must never see the
   words "depth", "Source Scope", "recency_weighting", "adapter", or any field
   name. Translate every internal concept into plain language.
+- React to what they actually said before you ask the next thing. A short nod
+  to their last answer ("Got it — so you care more about X than Y") makes the
+  exchange feel like a conversation, not a form.
 - One question per turn. Make it concrete and answerable in a sentence.
 - When you offer choices, give 2-3 plain options and a one-line "why this
   matters" so the user is never forced to ask "what does that mean?".
+- Let the chosen sources steer the conversation. Open on the angle that those
+  sources change most: for markets, the investable signals that matter; for
+  podcasts/YouTube, the voices or formats worth following; for foreign media,
+  the regions or languages that carry the real signal; for community sources,
+  the debates worth listening in on. Make the first question feel like it was
+  written for this exact mix of interest and sources.
 - Match the user's effort. If they're terse, infer more and ask less. If
   they're detailed, you can confirm in batches.
 - For market/investor tracking, do not ask "how recent" when the user gives a
@@ -122,6 +134,31 @@ You are an expert interviewer, not a form. Think first, ask second.
 Every turn, output a concrete, runnable search plan, not vague themes. Prefer
 specific phrases, entity names, aliases, subtopics, source-specific queries, and
 explicit exclusions. The plan should improve measurably with each answer.
+
+== QUERY CRAFT ==
+
+The quality of the brief is decided here, so treat query writing as the core
+skill, for ANY topic — a city trip, a scientific field, a company, a hobby, a
+policy fight.
+
+- Map the topic's facets first. Identify the distinct angles that matter
+  (key entities/people/places, sub-questions, competing viewpoints, time
+  sensitivity) and make sure the query set covers them rather than circling one
+  facet.
+- Write DIVERSE queries, not paraphrases. Each query should chase a different
+  facet or use different vocabulary (synonyms, insider terms, proper nouns,
+  acronyms spelled out). Never emit two queries that would return basically the
+  same results.
+- Tailor each source's queries to how that source is searched: precise web
+  phrases with names/places/time for web_search; community phrasing and
+  problems for reddit; creator/format phrasing for youtube/podcasts; native,
+  idiomatic phrasing for foreign_media; company names plus resolved tickers for
+  markets. Do not paste the same string into every source.
+- Resolve named entities to their canonical forms and useful aliases yourself
+  (e.g. a company to its ticker, a person to their full name and role) so the
+  queries hit. Do not ask the user for identifiers you can infer.
+- A few sharp queries beat many dull ones. Aim for breadth of coverage with
+  the smallest set that achieves it.
 
 == RULES ==
 
@@ -185,6 +222,36 @@ Return strict JSON only with this shape:
 """.strip()
 
 
+CRITIQUE_SYSTEM_PROMPT = """
+You are a senior research editor reviewing a draft search plan before it runs.
+
+The plan below was drafted to gather high-quality material on the user's topic.
+Your job is to make it stronger, for ANY kind of topic. Look for concrete
+weaknesses and fix them:
+- Coverage gaps: an obvious facet, entity, angle, or counter-viewpoint the
+  queries miss.
+- Redundancy: near-duplicate queries that would return the same results; replace
+  them with queries that reach new material.
+- Source fit: each selected source should have queries phrased the way that
+  source is actually searched, not a generic blob copied across sources.
+- Precision: vague queries that should name specific people, places, products,
+  organizations, tickers, or time windows.
+
+Only suggest queries for sources listed in selected_sources. Keep the user's
+intent; do not invent constraints they did not express. Prefer a small, sharp,
+diverse set over a long dull one.
+
+Return strict JSON only:
+{
+  "search_queries": ["improved general query phrases"],
+  "source_queries": {"web_search": ["query"], "reddit": ["query"]},
+  "subtopics": ["facet the plan should also cover"],
+  "notes": "one line on what you strengthened"
+}
+Return only sources you are improving; omit keys you are not changing.
+""".strip()
+
+
 def start_session(payload: dict[str, Any]) -> dict[str, Any]:
     statement = str(payload.get("statement") or "").strip()
     if not statement:
@@ -221,7 +288,7 @@ def start_session(payload: dict[str, Any]) -> dict[str, Any]:
         status = "finalized" if ready else "active"
     else:
         pending = _next_missing(profile)
-        messages = [{"role": "assistant", "content": QUESTIONS[pending]}] if pending else []
+        messages = [{"role": "assistant", "content": _deterministic_question(pending, profile)}] if pending else []
         status = "active" if pending else "finalized"
     session = database.create_refinement_session(
         statement=statement,
@@ -330,7 +397,7 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         status = "finalized" if next_pending is None else "active"
         topic_id = session.get("topic_id")
         if status == "active":
-            messages.append({"role": "assistant", "content": QUESTIONS[next_pending]})
+            messages.append({"role": "assistant", "content": _deterministic_question(next_pending, profile)})
         else:
             profile = _fill_defaults(profile)
             saved = explore.save_topic_profile(profile)
@@ -377,6 +444,8 @@ def _advance_gmail_refinement(
         rules = _gmail_rules_from_answer(answer, updated)
         candidates = _discover_gmail_candidates(rules)
         rules["candidates"] = [candidate.to_dict() for candidate in candidates]
+        if candidates:
+            gmail_allowlist.record_candidates(rules["candidates"], source="refinement")
         updated["gmail_rules"] = rules
         updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), {"gmail": [rules["intent"]]})
         updated["lookback_hours"] = rules["lookback_hours"]
@@ -404,7 +473,8 @@ def _advance_gmail_refinement(
         rules = _normalize_gmail_rules(updated.get("gmail_rules"))
         include_senders = _selected_gmail_senders(answer, rules)
         if include_senders:
-            rules["include_senders"] = include_senders
+            approved = gmail_allowlist.approve_senders(include_senders, source="refinement")
+            rules["include_senders"] = approved or include_senders
             updated["requested_sources"] = _merge_requested_source_lists(
                 _normalize_requested_sources(updated.get("requested_sources")),
                 [{"adapter": "gmail", "ref": sender} for sender in include_senders],
@@ -413,7 +483,10 @@ def _advance_gmail_refinement(
             updated["gmail_rules"] = rules
             return (
                 _coerce_profile(updated),
-                f"Got it. I'll include Gmail newsletters from {', '.join(include_senders)} and follow their article links for this brief.",
+                (
+                    f"Approved {', '.join(include_senders)} to the Gmail allowlist. "
+                    "These newsletters become discovery feeds, and the articles they link to become primary content for this brief."
+                ),
                 None,
                 "finalized",
             )
@@ -575,6 +648,72 @@ def _refinement_model_client(profile: dict[str, Any]) -> Any | None:
     ).client
 
 
+def _critique_search_plan(profile: dict[str, Any]) -> dict[str, Any]:
+    """Second LLM pass that strengthens the draft query set before building."""
+    client = _refinement_model_client(profile)
+    if client is None:
+        return profile
+    selected_sources = [
+        source
+        for source, enabled in _source_selection_dict(profile.get("source_selection")).items()
+        if enabled
+    ]
+    plan = {
+        "statement": str(profile.get("statement") or ""),
+        "scope": str(profile.get("scope") or ""),
+        "subtopics": _string_list(profile.get("subtopics")),
+        "keywords": _string_list(profile.get("keywords")),
+        "search_queries": _string_list(profile.get("search_queries"), limit=20),
+        "source_queries": _clean_source_queries(profile.get("source_queries")),
+        "selected_sources": selected_sources,
+        "exclusions": _string_list(profile.get("exclusions")),
+    }
+    prompt = json.dumps(
+        {
+            "task": "Review and strengthen this search plan before it runs.",
+            "plan": plan,
+        },
+        ensure_ascii=False,
+    )
+    try:
+        parsed = _run_sync_complete_json(
+            client.complete_json(
+                system=CRITIQUE_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=700,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to run search-plan critique")
+        return profile
+    if not isinstance(parsed, dict):
+        return profile
+    return _apply_critique(profile, parsed)
+
+
+def _apply_critique(profile: dict[str, Any], critique: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(profile)
+    if "search_queries" in critique:
+        updated["search_queries"] = _merge_string_lists(
+            updated.get("search_queries"), critique.get("search_queries"), limit=20
+        )
+    if "subtopics" in critique:
+        updated["subtopics"] = _merge_string_lists(
+            updated.get("subtopics"), critique.get("subtopics"), limit=16
+        )
+    if "source_queries" in critique:
+        # Only fold in queries for sources the user actually selected.
+        selection = _source_selection_dict(updated.get("source_selection"))
+        allowed = {
+            source: queries
+            for source, queries in _clean_source_queries(critique.get("source_queries")).items()
+            if selection.get(source)
+        }
+        if allowed:
+            updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), allowed)
+    return _coerce_profile(updated)
+
+
 def _privacy_markers_for_refinement(profile: dict[str, Any]) -> list[dict[str, str]]:
     selection = _source_selection_dict(profile.get("source_selection"))
     markers: list[dict[str, str]] = []
@@ -640,7 +779,10 @@ def _build_refinement_agent_prompt(
             ],
             "question_policy": (
                 "Ask the single question that most improves the search plan, in plain language the "
-                "user will understand without explanation. Infer every field you reasonably can "
+                "user will understand without explanation. Phrase it like a curious human "
+                "collaborator who just heard the user's last answer, not like a wizard stepping "
+                "through fields; vary your wording every turn and let the selected sources shape "
+                "what you open with. Infer every field you reasonably can "
                 "from the user's words and the brief type; surface inferences as quick "
                 "confirmations, not open questions. Never emit an internal field name. Never ask "
                 "about a constraint already present in already_inferred. If recency, exclusions, "
@@ -678,6 +820,9 @@ def _apply_agent_update(
     patched = _seed_profile_with_hints(patched)
     if not patched.get("scope"):
         patched["scope"] = str(profile.get("statement") or "").strip()
+    reasoning_summary = str(agent_update.get("reasoning_summary") or "").strip()
+    if reasoning_summary:
+        patched["reasoning_summary"] = reasoning_summary
     ready_requested = bool(agent_update.get("ready_to_build"))
     ready = ready_requested or just_go_now or turn_count >= MAX_REFINEMENT_TURNS
     next_question = _clean_next_question(agent_update.get("next_question"))
@@ -688,16 +833,17 @@ def _apply_agent_update(
         ready = False
         if not next_question:
             fallback_pending = _next_missing(patched)
-            next_question = QUESTIONS[fallback_pending] if fallback_pending else _search_strategy_question(patched)
+            next_question = _deterministic_question(fallback_pending, patched) if fallback_pending else _search_strategy_question(patched)
 
     if not next_question and not ready:
         fallback_pending = _next_missing(patched)
-        next_question = QUESTIONS[fallback_pending] if fallback_pending else None
+        next_question = _deterministic_question(fallback_pending, patched) if fallback_pending else None
         if next_question and _question_repeats_answered_constraint(next_question, patched):
             next_question = _strategy_deepening_question(patched, messages)
         ready = fallback_pending is None
     if ready:
         patched = _fill_defaults(patched)
+        patched = _critique_search_plan(patched)
         next_question = None
     return _coerce_profile(patched), next_question, ready
 
@@ -933,7 +1079,8 @@ def _gmail_candidate_question(candidates: list[NewsletterCandidate], rules: dict
     return (
         f"I searched Gmail for {rules.get('intent')} across {lookback} and found newsletter candidates:\n"
         + "\n".join(sender_lines)
-        + "\nWhich should I include? Reply with numbers, sender names, 'all', or 'none'."
+        + "\nWhich should I approve to the Gmail allowlist? Only approved senders are ever read. "
+        "Reply with numbers, sender names, 'all', or 'none'."
     )
 
 
@@ -1343,7 +1490,26 @@ def _fill_defaults(profile: dict[str, Any]) -> dict[str, Any]:
     updated["recency_weighting"] = _normalize_recency(updated.get("recency_weighting")) or "recent"
     if not isinstance(updated.get("exclusions"), list):
         updated["exclusions"] = []
+    updated = _ensure_source_query_coverage(updated)
     return _coerce_profile(updated)
+
+
+def _ensure_source_query_coverage(profile: dict[str, Any]) -> dict[str, Any]:
+    """Give every selected source a real query so connectors don't fall back to a generic blob."""
+    selection = _source_selection_dict(profile.get("source_selection"))
+    queries = dict(_clean_source_queries(profile.get("source_queries")))
+    phrase_queries = _string_list(profile.get("search_queries"), limit=20)
+    if not phrase_queries:
+        scope = str(profile.get("scope") or profile.get("statement") or "").strip()
+        phrase_queries = [scope] if scope else []
+    market_terms = _string_list(profile.get("keywords"), limit=4) or phrase_queries[:2]
+    for source, enabled in selection.items():
+        if not enabled or queries.get(source):
+            continue
+        fallback = market_terms if source == "markets" else phrase_queries[:3]
+        if fallback:
+            queries[source] = list(fallback)
+    return {**profile, "source_queries": queries}
 
 
 def _next_missing(profile: dict[str, Any]) -> str | None:
@@ -1376,6 +1542,88 @@ def _required_confirmation_field(profile: dict[str, Any]) -> str | None:
     return None
 
 
+_QUESTION_VARIANTS: dict[str, tuple[str, ...]] = {
+    "scope": (
+        "What angle would make this most useful for you?",
+        "If this brief nailed one thing, what would it be?",
+        "What's the outcome you're after here — what would make it land?",
+    ),
+    "related_interests": (
+        "Are there adjacent threads worth pulling in, or should I keep it tight?",
+        "Anything nearby you'd want folded in, or keep the aperture narrow?",
+        "Any related angles I should weave in while I'm at it?",
+    ),
+    "depth": (
+        "Do you want practical, get-things-done coverage, or a deeper expert-level read?",
+        "Should this read like a practitioner's working brief or a deeper analytical dive?",
+        "Are you after hands-on takeaways or a more thorough, expert-level treatment?",
+    ),
+    "recency_weighting": (
+        "How fresh does the material need to be — the last day or two, the past week, or is older context fine?",
+        "What time window matters here: breaking news, the last week or so, or best available regardless of date?",
+        "How recent should sources be — latest only, recent, or is evergreen background welcome?",
+    ),
+    "exclusions": (
+        "Anything I should steer clear of so the brief stays focused?",
+        "Any sources, angles, or noise you want me to filter out?",
+        "Is there anything that would be a waste of space for you here?",
+    ),
+}
+
+_SOURCE_PROMPT_LABELS: dict[str, str] = {
+    "reddit": "subreddits or communities",
+    "podcasts": "shows or hosts",
+    "youtube": "channels or creators",
+    "markets": "companies or tickers",
+    "foreign_media": "regions or languages",
+    "collections": "files or collections",
+    "gmail": "newsletters",
+    "web_search": "sites or publications",
+}
+
+
+def _pick_variant(field: str, profile: dict[str, Any]) -> str:
+    variants = _QUESTION_VARIANTS.get(field)
+    if not variants:
+        return QUESTIONS.get(field, "What else should I know to make this brief useful?")
+    answered = sum(
+        1
+        for flag in (
+            "related_interests_answered",
+            "depth_answered",
+            "source_scope_answered",
+            "requested_sources_answered",
+            "exclusions_answered",
+        )
+        if profile.get(flag)
+    )
+    index = (len(str(profile.get("statement") or "")) + answered) % len(variants)
+    return variants[index]
+
+
+def _requested_sources_question(profile: dict[str, Any]) -> str:
+    selected = [
+        source
+        for source, enabled in _source_selection_dict(profile.get("source_selection")).items()
+        if enabled and source in _SOURCE_PROMPT_LABELS
+    ]
+    labels = [_SOURCE_PROMPT_LABELS[source] for source in selected]
+    if not labels:
+        return QUESTIONS["requested_sources"]
+    if len(labels) == 1:
+        return f"Any specific {labels[0]} I should make sure to include?"
+    listed = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+    return f"Any specific {listed} I should make sure to include?"
+
+
+def _deterministic_question(field: str, profile: dict[str, Any]) -> str:
+    if field == "requested_sources":
+        return _requested_sources_question(profile)
+    if field in _QUESTION_VARIANTS:
+        return _pick_variant(field, profile)
+    return QUESTIONS.get(field, "What else should I know to make this brief useful?")
+
+
 def _search_strategy_question(profile: dict[str, Any]) -> str:
     selected_sources = [
         source
@@ -1391,13 +1639,6 @@ def _search_strategy_question(profile: dict[str, Any]) -> str:
 
 def _strategy_deepening_question(profile: dict[str, Any], messages: list[dict[str, str]]) -> str:
     text = _user_authored_text(profile, messages)
-    companies = _extract_market_entities(text)
-    if _market_tracking_interest(text) and companies:
-        company_text = ", ".join(company["name"] for company in companies[:4])
-        return (
-            f"For {company_text}, which signals should I prioritize: earnings and guidance, "
-            "memory pricing/supply-demand, customer wins, capex and capacity moves, or competitive risk?"
-        )
     if _market_tracking_interest(text):
         return "What would make this brief actionable for you: catalysts, risks, valuation context, or company-by-company comparisons?"
     if _string_list(profile.get("search_queries")) or _clean_source_queries(profile.get("source_queries")):
@@ -1518,36 +1759,6 @@ def _seed_profile_with_hints(profile: dict[str, Any]) -> dict[str, Any]:
     if exclusions:
         updated["exclusions"] = _merge_string_lists(updated.get("exclusions"), exclusions, limit=12)
         updated["exclusions_answered"] = True
-    market_entities = _extract_market_entities(statement)
-    if market_entities:
-        requested = _normalize_requested_sources(updated.get("requested_sources"))
-        requested.extend({"adapter": "markets", "ref": entity["ref"]} for entity in market_entities)
-        updated["requested_sources"] = _merge_requested_source_lists([], requested)
-        updated["requested_sources_answered"] = True
-        query_terms = [_market_entity_query_term(entity) for entity in market_entities]
-        ticker_terms = [entity["ref"] for entity in market_entities]
-        keyword_terms = [item for entity in market_entities for item in (entity["name"], entity["ref"])]
-        updated["keywords"] = _merge_string_lists(updated.get("keywords"), keyword_terms, limit=16)
-        updated["subtopics"] = _merge_string_lists(
-            updated.get("subtopics"),
-            [
-                "company performance and catalysts",
-                "memory pricing and supply-demand signals",
-                "competitive positioning across memory and storage suppliers",
-            ],
-            limit=16,
-        )
-        updated["source_queries"] = _merge_source_queries(
-            updated.get("source_queries"),
-            _market_source_queries(query_terms, ticker_terms=ticker_terms, lookback=lookback, exclusions=exclusions),
-        )
-        updated["search_queries"] = _merge_string_lists(
-            updated.get("search_queries"),
-            _market_search_queries(query_terms, lookback=lookback, exclusions=exclusions),
-            limit=20,
-        )
-    if exclusions or lookback or market_entities:
-        updated["related_interests_answered"] = bool(market_entities) or bool(updated.get("related_interests_answered"))
     return _coerce_profile(updated)
 
 
@@ -1583,6 +1794,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "source_selection": selected_sources,
         "requested_sources": requested_sources,
         "gmail_rules": _normalize_gmail_rules(profile.get("gmail_rules")),
+        "reasoning_summary": str(profile.get("reasoning_summary") or "").strip()[:600],
         "related_interests_answered": bool(profile.get("related_interests_answered")),
         "requested_sources_answered": bool(profile.get("requested_sources_answered")),
         "depth_answered": bool(profile.get("depth_answered")),
@@ -1619,14 +1831,12 @@ def _collect_hint_text(profile: dict[str, Any]) -> str:
 
 def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
     statement = str(profile.get("statement") or "")
-    companies = _extract_market_entities(statement)
     return {
         "lookback_window": _extract_lookback_constraint(statement),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")) or _extract_lookback_hours(statement),
         "recency_already_answered": bool(profile.get("source_scope_answered")) or bool(_normalize_recency(profile.get("recency_weighting"))),
         "excluded_publishers_or_source_types": _string_list(profile.get("exclusions")),
         "exclusions_already_answered": bool(profile.get("exclusions_answered")) or bool(_string_list(profile.get("exclusions"))),
-        "named_companies_or_tickers": [_market_entity_label(company) for company in companies],
         "market_tracking_interest": _market_tracking_interest(statement),
         "recommended_question_focus": (
             "Ask about investable signals, relative comparison, source quality, catalysts, or risks. "
@@ -1715,70 +1925,6 @@ def _market_tracking_interest(text: str) -> bool:
     return any(token in lowered for token in ("investor", "stock", "stocks", "company's performance", "companies performance", "performance", "ticker", "market"))
 
 
-def _extract_market_entities(text: str) -> list[dict[str, str]]:
-    clean = str(text or "")
-    patterns = (
-        ("Micron", "MU", r"\bmicron\b|\bmu\b"),
-        ("SK Hynix", "000660.KS", r"\b(?:sk\s+)?hynix\b|\b000660(?:\.ks)?\b"),
-        ("Kioxia", "285A.T", r"\bkioxia\b|\b285a(?:\.t)?\b|\bkxhcf\b"),
-        ("SanDisk", "SNDK", r"\bsandisk\b|\bsndk\b"),
-    )
-    entities: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for name, ref, pattern in patterns:
-        if re.search(pattern, clean, flags=re.IGNORECASE):
-            key = ref.lower()
-            if key not in seen:
-                entities.append({"name": name, "ref": ref})
-                seen.add(key)
-    return entities
-
-
-def _market_entity_label(entity: dict[str, str]) -> str:
-    name = str(entity.get("name") or "").strip()
-    ref = str(entity.get("ref") or "").strip()
-    if name and ref and name.lower() != ref.lower():
-        return f"{name} ({ref})"
-    return name or ref
-
-
-def _market_entity_query_term(entity: dict[str, str]) -> str:
-    name = str(entity.get("name") or "").strip()
-    ref = str(entity.get("ref") or "").strip()
-    if name and ref and name.lower() != ref.lower():
-        return f"{name} {ref}"
-    return name or ref
-
-
-def _market_search_queries(terms: list[str], *, lookback: str, exclusions: list[str]) -> list[str]:
-    if not terms:
-        return []
-    company_group = " ".join(terms)
-    time_phrase = lookback or "latest"
-    exclude_phrase = " ".join(f"-{term.replace(' ', '')}" for term in exclusions if term.lower() in {"msn", "yahoo news"})
-    return [
-        f"{company_group} memory chip news {time_phrase} {exclude_phrase}".strip(),
-        f"{company_group} earnings guidance NAND DRAM HBM pricing {time_phrase} {exclude_phrase}".strip(),
-        f"{company_group} supply demand capacity capex customer wins {time_phrase} {exclude_phrase}".strip(),
-    ]
-
-
-def _market_source_queries(
-    terms: list[str],
-    *,
-    ticker_terms: list[str] | None = None,
-    lookback: str,
-    exclusions: list[str],
-) -> dict[str, list[str]]:
-    queries = _market_search_queries(terms, lookback=lookback, exclusions=exclusions)
-    return {
-        "web_search": queries,
-        "markets": ticker_terms or terms,
-        "reddit": [f"{' '.join(terms)} memory stocks analysis", "DRAM NAND HBM stock discussion"],
-        "youtube": [f"{' '.join(terms)} stock analysis memory market", "DRAM NAND HBM market analysis"],
-    }
-
-
 def _contains(text: str, tokens: tuple[str, ...]) -> bool:
     return any(token in text for token in tokens)
 
@@ -1813,7 +1959,51 @@ def _requested_source_was_named_by_user(source: dict[str, str], user_text: str) 
     return False
 
 
+_SOURCE_DISPLAY: dict[str, str] = {
+    "web_search": "Web search",
+    "foreign_media": "Foreign media",
+    "gmail": "Gmail newsletters",
+    "reddit": "Reddit",
+    "podcasts": "Podcasts",
+    "youtube": "YouTube",
+    "collections": "Your collections",
+    "markets": "Markets",
+}
+
+
+def _strategy_preview(profile: dict[str, Any]) -> dict[str, Any]:
+    """Plain-language review of where the brief will look, what it ignores, and the exact queries."""
+    selection = _source_selection_dict(profile.get("source_selection"))
+    source_queries = _clean_source_queries(profile.get("source_queries"))
+    looks_at: list[str] = []
+    ignores: list[str] = []
+    per_source: list[dict[str, Any]] = []
+    for source, label in _SOURCE_DISPLAY.items():
+        if selection.get(source):
+            looks_at.append(label)
+            entry: dict[str, Any] = {"source": label, "key": source, "queries": list(source_queries.get(source, []))}
+            if source == "gmail":
+                entry["approved_senders"] = database.approved_gmail_senders()
+                entry["note"] = "Only approved newsletters are read; their linked articles become primary content."
+            per_source.append(entry)
+        else:
+            ignores.append(label)
+    return {
+        "statement": str(profile.get("statement") or ""),
+        "scope": str(profile.get("scope") or ""),
+        "looks_at": looks_at,
+        "ignores": ignores,
+        "search_queries": _string_list(profile.get("search_queries"), limit=8),
+        "per_source": per_source,
+        "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
+        "recency_weighting": str(profile.get("recency_weighting") or ""),
+        "exclusions": _string_list(profile.get("exclusions")),
+        "reasoning_summary": str(profile.get("reasoning_summary") or "").strip(),
+    }
+
+
 def _session_response(session: dict[str, Any]) -> dict[str, Any]:
+    profile = session.get("profile") if isinstance(session.get("profile"), dict) else {}
     response = {
         "session_id": session["session_id"],
         "statement": session["statement"],
@@ -1823,6 +2013,8 @@ def _session_response(session: dict[str, Any]) -> dict[str, Any]:
         "messages": _messages(session),
         "profile": session["profile"],
         "topic_id": session.get("topic_id"),
+        "reasoning_summary": str(profile.get("reasoning_summary") or "").strip(),
+        "strategy_preview": _strategy_preview(profile),
     }
     if session.get("topic_id"):
         response["topic_profile"] = database.get_topic_profile(str(session["topic_id"]))

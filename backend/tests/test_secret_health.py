@@ -17,6 +17,7 @@ def settings(tmp_path: Path) -> Settings:
         gmail_credentials_path=tmp_path / "secrets" / "gmail" / "credentials.json",
         gmail_oauth_state_path=tmp_path / "secrets" / "gmail" / "state.json",
         model_settings_path=tmp_path / "data" / "model-settings.json",
+        brief_settings_path=tmp_path / "data" / "brief-settings.json",
         web_search_brave_api_key="brave-configured",
         youtube_api_key="youtube-configured",
         model_api_key="model-configured",
