@@ -330,6 +330,7 @@ async def run_discovery(
     profile = _strengthen_profile_for_run(TopicProfile.from_dict(record["profile"]))
     merged_selection = _merged_source_selection(profile, source_selection)
     resolved_lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
+    resolved_candidate_limit = _resolve_candidate_limit(profile, candidate_limit)
     exploration = database.create_exploration(
         topic_id=topic_id,
         mode=mode,
@@ -338,7 +339,7 @@ async def run_discovery(
     try:
         context = SourceAdapterContext(
             exploration_id=str(exploration["exploration_id"]),
-            candidate_limit=candidate_limit,
+            candidate_limit=resolved_candidate_limit,
             lookback_hours=resolved_lookback_hours,
         )
         result = await DiscoveryRunner(default_source_registry()).run(
@@ -398,6 +399,7 @@ def start_show_now(
     profile = TopicProfile.from_dict(record["profile"])
     merged_selection = _merged_source_selection(profile, source_selection)
     resolved_lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
+    resolved_candidate_limit = _resolve_candidate_limit(profile, candidate_limit)
     exploration = database.create_exploration(
         topic_id=topic_id,
         mode=mode,
@@ -411,7 +413,7 @@ def start_show_now(
         "action": "build",
     }
     initial_progress["queue_options"] = {
-        "candidate_limit": candidate_limit,
+        "candidate_limit": resolved_candidate_limit,
         "lookback_hours": resolved_lookback_hours,
     }
     database.update_exploration_progress(
@@ -439,6 +441,7 @@ def start_rebuild(
     profile = TopicProfile.from_dict(topic["profile"])
     merged_selection = _merged_source_selection(profile, source_selection or exploration.get("source_selection"))
     resolved_lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
+    resolved_candidate_limit = _resolve_candidate_limit(profile, candidate_limit)
     progress = _initial_progress(merged_selection)
     progress["queue"] = {
         "status": "queued",
@@ -446,7 +449,7 @@ def start_rebuild(
         "action": "rebuild",
     }
     progress["queue_options"] = {
-        "candidate_limit": candidate_limit,
+        "candidate_limit": resolved_candidate_limit,
         "lookback_hours": resolved_lookback_hours,
     }
     database.clear_inference_metrics_for_run(exploration_id)
@@ -494,6 +497,7 @@ async def _run_exploration(
     profile = TopicProfile.from_dict(record["profile"])
     merged_selection = _merged_source_selection(profile, source_selection)
     lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
+    candidate_limit = _resolve_candidate_limit(profile, candidate_limit)
 
     exploration = existing_exploration
     if exploration is None:
@@ -1557,6 +1561,20 @@ def _resolve_lookback_hours(profile: TopicProfile, lookback_hours: int | None) -
     if profile.recency_weighting == "recent":
         return 72
     return 24
+
+
+def _resolve_candidate_limit(profile: TopicProfile, candidate_limit: int | None) -> int:
+    saved_limit = None
+    if isinstance(profile.content_limits, dict):
+        saved_limit = profile.content_limits.get("total_items")
+    if saved_limit is not None:
+        try:
+            return max(1, min(int(saved_limit), 250))
+        except (TypeError, ValueError):
+            pass
+    if candidate_limit is not None:
+        return max(1, min(int(candidate_limit), 250))
+    return 250
 
 
 def _strengthen_profile_for_run(profile: TopicProfile) -> TopicProfile:

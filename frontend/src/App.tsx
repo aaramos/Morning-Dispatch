@@ -46,6 +46,7 @@ type TopicProfile = {
   schedule?: string | null;
   schedule_config?: Record<string, unknown>;
   delivery_config?: Record<string, unknown>;
+  content_limits?: Partial<ContentLimitsDraft>;
   status?: string;
   archived?: boolean;
   deleted?: boolean;
@@ -92,6 +93,8 @@ type ConfirmedProfilePayload = {
   schedule?: string | null;
   schedule_config?: Record<string, unknown>;
   delivery_config?: Record<string, unknown>;
+  candidate_limit?: number;
+  content_limits?: ContentLimitsDraft;
 };
 
 type ExplorationIssue = {
@@ -316,7 +319,15 @@ type ConfirmationDraft = {
   depth: "practitioner" | "informed-generalist";
   recency_weighting: SourceScope;
   exclusions: string;
+  content_limits: ContentLimitsDraft;
   sourceScopeTouched?: boolean;
+};
+
+type ContentLimitsDraft = {
+  total_items: number;
+  lead_items: number;
+  per_source: Partial<Record<SourceKey, number>>;
+  quality_floor: "standard" | "strong";
 };
 
 type RefinementProgress = {
@@ -347,6 +358,22 @@ const defaultSourceSelection: Record<SourceKey, boolean> = {
   youtube: false,
   collections: false,
   markets: false,
+};
+
+const defaultContentLimits: ContentLimitsDraft = {
+  total_items: 12,
+  lead_items: 3,
+  per_source: {
+    web_search: 6,
+    foreign_media: 4,
+    gmail: 4,
+    reddit: 3,
+    podcasts: 2,
+    youtube: 2,
+    collections: 4,
+    markets: 2,
+  },
+  quality_floor: "standard",
 };
 
 const schedulePresets: Array<{ value: SchedulePreset; label: string }> = [
@@ -692,6 +719,8 @@ function DispatchApp() {
       schedule: baseProfile?.schedule ?? null,
       schedule_config: baseProfile?.schedule_config ?? {},
       delivery_config: baseProfile?.delivery_config ?? {},
+      candidate_limit: draft.content_limits.total_items,
+      content_limits: draft.content_limits,
     };
   }
 
@@ -718,6 +747,7 @@ function DispatchApp() {
             topic_profile: profilePayload,
             refinement_session_id: session?.session_id,
             source_selection: selectedEnabledSources,
+            candidate_limit: profilePayload.candidate_limit,
             lookback_hours: profilePayload.lookback_hours,
           }),
         })
@@ -756,6 +786,7 @@ function DispatchApp() {
         method: "POST",
         body: JSON.stringify({
           source_selection: selectedEnabledSources,
+          candidate_limit: draft.content_limits.total_items,
           lookback_hours: lookbackHoursForBuild(topicProfile?.profile ?? session?.profile, draft),
         }),
       });
@@ -1553,6 +1584,12 @@ function ConfirmationPanel(props: {
   onSourceClick: (source: SourceKey) => void;
   onBuild: () => void;
 }) {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  function updateContentLimits(next: ContentLimitsDraft) {
+    props.onDraftChange({ ...props.draft, content_limits: next });
+  }
+
   return (
     <section className="confirmation-panel">
       <div className="panel-title-row">
@@ -1622,12 +1659,129 @@ function ConfirmationPanel(props: {
           ))}
         </div>
       ) : null}
+      <div className="advanced-settings-shell">
+        <DisclosureButton
+          expanded={advancedOpen}
+          label="Advanced Settings"
+          onToggle={() => setAdvancedOpen((open) => !open)}
+        />
+        {advancedOpen ? (
+          <ContentLimitsPanel
+            limits={props.draft.content_limits}
+            sourceSelection={props.sources}
+            onChange={updateContentLimits}
+          />
+        ) : null}
+      </div>
       <div className="confirmation-actions">
         <button type="button" className="primary-action build-brief-action" onClick={props.onBuild} disabled={props.busy}>
           Build brief
         </button>
       </div>
     </section>
+  );
+}
+
+function ContentLimitsPanel(props: {
+  limits: ContentLimitsDraft;
+  sourceSelection: Record<SourceKey, boolean>;
+  onChange: (limits: ContentLimitsDraft) => void;
+}) {
+  const selectedSources = sourceOptions.filter((source) => props.sourceSelection[source.key]);
+
+  function updateNumber(key: "total_items" | "lead_items", value: number) {
+    const nextValue = clampContentLimit(value, key === "total_items" ? 1 : 0, key === "total_items" ? 250 : 20);
+    props.onChange({ ...props.limits, [key]: nextValue });
+  }
+
+  function updateSourceLimit(source: SourceKey, value: number) {
+    props.onChange({
+      ...props.limits,
+      per_source: {
+        ...props.limits.per_source,
+        [source]: clampContentLimit(value, 1, 100),
+      },
+    });
+  }
+
+  return (
+    <div className="content-limits-panel">
+      <div className="content-limit-grid">
+        <NumberStepper
+          label="Total brief size"
+          value={props.limits.total_items}
+          min={1}
+          max={250}
+          onChange={(value) => updateNumber("total_items", value)}
+        />
+        <NumberStepper
+          label="Lead stories"
+          value={props.limits.lead_items}
+          min={0}
+          max={20}
+          onChange={(value) => updateNumber("lead_items", value)}
+        />
+        <label>
+          Quality floor
+          <select
+            value={props.limits.quality_floor}
+            onChange={(event) => props.onChange({ ...props.limits, quality_floor: event.target.value as ContentLimitsDraft["quality_floor"] })}
+          >
+            <option value="standard">Standard signal</option>
+            <option value="strong">Strong signal only</option>
+          </select>
+        </label>
+      </div>
+      {selectedSources.length ? (
+        <div className="source-limit-list">
+          <strong>Per-source maximums</strong>
+          {selectedSources.map((source) => (
+            <NumberStepper
+              key={source.key}
+              label={source.label}
+              value={props.limits.per_source[source.key] ?? defaultContentLimits.per_source[source.key] ?? 3}
+              min={1}
+              max={100}
+              compact
+              onChange={(value) => updateSourceLimit(source.key, value)}
+            />
+          ))}
+        </div>
+      ) : null}
+      <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(defaultContentLimits)}>
+        Reset to defaults
+      </button>
+    </div>
+  );
+}
+
+function NumberStepper(props: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  compact?: boolean;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className={props.compact ? "number-stepper compact" : "number-stepper"}>
+      {props.label}
+      <span>
+        <button type="button" onClick={() => props.onChange(props.value - 1)} disabled={props.value <= props.min} aria-label={`Decrease ${props.label}`}>
+          -
+        </button>
+        <input
+          type="number"
+          min={props.min}
+          max={props.max}
+          value={props.value}
+          onChange={(event) => props.onChange(Number(event.target.value))}
+        />
+        <button type="button" onClick={() => props.onChange(props.value + 1)} disabled={props.value >= props.max} aria-label={`Increase ${props.label}`}>
+          +
+        </button>
+      </span>
+    </label>
   );
 }
 
@@ -3262,6 +3416,7 @@ function emptyDraft(): ConfirmationDraft {
     depth: "informed-generalist",
     recency_weighting: "recent",
     exclusions: "",
+    content_limits: defaultContentLimits,
     sourceScopeTouched: false,
   };
 }
@@ -3272,8 +3427,27 @@ function draftFromProfile(profile: TopicProfile): ConfirmationDraft {
     depth: profile.depth === "practitioner" ? "practitioner" : "informed-generalist",
     recency_weighting: sourceScopeFromProfile(profile),
     exclusions: (profile.exclusions ?? []).join(", "),
+    content_limits: contentLimitsFromProfile(profile),
     sourceScopeTouched: false,
   };
+}
+
+function contentLimitsFromProfile(profile: TopicProfile): ContentLimitsDraft {
+  const saved = profile.content_limits ?? {};
+  return {
+    total_items: clampContentLimit(Number(saved.total_items ?? defaultContentLimits.total_items), 1, 250),
+    lead_items: clampContentLimit(Number(saved.lead_items ?? defaultContentLimits.lead_items), 0, 20),
+    per_source: {
+      ...defaultContentLimits.per_source,
+      ...(saved.per_source ?? {}),
+    },
+    quality_floor: saved.quality_floor === "strong" ? "strong" : "standard",
+  };
+}
+
+function clampContentLimit(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, Math.round(value)));
 }
 
 function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft): number {

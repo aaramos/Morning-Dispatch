@@ -596,6 +596,84 @@ label {
   border-top: 1px solid #deddd6;
 }
 
+.advanced-settings-shell {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid #deddd6;
+}
+
+.content-limits-panel {
+  display: grid;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #f7f7f4;
+}
+
+.content-limit-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.source-limit-list {
+  display: grid;
+  gap: 10px;
+}
+
+.source-limit-list > strong {
+  color: #5d5b55;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.number-stepper span {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 40px;
+  align-items: stretch;
+  min-height: 44px;
+}
+
+.number-stepper input {
+  border-radius: 0;
+  text-align: center;
+  border-left: 0;
+  border-right: 0;
+}
+
+.number-stepper button {
+  border: 1px solid #c8c7bf;
+  background: #ffffff;
+  color: #1d1d1b;
+  font-weight: 900;
+}
+
+.number-stepper button:first-child {
+  border-radius: 8px 0 0 8px;
+}
+
+.number-stepper button:last-child {
+  border-radius: 0 8px 8px 0;
+}
+
+.number-stepper.compact {
+  grid-template-columns: minmax(0, 1fr) minmax(138px, 168px);
+  align-items: center;
+  gap: 12px;
+}
+
+.number-stepper.compact span {
+  width: 100%;
+}
+
+.reset-limits-action {
+  justify-self: start;
+}
+
 .build-brief-action {
   min-width: 158px;
   border-color: #c65f1a;
@@ -1342,6 +1420,7 @@ label {
 
   .active-digest-row,
   .confirm-grid,
+  .content-limit-grid,
   .admin-form-grid,
   .schedule-controls,
   .email-send-box,
@@ -1358,6 +1437,11 @@ label {
 
   .confirmation-actions {
     justify-content: stretch;
+  }
+
+  .number-stepper.compact {
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 
   .build-brief-action {

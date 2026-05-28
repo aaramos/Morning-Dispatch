@@ -914,6 +914,50 @@ def test_discovery_runner_dedupes_and_marks_opt_outs() -> None:
     assert statuses["reddit"] == "skipped"
 
 
+def test_discovery_runner_applies_per_source_content_limits() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "AI agents for local infrastructure",
+            "scope": "Practical agent workflows",
+            "source_selection": {"gmail": True, "web_search": True},
+            "content_limits": {"per_source": {"gmail": 1, "web_search": 2}},
+        }
+    )
+    registry = SourceRegistry(
+        [
+            FakeAdapter(
+                "gmail",
+                [
+                    candidate("gmail", "https://example.com/mail-1", 0.9),
+                    candidate("gmail", "https://example.com/mail-2", 0.8),
+                ],
+            ),
+            FakeAdapter(
+                "web_search",
+                [
+                    candidate("web_search", "https://example.com/web-1", 0.7),
+                    candidate("web_search", "https://example.com/web-2", 0.6),
+                    candidate("web_search", "https://example.com/web-3", 0.5),
+                ],
+            ),
+        ]
+    )
+
+    result = asyncio.run(
+        DiscoveryRunner(registry).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="explore-1", candidate_limit=10),
+        )
+    )
+
+    assert [candidate.adapter for candidate in result.candidates] == ["gmail", "web_search", "web_search"]
+    assert [candidate.payload.original_url for candidate in result.candidates] == [
+        "https://example.com/mail-1",
+        "https://example.com/web-1",
+        "https://example.com/web-2",
+    ]
+
+
 def test_discovery_runner_applies_exclusions() -> None:
     profile = TopicProfile.from_dict(
         {

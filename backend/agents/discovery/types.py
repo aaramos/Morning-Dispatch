@@ -71,6 +71,7 @@ class TopicProfile:
     schedule: ScheduleValue | None = None
     schedule_config: dict[str, Any] = field(default_factory=dict)
     delivery_config: dict[str, Any] = field(default_factory=dict)
+    content_limits: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> TopicProfile:
@@ -104,6 +105,7 @@ class TopicProfile:
             schedule=_schedule(payload.get("schedule")),
             schedule_config=_dict(payload.get("schedule_config")),
             delivery_config=_dict(payload.get("delivery_config")),
+            content_limits=_content_limits(payload.get("content_limits")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,6 +129,7 @@ class TopicProfile:
             "schedule": self.schedule,
             "schedule_config": dict(self.schedule_config),
             "delivery_config": dict(self.delivery_config),
+            "content_limits": dict(self.content_limits),
         }
 
     def search_text(self) -> str:
@@ -283,6 +286,42 @@ def _source_queries(value: Any) -> dict[str, tuple[str, ...]]:
 
 def _dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _content_limits(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    limits: dict[str, Any] = {}
+    total_items = _positive_int(value.get("total_items"), maximum=250)
+    if total_items is not None:
+        limits["total_items"] = total_items
+    lead_items = _positive_int(value.get("lead_items"), maximum=20, allow_zero=True)
+    if lead_items is not None:
+        limits["lead_items"] = lead_items
+    if _clean_text(value.get("quality_floor")) in {"standard", "strong"}:
+        limits["quality_floor"] = _clean_text(value.get("quality_floor"))
+    per_source: dict[str, int] = {}
+    raw_per_source = value.get("per_source")
+    if isinstance(raw_per_source, dict):
+        for raw_key, raw_limit in raw_per_source.items():
+            key = _clean_text(raw_key)
+            source_limit = _positive_int(raw_limit, maximum=100)
+            if key and source_limit is not None:
+                per_source[key] = source_limit
+    if per_source:
+        limits["per_source"] = per_source
+    return limits
+
+
+def _positive_int(value: Any, *, maximum: int, allow_zero: bool = False) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    minimum = 0 if allow_zero else 1
+    if number < minimum:
+        return None
+    return min(number, maximum)
 
 
 def _source_selection(value: Any) -> dict[str, bool]:

@@ -164,6 +164,7 @@ class DiscoveryRunner:
             [candidate for adapter_candidates, _status in results for candidate in adapter_candidates],
         )
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
+        candidates = _apply_source_limits(profile, candidates)
         candidates = _dedupe_candidates(
             candidates,
             limit=context.candidate_limit,
@@ -244,6 +245,36 @@ def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candi
         if len(deduped) >= max(1, limit):
             break
     return deduped
+
+
+def _apply_source_limits(profile: TopicProfile, candidates: list[Candidate]) -> list[Candidate]:
+    per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else None
+    if not isinstance(per_source, dict) or not per_source:
+        return candidates
+
+    counts: dict[str, int] = {}
+    kept: list[Candidate] = []
+    for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
+        limit = _source_limit(per_source.get(candidate.adapter))
+        if limit is None:
+            kept.append(candidate)
+            continue
+        current = counts.get(candidate.adapter, 0)
+        if current >= limit:
+            continue
+        counts[candidate.adapter] = current + 1
+        kept.append(candidate)
+    return kept
+
+
+def _source_limit(value: Any) -> int | None:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return None
+    if limit < 1:
+        return None
+    return min(limit, 100)
 
 
 def _apply_exclusions(profile: TopicProfile, candidates: list[Candidate]) -> tuple[list[Candidate], list[dict[str, Any]]]:

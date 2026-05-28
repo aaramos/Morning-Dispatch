@@ -58,6 +58,7 @@ class TopicProfileCreate(BaseModel):
     schedule: ScheduleValue | None = None
     schedule_config: dict[str, Any] = Field(default_factory=dict)
     delivery_config: dict[str, Any] = Field(default_factory=dict)
+    content_limits: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExplorationCreate(BaseModel):
