@@ -576,7 +576,7 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
     for key in ("subtopics", "search_queries", "exclusions"):
         if key not in patch:
             continue
-        updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 10)
+        updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
     if "keywords" in patch:
         keywords = _string_list(patch.get("keywords"), limit=16)
         if keywords:
@@ -687,7 +687,7 @@ def _clean_source_queries(value: Any) -> dict[str, list[str]]:
         source_key = str(key)
         if source_key not in VALID_SOURCE_ADAPTERS:
             continue
-        query_list = _string_list(queries, limit=5)
+        query_list = _string_list(queries, limit=20)
         if query_list:
             cleaned[source_key] = query_list
     return cleaned
@@ -696,7 +696,7 @@ def _clean_source_queries(value: Any) -> dict[str, list[str]]:
 def _merge_source_queries(existing: Any, incoming: Any) -> dict[str, list[str]]:
     merged = _clean_source_queries(existing)
     for key, values in _clean_source_queries(incoming).items():
-        merged[key] = _merge_string_lists(merged.get(key), values, limit=5)
+        merged[key] = _merge_string_lists(merged.get(key), values, limit=20)
     return merged
 
 
@@ -725,7 +725,7 @@ def _normalize_foreign_language_plan(value: Any) -> list[dict[str, Any]]:
             }
         )
         seen.add(code)
-        if len(cleaned) >= 3:
+        if len(cleaned) >= 10:
             break
     return cleaned
 
@@ -738,7 +738,7 @@ def _merge_foreign_language_plan(existing: Any, incoming: Any) -> list[dict[str,
             continue
         merged.append(item)
         seen.add(item["code"])
-        if len(merged) >= 3:
+        if len(merged) >= 10:
             break
     return merged
 
@@ -1226,7 +1226,7 @@ def _seed_profile_with_hints(profile: dict[str, Any]) -> dict[str, Any]:
         updated["search_queries"] = _merge_string_lists(
             updated.get("search_queries"),
             _market_search_queries(query_terms, lookback=lookback, exclusions=exclusions),
-            limit=10,
+            limit=20,
         )
     if exclusions or lookback or market_entities:
         updated["related_interests_answered"] = bool(market_entities) or bool(updated.get("related_interests_answered"))
@@ -1255,7 +1255,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "scope": str(profile.get("scope") or ""),
         "subtopics": _string_list(profile.get("subtopics")),
         "keywords": _string_list(profile.get("keywords")),
-        "search_queries": _string_list(profile.get("search_queries"), limit=10),
+        "search_queries": _string_list(profile.get("search_queries"), limit=20),
         "source_queries": source_queries,
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
         "depth": str(profile.get("depth") or ""),

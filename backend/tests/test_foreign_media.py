@@ -111,11 +111,45 @@ def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path)
     )
 
     assert calls[0]["language"] == "ko"
+    assert calls[0]["limit"] == 15
     assert candidates[0].adapter == "foreign_media"
     assert candidates[0].payload.source_type == "foreign_web"
     assert candidates[0].payload.metadata["needs_translation"] is True
     assert candidates[0].payload.metadata["source_language"] == "ko"
     assert candidates[0].payload.metadata["foreign_quality"]["decision"] == "include"
+
+
+def test_foreign_media_accepts_up_to_ten_languages(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    plan = [
+        {"code": code, "name": name, "native_query": f"{name} semiconductor news"}
+        for code, name in (
+            ("ko", "Korean"),
+            ("ja", "Japanese"),
+            ("zh", "Mandarin Chinese"),
+            ("de", "German"),
+            ("fr", "French"),
+            ("es", "Spanish"),
+            ("pt", "Portuguese"),
+            ("it", "Italian"),
+            ("nl", "Dutch"),
+            ("pl", "Polish"),
+            ("tr", "Turkish"),
+        )
+    ]
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track semiconductor supply chains in foreign media.",
+            "scope": "Native-language semiconductor coverage",
+            "source_selection": {"foreign_media": True},
+            "foreign_language_plan": plan,
+        }
+    )
+
+    selected = asyncio.run(foreign_language_plan_for_profile(profile))
+
+    assert len(selected) == 10
+    assert [item["code"] for item in selected][-1] == "pl"
 
 
 def test_foreign_media_adapter_filters_english_and_low_quality_results(monkeypatch, tmp_path) -> None:

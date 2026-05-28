@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS inference_metrics (
   model_tag             TEXT,
   quantization          TEXT,
   backend               TEXT,
+  route_name            TEXT,
   mode                  TEXT NOT NULL,
   queue_wait_ms         INTEGER,
   ttft_ms               INTEGER,

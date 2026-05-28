@@ -114,11 +114,25 @@ type Exploration = {
     reasoning?: { editorial?: string; critic?: string };
     queue?: { status?: string; message?: string };
     source_audit?: { status?: string; message?: string; summary?: string };
+    model_health?: {
+      status?: "ok" | "degraded";
+      message?: string;
+      model_call_count?: number;
+      model_success_count?: number;
+      model_failure_count?: number;
+      included_article_count?: number;
+    };
     brief?: {
       title: string;
       html_path?: string;
       snapshot?: string;
-      stats?: { stage_seconds?: Record<string, number> };
+      stats?: {
+        stage_seconds?: Record<string, number>;
+        model_call_count?: number;
+        model_success_count?: number;
+        model_failure_count?: number;
+        included_article_count?: number;
+      };
       candidate_count?: number;
     };
     error?: string;
@@ -170,25 +184,31 @@ type AdminStatus = {
   };
   model?: {
     model: string | null;
+    local_model?: string | null;
+    ollama_cloud_model?: string | null;
     enabled: boolean;
     api_key_configured: boolean;
     catalog: {
       available: boolean;
       models: Array<{ id: string }>;
       selected_model: string | null;
+      selected_local_model?: string | null;
+      selected_ollama_cloud_model?: string | null;
       error: string | null;
       providers?: {
-        local?: { available: boolean; models: Array<{ id: string }>; error: string | null };
-        ollama_cloud?: { available: boolean; configured: boolean; models: Array<{ id: string }>; error: string | null };
+        local?: { available: boolean; models: Array<{ id: string }>; error: string | null; selected_model?: string | null };
+        ollama_cloud?: { available: boolean; configured: boolean; models: Array<{ id: string }>; error: string | null; selected_model?: string | null };
       };
     };
     routing?: {
       agents: Array<{ id: string; label: string; description: string }>;
       providers: Array<{ id: string; label: string; configured: boolean; privacy: string }>;
       routes: Record<string, { provider: string; model: string | null; allow_private_cloud: boolean; effective_model?: string | null; label?: string }>;
-      ollama_cloud: { configured: boolean; base_url: string; key_path: string };
+      ollama_cloud: { configured: boolean; base_url: string; key_path: string; default_model?: string | null };
+      defaults?: { local?: string | null; ollama_cloud?: string | null };
       privacy: { rule: string; private_sources: string[] };
     };
+    selection_sources?: { local?: string; ollama_cloud?: string };
   };
   delivery?: {
     email: {
@@ -207,8 +227,31 @@ type AdminStatus = {
     failure_count: number;
     latest_ts: string | null;
     ttft_available?: boolean;
-    models?: Array<{ model: string; record_count: number; avg_total_ms: number | null; p95_total_ms: number | null }>;
-    routes?: Array<{ mode: string; model: string; backend: string | null; record_count: number; avg_total_ms: number | null; fallback_rate: number | null }>;
+    models?: Array<{
+      model: string;
+      backend: string | null;
+      record_count: number;
+      avg_total_ms: number | null;
+      p95_total_ms: number | null;
+      avg_prompt_tokens?: number | null;
+      avg_completion_tokens?: number | null;
+      avg_tokens_per_sec?: number | null;
+      fallback_rate?: number | null;
+    }>;
+    routes?: Array<{
+      route_name: string;
+      model: string;
+      backend: string | null;
+      record_count: number;
+      avg_total_ms: number | null;
+      p95_total_ms?: number | null;
+      avg_queue_wait_ms?: number | null;
+      avg_prompt_tokens?: number | null;
+      avg_completion_tokens?: number | null;
+      avg_total_tokens?: number | null;
+      avg_tokens_per_sec?: number | null;
+      fallback_rate: number | null;
+    }>;
   };
   model_cache?: {
     record_count: number;
@@ -280,6 +323,8 @@ type RefinementProgress = {
   label: string;
 };
 
+type AdminTab = "status" | "sources" | "library" | "models" | "metrics";
+
 const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
   { key: "web_search", label: "Web", icon: "🌐" },
   { key: "foreign_media", label: "Foreign Media", icon: "🌍" },
@@ -311,6 +356,7 @@ const schedulePresets: Array<{ value: SchedulePreset; label: string }> = [
 const interestDraftCookieName = "morning_dispatch_interest_draft";
 const interestDraftTtlSeconds = 60 * 60;
 const interestDraftTtlMs = interestDraftTtlSeconds * 1000;
+const adminTabOptions: AdminTab[] = ["status", "sources", "library", "models", "metrics"];
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -361,6 +407,16 @@ function clearInterestDraft(): void {
   document.cookie = `${interestDraftCookieName}=; Max-Age=0; Path=/; SameSite=Lax`;
 }
 
+function loadSessionValue<T>(key: string, fallback: T): T {
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 export default function App() {
   if (window.location.pathname === "/admin") {
     return <AdminApp />;
@@ -395,6 +451,7 @@ function DispatchApp() {
   const [emailSendReady, setEmailSendReady] = useState(false);
   const [briefEmailRecipient, setBriefEmailRecipient] = useState("");
   const [homeDeleteUndo, setHomeDeleteUndo] = useState<{ explorationId: string; title: string; until: string | null } | null>(null);
+  const [recentExpanded, setRecentExpanded] = useState(() => loadSessionValue("dispatch.recentExpanded", false));
   const [schedulePreset, setSchedulePreset] = useState<SchedulePreset>("daily");
   const [scheduleTime, setScheduleTime] = useState("08:00");
   const [emailOnSchedule, setEmailOnSchedule] = useState(false);
@@ -494,6 +551,10 @@ function DispatchApp() {
     saveInterestDraft(statement);
     return () => window.clearTimeout(timer);
   }, [flow, statement]);
+
+  useEffect(() => {
+    window.sessionStorage.setItem("dispatch.recentExpanded", JSON.stringify(recentExpanded));
+  }, [recentExpanded]);
 
   useEffect(() => {
     if (!session) return;
@@ -1141,47 +1202,65 @@ function DispatchApp() {
 
         <section className="dispatch-body">
           {activeDigest ? (
-            <button className="active-digest-row" onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}>
+            <div className="active-digest-row">
               <span className="live-dot" />
               <strong>{profileName(activeDigest)}</strong>
-              <span>Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}</span>
-            </button>
+              <button
+                type="button"
+                className="active-digest-link"
+                onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}
+                disabled={!activeDigest.latest_exploration}
+              >
+                Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}
+              </button>
+            </div>
           ) : null}
 
           {homeRecentItems.length ? (
             <div className="recent-block">
-              <p className="section-kicker">Recent Briefs</p>
-              <div className="recent-list">
-                {homeRecentItems.map((item) => (
-                  <div className="recent-pill-row" key={homeRecentKey(item)}>
-                    <button className="recent-pill" onClick={() => void openHomeRecentItem(item)}>
-                      <span>{homeRecentIcon(item)}</span>
-                      <strong>{homeRecentTitle(item)}</strong>
-                      <em>{homeRecentMeta(item)}</em>
-                      {item.digest ? <b>digest</b> : homeRecentBadge(item) ? <b>{homeRecentBadge(item)}</b> : null}
-                    </button>
-                    {item.kind === "exploration" ? (
-                      <button
-                        type="button"
-                        className="recent-delete"
-                        onClick={() => void deleteHomeExploration(item)}
-                        disabled={busy}
-                        aria-label={`Delete ${homeRecentTitle(item)}`}
-                      >
-                        Delete
-                      </button>
-                    ) : null}
-                  </div>
-                ))}
+              <div className="section-header-row">
+                <p className="section-kicker">Recent Briefs</p>
+                <DisclosureButton
+                  expanded={recentExpanded}
+                  label={recentExpanded ? "Hide" : "Show"}
+                  onToggle={() => setRecentExpanded((current) => !current)}
+                />
               </div>
-              {homeDeleteUndo ? (
-                <div className="undo-note">
-                  <span>
-                    Deleted "{homeDeleteUndo.title}".
-                    {homeDeleteUndo.until ? ` Undo until ${formatDateTime(homeDeleteUndo.until)}.` : " Undo is available for 7 days."}
-                  </span>
-                  <button type="button" className="secondary-action" onClick={() => void restoreHomeExploration()} disabled={busy}>Undo</button>
-                </div>
+              {recentExpanded ? (
+                <>
+                  <div className="recent-list">
+                    {homeRecentItems.map((item) => (
+                      <div className="recent-pill-row" key={homeRecentKey(item)}>
+                        <button className="recent-pill" onClick={() => void openHomeRecentItem(item)}>
+                          <span>{homeRecentIcon(item)}</span>
+                          <strong>{homeRecentTitle(item)}</strong>
+                          <em>{homeRecentMeta(item)}</em>
+                          {item.digest ? <b>digest</b> : homeRecentBadge(item) ? <b>{homeRecentBadge(item)}</b> : null}
+                        </button>
+                        {item.kind === "exploration" ? (
+                          <button
+                            type="button"
+                            className="recent-delete"
+                            onClick={() => void deleteHomeExploration(item)}
+                            disabled={busy}
+                            aria-label={`Delete ${homeRecentTitle(item)}`}
+                          >
+                            Delete
+                          </button>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                  {homeDeleteUndo ? (
+                    <div className="undo-note">
+                      <span>
+                        Deleted "{homeDeleteUndo.title}".
+                        {homeDeleteUndo.until ? ` Undo until ${formatDateTime(homeDeleteUndo.until)}.` : " Undo is available for 7 days."}
+                      </span>
+                      <button type="button" className="secondary-action" onClick={() => void restoreHomeExploration()} disabled={busy}>Undo</button>
+                    </div>
+                  ) : null}
+                </>
               ) : null}
             </div>
           ) : null}
@@ -1561,7 +1640,9 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
           <p className="section-kicker">{props.exploration.status === "queued" ? "Queued" : "Full pipeline running"}</p>
           <h2>{progressHeadline(props.exploration)}</h2>
         </div>
-        <span className={`status-pill ${props.exploration.status === "running" ? "good" : ""}`}>{formatStage(props.exploration.status)}</span>
+        <span className={`status-pill ${props.exploration.status === "running" ? "good" : ""} ${isModelDegraded(props.exploration) ? "warning" : ""}`}>
+          {isModelDegraded(props.exploration) ? "Needs attention" : formatStage(props.exploration.status)}
+        </span>
       </div>
       <p className="queue-note">{progressDetail(props.exploration)}</p>
       <p className="section-kicker">{sourcePlan(props.sourceSelection)}</p>
@@ -1577,6 +1658,11 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
         <p className="queue-note">{props.exploration.progress.source_audit.message}</p>
       ) : props.exploration.progress.source_audit?.summary ? (
         <p className="queue-note">{props.exploration.progress.source_audit.summary}</p>
+      ) : null}
+      {isModelDegraded(props.exploration) ? (
+        <div className="issue-note strong">
+          <p>{modelDegradedMessage(props.exploration)}</p>
+        </div>
       ) : null}
       <div className="source-progress-grid">
         {sources.map(([source, data]) => (
@@ -1618,7 +1704,7 @@ function LibraryBuildProgress(props: { exploration: Exploration }) {
     <div className="library-progress">
       <div className="library-progress-top">
         <strong>{progressHeadline(props.exploration)}</strong>
-        <span>{formatStage(props.exploration.status)}</span>
+        <span>{isModelDegraded(props.exploration) ? "Needs attention" : formatStage(props.exploration.status)}</span>
       </div>
       <p>{progressDetail(props.exploration)}</p>
       <div className="pipeline-row compact">
@@ -1634,6 +1720,9 @@ function LibraryBuildProgress(props: { exploration: Exploration }) {
             <span key={source}>{formatSourceLabel(source)}: {formatStage(data.status)}</span>
           ))}
         </div>
+      ) : null}
+      {isModelDegraded(props.exploration) ? (
+        <p className="warning-text">{modelDegradedMessage(props.exploration)}</p>
       ) : null}
     </div>
   );
@@ -1658,7 +1747,7 @@ function BriefReadyPanel(props: {
   return (
     <section className="brief-ready-panel">
       <div className="ready-footer">
-        <strong>Brief ready</strong>
+        <strong>{isModelDegraded(props.exploration) ? "Brief ready with AI issues" : "Brief ready"}</strong>
         <button type="button" onClick={props.onOpen}>Open brief</button>
       </div>
       {props.issues.length ? (
@@ -1914,7 +2003,7 @@ function EnableSourceModal(props: {
 
 function AdminApp() {
   const requestedTab = new URLSearchParams(window.location.search).get("tab") ?? "status";
-  const initialTab = ["status", "sources", "library", "models"].includes(requestedTab) ? requestedTab : "status";
+  const initialTab = adminTabOptions.includes(requestedTab as AdminTab) ? (requestedTab as AdminTab) : "status";
   const issueRun = new URLSearchParams(window.location.search).get("issue_run");
   const [tab, setTab] = useState(initialTab);
   const [status, setStatus] = useState<AdminStatus | null>(null);
@@ -1922,8 +2011,8 @@ function AdminApp() {
   const [library, setLibrary] = useState<LibraryResponse>({ explorations: [], deleted_explorations: [], topics: [], digests: [], legacy_digests: [] });
   const [message, setMessage] = useState("Loading Admin...");
   const [busy, setBusy] = useState(false);
-  const [explorationSort, setExplorationSort] = useState<SortMode>("recent");
-  const [digestSort, setDigestSort] = useState<SortMode>("recent");
+  const [explorationSort, setExplorationSort] = useState<SortMode>(() => loadSessionValue("admin.explorationSort", "recent"));
+  const [digestSort, setDigestSort] = useState<SortMode>(() => loadSessionValue("admin.digestSort", "recent"));
   const [editingDigest, setEditingDigest] = useState<{ topicId: string; preset: SchedulePreset; time: string } | null>(null);
   const [issueDetails, setIssueDetails] = useState<{ built_with_issues: boolean; issues: ExplorationIssue[] } | null>(null);
   const [webProvider, setWebProvider] = useState<"tavily" | "brave" | "serpapi">("tavily");
@@ -1933,11 +2022,17 @@ function AdminApp() {
   const [adminPodcastSecret, setAdminPodcastSecret] = useState("");
   const [youtubeKey, setYoutubeKey] = useState("");
   const [adminEmailRecipients, setAdminEmailRecipients] = useState<Record<string, string>>({});
-  const [selectedModel, setSelectedModel] = useState("");
+  const [selectedLocalModel, setSelectedLocalModel] = useState("");
+  const [selectedCloudModel, setSelectedCloudModel] = useState("");
   const [jobModel, setJobModel] = useState("");
   const [jobLimit, setJobLimit] = useState(100);
   const [ollamaKey, setOllamaKey] = useState("");
   const [modelRoutes, setModelRoutes] = useState<ModelRouteDraft>({});
+  const [secretsExpanded, setSecretsExpanded] = useState(() => loadSessionValue("admin.secretsExpanded", false));
+  const [sourceConfigExpanded, setSourceConfigExpanded] = useState(() => loadSessionValue("admin.sourceConfigExpanded", false));
+  const [explorationsExpanded, setExplorationsExpanded] = useState(() => loadSessionValue("admin.explorationsExpanded", false));
+  const [deletedExpanded, setDeletedExpanded] = useState(() => loadSessionValue("admin.deletedExpanded", false));
+  const [digestsExpanded, setDigestsExpanded] = useState(() => loadSessionValue("admin.digestsExpanded", false));
 
   const topicById = useMemo(() => new Map(library.topics.map((topic) => [topic.topic_id, topic])), [library.topics]);
   const sortedExplorations = useMemo<ExplorationLibraryItem[]>(() => {
@@ -1987,9 +2082,17 @@ function AdminApp() {
     setStatus(nextStatus);
     if (nextSources) setSources(nextSources);
     setLibrary(nextLibrary);
-    const preferredModel = nextStatus?.model?.catalog.selected_model ?? nextStatus?.model?.model ?? nextStatus?.model?.catalog.models[0]?.id ?? "";
-    setSelectedModel(preferredModel);
-    setJobModel((current) => current || preferredModel);
+    const preferredLocalModel = nextStatus?.model?.catalog.selected_local_model
+      ?? nextStatus?.model?.local_model
+      ?? nextStatus?.model?.catalog.models[0]?.id
+      ?? "";
+    const preferredCloudModel = nextStatus?.model?.catalog.selected_ollama_cloud_model
+      ?? nextStatus?.model?.ollama_cloud_model
+      ?? nextStatus?.model?.catalog.providers?.ollama_cloud?.models?.[0]?.id
+      ?? "";
+    setSelectedLocalModel(preferredLocalModel);
+    setSelectedCloudModel(preferredCloudModel);
+    setJobModel((current) => current || preferredLocalModel);
     setModelRoutes(routeDraftFromStatus(nextStatus));
     setMessage(nextStatus?.health?.headline ?? "Admin ready");
   }, []);
@@ -2014,7 +2117,23 @@ function AdminApp() {
       .catch(() => setIssueDetails(null));
   }, [issueRun]);
 
-  function changeTab(nextTab: string) {
+  useEffect(() => {
+    window.sessionStorage.setItem("admin.explorationSort", JSON.stringify(explorationSort));
+  }, [explorationSort]);
+
+  useEffect(() => {
+    window.sessionStorage.setItem("admin.digestSort", JSON.stringify(digestSort));
+  }, [digestSort]);
+
+  useEffect(() => {
+    window.sessionStorage.setItem("admin.secretsExpanded", JSON.stringify(secretsExpanded));
+    window.sessionStorage.setItem("admin.sourceConfigExpanded", JSON.stringify(sourceConfigExpanded));
+    window.sessionStorage.setItem("admin.explorationsExpanded", JSON.stringify(explorationsExpanded));
+    window.sessionStorage.setItem("admin.deletedExpanded", JSON.stringify(deletedExpanded));
+    window.sessionStorage.setItem("admin.digestsExpanded", JSON.stringify(digestsExpanded));
+  }, [deletedExpanded, digestsExpanded, explorationsExpanded, secretsExpanded, sourceConfigExpanded]);
+
+  function changeTab(nextTab: AdminTab) {
     setTab(nextTab);
     const url = new URL(window.location.href);
     url.searchParams.set("tab", nextTab);
@@ -2149,18 +2268,32 @@ function AdminApp() {
     }
   }
 
-  async function saveModel() {
-    if (!selectedModel.trim()) return;
+  async function saveModel(provider: "local" | "ollama_cloud") {
+    const modelName = (provider === "ollama_cloud" ? selectedCloudModel : selectedLocalModel).trim();
+    if (!modelName) return;
     setBusy(true);
     try {
       await api("/api/admin/model/selection", {
         method: "POST",
-        body: JSON.stringify({ model_name: selectedModel.trim() }),
+        body: JSON.stringify({ provider, model_name: modelName }),
       });
       await loadAdmin();
-      setMessage("Model saved");
+      setMessage(provider === "ollama_cloud" ? "Cloud default saved" : "Local default saved");
     } catch (error) {
       setMessage(errorMessage(error, "Could not save model"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreModelDefaults() {
+    setBusy(true);
+    try {
+      await api("/api/admin/model/defaults/restore", { method: "POST" });
+      await loadAdmin();
+      setMessage("Model defaults restored to Gemma4-MTP-26B-BF16");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not restore model defaults"));
     } finally {
       setBusy(false);
     }
@@ -2461,7 +2594,7 @@ function AdminApp() {
         <a className="secondary-action" href="/">Back to Dispatch</a>
       </header>
       <nav className="admin-tabs">
-        {["status", "sources", "library", "models"].map((item) => (
+        {adminTabOptions.map((item) => (
           <button type="button" className={tab === item ? "active" : ""} key={item} onClick={() => changeTab(item)}>
             {formatStage(item)}
           </button>
@@ -2486,7 +2619,11 @@ function AdminApp() {
               </article>
             ))}
           </div>
-          <SecretHealthPanel health={status?.secret_health} />
+          <SecretHealthPanel
+            health={status?.secret_health}
+            expanded={secretsExpanded}
+            onToggle={() => setSecretsExpanded((current) => !current)}
+          />
           <div className="button-row">
             <a className="secondary-action" href="/brief" target="_blank" rel="noreferrer">View latest brief</a>
             <button type="button" onClick={() => void runVerification(false)} disabled={busy}>Verify only</button>
@@ -2516,94 +2653,109 @@ function AdminApp() {
               );
             })}
           </div>
-          <div className="source-setup-grid">
-            <section className="source-setup-card">
-              <h2>Web</h2>
-              <p>{sources?.sources.web_search?.enabled ? "Connected." : sources?.sources.web_search?.reason}</p>
-              <label>
-                Provider
-                <select value={webProvider} onChange={(event) => setWebProvider(event.target.value as "tavily" | "brave" | "serpapi")}>
-                  <option value="tavily">Tavily</option>
-                  <option value="brave">Brave</option>
-                  <option value="serpapi">SerpAPI</option>
-                </select>
-              </label>
-              <label>
-                API key
-                <input type="password" value={webKey} onChange={(event) => setWebKey(event.target.value)} />
-              </label>
-              <button type="button" onClick={() => void saveWebSearch()} disabled={busy || !webKey.trim()}>Save Web Search</button>
-            </section>
-
-            <section className="source-setup-card">
-              <h2>Gmail</h2>
-              <p>
-                {status?.gmail?.connected
-                  ? "Connected."
-                  : status?.gmail?.configured
-                    ? "OAuth client saved. Finish the Gmail connection."
-                    : "Upload a Gmail OAuth client, then connect Gmail."}
-              </p>
-              <label>
-                OAuth client JSON file
-                <input type="file" accept=".json,application/json" onChange={(event) => void loadAdminGmailClientFile(event)} />
-              </label>
-              <label>
-                OAuth client JSON
-                <textarea
-                  value={adminGmailSecret}
-                  onChange={(event) => setAdminGmailSecret(event.target.value)}
-                  rows={5}
-                  placeholder='{"installed": ... }'
-                />
-              </label>
-              <div className="button-row">
-                <button type="button" onClick={() => void saveAdminGmailClientSecret()} disabled={busy || !adminGmailSecret.trim()}>
-                  Save OAuth Client
-                </button>
-                <button type="button" className="secondary-action" onClick={() => void connectAdminGmail()} disabled={busy || !status?.gmail?.configured}>
-                  Connect Gmail
-                </button>
+          <section className="collapsible-panel">
+            <div className="library-section-header">
+              <div>
+                <p className="section-kicker">Setup forms</p>
+                <h2>Source Configuration</h2>
               </div>
-            </section>
+              <DisclosureButton
+                expanded={sourceConfigExpanded}
+                label={sourceConfigExpanded ? "Hide" : "Show"}
+                onToggle={() => setSourceConfigExpanded((current) => !current)}
+              />
+            </div>
+            {sourceConfigExpanded ? (
+              <div className="source-setup-grid">
+                <section className="source-setup-card">
+                  <h2>Web</h2>
+                  <p>{sources?.sources.web_search?.enabled ? "Connected." : sources?.sources.web_search?.reason}</p>
+                  <label>
+                    Provider
+                    <select value={webProvider} onChange={(event) => setWebProvider(event.target.value as "tavily" | "brave" | "serpapi")}>
+                      <option value="tavily">Tavily</option>
+                      <option value="brave">Brave</option>
+                      <option value="serpapi">SerpAPI</option>
+                    </select>
+                  </label>
+                  <label>
+                    API key
+                    <input type="password" value={webKey} onChange={(event) => setWebKey(event.target.value)} />
+                  </label>
+                  <button type="button" onClick={() => void saveWebSearch()} disabled={busy || !webKey.trim()}>Save Web Search</button>
+                </section>
 
-            <section className="source-setup-card">
-              <h2>Podcast</h2>
-              <p>{status?.podcasts?.aggregator_configured ? "Podcast Index connected." : "Add Podcast Index credentials."}</p>
-              <label>
-                Podcast Index API key
-                <input type="password" value={adminPodcastKey} onChange={(event) => setAdminPodcastKey(event.target.value)} />
-              </label>
-              <label>
-                Podcast Index API secret
-                <input type="password" value={adminPodcastSecret} onChange={(event) => setAdminPodcastSecret(event.target.value)} />
-              </label>
-              <button type="button" onClick={() => void saveAdminPodcastCredentials()} disabled={busy || !adminPodcastKey.trim() || !adminPodcastSecret.trim()}>
-                Save Podcast Index
-              </button>
-            </section>
+                <section className="source-setup-card">
+                  <h2>Gmail</h2>
+                  <p>
+                    {status?.gmail?.connected
+                      ? "Connected."
+                      : status?.gmail?.configured
+                        ? "OAuth client saved. Finish the Gmail connection."
+                        : "Upload a Gmail OAuth client, then connect Gmail."}
+                  </p>
+                  <label>
+                    OAuth client JSON file
+                    <input type="file" accept=".json,application/json" onChange={(event) => void loadAdminGmailClientFile(event)} />
+                  </label>
+                  <label>
+                    OAuth client JSON
+                    <textarea
+                      value={adminGmailSecret}
+                      onChange={(event) => setAdminGmailSecret(event.target.value)}
+                      rows={5}
+                      placeholder='{"installed": ... }'
+                    />
+                  </label>
+                  <div className="button-row">
+                    <button type="button" onClick={() => void saveAdminGmailClientSecret()} disabled={busy || !adminGmailSecret.trim()}>
+                      Save OAuth Client
+                    </button>
+                    <button type="button" className="secondary-action" onClick={() => void connectAdminGmail()} disabled={busy || !status?.gmail?.configured}>
+                      Connect Gmail
+                    </button>
+                  </div>
+                </section>
 
-            <section className="source-setup-card">
-              <h2>YouTube</h2>
-              <p>{sources?.sources.youtube?.enabled ? "Connected." : sources?.sources.youtube?.reason}</p>
-              <label>
-                YouTube Data API key
-                <input type="password" value={youtubeKey} onChange={(event) => setYoutubeKey(event.target.value)} />
-              </label>
-              <button type="button" onClick={() => void saveYoutube()} disabled={busy || !youtubeKey.trim()}>Save YouTube</button>
-            </section>
+                <section className="source-setup-card">
+                  <h2>Podcast</h2>
+                  <p>{status?.podcasts?.aggregator_configured ? "Podcast Index connected." : "Add Podcast Index credentials."}</p>
+                  <label>
+                    Podcast Index API key
+                    <input type="password" value={adminPodcastKey} onChange={(event) => setAdminPodcastKey(event.target.value)} />
+                  </label>
+                  <label>
+                    Podcast Index API secret
+                    <input type="password" value={adminPodcastSecret} onChange={(event) => setAdminPodcastSecret(event.target.value)} />
+                  </label>
+                  <button type="button" onClick={() => void saveAdminPodcastCredentials()} disabled={busy || !adminPodcastKey.trim() || !adminPodcastSecret.trim()}>
+                    Save Podcast Index
+                  </button>
+                </section>
 
-            <section className="source-setup-card">
-              <h2>Collections</h2>
-              <p>{sources?.sources.collections?.root_path ?? "Local folder source"}</p>
-              <button type="button" onClick={() => void setupCollections()} disabled={busy}>Create Collections Folder</button>
-            </section>
+                <section className="source-setup-card">
+                  <h2>YouTube</h2>
+                  <p>{sources?.sources.youtube?.enabled ? "Connected." : sources?.sources.youtube?.reason}</p>
+                  <label>
+                    YouTube Data API key
+                    <input type="password" value={youtubeKey} onChange={(event) => setYoutubeKey(event.target.value)} />
+                  </label>
+                  <button type="button" onClick={() => void saveYoutube()} disabled={busy || !youtubeKey.trim()}>Save YouTube</button>
+                </section>
 
-            <section className="source-setup-card">
-              <h2>Markets</h2>
-              <p>Simple mode. No API key required.</p>
-            </section>
-          </div>
+                <section className="source-setup-card">
+                  <h2>Collections</h2>
+                  <p>{sources?.sources.collections?.root_path ?? "Local folder source"}</p>
+                  <button type="button" onClick={() => void setupCollections()} disabled={busy}>Create Collections Folder</button>
+                </section>
+
+                <section className="source-setup-card">
+                  <h2>Markets</h2>
+                  <p>Simple mode. No API key required.</p>
+                </section>
+              </div>
+            ) : null}
+          </section>
         </section>
       ) : null}
 
@@ -2622,6 +2774,8 @@ function AdminApp() {
             sort={explorationSort}
             onSort={setExplorationSort}
             count={sortedExplorations.length}
+            expanded={explorationsExpanded}
+            onToggle={() => setExplorationsExpanded((current) => !current)}
           >
             {sortedExplorations.map((item) => {
               if (item.kind === "topic") {
@@ -2642,7 +2796,11 @@ function AdminApp() {
                   <div>
                     <strong>{explorationLibraryName(item)}</strong>
                     <small>{formatDateTime(item.exploration.finished_at ?? item.exploration.started_at)} · {formatSourceSelection(item.exploration.source_selection)}</small>
-                    {item.exploration.progress.built_with_issues ? <p className="warning-text">Built with source issues.</p> : null}
+                    {isModelDegraded(item.exploration) ? (
+                      <p className="warning-text">Built with AI issues.</p>
+                    ) : item.exploration.progress.built_with_issues ? (
+                      <p className="warning-text">Built with source issues.</p>
+                    ) : null}
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => openPath(briefPath(item.exploration))} disabled={!briefPath(item.exploration)}>Open</button>
@@ -2651,7 +2809,7 @@ function AdminApp() {
                     <button type="button" className="secondary-action" onClick={() => void scheduleExploration(item.exploration)} disabled={busy || item.exploration.status !== "complete"}>Schedule</button>
                     <button type="button" className="secondary-action destructive" onClick={() => void deleteExplorationFromAdmin(item.exploration)} disabled={busy}>Delete</button>
                   </div>
-                  {item.exploration.status === "queued" || item.exploration.status === "running" ? (
+                  {item.exploration.status === "queued" || item.exploration.status === "running" || isModelDegraded(item.exploration) ? (
                     <LibraryBuildProgress exploration={item.exploration} />
                   ) : null}
                   {item.exploration.status === "complete" ? (
@@ -2687,30 +2845,37 @@ function AdminApp() {
                   <p className="section-kicker">{library.deleted_explorations.length} restorable</p>
                   <h2>Recently Deleted</h2>
                 </div>
+                <DisclosureButton
+                  expanded={deletedExpanded}
+                  label={deletedExpanded ? "Hide" : "Show"}
+                  onToggle={() => setDeletedExpanded((current) => !current)}
+                />
               </div>
-              <div className="library-list">
-                {library.deleted_explorations.map((deleted) => {
-                  const item: ExplorationLibraryItem = {
-                    kind: "exploration",
-                    exploration: deleted,
-                    topic: topicById.get(deleted.topic_id) ?? null,
-                  };
-                  return (
-                    <article className="library-row deleted-row" key={`deleted-${deleted.exploration_id}`}>
-                      <div>
-                        <strong>{explorationLibraryName(item)}</strong>
-                        <small>
-                          Deleted {formatDateTime(deleted.deleted_at)}
-                          {deleted.delete_after ? ` · undo until ${formatDateTime(deleted.delete_after)}` : ""}
-                        </small>
-                      </div>
-                      <div className="button-row">
-                        <button type="button" className="secondary-action" onClick={() => void restoreExplorationFromAdmin(deleted)} disabled={busy}>Restore</button>
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
+              {deletedExpanded ? (
+                <div className="library-list">
+                  {library.deleted_explorations.map((deleted) => {
+                    const item: ExplorationLibraryItem = {
+                      kind: "exploration",
+                      exploration: deleted,
+                      topic: topicById.get(deleted.topic_id) ?? null,
+                    };
+                    return (
+                      <article className="library-row deleted-row" key={`deleted-${deleted.exploration_id}`}>
+                        <div>
+                          <strong>{explorationLibraryName(item)}</strong>
+                          <small>
+                            Deleted {formatDateTime(deleted.deleted_at)}
+                            {deleted.delete_after ? ` · undo until ${formatDateTime(deleted.delete_after)}` : ""}
+                          </small>
+                        </div>
+                        <div className="button-row">
+                          <button type="button" className="secondary-action" onClick={() => void restoreExplorationFromAdmin(deleted)} disabled={busy}>Restore</button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              ) : null}
             </section>
           ) : null}
           <LibrarySection
@@ -2718,6 +2883,8 @@ function AdminApp() {
             sort={digestSort}
             onSort={setDigestSort}
             count={sortedDigests.length}
+            expanded={digestsExpanded}
+            onToggle={() => setDigestsExpanded((current) => !current)}
           >
             {sortedDigests.map((item) => {
               if (item.kind === "legacy") {
@@ -2787,17 +2954,39 @@ function AdminApp() {
           <div className="panel-title-row">
             <div>
               <p className="section-kicker">Models</p>
-              <h1>{status?.model?.model ?? "Model settings"}</h1>
+              <h1>Model settings</h1>
             </div>
+            <button type="button" className="secondary-action" onClick={() => void restoreModelDefaults()} disabled={busy}>
+              Restore defaults
+            </button>
           </div>
           <div className="admin-form-grid">
             <label>
-              Active model
-              <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} disabled={!modelOptions.length}>
+              Local default model
+              <select value={selectedLocalModel} onChange={(event) => setSelectedLocalModel(event.target.value)} disabled={!modelOptions.length}>
                 {modelOptions.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
               </select>
             </label>
-            <button type="button" onClick={() => void saveModel()} disabled={busy || !selectedModel}>Save model</button>
+            <button type="button" onClick={() => void saveModel("local")} disabled={busy || !selectedLocalModel}>Save local default</button>
+            <label>
+              Cloud default model
+              <select value={selectedCloudModel} onChange={(event) => setSelectedCloudModel(event.target.value)} disabled={!cloudModelOptions.length}>
+                {cloudModelOptions.length ? cloudModelOptions.map((model) => <option key={model.id} value={model.id}>{model.id}</option>) : <option value="">No cloud models</option>}
+              </select>
+            </label>
+            <button type="button" onClick={() => void saveModel("ollama_cloud")} disabled={busy || !selectedCloudModel || !cloudModelOptions.length}>
+              Save cloud default
+            </button>
+            <div className="admin-form-note">
+              <strong>Current defaults</strong>
+              <span>Local: {status?.model?.local_model ?? "Not set"}</span>
+              <span>Cloud: {status?.model?.ollama_cloud_model ?? "Not set"}</span>
+            </div>
+            <div className="admin-form-note">
+              <strong>Source</strong>
+              <span>Local: {status?.model?.selection_sources?.local ?? "environment"}</span>
+              <span>Cloud: {status?.model?.selection_sources?.ollama_cloud ?? "environment"}</span>
+            </div>
             <label>
               Batch model
               <input value={jobModel} onChange={(event) => setJobModel(event.target.value)} />
@@ -2861,9 +3050,9 @@ function AdminApp() {
                         </select>
                       </label>
                       {route.provider === "ollama_cloud" ? (
-                        <span className="status-pill">Public sources only</span>
+                        <span className="status-pill">Default: {status?.model?.routing?.defaults?.ollama_cloud ?? "Cloud default"}</span>
                       ) : (
-                        <span className="status-pill good">Private safe</span>
+                        <span className="status-pill good">Default: {status?.model?.routing?.defaults?.local ?? "Local default"}</span>
                       )}
                     </article>
                   );
@@ -2871,23 +3060,87 @@ function AdminApp() {
               </div>
             </section>
           </div>
+        </section>
+      ) : null}
+
+      {tab === "metrics" ? (
+        <section className="admin-panel">
+          <div className="panel-title-row">
+            <div>
+              <p className="section-kicker">Metrics</p>
+              <h1>Inference performance</h1>
+            </div>
+            <button type="button" onClick={() => void loadAdmin()} disabled={busy}>Refresh</button>
+          </div>
           <div className="metric-grid">
             <article><span>Attempts</span><strong>{status?.inference_metrics?.record_count ?? 0}</strong></article>
             <article><span>Success</span><strong>{status?.inference_metrics?.success_count ?? 0}</strong></article>
-            <article><span>Fallbacks</span><strong>{status?.inference_metrics?.failure_count ?? 0}</strong></article>
-            <article><span>Cache</span><strong>{status?.model_cache?.record_count ?? 0}</strong></article>
+            <article><span>Failures</span><strong>{status?.inference_metrics?.failure_count ?? 0}</strong></article>
+            <article><span>Cache entries</span><strong>{status?.model_cache?.record_count ?? 0}</strong></article>
           </div>
           {status?.inference_metrics?.routes?.length ? (
-            <div className="model-route-metrics">
-              <p className="section-kicker">Recent route metrics</p>
-              {status.inference_metrics.routes.slice(0, 6).map((route) => (
-                <article key={`${route.mode}-${route.model}-${route.backend}`}>
-                  <span>{route.mode} · {route.backend ?? "unknown"}</span>
-                  <strong>{route.model}</strong>
-                  <small>{route.record_count} call(s){route.avg_total_ms ? ` · ${Math.round(route.avg_total_ms)} ms avg` : ""}</small>
-                </article>
-              ))}
-            </div>
+            <section className="metrics-section">
+              <div className="library-section-header">
+                <div>
+                  <p className="section-kicker">By route and model</p>
+                  <h2>Route performance</h2>
+                </div>
+              </div>
+              <div className="metrics-table">
+                <div className="metrics-table-header">
+                  <span>Route</span>
+                  <span>Model</span>
+                  <span>Calls</span>
+                  <span>Avg time</span>
+                  <span>P95</span>
+                  <span>Avg tokens</span>
+                  <span>Fallbacks</span>
+                </div>
+                {status.inference_metrics.routes.map((route) => (
+                  <article className="metrics-table-row" key={`${route.route_name}-${route.model}-${route.backend ?? "unknown"}`}>
+                    <span>{formatStage(route.route_name)}</span>
+                    <strong>{route.model}</strong>
+                    <span>{route.record_count}</span>
+                    <span>{formatMetricMs(route.avg_total_ms)}</span>
+                    <span>{formatMetricMs(route.p95_total_ms ?? null)}</span>
+                    <span>{formatMetricNumber(route.avg_total_tokens ?? null)}</span>
+                    <span>{formatRate(route.fallback_rate)}</span>
+                  </article>
+                ))}
+              </div>
+            </section>
+          ) : null}
+          {status?.inference_metrics?.models?.length ? (
+            <section className="metrics-section">
+              <div className="library-section-header">
+                <div>
+                  <p className="section-kicker">By model</p>
+                  <h2>Model averages</h2>
+                </div>
+              </div>
+              <div className="metrics-table">
+                <div className="metrics-table-header">
+                  <span>Model</span>
+                  <span>Backend</span>
+                  <span>Calls</span>
+                  <span>Avg time</span>
+                  <span>P95</span>
+                  <span>Avg prompt</span>
+                  <span>Avg completion</span>
+                </div>
+                {status.inference_metrics.models.map((model) => (
+                  <article className="metrics-table-row" key={`${model.model}-${model.backend ?? "unknown"}`}>
+                    <strong>{model.model}</strong>
+                    <span>{model.backend ?? "unknown"}</span>
+                    <span>{model.record_count}</span>
+                    <span>{formatMetricMs(model.avg_total_ms)}</span>
+                    <span>{formatMetricMs(model.p95_total_ms)}</span>
+                    <span>{formatMetricNumber(model.avg_prompt_tokens ?? null)}</span>
+                    <span>{formatMetricNumber(model.avg_completion_tokens ?? null)}</span>
+                  </article>
+                ))}
+              </div>
+            </section>
           ) : null}
         </section>
       ) : null}
@@ -2895,7 +3148,11 @@ function AdminApp() {
   );
 }
 
-function SecretHealthPanel(props: { health: AdminStatus["secret_health"] | undefined }) {
+function SecretHealthPanel(props: {
+  health: AdminStatus["secret_health"] | undefined;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   if (!props.health) return null;
   return (
     <section className="secret-health-panel">
@@ -2909,34 +3166,39 @@ function SecretHealthPanel(props: { health: AdminStatus["secret_health"] | undef
         <span className={props.health.summary.warning_count ? "status-pill" : "status-pill good"}>
           {props.health.summary.warning_count ? "Review" : "Owner-only"}
         </span>
+        <DisclosureButton expanded={props.expanded} label={props.expanded ? "Hide" : "Show"} onToggle={props.onToggle} />
       </div>
-      <p className="muted">Secrets folder: {props.health.secrets_dir}</p>
-      <div className="health-grid secret-health-grid">
-        <article className={`health-card ${props.health.directory_permissions.status === "ok" ? "ok" : "warning"}`}>
-          <strong>Folder permissions</strong>
-          <p>
-            {props.health.directory_permissions.status === "ok"
-              ? "Owner-only access."
-              : `Review folder mode ${props.health.directory_permissions.mode ?? "unknown"}.`}
-          </p>
-        </article>
-        {props.health.items.map((item) => (
-          <article className={`health-card ${item.status}`} key={item.id}>
-            <strong>{item.label}</strong>
-            <p>{item.configured ? item.storage : item.message}</p>
-            {item.path ? <small>{item.path}</small> : null}
-          </article>
-        ))}
-      </div>
-      {props.health.external_plaintext.length ? (
-        <div className="issue-note">
-          <strong>Plaintext MCP config to review</strong>
-          {props.health.external_plaintext.map((item) => (
-            <p key={`${item.server}-${item.location}-${item.key}`}>
-              {item.server}: {item.location}.{item.key} in {item.path}
-            </p>
-          ))}
-        </div>
+      {props.expanded ? (
+        <>
+          <p className="muted">Secrets folder: {props.health.secrets_dir}</p>
+          <div className="health-grid secret-health-grid">
+            <article className={`health-card ${props.health.directory_permissions.status === "ok" ? "ok" : "warning"}`}>
+              <strong>Folder permissions</strong>
+              <p>
+                {props.health.directory_permissions.status === "ok"
+                  ? "Owner-only access."
+                  : `Review folder mode ${props.health.directory_permissions.mode ?? "unknown"}.`}
+              </p>
+            </article>
+            {props.health.items.map((item) => (
+              <article className={`health-card ${item.status}`} key={item.id}>
+                <strong>{item.label}</strong>
+                <p>{item.configured ? item.storage : item.message}</p>
+                {item.path ? <small>{item.path}</small> : null}
+              </article>
+            ))}
+          </div>
+          {props.health.external_plaintext.length ? (
+            <div className="issue-note">
+              <strong>Plaintext MCP config to review</strong>
+              {props.health.external_plaintext.map((item) => (
+                <p key={`${item.server}-${item.location}-${item.key}`}>
+                  {item.server}: {item.location}.{item.key} in {item.path}
+                </p>
+              ))}
+            </div>
+          ) : null}
+        </>
       ) : null}
     </section>
   );
@@ -2947,6 +3209,8 @@ function LibrarySection(props: {
   sort: SortMode;
   onSort: (sort: SortMode) => void;
   count: number;
+  expanded: boolean;
+  onToggle: () => void;
   children: ReactNode;
 }) {
   return (
@@ -2960,9 +3224,19 @@ function LibrarySection(props: {
           <button type="button" className={props.sort === "recent" ? "active" : ""} onClick={() => props.onSort("recent")}>Recent</button>
           <button type="button" className={props.sort === "name" ? "active" : ""} onClick={() => props.onSort("name")}>Name</button>
         </div>
+        <DisclosureButton expanded={props.expanded} label={props.expanded ? "Hide" : "Show"} onToggle={props.onToggle} />
       </div>
-      <div className="library-list">{props.children}</div>
+      {props.expanded ? <div className="library-list">{props.children}</div> : null}
     </section>
+  );
+}
+
+function DisclosureButton(props: { expanded: boolean; label: string; onToggle: () => void }) {
+  return (
+    <button type="button" className="disclosure-button" onClick={props.onToggle} aria-expanded={props.expanded}>
+      <span>{props.expanded ? "▾" : "▸"}</span>
+      {props.label}
+    </button>
   );
 }
 
@@ -3168,6 +3442,7 @@ function formatPipeline(pipeline: Array<[string, string]>): string {
 function progressHeadline(exploration: Exploration): string {
   if (exploration.status === "queued") return "Waiting its turn";
   if (exploration.status === "failed") return "Build failed";
+  if (isModelDegraded(exploration)) return "Brief built with AI issues";
   const running = Object.entries(exploration.progress.pipeline ?? {}).find(([, status]) => status === "running");
   if (!running) return exploration.status === "complete" ? "Brief ready" : "Preparing build";
   const labels: Record<string, string> = {
@@ -3187,6 +3462,7 @@ function progressDetail(exploration: Exploration): string {
     return exploration.progress.queue?.message ?? "Queued behind another brief. It will start automatically.";
   }
   if (exploration.status === "failed") return exploration.progress.error ?? "The build stopped before the brief was ready.";
+  if (isModelDegraded(exploration)) return modelDegradedMessage(exploration);
   if (exploration.progress.source_audit?.message) return exploration.progress.source_audit.message;
   if (exploration.progress.source_audit?.summary) return exploration.progress.source_audit.summary;
   const candidateCount = exploration.progress.candidate_count ?? 0;
@@ -3199,6 +3475,27 @@ function progressDetail(exploration: Exploration): string {
   if (running === "review") return "The critic is checking quality, cuts, and adherence before publish.";
   if (running === "done") return "Writing the finished brief HTML.";
   return "Preparing the full rebuild pipeline.";
+}
+
+function isModelDegraded(exploration: Exploration): boolean {
+  if (exploration.progress.model_health?.status === "degraded") return true;
+  const stats = exploration.progress.brief?.stats;
+  const modelCalls = Number(stats?.model_call_count ?? 0);
+  const modelSuccesses = Number(stats?.model_success_count ?? 0);
+  const modelFailures = Number(stats?.model_failure_count ?? 0);
+  const includedArticles = Number(stats?.included_article_count ?? 0);
+  return modelCalls > 0 && (modelSuccesses === 0 || (modelFailures > 0 && includedArticles === 0));
+}
+
+function modelDegradedMessage(exploration: Exploration): string {
+  if (exploration.progress.model_health?.message) return exploration.progress.model_health.message;
+  const stats = exploration.progress.brief?.stats;
+  const modelCalls = Number(stats?.model_call_count ?? 0);
+  const modelSuccesses = Number(stats?.model_success_count ?? 0);
+  if (modelCalls > 0 && modelSuccesses === 0) {
+    return "AI review did not complete; the brief was built with fallback checks.";
+  }
+  return "The brief finished, but AI review had failures. Rebuild after the model service is healthy.";
 }
 
 function formatStage(value: string): string {
@@ -3245,6 +3542,21 @@ function routeDraftFromStatus(status: AdminStatus | null): ModelRouteDraft {
     };
   });
   return draft;
+}
+
+function formatMetricMs(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "n/a";
+  return `${Math.round(value)} ms`;
+}
+
+function formatMetricNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "n/a";
+  return `${Math.round(value)}`;
+}
+
+function formatRate(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "n/a";
+  return `${Math.round(value * 100)}%`;
 }
 
 type RefinementProgressState = {

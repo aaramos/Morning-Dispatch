@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_LIBRARIAN_MODEL = "Gemma4-MTP-26B-BF16"
-DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 250
+DEFAULT_OLLAMA_CLOUD_MODEL = "Gemma4-MTP-26B-BF16"
+DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 150
 DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 DEFAULT_SCHEDULER_DAILY_RUN_TIME = "05:00"
 DEFAULT_SCHEDULER_TIMEZONE = "America/Los_Angeles"
@@ -38,8 +39,9 @@ class Settings:
     model_base_url: str | None = None
     model_api_key: str | None = None
     ollama_api_key: str | None = None
-    ollama_base_url: str = "https://ollama.com/api"
+    ollama_base_url: str = "https://api.ollama.com/v1"
     librarian_model: str | None = DEFAULT_LIBRARIAN_MODEL
+    ollama_cloud_model: str | None = DEFAULT_OLLAMA_CLOUD_MODEL
     librarian_use_model: bool = False
     librarian_model_max_items: int = DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS
     model_timeout_seconds: float = DEFAULT_MODEL_TIMEOUT_SECONDS
@@ -50,14 +52,14 @@ class Settings:
     web_search_brave_api_key: str | None = None
     web_search_serpapi_api_key: str | None = None
     youtube_api_key: str | None = None
-    youtube_max_results: int = 15
+    youtube_max_results: int = 40
     youtube_duration_filter: str = "medium"
     collections_root: Path | None = None
-    collections_max_results: int = 12
+    collections_max_results: int = 50
     collections_max_file_bytes: int = 1_000_000
     markets_mode: str = "simple"
-    markets_max_core_companies: int = 5
-    markets_max_related_companies: int = 5
+    markets_max_core_companies: int = 10
+    markets_max_related_companies: int = 10
     scheduler_enabled: bool = False
     scheduler_interval_seconds: int = 300
     scheduler_daily_run_time: str = DEFAULT_SCHEDULER_DAILY_RUN_TIME
@@ -158,15 +160,23 @@ def _model_settings_payload(path: Path) -> dict[str, object]:
     return payload
 
 
-def _librarian_model_from_runtime(path: Path) -> str | None:
+def _runtime_model_value(path: Path, key: str) -> str | None:
     payload = _model_settings_payload(path)
     if not payload:
         return None
-    model = payload.get("librarian_model")
+    model = payload.get(key)
     if not isinstance(model, str):
         return None
     model = model.strip()
     return model or None
+
+
+def _librarian_model_from_runtime(path: Path) -> str | None:
+    return _runtime_model_value(path, "librarian_model")
+
+
+def _ollama_cloud_model_from_runtime(path: Path) -> str | None:
+    return _runtime_model_value(path, "ollama_cloud_model")
 
 
 def _model_routes_from_runtime(path: Path) -> dict[str, dict[str, object]]:
@@ -226,6 +236,10 @@ def get_settings() -> Settings:
     librarian_model = (
         _librarian_model_from_runtime(model_settings_path)
         or os.environ.get("MORNING_DISPATCH_LIBRARIAN_MODEL", DEFAULT_LIBRARIAN_MODEL)
+    )
+    ollama_cloud_model = (
+        _ollama_cloud_model_from_runtime(model_settings_path)
+        or os.environ.get("MORNING_DISPATCH_OLLAMA_MODEL", DEFAULT_OLLAMA_CLOUD_MODEL)
     )
     podcastindex_api_key = os.environ.get("MORNING_DISPATCH_PODCASTINDEX_API_KEY") or _secret_text(
         secrets_dir / "podcastindex" / "api_key"
@@ -295,8 +309,9 @@ def get_settings() -> Settings:
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
         ollama_api_key=ollama_api_key,
-        ollama_base_url=os.environ.get("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://ollama.com/api").rstrip("/"),
+        ollama_base_url=os.environ.get("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://api.ollama.com/v1").rstrip("/"),
         librarian_model=librarian_model,
+        ollama_cloud_model=ollama_cloud_model,
         librarian_use_model=_model_enabled(
             os.environ.get("MORNING_DISPATCH_LIBRARIAN_USE_MODEL"),
             model=librarian_model,
@@ -314,14 +329,14 @@ def get_settings() -> Settings:
         web_search_brave_api_key=web_search_brave_api_key,
         web_search_serpapi_api_key=web_search_serpapi_api_key,
         youtube_api_key=youtube_api_key,
-        youtube_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_YOUTUBE_MAX_RESULTS", 15), 50)),
+        youtube_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_YOUTUBE_MAX_RESULTS", 40), 50)),
         youtube_duration_filter=os.environ.get("MORNING_DISPATCH_YOUTUBE_DURATION_FILTER", "medium"),
         collections_root=collections_root,
-        collections_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_COLLECTIONS_MAX_RESULTS", 12), 50)),
+        collections_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_COLLECTIONS_MAX_RESULTS", 50), 50)),
         collections_max_file_bytes=max(1_000, _int_from_env("MORNING_DISPATCH_COLLECTIONS_MAX_FILE_BYTES", 1_000_000)),
         markets_mode=os.environ.get("MORNING_DISPATCH_MARKETS_MODE", "simple").strip().lower() or "simple",
-        markets_max_core_companies=max(1, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_CORE_COMPANIES", 5), 10)),
-        markets_max_related_companies=max(0, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_RELATED_COMPANIES", 5), 10)),
+        markets_max_core_companies=max(1, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_CORE_COMPANIES", 10), 10)),
+        markets_max_related_companies=max(0, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_RELATED_COMPANIES", 10), 10)),
         scheduler_enabled=_bool_from_env("MORNING_DISPATCH_SCHEDULER_ENABLED", False),
         scheduler_interval_seconds=max(30, _int_from_env("MORNING_DISPATCH_SCHEDULER_INTERVAL_SECONDS", 300)),
         scheduler_daily_run_time=os.environ.get(

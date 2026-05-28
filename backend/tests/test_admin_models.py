@@ -30,9 +30,31 @@ async def fake_available_models(_settings):
     ]
 
 
+async def fake_ollama_cloud_models(_settings):
+    return [
+        {"id": "Gemma4-MTP-26B-BF16", "owned_by": "ollama_cloud", "created": None},
+        {"id": "cloud-mix", "owned_by": "ollama_cloud", "created": None},
+    ]
+
+
+def test_admin_rejects_invalid_ollama_cloud_api_key(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        response = client.post("/api/admin/model/ollama-cloud/credentials", json={"api_key": "ssh-ed25519 AAAAC3"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "That key doesn't look like an Ollama Cloud token. "
+        "Please paste the token from your Ollama Cloud dashboard (single token string)."
+    )
+
+
 def test_admin_status_includes_omlx_model_catalog(monkeypatch, tmp_path):
     configure_runtime(monkeypatch, tmp_path)
     monkeypatch.setattr(admin_api.model_catalog, "fetch_available_models", fake_available_models)
+    monkeypatch.setattr(admin_api.model_catalog, "fetch_ollama_cloud_models", fake_ollama_cloud_models)
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_API_KEY", "ollama-key")
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         response = client.get("/api/admin/status")
@@ -42,6 +64,7 @@ def test_admin_status_includes_omlx_model_catalog(monkeypatch, tmp_path):
     assert catalog["available"] is True
     assert [model["id"] for model in catalog["models"]] == ["env-default-model", "Gemma - MTP - 4Bit"]
     assert response.json()["model"]["model"] == "env-default-model"
+    assert catalog["selected_ollama_cloud_model"] == "Gemma4-MTP-26B-BF16"
 
 
 def test_admin_can_persist_selected_omlx_model(monkeypatch, tmp_path):
@@ -58,6 +81,33 @@ def test_admin_can_persist_selected_omlx_model(monkeypatch, tmp_path):
     assert status.json()["model"]["selection_source"] == "admin"
     settings_payload = json.loads((runtime / "data" / "model-settings.json").read_text(encoding="utf-8"))
     assert settings_payload["librarian_model"] == "Gemma - MTP - 4Bit"
+
+
+def test_admin_can_persist_selected_ollama_cloud_model(monkeypatch, tmp_path):
+    runtime = configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_API_KEY", "ollama-key")
+    monkeypatch.setattr(admin_api.model_catalog, "fetch_ollama_cloud_models", fake_ollama_cloud_models)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        response = client.post("/api/admin/model/selection", json={"provider": "ollama_cloud", "model_name": "cloud-mix"})
+
+    assert response.status_code == 200
+    payload = json.loads((runtime / "data" / "model-settings.json").read_text(encoding="utf-8"))
+    assert payload["ollama_cloud_model"] == "cloud-mix"
+
+
+def test_admin_can_restore_model_defaults(monkeypatch, tmp_path):
+    runtime = configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(admin_api.model_catalog, "fetch_available_models", fake_available_models)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        client.post("/api/admin/model/selection", json={"model_name": "Gemma - MTP - 4Bit"})
+        response = client.post("/api/admin/model/defaults/restore")
+
+    assert response.status_code == 200
+    payload = json.loads((runtime / "data" / "model-settings.json").read_text(encoding="utf-8"))
+    assert payload["librarian_model"] == "Gemma4-MTP-26B-BF16"
+    assert payload["ollama_cloud_model"] == "Gemma4-MTP-26B-BF16"
 
 
 def test_admin_rejects_model_not_reported_by_omlx(monkeypatch, tmp_path):

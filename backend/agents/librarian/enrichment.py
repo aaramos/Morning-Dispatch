@@ -889,6 +889,7 @@ def _record_model_metric(
             "model_tag": _model_tag(model_name),
             "quantization": _quantization(model_name),
             "backend": metrics_context.get("backend") or _backend_name(model_client),
+            "route_name": getattr(getattr(model_client, "config", None), "route_name", None),
             "mode": metrics_context.get("mode") or "single",
             "queue_wait_ms": queue_wait_ms,
             "ttft_ms": ttft_ms,

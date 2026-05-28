@@ -13,7 +13,7 @@ from backend.agents.model import ModelClient, ModelClientError
 from backend.agents.model.metrics import record_model_response_metric
 from backend.app.core.config import get_settings
 
-MAX_EDITORIAL_CANDIDATES = 80
+MAX_EDITORIAL_CANDIDATES = 150
 ALLOWED_SECTIONS = {
     "Models & Labs",
     "Agents & Developer Tools",

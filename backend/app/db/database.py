@@ -5104,6 +5104,18 @@ def record_inference_metric(metric: dict[str, Any]) -> str:
     return metric_id
 
 
+def clear_inference_metrics_for_run(inference_run_id: str | None) -> int:
+    run_id = str(inference_run_id or "").strip()
+    if not run_id:
+        return 0
+    with connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM inference_metrics WHERE run_id = ?",
+            (run_id,),
+        )
+        return int(cursor.rowcount or 0)
+
+
 def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:
     with connect() as connection:
         rows = connection.execute(

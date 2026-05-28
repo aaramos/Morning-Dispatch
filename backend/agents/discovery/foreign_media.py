@@ -16,8 +16,8 @@ from backend.app.services import model_routing
 
 logger = logging.getLogger(__name__)
 
-MAX_FOREIGN_LANGUAGES = 3
-DEFAULT_RESULTS_PER_LANGUAGE = 6
+MAX_FOREIGN_LANGUAGES = 10
+DEFAULT_RESULTS_PER_LANGUAGE = 15
 NON_FOREIGN_MEDIA_LANGUAGE_CODES = {"en"}
 SCRIPT_RE = {
     "ko": re.compile(r"[\uac00-\ud7af]"),
@@ -89,10 +89,7 @@ class ForeignMediaSourceAdapter:
         if not plan:
             return []
 
-        per_language_limit = max(
-            3,
-            min(DEFAULT_RESULTS_PER_LANGUAGE, max(1, context.candidate_limit) // max(1, len(plan))),
-        )
+        per_language_limit = DEFAULT_RESULTS_PER_LANGUAGE
         results = await asyncio.gather(
             *(
                 search_web(str(item["native_query"]), limit=per_language_limit, language=str(item["code"]))

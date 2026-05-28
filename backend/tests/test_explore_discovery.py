@@ -39,6 +39,32 @@ class FakeAdapter:
         return candidate.payload
 
 
+def test_rebuild_strengthens_market_profile_from_statement():
+    profile = TopicProfile.from_dict(
+        {
+            "topic_id": "topic-memory",
+            "statement": (
+                "As an investor I'm interested in Micron, Hynix, Kioxia, and sandisk. "
+                "Track news from the previous 3 days and avoid MSN or Yahoo news."
+            ),
+            "scope": "Track company performance.",
+            "search_queries": ["an coming company days focus hynix in intrested"],
+            "source_selection": {"web_search": True, "markets": True},
+        }
+    )
+
+    strengthened = explore._strengthen_profile_for_run(profile)
+
+    assert "MU" in strengthened.source_queries["markets"]
+    assert "000660.KS" in strengthened.source_queries["markets"]
+    assert "285A.T" in strengthened.source_queries["markets"]
+    assert "SNDK" in strengthened.source_queries["markets"]
+    assert "Micron Technology MU" in strengthened.search_queries[0]
+    assert "Micron Technology MU" in strengthened.source_queries["web_search"][0]
+    assert "MSN" in strengthened.exclusions
+    assert "Yahoo News" in strengthened.exclusions
+
+
 class SlowAdapter(FakeAdapter):
     async def query(self, *_args, **_kwargs) -> list[Candidate]:
         await asyncio.sleep(0.05)
@@ -2271,7 +2297,7 @@ def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> 
     assert observed["cached_lookup_model"] == "topic-brief-model"
     assert observed["cached_write_model"] == "topic-brief-model"
     assert observed["refine_model"] == "topic-brief-model"
-    assert observed["refine_model_max_items"] == 24
+    assert observed["refine_model_max_items"] == 150
     assert observed["editorial_model"] == "topic-brief-model"
     assert observed["critic_model"] == "topic-brief-model"
 

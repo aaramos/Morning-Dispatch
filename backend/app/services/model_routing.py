@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from typing import Any
 
 from backend.agents.model import ModelClient, ModelClientConfig, ModelClientError, ModelResponse
@@ -19,6 +21,7 @@ from backend.app.core.config import (
 logger = logging.getLogger(__name__)
 
 PRIVATE_SOURCE_TYPES = {"gmail", "gmail_link", "collection_chunk"}
+_OLLAMA_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/=\\-]{19,}$")
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,11 @@ def routes_status(settings: Settings | None = None) -> dict[str, Any]:
             "configured": bool(settings.ollama_api_key),
             "base_url": settings.ollama_base_url,
             "key_path": str(settings.secrets_dir / "ollama" / "api_key"),
+            "default_model": settings.ollama_cloud_model,
+        },
+        "defaults": {
+            "local": settings.librarian_model,
+            "ollama_cloud": settings.ollama_cloud_model,
         },
     }
 
@@ -227,6 +235,11 @@ def save_ollama_api_key(settings: Settings, api_key: str) -> dict[str, Any]:
     value = api_key.strip()
     if not value:
         raise ValueError("Ollama API key is required")
+    if not _is_valid_ollama_api_key(value):
+        raise ValueError(
+            "That key doesn't look like an Ollama Cloud token. "
+            "Please paste the token from your Ollama Cloud dashboard (single token string)."
+        )
     path = settings.secrets_dir / "ollama" / "api_key"
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -246,14 +259,16 @@ def effective_route_model(settings: Settings, agent: str, route: dict[str, objec
     model = _route_model(route)
     if model:
         return model
-    return settings.librarian_model if route.get("provider") == "local" else None
+    if route.get("provider") == "ollama_cloud":
+        return settings.ollama_cloud_model
+    return settings.librarian_model
 
 
 def _local_client(settings: Settings, *, agent: str, model_override: str | None = None) -> ModelClient | None:
     if model_override:
-        client = ModelClient.from_settings(settings, model=model_override)
+        client = _model_client_from_settings(settings, model=model_override, route_name=agent)
     else:
-        client = ModelClient.from_settings(settings)
+        client = _model_client_from_settings(settings, route_name=agent)
     if client is None:
         return None
     config = getattr(client, "config", None)
@@ -262,19 +277,37 @@ def _local_client(settings: Settings, *, agent: str, model_override: str | None 
     return client
 
 
+def _model_client_from_settings(
+    settings: Settings,
+    *,
+    model: str | None = None,
+    route_name: str | None = None,
+) -> ModelClient | None:
+    try:
+        return ModelClient.from_settings(settings, model=model, route_name=route_name)
+    except TypeError:
+        if model:
+            try:
+                return ModelClient.from_settings(settings, model=model)
+            except TypeError:
+                pass
+        return ModelClient.from_settings(settings)
+
+
 def _ollama_client(settings: Settings, *, agent: str, model_override: str | None = None) -> ModelClient | None:
-    model = (model_override or "").strip()
+    model = (model_override or settings.ollama_cloud_model or "").strip()
     if not model or not settings.ollama_api_key:
         return None
+    base_url = _normalize_ollama_base_url(settings.ollama_base_url)
     return ModelClient(
         ModelClientConfig(
-            base_url=settings.ollama_base_url,
+            base_url=base_url,
             model=model,
             api_key=settings.ollama_api_key,
             timeout_seconds=settings.model_timeout_seconds,
             concurrency=settings.model_concurrency,
             provider="ollama_cloud",
-            api_mode="ollama",
+            api_mode="openai",
             route_name=agent,
         )
     )
@@ -300,6 +333,40 @@ def _route_model(route: dict[str, object] | None) -> str | None:
         model = model.strip()
         return model or None
     return None
+
+
+def _normalize_ollama_base_url(raw_url: str) -> str:
+    """Normalize an Ollama Cloud base URL to the OpenAI-compatible `/v1` style."""
+    value = raw_url.strip()
+    if not value:
+        return value
+    parsed = urlparse(value)
+    netloc = parsed.netloc
+    path = (parsed.path or "").rstrip("/") or "/"
+    if parsed.hostname in {"ollama.com", "www.ollama.com"} and path == "/api":
+        if parsed.port:
+            netloc = f"api.ollama.com:{parsed.port}"
+        else:
+            netloc = "api.ollama.com"
+    base_path = path
+    if not base_path or base_path == "/":
+        normalized_path = "/v1"
+    elif base_path in {"/chat", "/chat/completions", "/models", "/v1/models", "/tags", "/v1/tags", "/api"}:
+        normalized_path = "/v1"
+    elif not base_path.endswith("/v1"):
+        normalized_path = f"{base_path}/v1"
+    else:
+        normalized_path = base_path
+    normalized = parsed._replace(netloc=netloc, path=normalized_path, params="", query="", fragment="")
+    return urlunparse(normalized)
+
+
+def _is_valid_ollama_api_key(value: str) -> bool:
+    if " " in value:
+        return False
+    if value.lower().startswith("ssh-"):
+        return False
+    return bool(_OLLAMA_KEY_PATTERN.match(value))
 
 
 def _agent_label(agent: str) -> str:
