@@ -103,6 +103,8 @@ def test_fetch_market_snapshot_maps_yfinance_payload(monkeypatch, tmp_path) -> N
     assert snapshots[0].ticker == "NVDA"
     assert snapshots[0].company_name == "NVIDIA Corporation"
     assert snapshots[0].change_30d_pct == 12.5
+    assert snapshots[0].change_3m_pct == 12.5
+    assert [point["close"] for point in snapshots[0].price_history] == [800.0, 840.0, 870.0, 900.0]
     assert snapshots[0].recent_news[0]["title"] == "NVIDIA announces new AI platform"
 
 
@@ -120,6 +122,8 @@ def test_markets_adapter_returns_brief_candidates(monkeypatch, tmp_path) -> None
                 change_1d_pct=1.2,
                 change_7d_pct=4.1,
                 change_30d_pct=12.5,
+                change_3m_pct=18.4,
+                price_history=({"close": 760.0}, {"close": 820.0}, {"close": 900.0}),
                 analyst_rating="buy",
                 sector="Technology",
                 industry="Semiconductors",

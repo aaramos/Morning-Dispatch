@@ -67,6 +67,7 @@ class TopicProfile:
     source_selection: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_SOURCE_SELECTION))
     requested_sources: tuple[dict[str, Any], ...] = ()
     promoted_sources: tuple[dict[str, Any], ...] = ()
+    gmail_rules: dict[str, Any] = field(default_factory=dict)
     models: dict[str, str | None] = field(default_factory=lambda: {"refinement": None, "brief": None})
     schedule: ScheduleValue | None = None
     schedule_config: dict[str, Any] = field(default_factory=dict)
@@ -101,6 +102,7 @@ class TopicProfile:
             source_selection=_source_selection(payload.get("source_selection")),
             requested_sources=tuple(_dict_list(payload.get("requested_sources"))),
             promoted_sources=tuple(_dict_list(payload.get("promoted_sources"))),
+            gmail_rules=_dict(payload.get("gmail_rules")),
             models=_models(payload.get("models")),
             schedule=_schedule(payload.get("schedule")),
             schedule_config=_dict(payload.get("schedule_config")),
@@ -125,6 +127,7 @@ class TopicProfile:
             "source_selection": dict(self.source_selection),
             "requested_sources": [dict(source) for source in self.requested_sources],
             "promoted_sources": [dict(source) for source in self.promoted_sources],
+            "gmail_rules": dict(self.gmail_rules),
             "models": dict(self.models),
             "schedule": self.schedule,
             "schedule_config": dict(self.schedule_config),

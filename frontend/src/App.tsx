@@ -43,6 +43,12 @@ type TopicProfile = {
   source_selection: Record<string, boolean>;
   requested_sources?: Array<{ adapter: string; ref: string }>;
   promoted_sources?: Array<{ adapter: string; ref: string; has_feed: boolean; feed_url: string | null }>;
+  gmail_rules?: {
+    intent?: string;
+    lookback_hours?: number;
+    include_senders?: string[];
+    candidates?: Array<{ sender: string; sender_name?: string; subject?: string; message_count?: number; latest_at?: string | null }>;
+  };
   schedule?: string | null;
   schedule_config?: Record<string, unknown>;
   delivery_config?: Record<string, unknown>;
@@ -89,6 +95,7 @@ type ConfirmedProfilePayload = {
   keywords: string[];
   search_queries: string[];
   source_queries: Record<string, string[]>;
+  gmail_rules?: TopicProfile["gmail_rules"];
   models: Record<string, never>;
   schedule?: string | null;
   schedule_config?: Record<string, unknown>;
@@ -487,7 +494,7 @@ function DispatchApp() {
   const [refinementProgress, setRefinementProgress] = useState<RefinementProgress | null>(null);
   const [refinementFallbackStartedAt, setRefinementFallbackStartedAt] = useState(0);
   const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(null);
-  const [initialRefineExplorationId, setInitialRefineExplorationId] = useState(() => {
+  const [initialRefineExplorationId] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     const refineExplorationId = params.get("refine_exploration");
     if (refineExplorationId) {
@@ -715,6 +722,7 @@ function DispatchApp() {
       keywords: baseProfile?.keywords ?? [],
       search_queries: baseProfile?.search_queries ?? [],
       source_queries: baseProfile?.source_queries ?? {},
+      gmail_rules: baseProfile?.gmail_rules ?? {},
       models: {},
       schedule: baseProfile?.schedule ?? null,
       schedule_config: baseProfile?.schedule_config ?? {},
@@ -1166,8 +1174,8 @@ function DispatchApp() {
 
   useEffect(() => {
     if (!initialRefineExplorationId) return;
+    const explorationId = initialRefineExplorationId;
     let cancelled = false;
-    setInitialRefineExplorationId(null);
     setBusy(true);
     setFlow("refining");
     setMessage("Loading brief to refine...");
@@ -1177,7 +1185,7 @@ function DispatchApp() {
     setRefinementProgress({ phase: "starting", label: "Reopening refinement", startedAt: now });
     void (async () => {
       try {
-        const target = await api<Exploration>(`/api/explore/explorations/${initialRefineExplorationId}`);
+        const target = await api<Exploration>(`/api/explore/explorations/${explorationId}`);
         const topic = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${target.topic_id}`);
         const nextSession = await api<RefinementSession>("/api/explore/refinement-sessions", {
           method: "POST",
@@ -1473,7 +1481,7 @@ function RefinementPanel(props: {
       <div className="chat-list">
         {(props.session?.messages ?? []).map((message, index) => (
           <div className={`chat-bubble ${message.role}`} key={`${message.role}-${index}`}>
-            {message.content}
+            <ChatMessageContent content={message.content} />
           </div>
         ))}
         {!props.session ? (
@@ -1503,6 +1511,66 @@ function RefinementPanel(props: {
       </div>
     </section>
   );
+}
+
+type GmailCandidateLine = {
+  index: string;
+  name: string;
+  sender: string;
+  count: string;
+  subject: string;
+};
+
+function ChatMessageContent(props: { content: string }) {
+  const gmailCandidateMessage = parseGmailCandidateMessage(props.content);
+  if (gmailCandidateMessage) {
+    return (
+      <div className="gmail-candidate-message">
+        <p>{gmailCandidateMessage.intro}</p>
+        <ol className="gmail-candidate-list">
+          {gmailCandidateMessage.candidates.map((candidate) => (
+            <li key={`${candidate.index}-${candidate.sender}`}>
+              <div>
+                <strong>{candidate.name}</strong>
+                <span>{candidate.sender}</span>
+              </div>
+              <small>{candidate.count} found · Latest: {candidate.subject}</small>
+            </li>
+          ))}
+        </ol>
+        <p>{gmailCandidateMessage.prompt}</p>
+      </div>
+    );
+  }
+  return <>{props.content}</>;
+}
+
+function parseGmailCandidateMessage(content: string): { intro: string; candidates: GmailCandidateLine[]; prompt: string } | null {
+  const lines = content.split("\n").map((line) => line.trim()).filter(Boolean);
+  const firstCandidateIndex = lines.findIndex((line) => /^\d+\.\s/.test(line));
+  if (firstCandidateIndex < 1) return null;
+  const candidates: GmailCandidateLine[] = [];
+  let promptStart = lines.length;
+  for (let index = firstCandidateIndex; index < lines.length; index += 1) {
+    const match = lines[index].match(/^(\d+)\.\s+(.+?)\s+<([^>]+)>\s+\((\d+)\s+found;\s+latest subject:\s+(.+)\)$/i);
+    if (!match) {
+      promptStart = index;
+      break;
+    }
+    candidates.push({
+      index: match[1],
+      name: match[2],
+      sender: match[3],
+      count: match[4],
+      subject: match[5],
+    });
+  }
+  if (!candidates.length || !lines[0].includes("found newsletter candidates")) return null;
+  return {
+    intro: lines.slice(0, firstCandidateIndex).join(" "),
+    candidates,
+    prompt: lines.slice(promptStart).join(" "),
+  };
 }
 
 function RefinementStatusIndicator(props: { progress: RefinementProgress | null; now: number }) {
@@ -1651,6 +1719,13 @@ function ConfirmationPanel(props: {
           ))}
         </div>
       ) : null}
+      {props.profile?.gmail_rules?.include_senders?.length ? (
+        <div className="requested-source-list">
+          <strong>Gmail rules</strong>
+          <span>{props.profile.gmail_rules.intent || "Selected newsletters"}</span>
+          <span>{gmailLookbackLabel(props.profile.gmail_rules.lookback_hours)} · {props.profile.gmail_rules.include_senders.join(", ")}</span>
+        </div>
+      ) : null}
       {searchPlanItems(props.profile).length ? (
         <div className="search-plan-list">
           <strong>Search plan</strong>
@@ -1669,6 +1744,7 @@ function ConfirmationPanel(props: {
           <ContentLimitsPanel
             limits={props.draft.content_limits}
             sourceSelection={props.sources}
+            resetLabel="Use system defaults"
             onChange={updateContentLimits}
           />
         ) : null}
@@ -1685,6 +1761,8 @@ function ConfirmationPanel(props: {
 function ContentLimitsPanel(props: {
   limits: ContentLimitsDraft;
   sourceSelection: Record<SourceKey, boolean>;
+  resetLabel?: string;
+  showReset?: boolean;
   onChange: (limits: ContentLimitsDraft) => void;
 }) {
   const selectedSources = sourceOptions.filter((source) => props.sourceSelection[source.key]);
@@ -1748,9 +1826,11 @@ function ContentLimitsPanel(props: {
           ))}
         </div>
       ) : null}
-      <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(defaultContentLimits)}>
-        Reset to defaults
-      </button>
+      {props.showReset !== false ? (
+        <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(defaultContentLimits)}>
+          {props.resetLabel ?? "Reset to defaults"}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -2182,6 +2262,10 @@ function AdminApp() {
   const [explorationSort, setExplorationSort] = useState<SortMode>(() => loadSessionValue("admin.explorationSort", "recent"));
   const [digestSort, setDigestSort] = useState<SortMode>(() => loadSessionValue("admin.digestSort", "recent"));
   const [editingDigest, setEditingDigest] = useState<{ topicId: string; preset: SchedulePreset; time: string } | null>(null);
+  const [editingAdvancedSettings, setEditingAdvancedSettings] = useState<{
+    topic: TopicProfileResponse;
+    limits: ContentLimitsDraft;
+  } | null>(null);
   const [issueDetails, setIssueDetails] = useState<{ built_with_issues: boolean; issues: ExplorationIssue[] } | null>(null);
   const [webProvider, setWebProvider] = useState<"tavily" | "brave" | "serpapi">("tavily");
   const [webKey, setWebKey] = useState("");
@@ -2531,11 +2615,15 @@ function AdminApp() {
   }
 
   async function rebuildFromAdmin(exploration: Exploration) {
+    const topic = topicById.get(exploration.topic_id);
     setBusy(true);
     try {
       await api(`/api/explore/explorations/${exploration.exploration_id}/rebuild`, {
         method: "POST",
-        body: JSON.stringify({ source_selection: exploration.source_selection }),
+        body: JSON.stringify({
+          source_selection: exploration.source_selection,
+          candidate_limit: topic ? contentLimitsFromProfile(topic.profile).total_items : undefined,
+        }),
       });
       await loadAdmin();
       setMessage("Rebuild queued. Progress is shown in the row.");
@@ -2550,7 +2638,33 @@ function AdminApp() {
     window.location.href = `/?refine_exploration=${encodeURIComponent(exploration.exploration_id)}`;
   }
 
+  function openAdvancedSettings(topic: TopicProfileResponse) {
+    setEditingAdvancedSettings({
+      topic,
+      limits: contentLimitsFromProfile(topic.profile),
+    });
+  }
+
+  async function saveAdvancedSettings() {
+    if (!editingAdvancedSettings) return;
+    setBusy(true);
+    try {
+      const saved = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${editingAdvancedSettings.topic.topic_id}/content-limits`, {
+        method: "POST",
+        body: JSON.stringify({ content_limits: editingAdvancedSettings.limits }),
+      });
+      setEditingAdvancedSettings(null);
+      await loadAdmin();
+      setMessage(`Advanced settings saved for ${profileName(saved)}`);
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save advanced settings"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function buildTopicFromAdmin(topic: TopicProfileResponse) {
+    const limits = contentLimitsFromProfile(topic.profile);
     setBusy(true);
     try {
       await api(`/api/explore/topic-profiles/${topic.topic_id}/run`, {
@@ -2558,6 +2672,7 @@ function AdminApp() {
         body: JSON.stringify({
           mode: "show_now",
           source_selection: topic.profile.source_selection,
+          candidate_limit: limits.total_items,
           lookback_hours: lookbackHoursForBuild(topic.profile),
         }),
       });
@@ -2683,6 +2798,7 @@ function AdminApp() {
   }
 
   async function rebuildDigest(topic: TopicProfileResponse) {
+    const limits = contentLimitsFromProfile(topic.profile);
     setBusy(true);
     try {
       if (topic.latest_exploration) {
@@ -2690,6 +2806,7 @@ function AdminApp() {
           method: "POST",
           body: JSON.stringify({
             source_selection: topic.profile.source_selection,
+            candidate_limit: limits.total_items,
             lookback_hours: lookbackHoursForBuild(topic.profile),
           }),
         });
@@ -2699,6 +2816,7 @@ function AdminApp() {
           body: JSON.stringify({
             mode: "scheduled",
             source_selection: topic.profile.source_selection,
+            candidate_limit: limits.total_items,
             lookback_hours: lookbackHoursForBuild(topic.profile),
           }),
         });
@@ -2954,6 +3072,7 @@ function AdminApp() {
                       <small>Ready to build · {formatDateTime(item.topic.updated_at ?? item.topic.created_at)} · {formatSourceSelection(item.topic.profile.source_selection)}</small>
                     </div>
                     <div className="button-row">
+                      <button type="button" className="secondary-action" onClick={() => openAdvancedSettings(item.topic)} disabled={busy}>Advanced Settings</button>
                       <button type="button" className="secondary-action" onClick={() => void buildTopicFromAdmin(item.topic)} disabled={busy}>Build brief</button>
                     </div>
                   </article>
@@ -2974,6 +3093,7 @@ function AdminApp() {
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => openPath(briefPath(item.exploration))} disabled={!briefPath(item.exploration)}>Open</button>
+                    <button type="button" className="secondary-action" onClick={() => item.topic && openAdvancedSettings(item.topic)} disabled={busy || !item.topic}>Advanced Settings</button>
                     <button type="button" className="secondary-action" onClick={() => refineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildFromAdmin(item.exploration)} disabled={busy}>Rebuild</button>
                     <button type="button" className="secondary-action" onClick={() => void scheduleExploration(item.exploration)} disabled={busy || item.exploration.status !== "complete"}>Schedule</button>
@@ -3083,6 +3203,7 @@ function AdminApp() {
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && openPath(briefPath(topic.latest_exploration))} disabled={!topic.latest_exploration}>Open latest</button>
+                    <button type="button" className="secondary-action" onClick={() => openAdvancedSettings(topic)} disabled={busy}>Advanced Settings</button>
                     <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && refineFromAdmin(topic.latest_exploration)} disabled={busy || !topic.latest_exploration || topic.latest_exploration.status === "queued" || topic.latest_exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildDigest(topic)} disabled={busy}>Rebuild</button>
                     <button type="button" className="secondary-action" onClick={() => startEditingDigest(topic)} disabled={busy}>Edit schedule</button>
@@ -3313,6 +3434,40 @@ function AdminApp() {
             </section>
           ) : null}
         </section>
+      ) : null}
+      {editingAdvancedSettings ? (
+        <div className="modal-backdrop" role="presentation">
+          <section className="advanced-settings-modal" role="dialog" aria-modal="true" aria-labelledby="advanced-settings-title">
+            <button
+              type="button"
+              className="modal-close"
+              onClick={() => setEditingAdvancedSettings(null)}
+              aria-label="Close advanced settings"
+              disabled={busy}
+            >
+              ×
+            </button>
+            <div>
+              <p className="section-kicker">Brief settings</p>
+              <h2 id="advanced-settings-title">{profileName(editingAdvancedSettings.topic)}</h2>
+            </div>
+            <ContentLimitsPanel
+              limits={editingAdvancedSettings.limits}
+              sourceSelection={sourceSelectionFromRecord(editingAdvancedSettings.topic.profile.source_selection)}
+              showReset={false}
+              onChange={(limits) => setEditingAdvancedSettings({ ...editingAdvancedSettings, limits })}
+            />
+            <div className="modal-actions">
+              <button type="button" className="ghost-action" onClick={() => setEditingAdvancedSettings(null)} disabled={busy}>Cancel</button>
+              <button type="button" className="secondary-action" onClick={() => setEditingAdvancedSettings({ ...editingAdvancedSettings, limits: defaultContentLimits })} disabled={busy}>
+                Use system defaults
+              </button>
+              <button type="button" className="primary-action" onClick={() => void saveAdvancedSettings()} disabled={busy}>
+                Save settings
+              </button>
+            </div>
+          </section>
+        </div>
       ) : null}
     </main>
   );
@@ -3636,6 +3791,20 @@ function formatSourceLabel(source: string): string {
   return source.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function gmailLookbackLabel(hours: number | undefined): string {
+  const value = Number(hours || 0);
+  if (!Number.isFinite(value) || value < 1) return "Default window";
+  if (value % 168 === 0 && value >= 168) {
+    const weeks = value / 168;
+    return `Last ${weeks} week${weeks === 1 ? "" : "s"}`;
+  }
+  if (value % 24 === 0 && value >= 24) {
+    const days = value / 24;
+    return `Last ${days} day${days === 1 ? "" : "s"}`;
+  }
+  return `Last ${value} hour${value === 1 ? "" : "s"}`;
+}
+
 function formatSourceSelection(selection: Record<string, boolean>): string {
   const enabled = sourceOptions.filter((source) => selection[source.key]).map((source) => source.label);
   return enabled.length ? enabled.join(", ") : "No sources";
@@ -3840,14 +4009,14 @@ function refinementProgressState(progress: RefinementProgress, now: number): Ref
     percent = 68;
   }
   if (seconds >= 20) {
-    stage = "Still waiting on oMLX";
-    detail = "No response yet. The model may still be loading, but this is the point to watch.";
+    stage = "Still waiting on local model";
+    detail = "The local model may still be warming up or generating the structured response.";
     activity = "No server response yet; elapsed time is still updating.";
     percent = 82;
   }
-  if (seconds >= 45) {
-    stage = "Possibly hung";
-    detail = "This is taking longer than expected. You can keep waiting, retry, or refresh.";
+  if (seconds >= 75) {
+    stage = "Taking longer than usual";
+    detail = "The local model is still inside the backend timeout window. You can keep waiting, retry, or refresh.";
     percent = 90;
   }
   if (progress.phase === "answering" && seconds < 4) {

@@ -54,6 +54,7 @@ class TopicProfileCreate(BaseModel):
     source_selection: dict[str, bool] = Field(default_factory=dict)
     requested_sources: list[dict[str, Any]] = Field(default_factory=list)
     promoted_sources: list[dict[str, Any]] = Field(default_factory=list)
+    gmail_rules: dict[str, Any] = Field(default_factory=dict)
     models: dict[str, Any] = Field(default_factory=dict)
     schedule: ScheduleValue | None = None
     schedule_config: dict[str, Any] = Field(default_factory=dict)
@@ -113,6 +114,10 @@ class TopicProfileSchedule(BaseModel):
     time_of_day: str | None = Field(default=None, max_length=8)
     timezone: str | None = Field(default=None, max_length=80)
     email_enabled: bool | None = None
+
+
+class TopicProfileContentLimitsUpdate(BaseModel):
+    content_limits: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceSetupPayload(BaseModel):
@@ -257,6 +262,23 @@ def schedule_topic_profile(topic_id: str, payload: TopicProfileSchedule) -> dict
         "deleted": False,
     }
     return database.upsert_topic_profile(profile)
+
+
+@router.post("/explore/topic-profiles/{topic_id}/content-limits")
+def update_topic_profile_content_limits(topic_id: str, payload: TopicProfileContentLimitsUpdate) -> dict[str, Any]:
+    record = database.get_topic_profile(topic_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Topic profile not found")
+    profile = {
+        **record["profile"],
+        "topic_id": topic_id,
+        "statement": record["statement"],
+        "content_limits": payload.content_limits,
+    }
+    try:
+        return explore.save_topic_profile(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/explore/topic-profiles/{topic_id}/pause")

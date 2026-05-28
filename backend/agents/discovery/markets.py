@@ -33,6 +33,8 @@ class MarketSnapshot:
     change_1d_pct: float | None
     change_7d_pct: float | None
     change_30d_pct: float | None
+    change_3m_pct: float | None
+    price_history: tuple[dict[str, Any], ...]
     analyst_rating: str | None
     sector: str | None
     industry: str | None
@@ -141,6 +143,8 @@ def _fetch_market_snapshot(company: MarketCompany) -> MarketSnapshot | None:
         change_1d_pct=_change_pct(history, 1),
         change_7d_pct=_change_pct(history, 7),
         change_30d_pct=_change_pct(history, 30),
+        change_3m_pct=_change_since_first(history),
+        price_history=tuple(_history_points(history)),
         analyst_rating=str(info.get("recommendationKey") or info.get("recommendationMean") or "").strip() or None,
         sector=str(info.get("sector") or "").strip() or None,
         industry=str(info.get("industry") or "").strip() or None,
@@ -196,6 +200,13 @@ def _change_pct(history: Any, days_back: int) -> float | None:
     return round(((current - previous) / previous) * 100, 2)
 
 
+def _change_since_first(history: Any) -> float | None:
+    closes = _close_values(history)
+    if len(closes) < 2 or closes[0] == 0:
+        return None
+    return round(((closes[-1] - closes[0]) / closes[0]) * 100, 2)
+
+
 def _close_values(history: Any) -> list[float]:
     if history is None:
         return []
@@ -216,6 +227,40 @@ def _close_values(history: Any) -> list[float]:
     elif isinstance(history, dict):
         values = list(history.get("Close") or history.get("close") or [])
     return [float(value) for value in values if _number(value) is not None]
+
+
+def _history_points(history: Any) -> list[dict[str, Any]]:
+    closes = _close_values(history)
+    if not closes:
+        return []
+    dates = _history_dates(history)
+    start = max(0, len(closes) - MARKETS_WINDOW_DAYS)
+    points: list[dict[str, Any]] = []
+    for offset, close in enumerate(closes[start:]):
+        source_index = start + offset
+        point: dict[str, Any] = {"close": round(close, 4)}
+        if source_index < len(dates):
+            point["date"] = dates[source_index]
+        points.append(point)
+    return points
+
+
+def _history_dates(history: Any) -> list[str]:
+    if history is None:
+        return []
+    try:
+        raw_dates = history.index.tolist()
+    except Exception:
+        raw_dates = []
+    dates: list[str] = []
+    for raw_date in raw_dates:
+        try:
+            dates.append(raw_date.date().isoformat())
+        except AttributeError:
+            value = str(raw_date).strip()
+            if value:
+                dates.append(value[:10])
+    return dates
 
 
 def _recent_news(items: list[Any]) -> list[dict[str, Any]]:
@@ -299,7 +344,12 @@ def _movement_sentence(snapshot: MarketSnapshot) -> str:
     price = f"{snapshot.current_price:.2f}" if snapshot.current_price is not None else "n/a"
     currency = f" {snapshot.currency}" if snapshot.currency else ""
     changes = []
-    for label, value in (("1d", snapshot.change_1d_pct), ("7d", snapshot.change_7d_pct), ("30d", snapshot.change_30d_pct)):
+    for label, value in (
+        ("1d", snapshot.change_1d_pct),
+        ("7d", snapshot.change_7d_pct),
+        ("30d", snapshot.change_30d_pct),
+        ("3mo", snapshot.change_3m_pct),
+    ):
         if value is not None:
             changes.append(f"{label}: {value:+.2f}%")
     suffix = "; ".join(changes)

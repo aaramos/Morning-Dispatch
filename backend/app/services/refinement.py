@@ -9,6 +9,7 @@ from typing import Any
 
 from backend.agents.discovery.language_support import trusted_language_options
 from backend.agents.discovery.types import DEFAULT_EXPLORE_SOURCE_SELECTION
+from backend.agents.digestor.gmail import NewsletterCandidate, discover_newsletter_candidates
 from backend.agents.librarian.text_utils import keyword_set
 from backend.agents.model import ModelClient
 from backend.app.core.config import get_settings
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 MIN_REFINEMENT_TURNS = 2
 MAX_REFINEMENT_TURNS = 10
 AGENT_PENDING_FIELD = "refinement_agent"
+GMAIL_RULES_FIELD = "gmail_rules"
+GMAIL_SENDER_SELECTION_FIELD = "gmail_sender_selection"
 FIELD_ORDER = ("scope", "related_interests", "depth", "recency_weighting", "requested_sources", "exclusions")
 FIELD_HINT_TEXT_SOURCE = ("statement", "scope", "keywords", "subtopics")
 DEPTH_PRACTITIONER_TOKENS = (
@@ -47,6 +50,7 @@ QUESTIONS = {
     "recency_weighting": "How recent does the source material need to be? For example: last 24 hours, last 3 days, no more than a year old, or best available regardless of date.",
     "requested_sources": "Any specific podcast, YouTube channel, subreddit, newsletter, site, company, or collection I should try to include?",
     "exclusions": "Anything I should avoid so the brief stays focused?",
+    GMAIL_RULES_FIELD: "How do you want me to use Gmail for this brief? For example: AI-related newsletters received in the last 7 days.",
 }
 
 VALID_SOURCE_ADAPTERS = {"gmail", "reddit", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"}
@@ -187,6 +191,17 @@ def start_session(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Interest statement is required")
     profile = _seed_profile_with_hints(_initial_profile(payload))
     messages: list[dict[str, str]] = []
+    gmail_question = _gmail_refinement_question(profile)
+    if gmail_question:
+        messages = [{"role": "assistant", "content": gmail_question}]
+        session = database.create_refinement_session(
+            statement=statement,
+            profile=profile,
+            messages=messages,
+            pending_field=GMAIL_RULES_FIELD,
+            status="active",
+        )
+        return _session_response(session)
     agent_update = _run_refinement_agent(
         profile=profile,
         messages=messages,
@@ -257,6 +272,28 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
     if just_go_now:
         messages.append({"role": "user", "content": "Just go now."})
 
+    gmail_result = _advance_gmail_refinement(profile, pending, answer=answer, just_go_now=just_go_now)
+    if gmail_result is not None:
+        profile, assistant_message, next_pending, status = gmail_result
+        topic_id = session.get("topic_id")
+        if assistant_message:
+            messages.append({"role": "assistant", "content": assistant_message})
+        if status == "finalized":
+            profile = _fill_defaults(profile)
+            saved = explore.save_topic_profile(profile)
+            topic_id = str(saved["topic_id"])
+            messages.append({"role": "assistant", "content": "Topic profile is ready."})
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=messages,
+            pending_field=next_pending,
+            turn_count=turn_count,
+            status=status,
+            topic_id=topic_id,
+        )
+        return _session_response(updated) if updated else None
+
     agent_update = _run_refinement_agent(
         profile=profile,
         messages=messages,
@@ -312,6 +349,87 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
     return _session_response(updated) if updated else None
 
 
+def _gmail_refinement_question(profile: dict[str, Any]) -> str | None:
+    selection = _source_selection_dict(profile.get("source_selection"))
+    rules = _normalize_gmail_rules(profile.get("gmail_rules"))
+    if not selection.get("gmail"):
+        return None
+    if rules.get("include_senders"):
+        return None
+    return (
+        "How do you want me to use Gmail for this brief? "
+        "I'm looking for newsletter rules, like: AI-related newsletters received in the last 7 days."
+    )
+
+
+def _advance_gmail_refinement(
+    profile: dict[str, Any],
+    pending: Any,
+    *,
+    answer: str,
+    just_go_now: bool,
+) -> tuple[dict[str, Any], str | None, str | None, str] | None:
+    if just_go_now:
+        return None
+    pending_field = str(pending or "")
+    if pending_field == GMAIL_RULES_FIELD and answer.strip():
+        updated = dict(profile)
+        rules = _gmail_rules_from_answer(answer, updated)
+        candidates = _discover_gmail_candidates(rules)
+        rules["candidates"] = [candidate.to_dict() for candidate in candidates]
+        updated["gmail_rules"] = rules
+        updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), {"gmail": [rules["intent"]]})
+        updated["lookback_hours"] = rules["lookback_hours"]
+        updated["recency_weighting"] = _recency_from_lookback_hours(int(rules["lookback_hours"]))
+        updated["source_scope_answered"] = True
+        if candidates:
+            return (
+                _coerce_profile(updated),
+                _gmail_candidate_question(candidates, rules),
+                GMAIL_SENDER_SELECTION_FIELD,
+                "active",
+            )
+        return (
+            _coerce_profile(updated),
+            (
+                "I searched Gmail for that newsletter pattern but didn’t find clear newsletter senders. "
+                "Name any sender or newsletter you want included, or say to continue without Gmail."
+            ),
+            GMAIL_SENDER_SELECTION_FIELD,
+            "active",
+        )
+
+    if pending_field == GMAIL_SENDER_SELECTION_FIELD:
+        updated = dict(profile)
+        rules = _normalize_gmail_rules(updated.get("gmail_rules"))
+        include_senders = _selected_gmail_senders(answer, rules)
+        if include_senders:
+            rules["include_senders"] = include_senders
+            updated["requested_sources"] = _merge_requested_source_lists(
+                _normalize_requested_sources(updated.get("requested_sources")),
+                [{"adapter": "gmail", "ref": sender} for sender in include_senders],
+            )
+            updated["requested_sources_answered"] = True
+            updated["gmail_rules"] = rules
+            return (
+                _coerce_profile(updated),
+                f"Got it. I'll include Gmail newsletters from {', '.join(include_senders)} and follow their article links for this brief.",
+                None,
+                "finalized",
+            )
+        rules["include_senders"] = []
+        updated["gmail_rules"] = rules
+        updated["source_selection"] = {**_source_selection_dict(updated.get("source_selection")), "gmail": False}
+        return (
+            _coerce_profile(updated),
+            "Got it. I'll continue without Gmail for this brief.",
+            None,
+            "finalized",
+        )
+
+    return None
+
+
 def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
     statement = str(payload.get("statement") or "").strip()
     topic_id = str(payload.get("topic_id") or "").strip()
@@ -363,6 +481,7 @@ def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "exclusions": [],
         "source_selection": {**DEFAULT_EXPLORE_SOURCE_SELECTION, **selected_sources},
         "requested_sources": requested_sources,
+        "gmail_rules": {},
         "related_interests_answered": False,
         "requested_sources_answered": bool(requested_sources),
         "depth_answered": False,
@@ -448,7 +567,22 @@ def _run_refinement_agent(
 def _refinement_model_client(profile: dict[str, Any]) -> Any | None:
     settings = get_settings()
     model_name = str((profile.get("models") or {}).get("refinement") or "").strip() or None
-    return model_routing.client_for_agent("refinement", settings=settings, model_override=model_name).client
+    return model_routing.client_for_agent(
+        "refinement",
+        settings=settings,
+        items=_privacy_markers_for_refinement(profile),
+        model_override=model_name,
+    ).client
+
+
+def _privacy_markers_for_refinement(profile: dict[str, Any]) -> list[dict[str, str]]:
+    selection = _source_selection_dict(profile.get("source_selection"))
+    markers: list[dict[str, str]] = []
+    if selection.get("gmail"):
+        markers.append({"source_type": "gmail"})
+    if selection.get("collections"):
+        markers.append({"source_type": "collection_chunk"})
+    return markers
 
 
 def _build_refinement_agent_prompt(
@@ -472,6 +606,7 @@ def _build_refinement_agent_prompt(
         "exclusions": _string_list(profile.get("exclusions")),
         "source_selection": _source_selection_dict(profile.get("source_selection")),
         "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
+        "gmail_rules": _normalize_gmail_rules(profile.get("gmail_rules")),
     }
     compact_messages = [
         {"role": message["role"], "content": message["content"][:900]}
@@ -604,6 +739,8 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
             updated.get("foreign_language_plan"),
             patch.get("foreign_language_plan"),
         )
+    if "gmail_rules" in patch:
+        updated["gmail_rules"] = _normalize_gmail_rules(patch.get("gmail_rules"))
 
     requested = _normalize_requested_sources(updated.get("requested_sources"))
     requested_patch = [
@@ -702,6 +839,135 @@ def _merge_source_queries(existing: Any, incoming: Any) -> dict[str, list[str]]:
     for key, values in _clean_source_queries(incoming).items():
         merged[key] = _merge_string_lists(merged.get(key), values, limit=20)
     return merged
+
+
+def _normalize_gmail_rules(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    rules: dict[str, Any] = {}
+    intent = " ".join(str(value.get("intent") or value.get("query") or "").split()).strip()
+    if intent:
+        rules["intent"] = intent[:240]
+    lookback_hours = _coerce_lookback_hours(value.get("lookback_hours"))
+    if lookback_hours:
+        rules["lookback_hours"] = lookback_hours
+    include_senders = _email_list(value.get("include_senders"))
+    if include_senders:
+        rules["include_senders"] = include_senders
+    candidates = value.get("candidates")
+    if isinstance(candidates, list):
+        cleaned_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            sender = str(candidate.get("sender") or "").strip().lower()
+            if not sender:
+                continue
+            try:
+                message_count = max(1, int(candidate.get("message_count") or 1))
+            except (TypeError, ValueError):
+                message_count = 1
+            cleaned_candidates.append(
+                {
+                    "sender": sender,
+                    "sender_name": str(candidate.get("sender_name") or "").strip()[:120],
+                    "subject": str(candidate.get("subject") or "").strip()[:240],
+                    "message_count": message_count,
+                    "latest_at": str(candidate.get("latest_at") or "").strip() or None,
+                }
+            )
+            if len(cleaned_candidates) >= 12:
+                break
+        if cleaned_candidates:
+            rules["candidates"] = cleaned_candidates
+    return rules
+
+
+def _email_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [item for item in re.split(r"[,;\n]", value) if item.strip()]
+    if not isinstance(value, list):
+        return []
+    emails: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        email = str(item or "").strip().lower()
+        if "@" not in email or email in seen:
+            continue
+        emails.append(email)
+        seen.add(email)
+    return emails
+
+
+def _gmail_rules_from_answer(answer: str, profile: dict[str, Any]) -> dict[str, Any]:
+    intent = " ".join(answer.split()).strip()
+    lookback_hours = _extract_lookback_hours(answer) or _coerce_lookback_hours(profile.get("lookback_hours")) or 168
+    return {
+        "intent": intent,
+        "lookback_hours": lookback_hours,
+    }
+
+
+def _discover_gmail_candidates(rules: dict[str, Any]) -> list[NewsletterCandidate]:
+    intent = str(rules.get("intent") or "").strip()
+    lookback_hours = int(rules.get("lookback_hours") or 168)
+    try:
+        return _run_sync_list(
+            discover_newsletter_candidates(
+                query_text=intent,
+                lookback_hours=lookback_hours,
+                limit=8,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to discover Gmail newsletter candidates")
+        return []
+
+
+def _gmail_candidate_question(candidates: list[NewsletterCandidate], rules: dict[str, Any]) -> str:
+    sender_lines = [
+        f"{index}. {candidate.sender_name or candidate.sender} <{candidate.sender}> ({candidate.message_count} found; latest subject: {candidate.subject})"
+        for index, candidate in enumerate(candidates[:8], start=1)
+    ]
+    lookback = _lookback_label(int(rules.get("lookback_hours") or 168))
+    return (
+        f"I searched Gmail for {rules.get('intent')} across {lookback} and found newsletter candidates:\n"
+        + "\n".join(sender_lines)
+        + "\nWhich should I include? Reply with numbers, sender names, 'all', or 'none'."
+    )
+
+
+def _selected_gmail_senders(answer: str, rules: dict[str, Any]) -> list[str]:
+    candidates = [candidate for candidate in rules.get("candidates", []) if isinstance(candidate, dict)]
+    if not candidates:
+        return _email_list(answer)
+    lowered = answer.lower()
+    if any(token in lowered for token in ("none", "no gmail", "skip gmail", "without gmail")):
+        return []
+    if re.search(r"\ball\b|\bevery\b", lowered):
+        return _email_list([candidate.get("sender") for candidate in candidates])
+    selected: list[str] = []
+    for number in re.findall(r"\b\d+\b", answer):
+        index = int(number) - 1
+        if 0 <= index < len(candidates):
+            selected.extend(_email_list([candidates[index].get("sender")]))
+    for candidate in candidates:
+        sender = str(candidate.get("sender") or "").strip().lower()
+        name = str(candidate.get("sender_name") or "").strip().lower()
+        if sender and (sender in lowered or (name and name in lowered)):
+            selected.extend(_email_list([sender]))
+    selected.extend(_email_list(answer))
+    return _email_list(selected)
+
+
+def _lookback_label(hours: int) -> str:
+    if hours % 168 == 0 and hours >= 168:
+        weeks = hours // 168
+        return f"the last {weeks} week{'s' if weeks != 1 else ''}"
+    if hours % 24 == 0 and hours >= 24:
+        days = hours // 24
+        return f"the last {days} day{'s' if days != 1 else ''}"
+    return f"the last {hours} hour{'s' if hours != 1 else ''}"
 
 
 def _normalize_foreign_language_plan(value: Any) -> list[dict[str, Any]]:
@@ -831,7 +1097,12 @@ def _extract_model_updates(
         return None
 
     settings = get_settings()
-    model_client = model_routing.client_for_agent("refinement", settings=settings, model_override=model_name).client
+    model_client = model_routing.client_for_agent(
+        "refinement",
+        settings=settings,
+        items=_privacy_markers_for_refinement(profile),
+        model_override=model_name,
+    ).client
     if model_client is None:
         return None
 
@@ -1039,6 +1310,29 @@ def _run_sync_complete_json(coro: object) -> dict[str, Any]:
 
 def _run_event_loop(coro: object) -> dict[str, Any]:
     return asyncio.run(coro)  # type: ignore[call-arg]
+
+
+def _run_sync_list(coro: object) -> list[Any]:
+    result_holder: dict[str, list[Any]] = {}
+    error_holder: dict[str, BaseException] = {}
+
+    def run() -> None:
+        try:
+            result_holder["result"] = asyncio.run(coro)  # type: ignore[call-arg]
+        except BaseException as exc:  # pragma: no cover - defensive bridge.
+            error_holder["error"] = exc
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # type: ignore[call-arg]
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join()
+    if error_holder:
+        raise error_holder["error"]
+    return result_holder.get("result", [])
 
 
 def _fill_defaults(profile: dict[str, Any]) -> dict[str, Any]:
@@ -1288,6 +1582,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "exclusions": _string_list(profile.get("exclusions")),
         "source_selection": selected_sources,
         "requested_sources": requested_sources,
+        "gmail_rules": _normalize_gmail_rules(profile.get("gmail_rules")),
         "related_interests_answered": bool(profile.get("related_interests_answered")),
         "requested_sources_answered": bool(profile.get("requested_sources_answered")),
         "depth_answered": bool(profile.get("depth_answered")),

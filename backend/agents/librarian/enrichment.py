@@ -589,7 +589,12 @@ def _market_snapshot_text(result: ArticleFetchResult) -> str:
     if price is not None:
         parts.append(f"Latest price: {price:.2f}{f' {currency}' if currency else ''}.")
     changes = []
-    for label, key in (("1d", "change_1d_pct"), ("7d", "change_7d_pct"), ("30d", "change_30d_pct")):
+    for label, key in (
+        ("1d", "change_1d_pct"),
+        ("7d", "change_7d_pct"),
+        ("30d", "change_30d_pct"),
+        ("3mo", "change_3m_pct"),
+    ):
         value = _market_number(metadata.get(key))
         if value is not None:
             changes.append(f"{label}: {value:+.2f}%")

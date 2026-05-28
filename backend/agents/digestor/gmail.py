@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parseaddr
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,81 @@ class ExtractedLink:
     url: str
     text: str
     context: str = ""
+
+
+@dataclass(frozen=True)
+class NewsletterCandidate:
+    sender: str
+    sender_name: str
+    subject: str
+    message_count: int = 1
+    latest_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sender": self.sender,
+            "sender_name": self.sender_name,
+            "subject": self.subject,
+            "message_count": self.message_count,
+            "latest_at": self.latest_at,
+        }
+
+
+async def discover_newsletter_candidates(
+    *,
+    query_text: str,
+    lookback_hours: int,
+    limit: int = 12,
+) -> list[NewsletterCandidate]:
+    try:
+        service = get_gmail_service()
+    except Exception as exc:
+        logger.warning("Gmail authentication failed during newsletter discovery: %s", exc)
+        return []
+
+    query = build_discovery_query(query_text=query_text, lookback_hours=lookback_hours)
+    try:
+        messages = _list_messages(service, query, limit=max(limit * 3, limit))
+    except Exception as exc:
+        logger.warning("Gmail newsletter discovery failed: %s", exc)
+        return []
+
+    candidates: dict[str, NewsletterCandidate] = {}
+    for message_ref in messages:
+        message_id = message_ref.get("id")
+        if not message_id:
+            continue
+        try:
+            message = _get_message(service, str(message_id))
+        except Exception as exc:
+            logger.warning("Skipping Gmail discovery message %s: %s", message_id, exc)
+            continue
+        payload = message.get("payload", {})
+        sender_name, sender = sender_from_header(header_value(payload, "From"))
+        if not sender:
+            continue
+        subject = header_value(payload, "Subject") or "(no subject)"
+        if not _looks_like_newsletter(sender, subject, payload):
+            continue
+        published_at = message_published_at(message)
+        current = candidates.get(sender)
+        if current is None:
+            candidates[sender] = NewsletterCandidate(
+                sender=sender,
+                sender_name=sender_name,
+                subject=subject,
+                latest_at=published_at,
+            )
+        else:
+            candidates[sender] = NewsletterCandidate(
+                sender=sender,
+                sender_name=current.sender_name or sender_name,
+                subject=current.subject,
+                message_count=current.message_count + 1,
+                latest_at=_latest_iso(current.latest_at, published_at),
+            )
+
+    return sorted(candidates.values(), key=lambda item: (item.message_count, item.latest_at or ""), reverse=True)[:limit]
 
 
 async def fetch_newsletters(
@@ -171,6 +247,16 @@ def build_query(sender: str, after_timestamp: int) -> str:
     return f"from:{sender} after:{after_timestamp}"
 
 
+def build_discovery_query(*, query_text: str, lookback_hours: int) -> str:
+    lookback_days = max(1, min(365, (max(1, lookback_hours) + 23) // 24))
+    terms = _query_terms(query_text)
+    topic = " OR ".join(terms[:8])
+    newsletter_terms = "(newsletter OR digest OR roundup OR brief OR substack OR beehiiv)"
+    if topic:
+        return f"newer_than:{lookback_days}d ({topic}) {newsletter_terms}"
+    return f"newer_than:{lookback_days}d {newsletter_terms}"
+
+
 def extract_plain_text(payload: dict[str, Any]) -> str:
     parts: list[str] = []
     for part in _walk_mime_parts(payload):
@@ -217,6 +303,11 @@ def header_value(payload: dict[str, Any], name: str) -> str:
         if str(header.get("name", "")).lower() == name.lower():
             return str(header.get("value", ""))
     return ""
+
+
+def sender_from_header(value: str) -> tuple[str, str]:
+    name, address = parseaddr(value)
+    return (_clean_text(name), address.strip().lower())
 
 
 def message_published_at(message: dict[str, Any]) -> str | None:
@@ -270,16 +361,20 @@ def _newer_message_marker(
     return latest_at, latest_id
 
 
-def _list_messages(service: Any, query: str) -> list[dict[str, Any]]:
+def _list_messages(service: Any, query: str, *, limit: int | None = None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     page_token: str | None = None
     while True:
         kwargs = {"userId": "me", "q": query}
+        if limit is not None:
+            kwargs["maxResults"] = max(1, min(limit - len(messages), 100))
         if page_token:
             kwargs["pageToken"] = page_token
         request = service.users().messages().list(**kwargs)
         response = request.execute()
         messages.extend(response.get("messages", []))
+        if limit is not None and len(messages) >= limit:
+            return messages[:limit]
         page_token = response.get("nextPageToken")
         if not page_token:
             return messages
@@ -354,6 +449,62 @@ def _keep_newsletter_link(url: str, text: str) -> bool:
     if any(marker in url.lower() for marker in ("/unsubscribe", "unsubscribe=", "manage-preferences")):
         return False
     return True
+
+
+def _query_terms(value: str) -> list[str]:
+    words = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9+.-]{1,}", value.lower())
+    blocked = {
+        "and",
+        "are",
+        "days",
+        "emails",
+        "from",
+        "last",
+        "newsletter",
+        "newsletters",
+        "received",
+        "the",
+        "this",
+        "week",
+        "with",
+    }
+    terms: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        if word in blocked or word.isdigit() or word in seen:
+            continue
+        terms.append(word)
+        seen.add(word)
+    return terms
+
+
+def _looks_like_newsletter(sender: str, subject: str, payload: dict[str, Any]) -> bool:
+    haystack = " ".join([sender, subject, extract_plain_text(payload)[:900]]).lower()
+    markers = (
+        "newsletter",
+        "digest",
+        "roundup",
+        "weekly",
+        "daily",
+        "brief",
+        "substack",
+        "beehiiv",
+        "view in browser",
+        "unsubscribe",
+        "read more",
+    )
+    return any(marker in haystack for marker in markers)
+
+
+def _latest_iso(left: str | None, right: str | None) -> str | None:
+    if not left:
+        return right
+    if not right:
+        return left
+    try:
+        return left if _timestamp_from_iso(left) >= _timestamp_from_iso(right) else right
+    except (TypeError, ValueError):
+        return left
 
 
 def _http_status(exc: Exception) -> int | None:

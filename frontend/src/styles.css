@@ -524,6 +524,48 @@ a {
   background: #fff4dc;
 }
 
+.gmail-candidate-message {
+  display: grid;
+  gap: 10px;
+}
+
+.gmail-candidate-message p {
+  margin: 0;
+}
+
+.gmail-candidate-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding-left: 1.35rem;
+}
+
+.gmail-candidate-list li {
+  padding-left: 4px;
+}
+
+.gmail-candidate-list li::marker {
+  font-weight: 800;
+}
+
+.gmail-candidate-list div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.gmail-candidate-list span {
+  color: #5f5f59;
+  overflow-wrap: anywhere;
+}
+
+.gmail-candidate-list small {
+  display: block;
+  color: #6f6f68;
+  line-height: 1.35;
+}
+
 .refinement-input {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1166,6 +1208,40 @@ label {
   box-shadow: 0 24px 70px rgba(23, 23, 23, 0.24);
 }
 
+.advanced-settings-modal {
+  position: relative;
+  width: min(720px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  overflow: auto;
+  display: grid;
+  gap: 18px;
+  padding: 28px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(23, 23, 23, 0.24);
+}
+
+.advanced-settings-modal h2 {
+  margin: 2px 0 0;
+  font-size: clamp(1.25rem, 2vw, 1.65rem);
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.advanced-settings-modal .section-kicker {
+  margin: 0;
+}
+
+.modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid #deddd6;
+}
+
 .refinement-progress-modal h2,
 .refinement-progress-modal p {
   margin: 0;
@@ -1437,6 +1513,15 @@ label {
 
   .confirmation-actions {
     justify-content: stretch;
+  }
+
+  .modal-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .modal-actions button {
+    width: 100%;
   }
 
   .number-stepper.compact {

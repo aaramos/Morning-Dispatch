@@ -2466,7 +2466,12 @@ def render_ingested_issue(
         else [payload for payload in payloads if payload.source_type == "gmail"]
     )
     fetched_articles = [result for result in article_results if result.fetched and result.tier != "dropped"]
-    story_articles = [result for result in fetched_articles if not _is_media_result(result)]
+    market_articles = [result for result in fetched_articles if result.payload.source_type == "market_snapshot"]
+    story_articles = [
+        result
+        for result in fetched_articles
+        if not _is_media_result(result) and result.payload.source_type != "market_snapshot"
+    ]
     media_articles = [result for result in fetched_articles if _is_media_result(result)]
     lead_article = next((result for result in story_articles if result.tier == "lead"), None)
     if lead_article is None and story_articles:
@@ -2495,6 +2500,7 @@ def render_ingested_issue(
         stage_seconds=None,
     )
     lead_html = _render_lead_story(lead_article, issue_id=issue_id) if lead_article else ""
+    market_html = _render_market_snapshot_section(market_articles)
     image_strip_html = _render_image_strip([result for result in [lead_article, *ranked_articles, *media_articles] if result])
     ranked_html = "\n".join(
         _render_ranked_story(result, index=index, issue_id=issue_id)
@@ -2622,6 +2628,23 @@ def render_ingested_issue(
     .story-copy {{ display: grid; gap: 9px; }}
     .story-title {{ font-family: var(--display); font-size: clamp(1.42rem, 2.5vw, 2.05rem); line-height: 1.02; font-weight: 800; }}
     .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-transcript p {{ font-size: .98rem; line-height: 1.58; margin: 0; color: #4a4138; }}
+    .market-snapshot {{ border-top: 1px solid var(--ink); border-bottom: 1px solid var(--line); padding: 20px 0 8px; }}
+    .market-snapshot h2 {{ font-size: clamp(1.8rem, 3vw, 2.65rem); margin-bottom: 14px; }}
+    .market-grid {{ display: grid; gap: 10px; }}
+    .market-card {{ display: grid; grid-template-columns: minmax(118px, 160px) minmax(0, 1fr); gap: 14px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }}
+    .market-symbol {{ display: grid; gap: 3px; }}
+    .market-symbol strong {{ font: 900 1.35rem/1 var(--mono); color: var(--ink); }}
+    .market-symbol span {{ color: var(--muted); font: 700 .72rem/1.25 var(--mono); text-transform: uppercase; letter-spacing: .04em; }}
+    .market-performance {{ display: grid; gap: 8px; min-width: 0; }}
+    .market-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
+    .market-price {{ font: 900 1.05rem/1 var(--body); }}
+    .market-change {{ font: 800 .82rem/1 var(--mono); }}
+    .market-change.up {{ color: #17633a; }}
+    .market-change.down {{ color: #9f2820; }}
+    .market-change.flat {{ color: var(--muted); }}
+    .sparkline {{ width: 100%; height: 46px; display: block; overflow: visible; }}
+    .sparkline path {{ fill: none; stroke: var(--accent); stroke-width: 2.25; stroke-linecap: round; stroke-linejoin: round; }}
+    .sparkline .baseline {{ stroke: rgba(34, 29, 24, .18); stroke-width: 1; }}
     .story-thumb {{ aspect-ratio: 1; border-radius: 2px; }}
     .media-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
     .media-card {{ display: grid; gap: 12px; padding: 14px; background: rgba(255, 250, 241, .68); border: 1px solid var(--line); box-shadow: 0 10px 34px rgba(48, 35, 24, .06); }}
@@ -2685,6 +2708,7 @@ def render_ingested_issue(
       .masthead-meta {{ max-width: none; text-align: left; }}
       .brief-body, .media-grid, .podcast-brand {{ grid-template-columns: 1fr; }}
       .brief-sidebar {{ position: static; }}
+      .market-card {{ grid-template-columns: 1fr; }}
       .story-row {{ grid-template-columns: 48px minmax(0, 1fr); }}
       .story-thumb {{ display: none; }}
       .img-strip {{ grid-template-columns: 1fr; }}
@@ -2713,6 +2737,7 @@ def render_ingested_issue(
     {empty_state}
     <div class="brief-body">
       <div class="story-column">
+        {market_html}
         {image_strip_html}
         {lead_html}
         <section class="ranked-section" aria-labelledby="ranked-heading">
@@ -3443,6 +3468,119 @@ def _source_icon_svg(result: ArticleFetchResult) -> str:
     else:
         path = '<path d="M4 18 9.5 9l4 5 2.5-3 4 7H4Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="16" cy="7" r="2" fill="currentColor"/><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>'
     return f'<svg viewBox="0 0 24 24" role="img" aria-label="{escape(label)}">{path}</svg>'
+
+
+def _render_market_snapshot_section(results: list[ArticleFetchResult]) -> str:
+    cards = [_render_market_card(result) for result in results[:10]]
+    cards = [card for card in cards if card]
+    if not cards:
+        return ""
+    return f"""
+      <section class="market-snapshot" aria-labelledby="market-snapshot-heading">
+        <div class="section-kicker">Markets</div>
+        <h2 id="market-snapshot-heading">Ticker performance</h2>
+        <div class="market-grid">{''.join(cards)}</div>
+      </section>
+    """
+
+
+def _render_market_card(result: ArticleFetchResult) -> str:
+    metadata = _result_metadata(result)
+    ticker = str(metadata.get("ticker") or "").strip().upper()
+    if not ticker:
+        return ""
+    company_name = str(metadata.get("company_name") or result.title or ticker).strip()
+    price = _market_float(metadata.get("current_price"))
+    currency = str(metadata.get("currency") or "").strip()
+    change_1d = _market_float(metadata.get("change_1d_pct"))
+    change_3m = _market_float(metadata.get("change_3m_pct"))
+    if change_3m is None:
+        change_3m = _market_float(metadata.get("change_30d_pct"))
+    history = _market_price_history(metadata.get("price_history"))
+    sparkline = _render_sparkline(history)
+    return f"""
+      <article class="market-card">
+        <div class="market-symbol">
+          <strong>{escape(ticker)}</strong>
+          <span>{escape(_compact_company_name(company_name, ticker))}</span>
+        </div>
+        <div class="market-performance">
+          <div class="market-row">
+            <span class="market-price">{escape(_format_market_price(price, currency))}</span>
+            <span class="market-change {_change_class(change_1d)}">{escape(_format_pct(change_1d, "today"))}</span>
+            <span class="market-change {_change_class(change_3m)}">{escape(_format_pct(change_3m, "3M"))}</span>
+          </div>
+          {sparkline}
+        </div>
+      </article>
+    """
+
+
+def _market_price_history(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    prices: list[float] = []
+    for item in value[-90:]:
+        raw = item.get("close") if isinstance(item, dict) else item
+        number = _market_float(raw)
+        if number is not None:
+            prices.append(number)
+    return prices
+
+
+def _render_sparkline(prices: list[float]) -> str:
+    if len(prices) < 2:
+        return '<div class="meta">No 3-month price history available.</div>'
+    width = 220
+    height = 46
+    padding = 3
+    low = min(prices)
+    high = max(prices)
+    span = high - low
+    coordinates: list[str] = []
+    for index, price in enumerate(prices):
+        x = padding + (index / max(1, len(prices) - 1)) * (width - padding * 2)
+        y = height / 2 if span == 0 else padding + ((high - price) / span) * (height - padding * 2)
+        coordinates.append(f"{x:.1f},{y:.1f}")
+    path = "M " + " L ".join(coordinates)
+    return (
+        f'<svg class="sparkline" viewBox="0 0 {width} {height}" role="img" '
+        f'aria-label="Trailing 3-month price sparkline">'
+        f'<path class="baseline" d="M {padding} {height / 2:.1f} H {width - padding}" />'
+        f'<path d="{escape(path, quote=True)}" /></svg>'
+    )
+
+
+def _market_float(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def _format_market_price(value: float | None, currency: str) -> str:
+    if value is None:
+        return "Price n/a"
+    symbol = "$" if not currency or currency.upper() == "USD" else f"{currency.upper()} "
+    return f"{symbol}{value:,.2f}"
+
+
+def _format_pct(value: float | None, label: str) -> str:
+    if value is None:
+        return f"n/a {label}"
+    return f"{value:+.1f}% {label}"
+
+
+def _change_class(value: float | None) -> str:
+    if value is None or abs(value) < 0.05:
+        return "flat"
+    return "up" if value > 0 else "down"
+
+
+def _compact_company_name(company_name: str, ticker: str) -> str:
+    cleaned = company_name.replace(f"({ticker})", "").replace(ticker, "").strip(" -")
+    return cleaned[:70] or ticker
 
 
 def _render_lead_story(result: ArticleFetchResult, *, issue_id: str | None = None) -> str:

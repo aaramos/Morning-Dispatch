@@ -27,8 +27,10 @@ class FakeMessages:
         self.messages = messages
         self.list_error = list_error
         self.queries: list[str] = []
+        self.list_kwargs: list[dict[str, Any]] = []
 
     def list(self, **kwargs: Any) -> FakeRequest:
+        self.list_kwargs.append(dict(kwargs))
         self.queries.append(str(kwargs["q"]))
         if self.list_error:
             return FakeRequest(error=self.list_error)
@@ -247,3 +249,47 @@ def test_deduplication_by_url(monkeypatch, tmp_path):
     link_payloads = [payload for payload in payloads if payload.source_type == "gmail_link"]
     assert len(link_payloads) == 1
     assert link_payloads[0].original_url == "https://example.com/a"
+
+
+def test_discover_newsletter_candidates_groups_by_sender(monkeypatch):
+    service = FakeService(
+        {
+            "msg-1": gmail_message(
+                "msg-1",
+                plain_text="AI infrastructure newsletter with links and unsubscribe details.",
+                subject="AI Weekly Newsletter",
+                sender="AI Weekly <ai@example.com>",
+                internal_date="1779984000000",
+            ),
+            "msg-2": gmail_message(
+                "msg-2",
+                plain_text="The latest AI agents digest.",
+                subject="AI Weekly Digest",
+                sender="AI Weekly <ai@example.com>",
+                internal_date="1779897600000",
+            ),
+            "msg-3": gmail_message(
+                "msg-3",
+                plain_text="Personal note about coffee.",
+                subject="Coffee",
+                sender="friend@example.com",
+                internal_date="1779811200000",
+            ),
+        }
+    )
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: service)
+
+    candidates = asyncio.run(
+        gmail.discover_newsletter_candidates(
+            query_text="AI related newsletters received in last 7 days",
+            lookback_hours=168,
+            limit=4,
+        )
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sender == "ai@example.com"
+    assert candidates[0].sender_name == "AI Weekly"
+    assert candidates[0].message_count == 2
+    assert "newer_than:7d" in service.fake_messages.queries[0]
+    assert "maxResults" in service.fake_messages.list_kwargs[0]

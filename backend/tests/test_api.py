@@ -378,6 +378,56 @@ def test_issue_renderer_can_hide_scanned_newsletters_from_topic_brief():
     assert "Mexico City Travel Guide" in html
 
 
+def test_issue_renderer_surfaces_market_snapshot_sparklines():
+    payload = NormalizedPayload(
+        source_type="market_snapshot",
+        source_name="NVIDIA (NVDA)",
+        original_url="https://finance.yahoo.com/quote/NVDA",
+        raw_text="Public-market snapshot for NVIDIA.",
+        metadata={
+            "ticker": "NVDA",
+            "company_name": "NVIDIA",
+            "current_price": 900.0,
+            "currency": "USD",
+            "change_1d_pct": 1.2,
+            "change_3m_pct": 18.4,
+            "price_history": [{"close": 760.0}, {"close": 820.0}, {"close": 900.0}],
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://finance.yahoo.com/quote/NVDA",
+        final_url="https://finance.yahoo.com/quote/NVDA",
+        canonical_url="https://finance.yahoo.com/quote/NVDA",
+        title="NVIDIA (NVDA)",
+        text="Public-market snapshot for NVIDIA.",
+        excerpt="Public-market snapshot for NVIDIA.",
+        domain="finance.yahoo.com",
+        status="fetched",
+        section="Markets",
+        content_type="market",
+        metadata=dict(payload.metadata),
+    )
+
+    rendered = database.render_ingested_issue(
+        "AI Markets Brief",
+        "A market-aware brief.",
+        [payload],
+        [result],
+        lookback_hours=72,
+    )
+    html = BeautifulSoup(rendered, "html.parser")
+
+    market = html.select_one(".market-snapshot")
+    assert market is not None
+    assert "Ticker performance" in market.text
+    assert "NVDA" in market.text
+    assert "$900.00" in market.text
+    assert "+18.4% 3M" in market.text
+    assert market.select_one("svg.sparkline path") is not None
+    assert html.select_one(".story-list").text.strip() == "No stories were ready for this brief."
+
+
 def test_issue_renderer_flags_incomplete_ai_token_counts():
     article_result = ArticleFetchResult(
         payload=NormalizedPayload(

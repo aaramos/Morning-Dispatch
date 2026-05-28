@@ -31,13 +31,18 @@ class GmailSourceAdapter:
     good_for = ("newsletters", "primary_sources", "curated_links")
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
-        senders = _merge_unique(_approved_gmail_senders(), _requested_refs(profile, "gmail"))
+        senders = _merge_unique(
+            _approved_gmail_senders(),
+            _gmail_rule_senders(profile),
+            _requested_refs(profile, "gmail"),
+        )
         if not senders:
             return []
+        lookback_hours = _gmail_rule_lookback(profile) or context.lookback_hours
         payloads = await fetch_newsletters(
             digest_id=context.exploration_id,
             sender_allowlist=senders,
-            lookback_hours=context.lookback_hours,
+            lookback_hours=lookback_hours,
             db_path=str(database.database_path()),
         )
         return [
@@ -319,6 +324,25 @@ def _requested_refs(profile: TopicProfile, adapter: str) -> list[str]:
     return refs
 
 
+def _gmail_rule_senders(profile: TopicProfile) -> list[str]:
+    rules = profile.gmail_rules if isinstance(profile.gmail_rules, dict) else {}
+    senders = rules.get("include_senders")
+    if not isinstance(senders, list):
+        return []
+    return [str(sender).strip().lower() for sender in senders if str(sender).strip()]
+
+
+def _gmail_rule_lookback(profile: TopicProfile) -> int | None:
+    rules = profile.gmail_rules if isinstance(profile.gmail_rules, dict) else {}
+    try:
+        hours = int(rules.get("lookback_hours"))
+    except (TypeError, ValueError):
+        return None
+    if hours < 1:
+        return None
+    return min(hours, 8760)
+
+
 def _merge_unique(*groups: list[str]) -> list[str]:
     values: list[str] = []
     seen: set[str] = set()
@@ -447,6 +471,8 @@ def _market_candidate(snapshot: MarketSnapshot) -> Candidate:
                 "change_1d_pct": snapshot.change_1d_pct,
                 "change_7d_pct": snapshot.change_7d_pct,
                 "change_30d_pct": snapshot.change_30d_pct,
+                "change_3m_pct": snapshot.change_3m_pct,
+                "price_history": list(snapshot.price_history),
                 "analyst_rating": snapshot.analyst_rating,
                 "sector": snapshot.sector,
                 "industry": snapshot.industry,

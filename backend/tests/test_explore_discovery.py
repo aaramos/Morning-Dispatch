@@ -543,6 +543,41 @@ def test_create_topic_profile_and_queue_build_is_atomic(monkeypatch, tmp_path) -
         assert database.get_refinement_session(refinement["session_id"]) is None
 
 
+def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        created = client.post(
+            "/api/explore/topic-profiles",
+            json={
+                "statement": "Explore local AI workflows",
+                "scope": "Local AI operations and tooling",
+                "source_selection": {"web_search": True, "reddit": True},
+            },
+        )
+        topic_id = created.json()["topic_id"]
+
+        updated = client.post(
+            f"/api/explore/topic-profiles/{topic_id}/content-limits",
+            json={
+                "content_limits": {
+                    "total_items": 9,
+                    "lead_items": 2,
+                    "per_source": {"web_search": 5, "reddit": 2},
+                    "quality_floor": "strong",
+                },
+            },
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["profile"]["content_limits"] == {
+            "lead_items": 2,
+            "per_source": {"reddit": 2, "web_search": 5},
+            "quality_floor": "strong",
+            "total_items": 9,
+        }
+
+
 def test_rebuild_preserves_topic_profile_lookback(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
@@ -1395,7 +1430,7 @@ def test_refinement_session_finalizes_topic_profile(monkeypatch, tmp_path) -> No
             "/api/explore/refinement-sessions",
             json={
                 "statement": "Explore local AI agents",
-                "source_selection": {"gmail": True, "reddit": False},
+                "source_selection": {"gmail": False, "reddit": False},
             },
         )
         assert started.status_code == 201
@@ -1700,6 +1735,29 @@ def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None
     assert len(model_client.calls) >= 3
 
 
+def test_refinement_model_client_marks_private_sources_for_local_routing(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    calls: list[dict[str, Any]] = []
+    marker_client = object()
+
+    def fake_client_for_agent(agent: str, **kwargs: Any) -> Any:
+        calls.append({"agent": agent, **kwargs})
+        return type("Resolution", (), {"client": marker_client})()
+
+    monkeypatch.setattr(refinement.model_routing, "client_for_agent", fake_client_for_agent)
+
+    client = refinement._refinement_model_client(
+        {
+            "models": {"refinement": None},
+            "source_selection": {"gmail": True, "collections": True, "web_search": True},
+        }
+    )
+
+    assert client is marker_client
+    assert calls[0]["agent"] == "refinement"
+    assert calls[0]["items"] == [{"source_type": "gmail"}, {"source_type": "collection_chunk"}]
+
+
 def test_refinement_session_accepts_no_exclusions(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
 
@@ -1824,6 +1882,64 @@ def test_refinement_session_api_ignores_invalid_model_payload_values(monkeypatch
     assert body["profile"]["models"]["refinement"] is None
     assert body["topic_profile"]["profile"]["models"]["brief"] is None
     assert body["topic_profile"]["profile"]["models"]["refinement"] is None
+
+
+def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    async def fake_discover_newsletter_candidates(**_kwargs: Any) -> list[Any]:
+        class CandidateRecord:
+            sender = "ai@example.com"
+            sender_name = "AI Weekly"
+            subject = "AI Weekly: agents and infrastructure"
+            message_count = 2
+            latest_at = "2026-05-28T12:00:00+00:00"
+
+            def to_dict(self) -> dict[str, Any]:
+                return {
+                    "sender": self.sender,
+                    "sender_name": self.sender_name,
+                    "subject": self.subject,
+                    "message_count": self.message_count,
+                    "latest_at": self.latest_at,
+                }
+
+        return [CandidateRecord()]
+
+    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Track AI infrastructure",
+                "source_selection": {"gmail": True, "web_search": True},
+            },
+        )
+        assert started.status_code == 201
+        assert started.json()["pending_field"] == "gmail_rules"
+        assert "How do you want me to use Gmail" in started.json()["messages"][0]["content"]
+
+        searched = client.post(
+            f"/api/explore/refinement-sessions/{started.json()['session_id']}/messages",
+            json={"answer": "AI related newsletters received in last 7 days"},
+        )
+        assert searched.status_code == 200
+        body = searched.json()
+        assert body["pending_field"] == "gmail_sender_selection"
+        assert body["profile"]["gmail_rules"]["lookback_hours"] == 168
+        assert body["profile"]["gmail_rules"]["candidates"][0]["sender"] == "ai@example.com"
+        assert "AI Weekly" in body["messages"][-1]["content"]
+
+        confirmed = client.post(
+            f"/api/explore/refinement-sessions/{started.json()['session_id']}/messages",
+            json={"answer": "1"},
+        )
+        assert confirmed.status_code == 200
+        final_body = confirmed.json()
+        assert final_body["status"] == "finalized"
+        assert final_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
+        assert {"adapter": "gmail", "ref": "ai@example.com"} in final_body["profile"]["requested_sources"]
 
 
 def test_create_topic_profile_accepts_model_override(monkeypatch, tmp_path) -> None:
