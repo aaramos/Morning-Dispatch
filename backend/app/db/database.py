@@ -123,6 +123,7 @@ def init_database() -> None:
         _ensure_youtube_quota_table(connection)
         _ensure_collection_tables(connection)
         _ensure_inference_metric_status_values(connection)
+        _ensure_inference_metric_route_name_column(connection)
         _ensure_default_profile(connection)
 
 
@@ -631,6 +632,7 @@ def _ensure_inference_metric_status_values(connection: sqlite3.Connection) -> No
           model_tag             TEXT,
           quantization          TEXT,
           backend               TEXT,
+          route_name            TEXT,
           mode                  TEXT NOT NULL,
           queue_wait_ms         INTEGER,
           ttft_ms               INTEGER,
@@ -659,6 +661,16 @@ def _ensure_inference_metric_status_values(connection: sqlite3.Connection) -> No
         """
     )
     connection.execute("DROP TABLE inference_metrics_legacy")
+
+
+def _ensure_inference_metric_route_name_column(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(inference_metrics)").fetchall()
+    }
+    if "route_name" in columns:
+        return
+    connection.execute("ALTER TABLE inference_metrics ADD COLUMN route_name TEXT")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -2484,13 +2496,13 @@ def render_ingested_issue(
     if not payloads:
         empty_state = """
         <section class="empty">
-          <strong>No newsletter items were found.</strong>
-          Check the source allowlist, Gmail labels, or the digest lookback window.
+          <strong>No source content was found for this brief.</strong>
+          Try broadening the interest or adding more sources before rebuilding.
         </section>
         """
     ranked_empty = ""
     if not lead_html and not ranked_html and not media_html:
-        ranked_empty = '<p class="meta">No article pages were fetched yet.</p>'
+        ranked_empty = '<p class="meta">No stories were ready for this brief.</p>'
     media_section = ""
     if media_html:
         media_section = f"""
@@ -2511,6 +2523,7 @@ def render_ingested_issue(
         """
     generated_value = generated_at or utc_now()
     masthead_meta = _render_masthead_meta(generated_value, lookback_hours, effective_stats)
+    dateline_label = escape(_format_brief_dateline(generated_value))
     generated_footer = _render_generated_footer(generated_value)
     feedback_script = _render_feedback_script(issue_id)
     podcast_script = _render_podcast_modal_script()
@@ -2672,7 +2685,7 @@ def render_ingested_issue(
       <div class="masthead-meta">{masthead_meta}</div>
     </header>
     <section class="brief-header">
-      <div class="dateline">Editorial brief</div>
+      <div class="dateline">{dateline_label}</div>
       <h1>{escape(title)}</h1>
       <p class="snapshot">{escape(snapshot)}</p>
     </section>
@@ -2682,9 +2695,9 @@ def render_ingested_issue(
         {image_strip_html}
         {lead_html}
         <section class="ranked-section" aria-labelledby="ranked-heading">
-          <div class="section-kicker">Ranked stories</div>
-          <h2 id="ranked-heading">Ranked stories</h2>
-          <div class="story-list">{ranked_html or ranked_empty or '<p class="meta">No additional ranked stories.</p>'}</div>
+          <div class="section-kicker">Ranked</div>
+          <h2 id="ranked-heading">Top stories</h2>
+          <div class="story-list">{ranked_html or ranked_empty or '<p class="meta">No additional stories this run.</p>'}</div>
         </section>
         {media_section}
         {lower_section}
@@ -2728,12 +2741,12 @@ def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None
   <main>
     <header>
       <h1>{title}</h1>
-      <div class="date">Local preview issue</div>
+      <div class="date">Building your brief</div>
     </header>
     <p class="snapshot">{snapshot}</p>
     <section class="empty">
-      <strong>No article items yet.</strong>
-      The next slice will connect approved Gmail newsletters, filter links, and fetch primary articles.
+      <strong>Your brief is on its way.</strong>
+      Stories will appear here once sources have been searched and ranked. Check back in a moment.
     </section>
     {generated_footer}
   </main>
@@ -3633,7 +3646,7 @@ def _render_brief_sidebar(
       <aside class="brief-sidebar" aria-label="Brief sources and process">
         <section class="side-panel provenance">
           <div class="section-kicker">Sources & process</div>
-          <h2>How this was made</h2>
+          <h2>About this brief</h2>
           <div class="side-stats">{stat_html}</div>
           {strategy_html}
           {model_usage_html}
@@ -4592,7 +4605,7 @@ def _format_article_date(value: str | None) -> str:
 
 
 def _render_generated_footer(generated_at: str | None) -> str:
-    return f'<footer class="issue-footer">Generated {escape(_format_generated_timestamp(generated_at))}</footer>'
+    return f'<footer class="issue-footer">Morning Dispatch · {escape(_format_generated_timestamp(generated_at))}</footer>'
 
 
 def _render_masthead_meta(generated_at: str | None, lookback_hours: int, stats: dict[str, Any] | None = None) -> str:
@@ -4615,6 +4628,23 @@ def _format_source_scope(lookback_hours: int) -> str:
     if hours == 1:
         return "last hour"
     return f"last {hours} hours"
+
+
+def _format_brief_dateline(value: str | None) -> str:
+    if not value:
+        value = utc_now()
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return "Your brief"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    try:
+        local_zone = ZoneInfo(get_settings().scheduler_timezone)
+    except ZoneInfoNotFoundError:
+        local_zone = UTC
+    parsed = parsed.astimezone(local_zone)
+    return parsed.strftime("%A, %B %-d, %Y")
 
 
 def _format_generated_timestamp(value: str | None) -> str:
@@ -5014,6 +5044,7 @@ INFERENCE_METRIC_COLUMNS = {
     "model_tag",
     "quantization",
     "backend",
+    "route_name",
     "mode",
     "queue_wait_ms",
     "ttft_ms",
@@ -5046,6 +5077,7 @@ def record_inference_metric(metric: dict[str, Any]) -> str:
         "model_tag": _nullable_str(metric.get("model_tag")),
         "quantization": _nullable_str(metric.get("quantization")),
         "backend": _nullable_str(metric.get("backend")),
+        "route_name": _nullable_str(metric.get("route_name")),
         "mode": str(metric.get("mode") or "single"),
         "queue_wait_ms": _nullable_int(metric.get("queue_wait_ms")),
         "ttft_ms": _nullable_int(metric.get("ttft_ms")),
@@ -5139,7 +5171,7 @@ def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:
     route_groups: dict[tuple[str, str, str | None, str | None], list[dict[str, Any]]] = {}
     for row in records:
         key = (
-            str(row.get("mode") or "single"),
+            str(row.get("route_name") or row.get("mode") or "default"),
             str(row.get("model") or "unknown"),
             _nullable_str(row.get("backend")),
             _nullable_str(row.get("model_tag")),
@@ -5147,12 +5179,21 @@ def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:
         route_groups.setdefault(key, []).append(row)
 
     route_summaries = []
-    for (mode, model, backend, model_tag), group in route_groups.items():
+    for (route_name, model, backend, model_tag), group in route_groups.items():
         durations = sorted(_model_service_ms(row) for row in group if row.get("total_ms") is not None)
+        queue_waits = sorted(int(row["queue_wait_ms"]) for row in group if row.get("queue_wait_ms") is not None)
+        prompt_tokens = [int(row["prompt_tokens"]) for row in group if row.get("prompt_tokens") is not None]
+        completion_tokens = [int(row["completion_tokens"]) for row in group if row.get("completion_tokens") is not None]
+        token_rates = [float(row["tokens_per_sec"]) for row in group if row.get("tokens_per_sec") is not None]
+        total_tokens = [
+            int(row["prompt_tokens"]) + int(row["completion_tokens"])
+            for row in group
+            if row.get("prompt_tokens") is not None and row.get("completion_tokens") is not None
+        ]
         success = sum(1 for row in group if row["status"] == "success")
         route_summaries.append(
             {
-                "mode": mode,
+                "route_name": route_name,
                 "model": model,
                 "backend": backend,
                 "model_tag": model_tag,
@@ -5160,11 +5201,17 @@ def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:
                 "success_count": success,
                 "failure_count": len(group) - success,
                 "avg_total_ms": _average(durations),
+                "p95_total_ms": _percentile(durations, 95),
+                "avg_queue_wait_ms": _average(queue_waits),
+                "avg_prompt_tokens": _average(prompt_tokens),
+                "avg_completion_tokens": _average(completion_tokens),
+                "avg_tokens_per_sec": _average(token_rates),
+                "avg_total_tokens": _average(total_tokens),
                 "fallback_rate": _rate(sum(1 for row in group if row.get("fallback_triggered")), len(group)),
             }
         )
 
-    route_summaries.sort(key=lambda row: (row["mode"], -row["record_count"]))
+    route_summaries.sort(key=lambda row: (row["route_name"], -row["record_count"]))
     recent = records[:20]
     return {
         "record_count": total_count,
