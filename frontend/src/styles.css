@@ -886,6 +886,15 @@ label {
   overflow-wrap: anywhere;
 }
 
+.source-progress span,
+.source-progress small {
+  display: block;
+}
+
+.source-progress span {
+  margin-bottom: 4px;
+}
+
 .source-progress small,
 .source-admin-card p,
 .health-card p,
