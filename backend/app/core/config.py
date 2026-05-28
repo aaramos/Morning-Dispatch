@@ -141,7 +141,9 @@ def _model_enabled(raw_value: str | None, *, model: str | None, api_key: str | N
         return True
     if value in {"0", "false", "no", "off"}:
         return False
-    return bool(model and api_key)
+    # Auto: enable when a model name is configured. Local servers (LM Studio,
+    # Ollama) do not require an API key, so we don't gate on api_key here.
+    return bool(model)
 
 
 def _bool_from_env(name: str, default: bool = False) -> bool:

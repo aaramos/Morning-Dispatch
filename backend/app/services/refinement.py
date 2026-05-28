@@ -341,25 +341,34 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
 
     gmail_result = _advance_gmail_refinement(profile, pending, answer=answer, just_go_now=just_go_now)
     if gmail_result is not None:
-        profile, assistant_message, next_pending, status = gmail_result
-        topic_id = session.get("topic_id")
+        profile, assistant_message, gmail_next_pending, gmail_status = gmail_result
         if assistant_message:
             messages.append({"role": "assistant", "content": assistant_message})
-        if status == "finalized":
-            profile = _fill_defaults(profile)
-            saved = explore.save_topic_profile(profile)
-            topic_id = str(saved["topic_id"])
-            messages.append({"role": "assistant", "content": "Topic profile is ready."})
-        updated = database.update_refinement_session(
-            session_id,
-            profile=profile,
-            messages=messages,
-            pending_field=next_pending,
-            turn_count=turn_count,
-            status=status,
-            topic_id=topic_id,
-        )
-        return _session_response(updated) if updated else None
+        if gmail_status == "continue":
+            # Gmail is one step of the interview, not the whole thing. Hand control
+            # back to the questioning engine so scope/depth/recency/related
+            # interests/exclusions still get asked before we finalize.
+            answer = ""
+            answered_field = ""
+            answer_applied = True
+            pending = gmail_next_pending
+        else:
+            topic_id = session.get("topic_id")
+            if gmail_status == "finalized":
+                profile = _fill_defaults(profile)
+                saved = explore.save_topic_profile(profile)
+                topic_id = str(saved["topic_id"])
+                messages.append({"role": "assistant", "content": "Topic profile is ready."})
+            updated = database.update_refinement_session(
+                session_id,
+                profile=profile,
+                messages=messages,
+                pending_field=gmail_next_pending,
+                turn_count=turn_count,
+                status=gmail_status,
+                topic_id=topic_id,
+            )
+            return _session_response(updated) if updated else None
 
     agent_update = _run_refinement_agent(
         profile=profile,
@@ -488,7 +497,7 @@ def _advance_gmail_refinement(
                     "These newsletters become discovery feeds, and the articles they link to become primary content for this brief."
                 ),
                 None,
-                "finalized",
+                "continue",
             )
         rules["include_senders"] = []
         updated["gmail_rules"] = rules
@@ -497,7 +506,7 @@ def _advance_gmail_refinement(
             _coerce_profile(updated),
             "Got it. I'll continue without Gmail for this brief.",
             None,
-            "finalized",
+            "continue",
         )
 
     return None

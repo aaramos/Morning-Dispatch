@@ -1996,7 +1996,23 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
             json={"answer": "1"},
         )
         assert confirmed.status_code == 200
-        final_body = confirmed.json()
+        confirmed_body = confirmed.json()
+        # Gmail is one step of the interview, not the whole thing: after approving a
+        # sender the session must keep interviewing instead of finalizing.
+        assert confirmed_body["status"] == "active"
+        assert confirmed_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
+        assert {"adapter": "gmail", "ref": "ai@example.com"} in confirmed_body["profile"]["requested_sources"]
+        assert "Approved ai@example.com" in confirmed_body["messages"][-2]["content"]
+        # A real follow-up question is asked rather than ending the conversation.
+        assert confirmed_body["pending_field"] not in (None, "gmail_rules", "gmail_sender_selection")
+        assert confirmed_body["messages"][-1]["role"] == "assistant"
+
+        finalized = client.post(
+            f"/api/explore/refinement-sessions/{started.json()['session_id']}/messages",
+            json={"just_go_now": True},
+        )
+        assert finalized.status_code == 200
+        final_body = finalized.json()
         assert final_body["status"] == "finalized"
         assert final_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
         assert {"adapter": "gmail", "ref": "ai@example.com"} in final_body["profile"]["requested_sources"]
