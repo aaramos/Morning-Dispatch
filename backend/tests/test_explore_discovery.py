@@ -124,6 +124,34 @@ def test_topic_profile_infers_numeric_lookback_from_interest_text() -> None:
     assert profile.lookback_hours == 72
 
 
+def test_refinement_interprets_year_old_source_scope_answer() -> None:
+    profile = {
+        "statement": "traveling to mexico city",
+        "scope": "Mexico City travel planning",
+        "recency_weighting": "recent",
+        "lookback_hours": 72,
+    }
+
+    updated = refinement._apply_answer(profile, "recency_weighting", "articles should be no more than a year old")
+
+    assert updated["source_scope_answered"] is True
+    assert updated["recency_weighting"] == "last_year"
+    assert updated["lookback_hours"] == 8760
+
+
+def test_refinement_seeds_year_lookback_from_interest_text() -> None:
+    profile = refinement._seed_profile_with_hints(
+        {
+            "statement": "traveling to mexico city; include content from the most recent year",
+            "source_selection": {"web_search": True},
+        }
+    )
+
+    assert profile["source_scope_answered"] is True
+    assert profile["recency_weighting"] == "last_year"
+    assert profile["lookback_hours"] == 8760
+
+
 def test_source_window_filter_allows_undated_web_results_once(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
@@ -1513,7 +1541,8 @@ def test_refinement_agent_does_not_reask_stated_market_recency_and_exclusions(mo
     assert "how recent" not in question
     assert "avoid" not in question
     assert "signals" in question or "actionable" in question or "catalysts" in question
-    assert body["profile"]["recency_weighting"] == "breaking"
+    assert body["profile"]["recency_weighting"] == "recent"
+    assert body["profile"]["lookback_hours"] == 72
     assert body["profile"]["source_scope_answered"] is True
     assert "MSN" in body["profile"]["exclusions"]
     assert "Yahoo News" in body["profile"]["exclusions"]

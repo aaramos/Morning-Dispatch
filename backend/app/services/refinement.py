@@ -44,7 +44,7 @@ QUESTIONS = {
     "scope": "What angle would make this most useful for you?",
     "related_interests": "Are there any nearby topics or constraints I should include?",
     "depth": "Do you want practical, get-things-done coverage, or a deeper expert-level read?",
-    "recency_weighting": "Should I focus on what is happening now, recent material, the last year, or the best material I can find regardless of date?",
+    "recency_weighting": "How recent does the source material need to be? For example: last 24 hours, last 3 days, no more than a year old, or best available regardless of date.",
     "requested_sources": "Any specific podcast, YouTube channel, subreddit, newsletter, site, company, or collection I should try to include?",
     "exclusions": "Anything I should avoid so the brief stays focused?",
 }
@@ -105,6 +105,10 @@ You are an expert interviewer, not a form. Think first, ask second.
   avoid. Instead ask about investable signals: earnings/capex/pricing/supply
   chain/customer demand, relative comparison, risk catalysts, or what would make
   the brief actionable.
+- When the user answers how recent the content should be, interpret natural
+  language into a concrete source window. Examples: "last 24 hours" means 24
+  hours, "last 3 days" means 72 hours, and "no more than a year old" means the
+  last year. Confirm the interpreted window in plain language before building.
 - For finance requests, resolve company names to likely tradable tickers when
   you can. Put the ticker in markets source queries and show company + ticker in
   the search plan, rather than asking the user to provide the symbol.
@@ -778,7 +782,14 @@ def _apply_answer(profile: dict[str, Any], field: str, answer: str) -> dict[str,
             updated["depth"] = "informed-generalist"
         updated["depth_answered"] = True
     elif field == "recency_weighting":
-        updated["recency_weighting"] = _normalize_recency(answer) or "recent"
+        lookback_hours = _extract_lookback_hours(answer)
+        if lookback_hours:
+            updated["lookback_hours"] = lookback_hours
+            updated["recency_weighting"] = _recency_from_lookback_hours(lookback_hours)
+        else:
+            updated["recency_weighting"] = _normalize_recency(answer) or "recent"
+            if updated["recency_weighting"] in {"last_year", "all_available"}:
+                updated["lookback_hours"] = 8760
         updated["source_scope_answered"] = True
     elif field == "exclusions":
         updated["exclusions_answered"] = True
@@ -874,11 +885,21 @@ def _coerce_model_field_updates(
 
     if field == "recency_weighting":
         normalized = _normalize_recency(parsed.get("recency_weighting"))
+        lookback_hours = _coerce_lookback_hours(parsed.get("lookback_hours")) or _extract_lookback_hours(raw_answer)
+        if lookback_hours:
+            return {
+                "recency_weighting": _recency_from_lookback_hours(lookback_hours),
+                "lookback_hours": lookback_hours,
+                "source_scope_answered": True,
+            }
         if not normalized:
             normalized = _normalize_recency(raw_answer)
         if not normalized:
             return None
-        return {"recency_weighting": normalized, "source_scope_answered": True}
+        updates: dict[str, Any] = {"recency_weighting": normalized, "source_scope_answered": True}
+        if normalized in {"last_year", "all_available"}:
+            updates["lookback_hours"] = 8760
+        return updates
 
     if field == "exclusions":
         exclusions = parsed.get("exclusions")
@@ -912,7 +933,7 @@ def _normalize_recency(value: Any) -> str:
         return "breaking"
     if lowered in {"recent", "recent_time", "fresh_time", "last_30_days", "last_month", "balanced", "mix", "both"}:
         return "recent"
-    if lowered in {"last_year", "within_last_year", "past_year", "last_12_months", "year"}:
+    if lowered in {"last_year", "within_last_year", "past_year", "last_12_months", "year", "one_year", "a_year", "no_more_than_a_year_old"}:
         return "last_year"
     if lowered in {
         "all_available",
@@ -968,8 +989,11 @@ def _build_refinement_prompt(*, field: str, answer: str, profile: dict[str, Any]
         )
     if field == "recency_weighting":
         return (
-            "Return strict JSON with one key: recency_weighting.\n"
+            "Return strict JSON with recency_weighting and, when the user gives a concrete window, lookback_hours.\n"
             'Allowed values: breaking, recent, last_year, all_available.\n'
+            'Examples: "last 24 hours" -> {"recency_weighting": "breaking", "lookback_hours": 24}; '
+            '"last 3 days" -> {"recency_weighting": "recent", "lookback_hours": 72}; '
+            '"no more than a year old" -> {"recency_weighting": "last_year", "lookback_hours": 8760}.\n'
             f"\nCurrent profile snapshot: {profile_snapshot}\n"
             f"User answer: {answer}"
         )
@@ -1190,7 +1214,7 @@ def _seed_profile_with_hints(profile: dict[str, Any]) -> dict[str, Any]:
     if lookback_hours:
         updated["lookback_hours"] = lookback_hours
     if lookback:
-        updated["recency_weighting"] = "breaking"
+        updated["recency_weighting"] = _recency_from_lookback_hours(lookback_hours or 24)
         updated["source_scope_answered"] = True
     elif not updated.get("recency_weighting") and _contains(text, RECENCY_BREAKING_TOKENS):
         updated["recency_weighting"] = "breaking"
@@ -1320,12 +1344,16 @@ def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_lookback_constraint(text: str) -> str:
     lowered = str(text or "").lower()
-    match = re.search(r"\b(?:previous|past|last|within)\s+(\d{1,3})\s+(hour|hours|day|days|week|weeks|month|months)\b", lowered)
+    match = re.search(r"\b(?:previous|past|last|within|over|no more than|not older than)\s+(?:the\s+)?(\d{1,3}|a|an|one)\s+(hour|hours|day|days|week|weeks|month|months|year|years)\b", lowered)
     if match:
-        amount = int(match.group(1))
+        amount = _lookback_amount(match.group(1))
         unit = match.group(2)
         normalized_unit = unit if unit.endswith("s") else f"{unit}s"
         return f"previous {amount} {normalized_unit}"
+    if re.search(r"\b(?:within|over|during|from|include content from)\s+(?:the\s+)?(?:past|last|most recent|recent)\s+year\b", lowered):
+        return "previous 1 year"
+    if re.search(r"\b(?:no more than|not older than|within)\s+(?:a|one|the last)\s+year\s+old\b", lowered):
+        return "previous 1 year"
     if re.search(r"\b(today|latest|breaking|current|this week)\b", lowered):
         return "current/latest"
     return ""
@@ -1333,12 +1361,16 @@ def _extract_lookback_constraint(text: str) -> str:
 
 def _extract_lookback_hours(text: str) -> int | None:
     lowered = str(text or "").lower()
-    match = re.search(r"\b(?:previous|past|last|within)\s+(\d{1,3})\s+(hour|hours|day|days|week|weeks|month|months)\b", lowered)
+    match = re.search(r"\b(?:previous|past|last|within|over|no more than|not older than)\s+(?:the\s+)?(\d{1,3}|a|an|one)\s+(hour|hours|day|days|week|weeks|month|months|year|years)\b", lowered)
     if not match:
+        if re.search(r"\b(?:within|over|during|from|include content from)\s+(?:the\s+)?(?:past|last|most recent|recent)\s+year\b", lowered):
+            return 8760
+        if re.search(r"\b(?:no more than|not older than|within)\s+(?:a|one|the last)\s+year\s+old\b", lowered):
+            return 8760
         if re.search(r"\b(today|latest|breaking|current)\b", lowered):
             return 24
         return None
-    amount = int(match.group(1))
+    amount = _lookback_amount(match.group(1))
     unit = match.group(2)
     if unit.startswith("hour"):
         hours = amount
@@ -1346,9 +1378,27 @@ def _extract_lookback_hours(text: str) -> int | None:
         hours = amount * 24
     elif unit.startswith("week"):
         hours = amount * 7 * 24
+    elif unit.startswith("year"):
+        hours = amount * 365 * 24
     else:
         hours = amount * 30 * 24
     return _coerce_lookback_hours(hours)
+
+
+def _lookback_amount(value: str) -> int:
+    lowered = str(value or "").strip().lower()
+    if lowered in {"a", "an", "one"}:
+        return 1
+    return int(lowered)
+
+
+def _recency_from_lookback_hours(lookback_hours: int) -> str:
+    hours = _coerce_lookback_hours(lookback_hours) or 24
+    if hours <= 48:
+        return "breaking"
+    if hours >= 365 * 24:
+        return "last_year"
+    return "recent"
 
 
 def _extract_exclusion_hints(text: str) -> list[str]:

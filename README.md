@@ -41,10 +41,10 @@ Use absolute paths in `.env`; Docker Compose does not reliably expand `~`.
 
 ```bash
 uv sync
-MORNING_DISPATCH_HOME=/private/tmp/morning-dispatch-dev \
-MORNING_DISPATCH_DATA_DIR=/private/tmp/morning-dispatch-dev/data \
-MORNING_DISPATCH_SECRETS_DIR=/private/tmp/morning-dispatch-dev/secrets \
-MORNING_DISPATCH_DB_PATH=/private/tmp/morning-dispatch-dev/data/db/morning_dispatch.sqlite3 \
+MORNING_DISPATCH_HOME=/Users/macstudio/Apps/personal_intel/runtime \
+MORNING_DISPATCH_DATA_DIR=/Users/macstudio/Apps/personal_intel/runtime/data \
+MORNING_DISPATCH_SECRETS_DIR=/Users/macstudio/.morning-dispatch/secrets \
+MORNING_DISPATCH_DB_PATH=/Users/macstudio/Apps/personal_intel/runtime/data/db/morning_dispatch.sqlite3 \
 uv run uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -59,7 +59,7 @@ bash scripts/install_launchd.sh
 It runs `scripts/run_morning_dispatch.sh`, enables scheduled digest checks, runs daily digests at `05:00` Pacific by default, and keeps runtime data under:
 
 ```text
-/private/tmp/morning-dispatch-dev/
+/Users/macstudio/Apps/personal_intel/runtime/
 ```
 
 Useful checks:
@@ -67,7 +67,7 @@ Useful checks:
 ```bash
 launchctl print gui/$(id -u)/com.morning-dispatch
 curl http://127.0.0.1:8000/api/health
-curl https://ultras-mac-studio-2.tail4aeef0.ts.net/api/health
+curl https://ultras-mac-studio-3.tail4aeef0.ts.net/api/health
 ```
 
 ## Admin Gmail Login
@@ -87,8 +87,8 @@ From there you can upload a Google OAuth client secret JSON file and start the G
 Google OAuth redirect URLs generally need HTTPS unless they are localhost. For Tailscale use, set `MORNING_DISPATCH_PUBLIC_BASE_URL` to the HTTPS MagicDNS URL you registered in Google Cloud, for example:
 
 ```bash
-MORNING_DISPATCH_PUBLIC_BASE_URL=https://ultras-mac-studio-2.tail4aeef0.ts.net:8000 \
-MORNING_DISPATCH_HOST=100.113.204.75 \
+MORNING_DISPATCH_PUBLIC_BASE_URL=https://ultras-mac-studio-3.tail4aeef0.ts.net \
+MORNING_DISPATCH_HOST=0.0.0.0 \
 uv run python -m backend.app.server
 ```
 

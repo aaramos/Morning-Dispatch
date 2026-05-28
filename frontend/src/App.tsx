@@ -315,6 +315,7 @@ type ConfirmationDraft = {
   depth: "practitioner" | "informed-generalist";
   recency_weighting: SourceScope;
   exclusions: string;
+  sourceScopeTouched?: boolean;
 };
 
 type RefinementProgress = {
@@ -673,7 +674,7 @@ function DispatchApp() {
     const baseProfile = session?.profile ?? topicProfile?.profile;
     const topicId = topicProfile?.topic_id ?? session?.topic_id ?? baseProfile?.topic_id;
     const interest = activeInterest || baseProfile?.statement || "";
-    const lookbackHours = lookbackHoursForBuild(baseProfile, draft);
+    const lookbackHours = lookbackHoursForConfirmedDraft(baseProfile, draft);
     return {
       ...(topicId ? { topic_id: topicId } : {}),
       ...(session?.session_id ? { refinement_session_id: session.session_id } : {}),
@@ -1584,13 +1585,18 @@ function ConfirmationPanel(props: {
           Source Scope
           <select
             value={props.draft.recency_weighting}
-            onChange={(event) => props.onDraftChange({ ...props.draft, recency_weighting: event.target.value as ConfirmationDraft["recency_weighting"] })}
+            onChange={(event) => props.onDraftChange({
+              ...props.draft,
+              recency_weighting: event.target.value as ConfirmationDraft["recency_weighting"],
+              sourceScopeTouched: true,
+            })}
           >
             <option value="breaking">Breaking News</option>
             <option value="recent">Recent Time</option>
             <option value="last_year">Within Last Year</option>
             <option value="all_available">As Much as possible</option>
           </select>
+          <small>{sourceScopeConfirmation(props.draft.recency_weighting)}</small>
         </label>
         <label>
           Exclusions
@@ -2798,8 +2804,10 @@ function AdminApp() {
                     <small>{formatDateTime(item.exploration.finished_at ?? item.exploration.started_at)} · {formatSourceSelection(item.exploration.source_selection)}</small>
                     {isModelDegraded(item.exploration) ? (
                       <p className="warning-text">Built with AI issues.</p>
-                    ) : item.exploration.progress.built_with_issues ? (
+                    ) : item.exploration.progress.built_with_issues && item.exploration.status === "complete" ? (
                       <p className="warning-text">Built with source issues.</p>
+                    ) : item.exploration.progress.built_with_issues ? (
+                      <p className="warning-text">Source issues detected so far.</p>
                     ) : null}
                   </div>
                   <div className="button-row">
@@ -3246,6 +3254,7 @@ function emptyDraft(): ConfirmationDraft {
     depth: "informed-generalist",
     recency_weighting: "recent",
     exclusions: "",
+    sourceScopeTouched: false,
   };
 }
 
@@ -3253,18 +3262,44 @@ function draftFromProfile(profile: TopicProfile): ConfirmationDraft {
   return {
     scope: profile.scope || profile.statement || "",
     depth: profile.depth === "practitioner" ? "practitioner" : "informed-generalist",
-    recency_weighting: normalizeSourceScope(profile.recency_weighting),
+    recency_weighting: sourceScopeFromProfile(profile),
     exclusions: (profile.exclusions ?? []).join(", "),
+    sourceScopeTouched: false,
   };
+}
+
+function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft): number {
+  if (draft.sourceScopeTouched) return lookbackHoursFromSourceScope(draft.recency_weighting);
+  return lookbackHoursForBuild(profile, draft);
 }
 
 function lookbackHoursForBuild(profile: TopicProfile | null | undefined, draft?: ConfirmationDraft): number {
   const explicit = Number(profile?.lookback_hours ?? 0);
   if (Number.isFinite(explicit) && explicit >= 1) return Math.min(8760, Math.floor(explicit));
-  const sourceScope = draft?.recency_weighting ?? normalizeSourceScope(profile?.recency_weighting);
+  return lookbackHoursFromSourceScope(draft?.recency_weighting ?? normalizeSourceScope(profile?.recency_weighting));
+}
+
+function sourceScopeFromProfile(profile: TopicProfile): SourceScope {
+  const explicit = Number(profile.lookback_hours ?? 0);
+  if (Number.isFinite(explicit) && explicit >= 1) {
+    if (explicit <= 48) return "breaking";
+    if (explicit >= 365 * 24) return "last_year";
+    return "recent";
+  }
+  return normalizeSourceScope(profile.recency_weighting);
+}
+
+function lookbackHoursFromSourceScope(sourceScope: SourceScope): number {
   if (sourceScope === "last_year" || sourceScope === "all_available") return 8760;
   if (sourceScope === "recent") return 72;
   return 24;
+}
+
+function sourceScopeConfirmation(sourceScope: SourceScope): string {
+  if (sourceScope === "breaking") return "I’ll look for sources dated within the last 24 hours.";
+  if (sourceScope === "recent") return "I’ll look for sources dated within the last 3 days.";
+  if (sourceScope === "last_year") return "I’ll look for sources dated within the last year.";
+  return "I’ll use the best available sources, even when older context is useful.";
 }
 
 function normalizeSourceScope(value: string | undefined): SourceScope {

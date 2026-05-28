@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 PROJECT_DIR="/Users/macstudio/Apps/personal_intel"
-RUNTIME_HOME="/private/tmp/morning-dispatch-dev"
+RUNTIME_HOME="$PROJECT_DIR/runtime"
 SECRETS_HOME="${MORNING_DISPATCH_SECRETS_DIR:-/Users/macstudio/.morning-dispatch/secrets}"
 
 mkdir -p \
@@ -35,7 +35,7 @@ export MORNING_DISPATCH_SECRETS_DIR="$SECRETS_HOME"
 export MORNING_DISPATCH_DB_PATH="$RUNTIME_HOME/data/db/morning_dispatch.sqlite3"
 export MORNING_DISPATCH_GMAIL_CLIENT_SECRET_PATH="${MORNING_DISPATCH_GMAIL_CLIENT_SECRET_PATH:-$SECRETS_HOME/gmail/gmail_client_secret.json}"
 export MORNING_DISPATCH_GMAIL_CREDENTIALS_PATH="${MORNING_DISPATCH_GMAIL_CREDENTIALS_PATH:-$SECRETS_HOME/gmail/gmail_credentials.json}"
-export MORNING_DISPATCH_PUBLIC_BASE_URL="https://ultras-mac-studio-2.tail4aeef0.ts.net"
+export MORNING_DISPATCH_PUBLIC_BASE_URL="https://ultras-mac-studio-3.tail4aeef0.ts.net"
 export MORNING_DISPATCH_GMAIL_REMOTE_MCP_ENABLED="false"
 export MORNING_DISPATCH_LIBRARIAN_USE_MODEL="auto"
 export MORNING_DISPATCH_MODEL_BASE_URL="http://127.0.0.1:1234/v1"

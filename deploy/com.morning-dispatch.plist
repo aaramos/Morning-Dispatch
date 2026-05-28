@@ -17,8 +17,8 @@
   <key>WorkingDirectory</key>
   <string>/Users/macstudio/Apps/personal_intel</string>
   <key>StandardOutPath</key>
-  <string>/private/tmp/morning-dispatch-dev/logs/launchd.out.log</string>
+  <string>/Users/macstudio/Apps/personal_intel/runtime/logs/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/private/tmp/morning-dispatch-dev/logs/launchd.err.log</string>
+  <string>/Users/macstudio/Apps/personal_intel/runtime/logs/launchd.err.log</string>
 </dict>
 </plist>
