@@ -63,7 +63,7 @@ class TopicProfileCreate(BaseModel):
 class ExplorationCreate(BaseModel):
     mode: Literal["show_now", "scheduled"] = "show_now"
     source_selection: dict[str, bool] = Field(default_factory=dict)
-    candidate_limit: int = Field(default=80, ge=1, le=250)
+    candidate_limit: int = Field(default=250, ge=1, le=250)
     lookback_hours: int | None = Field(default=None, ge=1, le=8760)
 
 
@@ -74,7 +74,7 @@ class ExplorationRebuildCreate(ExplorationCreate):
 
 class TopicProfileBuildCreate(TopicProfileCreate):
     mode: Literal["show_now", "scheduled"] = "show_now"
-    candidate_limit: int = Field(default=80, ge=1, le=250)
+    candidate_limit: int = Field(default=250, ge=1, le=250)
     lookback_hours: int | None = Field(default=None, ge=1, le=8760)
     refinement_session_id: str | None = None
 

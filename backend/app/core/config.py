@@ -7,7 +7,7 @@ from pathlib import Path
 
 DEFAULT_LIBRARIAN_MODEL = "Gemma4-MTP-26B-BF16"
 DEFAULT_OLLAMA_CLOUD_MODEL = "Gemma4-MTP-26B-BF16"
-DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 250
+DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 150
 DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 DEFAULT_SCHEDULER_DAILY_RUN_TIME = "05:00"
 DEFAULT_SCHEDULER_TIMEZONE = "America/Los_Angeles"
@@ -52,14 +52,14 @@ class Settings:
     web_search_brave_api_key: str | None = None
     web_search_serpapi_api_key: str | None = None
     youtube_api_key: str | None = None
-    youtube_max_results: int = 15
+    youtube_max_results: int = 40
     youtube_duration_filter: str = "medium"
     collections_root: Path | None = None
-    collections_max_results: int = 12
+    collections_max_results: int = 50
     collections_max_file_bytes: int = 1_000_000
     markets_mode: str = "simple"
-    markets_max_core_companies: int = 5
-    markets_max_related_companies: int = 5
+    markets_max_core_companies: int = 10
+    markets_max_related_companies: int = 10
     scheduler_enabled: bool = False
     scheduler_interval_seconds: int = 300
     scheduler_daily_run_time: str = DEFAULT_SCHEDULER_DAILY_RUN_TIME
@@ -329,14 +329,14 @@ def get_settings() -> Settings:
         web_search_brave_api_key=web_search_brave_api_key,
         web_search_serpapi_api_key=web_search_serpapi_api_key,
         youtube_api_key=youtube_api_key,
-        youtube_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_YOUTUBE_MAX_RESULTS", 15), 50)),
+        youtube_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_YOUTUBE_MAX_RESULTS", 40), 50)),
         youtube_duration_filter=os.environ.get("MORNING_DISPATCH_YOUTUBE_DURATION_FILTER", "medium"),
         collections_root=collections_root,
-        collections_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_COLLECTIONS_MAX_RESULTS", 12), 50)),
+        collections_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_COLLECTIONS_MAX_RESULTS", 50), 50)),
         collections_max_file_bytes=max(1_000, _int_from_env("MORNING_DISPATCH_COLLECTIONS_MAX_FILE_BYTES", 1_000_000)),
         markets_mode=os.environ.get("MORNING_DISPATCH_MARKETS_MODE", "simple").strip().lower() or "simple",
-        markets_max_core_companies=max(1, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_CORE_COMPANIES", 5), 10)),
-        markets_max_related_companies=max(0, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_RELATED_COMPANIES", 5), 10)),
+        markets_max_core_companies=max(1, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_CORE_COMPANIES", 10), 10)),
+        markets_max_related_companies=max(0, min(_int_from_env("MORNING_DISPATCH_MARKETS_MAX_RELATED_COMPANIES", 10), 10)),
         scheduler_enabled=_bool_from_env("MORNING_DISPATCH_SCHEDULER_ENABLED", False),
         scheduler_interval_seconds=max(30, _int_from_env("MORNING_DISPATCH_SCHEDULER_INTERVAL_SECONDS", 300)),
         scheduler_daily_run_time=os.environ.get(

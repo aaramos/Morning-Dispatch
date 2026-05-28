@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 _BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
 _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
-_EXPLORE_MODEL_REFINEMENT_LIMIT = 24
+_EXPLORE_MODEL_REFINEMENT_LIMIT = 150
 _STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web"}
 _DATE_METADATA_KEYS = (
     "published_at",
@@ -129,7 +129,7 @@ async def _build_queue_worker() -> None:
                     str(exploration["topic_id"]),
                     mode=str(exploration.get("mode") or "show_now"),
                     source_selection=dict(exploration.get("source_selection") or {}),
-                    candidate_limit=int(queue_options.get("candidate_limit") or 80),
+                    candidate_limit=int(queue_options.get("candidate_limit") or 250),
                     lookback_hours=int(queue_options.get("lookback_hours") or 24),
                     existing_exploration=exploration,
                 )
@@ -320,7 +320,7 @@ async def run_discovery(
     *,
     mode: str = "show_now",
     source_selection: dict[str, bool] | None = None,
-    candidate_limit: int = 80,
+    candidate_limit: int = 250,
     lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     record = database.get_topic_profile(topic_id)
@@ -371,7 +371,7 @@ async def run_show_now(
     topic_id: str,
     *,
     source_selection: dict[str, bool] | None = None,
-    candidate_limit: int = 80,
+    candidate_limit: int = 250,
     lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     return await _run_exploration(
@@ -388,7 +388,7 @@ def start_show_now(
     *,
     mode: str = "show_now",
     source_selection: dict[str, bool] | None = None,
-    candidate_limit: int = 80,
+    candidate_limit: int = 250,
     lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     record = database.get_topic_profile(topic_id)
@@ -426,7 +426,7 @@ def start_rebuild(
     exploration_id: str,
     *,
     source_selection: dict[str, bool] | None = None,
-    candidate_limit: int = 80,
+    candidate_limit: int = 250,
     lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     exploration = database.get_exploration(exploration_id)
@@ -465,7 +465,7 @@ async def run_scheduled(
     topic_id: str,
     *,
     source_selection: dict[str, bool] | None = None,
-    candidate_limit: int = 80,
+    candidate_limit: int = 250,
     lookback_hours: int | None = None,
 ) -> dict[str, Any] | None:
     return await _run_exploration(
@@ -1580,7 +1580,7 @@ def _strengthen_profile_for_run(profile: TopicProfile) -> TopicProfile:
             ],
         )
     )
-    search_queries = tuple(_merge_terms(market_queries, profile.search_queries, limit=10))
+    search_queries = tuple(_merge_terms(market_queries, profile.search_queries, limit=20))
     source_selection = dict(profile.source_selection)
     if source_selection.get("markets"):
         source_selection["markets"] = True
@@ -1660,7 +1660,7 @@ def _merge_source_query_terms(
 ) -> dict[str, tuple[str, ...]]:
     merged = dict(existing)
     for source, queries in incoming.items():
-        merged[source] = tuple(_merge_terms(merged.get(source, ()), queries, limit=5))
+        merged[source] = tuple(_merge_terms(merged.get(source, ()), queries, limit=20))
     return merged
 
 

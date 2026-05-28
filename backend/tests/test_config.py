@@ -20,7 +20,11 @@ def test_production_model_defaults(monkeypatch, tmp_path):
     settings = get_settings()
 
     assert settings.librarian_model == "Gemma4-MTP-26B-BF16"
-    assert settings.librarian_model_max_items == 250
+    assert settings.librarian_model_max_items == 150
+    assert settings.youtube_max_results == 40
+    assert settings.collections_max_results == 50
+    assert settings.markets_max_core_companies == 10
+    assert settings.markets_max_related_companies == 10
     assert settings.model_timeout_seconds == 90.0
     assert settings.scheduler_daily_run_time == "05:00"
     assert settings.scheduler_timezone == "America/Los_Angeles"

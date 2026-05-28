@@ -47,7 +47,7 @@ class CostProfile:
 class SourceAdapterContext:
     exploration_id: str
     lookback_hours: int = 24
-    candidate_limit: int = 80
+    candidate_limit: int = 250
 
 
 @dataclass(frozen=True)
@@ -275,7 +275,7 @@ def _source_queries(value: Any) -> dict[str, tuple[str, ...]]:
         key = _clean_text(raw_key)
         if key not in valid_adapters:
             continue
-        cleaned = tuple(_string_list(raw_queries)[:5])
+        cleaned = tuple(_string_list(raw_queries)[:20])
         if cleaned:
             queries[key] = cleaned
     return queries

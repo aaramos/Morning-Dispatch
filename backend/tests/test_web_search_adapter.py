@@ -441,10 +441,39 @@ def test_web_search_adapter_fans_out_refinement_queries_and_dedupes(monkeypatch,
     assert queries[:2] == ["mexico city walking tours", "mexico city bike tours"]
     assert "best museums in mexico city" in queries
     assert "mexico city food tours" in queries
-    assert all(limit == 4 for _query, limit in observed)
+    assert all(limit == 5 for _query, limit in observed)
     assert len(candidates) == 5
     assert len({candidate.payload.original_url for candidate in candidates}) == 5
     assert all(candidate.payload.metadata["search_query"] in queries for candidate in candidates)
+
+
+def test_web_search_adapter_allows_twenty_refinement_queries(monkeypatch, tmp_path) -> None:
+    observed: list[tuple[str, int]] = []
+
+    async def fake_search_web(query: str, limit: int):
+        observed.append((query, limit))
+        return []
+
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("backend.agents.discovery.adapters.search_web", fake_search_web)
+
+    adapter = WebSearchSourceAdapter()
+    asyncio.run(
+        adapter.query(
+            TopicProfile.from_dict(
+                {
+                    "statement": "AI infrastructure",
+                    "scope": "AI infrastructure market signals",
+                    "search_queries": [f"AI infrastructure query {index}" for index in range(25)],
+                }
+            ),
+            SourceAdapterContext(exploration_id="explore-query", candidate_limit=250),
+        )
+    )
+
+    assert len(observed) == 20
+    assert all(limit == 20 for _query, limit in observed)
 
 
 def test_search_web_trims_long_provider_queries(monkeypatch, tmp_path) -> None:

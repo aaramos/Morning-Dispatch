@@ -2313,7 +2313,7 @@ def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> 
     assert observed["cached_lookup_model"] == "topic-brief-model"
     assert observed["cached_write_model"] == "topic-brief-model"
     assert observed["refine_model"] == "topic-brief-model"
-    assert observed["refine_model_max_items"] == 24
+    assert observed["refine_model_max_items"] == 150
     assert observed["editorial_model"] == "topic-brief-model"
     assert observed["critic_model"] == "topic-brief-model"
 

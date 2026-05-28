@@ -130,7 +130,7 @@ class WebSearchSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         queries = _web_search_queries(profile, _requested_refs(profile, "web_search"), adapter=self.name)
-        per_query_limit = max(4, min(12, (max(1, context.candidate_limit) + len(queries) - 1) // len(queries)))
+        per_query_limit = max(4, min(20, max(1, context.candidate_limit)))
         results = await asyncio.gather(
             *(search_web(query, limit=per_query_limit) for query in queries),
             return_exceptions=True,
@@ -532,7 +532,7 @@ def _web_search_queries(profile: TopicProfile, requested_refs: list[str], *, ada
         if query and key not in seen:
             queries.append(query)
             seen.add(key)
-        if len(queries) >= 8:
+        if len(queries) >= 20:
             break
     return queries or [_trim_query(profile.scope or profile.statement)]
 
