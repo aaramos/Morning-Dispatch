@@ -67,7 +67,7 @@ Useful checks:
 ```bash
 launchctl print gui/$(id -u)/com.morning-dispatch
 curl http://127.0.0.1:8000/api/health
-curl https://ultras-mac-studio-3.tail4aeef0.ts.net/api/health
+curl https://ultras-mac-studio-2.tail4aeef0.ts.net/api/health
 ```
 
 ## Admin Gmail Login
@@ -87,7 +87,7 @@ From there you can upload a Google OAuth client secret JSON file and start the G
 Google OAuth redirect URLs generally need HTTPS unless they are localhost. For Tailscale use, set `MORNING_DISPATCH_PUBLIC_BASE_URL` to the HTTPS MagicDNS URL you registered in Google Cloud, for example:
 
 ```bash
-MORNING_DISPATCH_PUBLIC_BASE_URL=https://ultras-mac-studio-3.tail4aeef0.ts.net \
+MORNING_DISPATCH_PUBLIC_BASE_URL=https://ultras-mac-studio-2.tail4aeef0.ts.net \
 MORNING_DISPATCH_HOST=0.0.0.0 \
 uv run python -m backend.app.server
 ```
