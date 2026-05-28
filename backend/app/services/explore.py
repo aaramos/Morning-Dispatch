@@ -565,11 +565,10 @@ async def _run_exploration(
             "excluded_count": len(source_window_issues),
         }
         if source_window_issues:
-            progress["source_audit_issues"] = [
-                *list(progress.get("source_audit_issues") or []),
+            progress["source_filter_notes"] = [
+                *list(progress.get("source_filter_notes") or []),
                 *source_window_issues,
             ]
-            progress["built_with_issues"] = True
         _set_pipeline_stage(progress, "fetch", "done")
         _persist_progress(exploration_id, progress)
 
@@ -1020,9 +1019,16 @@ async def _run_digest_core(
     )
     progress["source_audit"] = audit_summary
     if audit_summary.get("issues"):
+        progress["source_filter_notes"] = [
+            *list(progress.get("source_filter_notes") or []),
+            *list(audit_summary.get("issues") or []),
+        ]
+    if audit_summary.get("model_issue") or audit_summary.get("status") == "failed":
+        issue_reason = str(audit_summary.get("model_issue") or "Source audit could not complete.").strip()
+        issue = {"source_name": "Source Audit", "reason": issue_reason}
         progress["source_audit_issues"] = [
             *list(progress.get("source_audit_issues") or []),
-            *list(audit_summary.get("issues") or []),
+            issue,
         ]
         progress["built_with_issues"] = True
     _set_pipeline_stage(progress, "audit", "done" if audit_summary.get("status") != "failed" else "failed")
@@ -1461,23 +1467,35 @@ def exploration_build_issues(
     progress = exploration.get("progress")
     if not isinstance(progress, dict):
         return []
-    raw_issues: list[Any] = []
+    issues: list[dict[str, str]] = []
     requested = progress.get("requested_source_issues")
     if isinstance(requested, list):
-        raw_issues.extend(requested)
+        issues.extend(_normalize_issue_list(requested))
     if include_source_audit:
         audit = progress.get("source_audit_issues")
         if isinstance(audit, list):
-            raw_issues.extend(audit)
+            issues.extend(_normalize_issue_list(audit, action_required_only=True))
+    return issues
+
+
+def _normalize_issue_list(raw_issues: list[Any], *, action_required_only: bool = False) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
     for issue in raw_issues:
         if not isinstance(issue, dict):
             continue
         source_name = str(issue.get("source_name") or issue.get("ref") or "").strip()
         reason = str(issue.get("reason") or "").strip()
+        if action_required_only and not _is_action_required_audit_issue(source_name, reason):
+            continue
         if source_name and reason:
             issues.append({"source_name": source_name, "reason": reason})
     return issues
+
+
+def _is_action_required_audit_issue(source_name: str, reason: str) -> bool:
+    normalized_name = source_name.strip().lower()
+    normalized = reason.strip().lower()
+    return normalized_name in {"source audit", "ai review"} or normalized.startswith("audit could not complete")
 
 
 def _requested_source_issues(

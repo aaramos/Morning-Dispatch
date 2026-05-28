@@ -943,6 +943,26 @@ label {
   background: #fff0db;
 }
 
+.filter-note {
+  margin: 16px 0;
+  padding: 12px 14px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #fbfaf6;
+  color: #5d5950;
+}
+
+.filter-note summary {
+  cursor: pointer;
+  font-weight: 850;
+}
+
+.filter-note p {
+  margin: 10px 0 0;
+  color: #6f6a60;
+  font-weight: 650;
+}
+
 .ready-footer {
   display: flex;
   align-items: center;

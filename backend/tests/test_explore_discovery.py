@@ -2044,6 +2044,45 @@ def test_admin_exploration_issue_details_report_source_and_reason(monkeypatch, t
     }
 
 
+def test_admin_exploration_issue_details_ignore_filter_decisions(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        topic = client.post(
+            "/api/explore/topic-profiles",
+            json={
+                "statement": "Explore filtered items",
+                "scope": "Filter reporting",
+                "source_selection": {"web_search": True},
+            },
+        ).json()
+        exploration = database.create_exploration(
+            topic_id=topic["topic_id"],
+            mode="show_now",
+            source_selection={"web_search": True},
+        )
+        database.update_exploration_progress(
+            exploration["exploration_id"],
+            progress={
+                "built_with_issues": True,
+                "source_audit_issues": [
+                    {
+                        "source_name": "Old Article",
+                        "reason": "Date hints place it outside the requested source window (2026-04-28 06:16 UTC or newer required).",
+                    }
+                ],
+            },
+        )
+        details = client.get(f"/api/admin/explorations/{exploration['exploration_id']}/issues")
+
+    assert details.status_code == 200
+    assert details.json() == {
+        "exploration_id": exploration["exploration_id"],
+        "built_with_issues": False,
+        "issues": [],
+    }
+
+
 def test_run_topic_profile_as_scheduled_mode(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
 

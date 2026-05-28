@@ -110,6 +110,7 @@ type Exploration = {
     candidate_count?: number;
     requested_source_issues?: ExplorationIssue[];
     source_audit_issues?: ExplorationIssue[];
+    source_filter_notes?: ExplorationIssue[];
     built_with_issues?: boolean;
     reasoning?: { editorial?: string; critic?: string };
     queue?: { status?: string; message?: string };
@@ -502,10 +503,7 @@ function DispatchApp() {
   const sourceLocked = flow === "building";
   const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
   const canBuild = activeInterest.length > 0 && !busy;
-  const currentIssues = [
-    ...(exploration?.progress.requested_source_issues ?? []),
-    ...(exploration?.progress.source_audit_issues ?? []),
-  ];
+  const currentIssues = buildAttentionIssues(exploration);
   const refinementWorking = busy && !enableSource && !exploration && flow === "refining";
   const activeRefinementProgress = useMemo<RefinementProgress | null>(() => {
     if (refinementProgress) return refinementProgress;
@@ -1636,6 +1634,8 @@ function ConfirmationPanel(props: {
 function ProgressPanel(props: { exploration: Exploration; sourceSelection: Record<string, boolean> }) {
   const pipeline = Object.entries(props.exploration.progress.pipeline ?? {});
   const sources = Object.entries(props.exploration.progress.sources ?? {});
+  const filterNotes = filterDecisionNotes(props.exploration);
+  const auditIssues = actionableIssues(props.exploration.progress.source_audit_issues);
   const queuedMessage = props.exploration.status === "queued"
     ? props.exploration.progress.queue?.message ?? "Waiting for the current brief build to finish."
     : null;
@@ -1688,14 +1688,22 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
           ))}
         </div>
       ) : null}
-      {props.exploration.progress.source_audit_issues?.length ? (
+      {auditIssues.length ? (
         <div className="issue-note">
-          {props.exploration.progress.source_audit_issues.map((issue) => (
+          {auditIssues.map((issue) => (
             <p key={`${issue.source_name}-${issue.reason}`}>
               {issue.source_name}: {issue.reason}
             </p>
           ))}
         </div>
+      ) : null}
+      {filterNotes.length ? (
+        <details className="filter-note">
+          <summary>{filterNotes.length} item(s) filtered out</summary>
+          {filterNotes.slice(0, 20).map((issue) => (
+            <p key={`${issue.source_name}-${issue.reason}`}>{issue.source_name}: {issue.reason}</p>
+          ))}
+        </details>
       ) : null}
       {pipeline.length ? <p className="muted">{formatPipeline(pipeline)}</p> : null}
     </section>
@@ -2804,9 +2812,9 @@ function AdminApp() {
                     <small>{formatDateTime(item.exploration.finished_at ?? item.exploration.started_at)} · {formatSourceSelection(item.exploration.source_selection)}</small>
                     {isModelDegraded(item.exploration) ? (
                       <p className="warning-text">Built with AI issues.</p>
-                    ) : item.exploration.progress.built_with_issues && item.exploration.status === "complete" ? (
+                    ) : hasActionableBuildIssues(item.exploration) && item.exploration.status === "complete" ? (
                       <p className="warning-text">Built with source issues.</p>
-                    ) : item.exploration.progress.built_with_issues ? (
+                    ) : hasActionableBuildIssues(item.exploration) ? (
                       <p className="warning-text">Source issues detected so far.</p>
                     ) : null}
                   </div>
@@ -3520,6 +3528,35 @@ function isModelDegraded(exploration: Exploration): boolean {
   const modelFailures = Number(stats?.model_failure_count ?? 0);
   const includedArticles = Number(stats?.included_article_count ?? 0);
   return modelCalls > 0 && (modelSuccesses === 0 || (modelFailures > 0 && includedArticles === 0));
+}
+
+function hasActionableBuildIssues(exploration: Exploration): boolean {
+  return buildAttentionIssues(exploration).length > 0;
+}
+
+function buildAttentionIssues(exploration: Exploration | null): ExplorationIssue[] {
+  if (!exploration) return [];
+  return [
+    ...(exploration.progress.requested_source_issues ?? []),
+    ...actionableIssues(exploration.progress.source_audit_issues),
+  ];
+}
+
+function actionableIssues(issues: ExplorationIssue[] | undefined): ExplorationIssue[] {
+  return (issues ?? []).filter((issue) => isActionableIssue(issue));
+}
+
+function filterDecisionNotes(exploration: Exploration): ExplorationIssue[] {
+  return [
+    ...(exploration.progress.source_filter_notes ?? []),
+    ...(exploration.progress.source_audit_issues ?? []).filter((issue) => !isActionableIssue(issue)),
+  ];
+}
+
+function isActionableIssue(issue: ExplorationIssue): boolean {
+  const source = issue.source_name.trim().toLowerCase();
+  const reason = issue.reason.trim().toLowerCase();
+  return source === "source audit" || source === "ai review" || reason.startsWith("audit could not complete");
 }
 
 function modelDegradedMessage(exploration: Exploration): string {
