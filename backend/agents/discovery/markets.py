@@ -300,6 +300,29 @@ def _published_at(item: dict[str, Any]) -> datetime | None:
     return None
 
 
+def resolve_tickers_from_text(text: str) -> list[str]:
+    """Return ticker symbols found in *text* using known company patterns and bare-ticker regex.
+
+    Used by the refinement layer to populate markets source_queries and strategy previews
+    before the discovery adapter runs. Mirrors the logic inside _explicit_tickers.
+    """
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for pattern, ticker in _KNOWN_COMPANY_TICKERS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            normalized = ticker.upper()
+            if normalized not in seen:
+                tickers.append(normalized)
+                seen.add(normalized)
+    for match in re.findall(r"\b(?:[A-Z]{1,5}|[0-9]{3,6}[A-Z]?)(?:\.[A-Z]{1,3})?\b", text):
+        normalized = match.upper()
+        if normalized in _TICKER_STOPWORDS or normalized in seen:
+            continue
+        tickers.append(normalized)
+        seen.add(normalized)
+    return tickers
+
+
 def _explicit_tickers(profile: TopicProfile) -> list[str]:
     raw = " ".join(
         [

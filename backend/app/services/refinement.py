@@ -8,6 +8,7 @@ import threading
 from typing import Any
 
 from backend.agents.discovery.language_support import trusted_language_options
+from backend.agents.discovery.markets import resolve_tickers_from_text
 from backend.agents.discovery.types import DEFAULT_EXPLORE_SOURCE_SELECTION
 from backend.agents.digestor.gmail import NewsletterCandidate, discover_newsletter_candidates
 from backend.agents.librarian.text_utils import keyword_set
@@ -635,7 +636,7 @@ def _run_refinement_agent(
             client.complete_json(
                 system=REFINEMENT_AGENT_SYSTEM_PROMPT,
                 prompt=prompt,
-                max_tokens=900,
+                max_tokens=2000,
             )
         )
     except Exception:
@@ -689,7 +690,7 @@ def _critique_search_plan(profile: dict[str, Any]) -> dict[str, Any]:
             client.complete_json(
                 system=CRITIQUE_SYSTEM_PROMPT,
                 prompt=prompt,
-                max_tokens=700,
+                max_tokens=1200,
             )
         )
     except Exception:
@@ -780,7 +781,13 @@ def _build_refinement_agent_prompt(
                 "youtube": "Use creator/video search phrases for walkthroughs, explainers, interviews, or demos.",
                 "podcasts": "Use show/interview/topic phrases for deeper context.",
                 "collections": "Use terms likely to appear in local documents.",
-                "markets": "Use company names, tickers, and sector themes only when the interest has a market angle.",
+                "markets": (
+                    "List specific exchange ticker symbols to track (e.g. 'MU', 'NVDA', '000660.KS', '285A.T'). "
+                    "Resolve every company name in the profile to its primary exchange ticker. "
+                    "One ticker per query entry. Do not use descriptive phrases or keyword soup — "
+                    "only tickers and, if needed, sector ETF symbols (e.g. 'SOXX', 'XLK'). "
+                    "If the user mentions a company without a well-known ticker, ask for clarification."
+                ),
             },
             "already_inferred": _inferred_constraints(profile_snapshot),
             "trusted_foreign_languages": [
@@ -1507,18 +1514,129 @@ def _ensure_source_query_coverage(profile: dict[str, Any]) -> dict[str, Any]:
     """Give every selected source a real query so connectors don't fall back to a generic blob."""
     selection = _source_selection_dict(profile.get("source_selection"))
     queries = dict(_clean_source_queries(profile.get("source_queries")))
-    phrase_queries = _string_list(profile.get("search_queries"), limit=20)
+    phrase_queries = [
+        q for q in _string_list(profile.get("search_queries"), limit=20)
+        if not _is_conversational_sentence(q)
+    ]
     if not phrase_queries:
-        scope = str(profile.get("scope") or profile.get("statement") or "").strip()
-        phrase_queries = [scope] if scope else []
-    market_terms = _string_list(profile.get("keywords"), limit=4) or phrase_queries[:2]
+        # Agent produced no usable search_queries — derive compact ones from the
+        # statement so we never submit a multi-sentence paragraph as a search term.
+        phrase_queries = _queries_from_statement(
+            str(profile.get("scope") or profile.get("statement") or "")
+        )
+
+    # Filter any existing per-source queries that are conversational sentences.
+    for src in list(queries.keys()):
+        clean = [q for q in queries[src] if not _is_conversational_sentence(q)]
+        if clean:
+            queries[src] = clean
+        else:
+            del queries[src]
+
+    # For markets, always resolve to actual ticker symbols — never use keyword soup.
+    profile_text = " ".join(filter(None, [
+        str(profile.get("statement") or ""),
+        str(profile.get("scope") or ""),
+        *_string_list(profile.get("keywords")),
+        *_string_list(profile.get("subtopics")),
+        *_string_list(profile.get("search_queries")),
+    ]))
+    resolved_tickers = resolve_tickers_from_text(profile_text)
+
     for source, enabled in selection.items():
         if not enabled or queries.get(source):
             continue
-        fallback = market_terms if source == "markets" else phrase_queries[:3]
+        if source == "markets":
+            fallback = resolved_tickers or phrase_queries[:2]
+        else:
+            fallback = phrase_queries[:3]
         if fallback:
             queries[source] = list(fallback)
     return {**profile, "source_queries": queries}
+
+
+def _is_conversational_sentence(text: str) -> bool:
+    """Return True when text reads like a typed request rather than a search query."""
+    t = text.strip()
+    if len(t) > 100:
+        return True
+    lowered = t.lower()
+    conversational = (
+        "i am ", "i'm ", "i want", "help me", "be sure", "please ", "looking to",
+        "looking for", "identify ", "find me ", "give me ", "tell me ", "make sure",
+    )
+    return any(lowered.startswith(c) or f" {c}" in lowered for c in conversational)
+
+
+def _queries_from_statement(text: str) -> list[str]:
+    """Generate 2–4 compact search queries from a free-form topic statement.
+
+    Extracts named entities (capitalised runs) and the first short phrase, which
+    together produce search-engine-ready strings even when the refinement agent
+    fails to generate queries.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    parts: list[str] = []
+
+    # 1. Named entities: (a) capitalised runs, (b) items listed after "like/including/such as".
+    _stops = {
+        "I", "The", "A", "An", "My", "We", "Help", "Use", "Return", "It", "Is", "In",
+        "Companies", "Company", "Please", "Also", "Both", "Each",
+    }
+    cap_names = [
+        n for n in re.findall(r"\b[A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)*\b", text)
+        if n not in _stops and len(n) > 2
+    ]
+    # Also pull items after "companies like / including / such as" — often lowercase
+    list_items: list[str] = []
+    for m in re.finditer(
+        r"\b(?:companies like|including|such as)\s+([^.!?;]{3,80})",
+        text, flags=re.IGNORECASE,
+    ):
+        raw_items = re.split(r"[,\s]+and\s+|,\s*", m.group(1))
+        for raw in raw_items:
+            # Keep only the first token(s) that look like a proper name (no verbs/articles).
+            clean = re.match(r"^([A-Za-z][A-Za-z0-9&.\-]+(?:\s+[A-Z][A-Za-z0-9&.\-]+)*)", raw.strip())
+            item = clean.group(1).strip().title() if clean else ""
+            if 2 < len(item) < 25 and item.lower() not in {
+                "should", "will", "must", "are", "is", "the", "and", "or",
+            }:
+                list_items.append(item)
+    names = list(dict.fromkeys(cap_names + list_items))
+    entity_chunk = " ".join(names[:4])  # up to 4, order-deduped
+    if entity_chunk:
+        parts.append(f"{entity_chunk} news")
+
+    # 2. Domain theme words combined with entity names.
+    theme_words = re.findall(
+        r"\b(AI|artificial intelligence|machine learning|semiconductor|HBM|NAND|DRAM|"
+        r"investment|portfolio|infrastructure|picks.and.shovels|earnings|growth|"
+        r"local model|Apple Silicon|MLX|agents?|LLM|inference)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if theme_words:
+        theme_chunk = " ".join(dict.fromkeys(w.lower() for w in theme_words[:4]))
+        lead = " ".join(dict.fromkeys(names[:2])) if names else ""
+        parts.append(f"{lead} {theme_chunk} 2025".strip())
+
+    # 3. First short phrase before the first sentence-ending punctuation.
+    first_phrase = re.split(r"[.!?;]", text)[0].strip()
+    if len(first_phrase) <= 80 and not _is_conversational_sentence(first_phrase):
+        parts.append(first_phrase)
+
+    # Dedupe and cap at 4.
+    seen: set[str] = set()
+    result: list[str] = []
+    for q in parts:
+        key = q.casefold()
+        if q and key not in seen:
+            seen.add(key)
+            result.append(q)
+    return result[:4] or [text[:80].strip()]
 
 
 def _next_missing(profile: dict[str, Any]) -> str | None:
@@ -1994,6 +2112,20 @@ def _strategy_preview(profile: dict[str, Any]) -> dict[str, Any]:
             if source == "gmail":
                 entry["approved_senders"] = database.approved_gmail_senders()
                 entry["note"] = "Only approved newsletters are read; their linked articles become primary content."
+            if source == "markets":
+                # Resolve the actual tickers that will be fetched so the user can
+                # see and verify them in the confirmation card.
+                profile_text = " ".join(filter(None, [
+                    str(profile.get("statement") or ""),
+                    str(profile.get("scope") or ""),
+                    *_string_list(profile.get("keywords")),
+                    *_string_list(profile.get("subtopics")),
+                    *entry["queries"],
+                ]))
+                resolved = resolve_tickers_from_text(profile_text)
+                if resolved:
+                    entry["tickers"] = resolved
+                    entry["note"] = "Tracks price, recent news, and key metrics for each ticker."
             per_source.append(entry)
         else:
             ignores.append(label)

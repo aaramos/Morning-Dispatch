@@ -81,6 +81,7 @@ type StrategyPreview = {
     key: string;
     queries: string[];
     approved_senders?: string[];
+    tickers?: string[];
     note?: string;
   }>;
   lookback_hours: number | null;
@@ -1821,6 +1822,24 @@ function StrategyReviewCard(props: { preview: StrategyPreview }) {
             .filter((entry) => entry.approved_senders?.length)
             .map((entry) => (
               <span key={entry.key}>{entry.approved_senders!.join(", ")}</span>
+            ))}
+        </div>
+      ) : null}
+      {preview.per_source.some((entry) => entry.tickers?.length) ? (
+        <div className="strategy-review-block">
+          <strong>Market tickers</strong>
+          <div className="strategy-review-tickers">
+            {preview.per_source
+              .filter((entry) => entry.tickers?.length)
+              .flatMap((entry) => entry.tickers!)
+              .map((ticker) => (
+                <span key={ticker} className="strategy-ticker-chip">{ticker}</span>
+              ))}
+          </div>
+          {preview.per_source
+            .filter((entry) => entry.tickers?.length && entry.note)
+            .map((entry) => (
+              <span key={entry.key} className="strategy-review-note">{entry.note}</span>
             ))}
         </div>
       ) : null}
