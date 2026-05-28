@@ -122,6 +122,7 @@ def init_database() -> None:
         _ensure_podcast_metrics_table(connection)
         _ensure_youtube_quota_table(connection)
         _ensure_collection_tables(connection)
+        _ensure_served_undated_items_table(connection)
         _ensure_inference_metric_status_values(connection)
         _ensure_inference_metric_route_name_column(connection)
         _ensure_default_profile(connection)
@@ -189,6 +190,26 @@ def _ensure_collection_tables(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_collection_files_collection ON collection_files(collection_name)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_collection_files_status ON collection_files(status)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_collection_chunks_collection ON collection_chunks(collection_name)")
+
+
+def _ensure_served_undated_items_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS served_undated_items (
+          id              TEXT PRIMARY KEY,
+          topic_id        TEXT NOT NULL,
+          item_key        TEXT NOT NULL,
+          title           TEXT,
+          source_name     TEXT,
+          url             TEXT,
+          first_seen_at   TEXT NOT NULL,
+          UNIQUE(topic_id, item_key)
+        ) STRICT
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_served_undated_items_topic ON served_undated_items(topic_id)"
+    )
 
 
 def record_youtube_quota(units_used: int, *, usage_date: str | None = None) -> dict[str, Any]:
@@ -3221,8 +3242,17 @@ def _meta_line_for_result(result: ArticleFetchResult) -> str:
     parts = [domain]
     if published:
         parts.append(published)
+    elif _served_once_note(result):
+        parts.append(_served_once_note(result))
     parts.append(f"via {source}")
     return " · ".join(part for part in parts if part)
+
+
+def _served_once_note(result: ArticleFetchResult) -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    if metadata.get("served_once") is True:
+        return str(metadata.get("served_once_note") or "Date unknown; shown once.")
+    return ""
 
 
 def _score_badge(result: ArticleFetchResult) -> str:
@@ -3788,6 +3818,8 @@ def _render_article_card(
     meta_parts = [domain]
     if published:
         meta_parts.append(published)
+    elif _served_once_note(result):
+        meta_parts.append(_served_once_note(result))
     meta_parts.append(f"via {source}")
     meta = " · ".join(escape(part) for part in meta_parts)
     score = f'<span class="score">{int((result.relevance_score or 0) * 100)}%</span>' if result.relevance_score else ""
@@ -5102,6 +5134,60 @@ def record_inference_metric(metric: dict[str, Any]) -> str:
             tuple(row.values()),
         )
     return metric_id
+
+
+def clear_inference_metrics_for_run(inference_run_id: str | None) -> int:
+    run_id = str(inference_run_id or "").strip()
+    if not run_id:
+        return 0
+    with connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM inference_metrics WHERE run_id = ?",
+            (run_id,),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def has_served_undated_item(topic_id: str, item_key: str) -> bool:
+    if not topic_id or not item_key:
+        return False
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT 1 FROM served_undated_items WHERE topic_id = ? AND item_key = ? LIMIT 1",
+            (topic_id, item_key),
+        ).fetchone()
+    return row is not None
+
+
+def record_served_undated_items(topic_id: str, items: list[dict[str, str]]) -> int:
+    if not topic_id or not items:
+        return 0
+    now = utc_now()
+    written = 0
+    with connect() as connection:
+        for item in items:
+            item_key = str(item.get("item_key") or "").strip()
+            if not item_key:
+                continue
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO served_undated_items (
+                  id, topic_id, item_key, title, source_name, url, first_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id(),
+                    topic_id,
+                    item_key,
+                    _nullable_str(item.get("title")),
+                    _nullable_str(item.get("source_name")),
+                    _nullable_str(item.get("url")),
+                    now,
+                ),
+            )
+            written += int(cursor.rowcount or 0)
+    return written
 
 
 def inference_metrics_summary(*, limit: int = 5000) -> dict[str, Any]:

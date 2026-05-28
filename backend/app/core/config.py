@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_LIBRARIAN_MODEL = "Gemma4-MTP-26B-BF16"
+DEFAULT_OLLAMA_CLOUD_MODEL = "Gemma4-MTP-26B-BF16"
 DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 250
 DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 DEFAULT_SCHEDULER_DAILY_RUN_TIME = "05:00"
@@ -38,8 +39,9 @@ class Settings:
     model_base_url: str | None = None
     model_api_key: str | None = None
     ollama_api_key: str | None = None
-    ollama_base_url: str = "https://ollama.com/api"
+    ollama_base_url: str = "https://api.ollama.com/v1"
     librarian_model: str | None = DEFAULT_LIBRARIAN_MODEL
+    ollama_cloud_model: str | None = DEFAULT_OLLAMA_CLOUD_MODEL
     librarian_use_model: bool = False
     librarian_model_max_items: int = DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS
     model_timeout_seconds: float = DEFAULT_MODEL_TIMEOUT_SECONDS
@@ -158,15 +160,23 @@ def _model_settings_payload(path: Path) -> dict[str, object]:
     return payload
 
 
-def _librarian_model_from_runtime(path: Path) -> str | None:
+def _runtime_model_value(path: Path, key: str) -> str | None:
     payload = _model_settings_payload(path)
     if not payload:
         return None
-    model = payload.get("librarian_model")
+    model = payload.get(key)
     if not isinstance(model, str):
         return None
     model = model.strip()
     return model or None
+
+
+def _librarian_model_from_runtime(path: Path) -> str | None:
+    return _runtime_model_value(path, "librarian_model")
+
+
+def _ollama_cloud_model_from_runtime(path: Path) -> str | None:
+    return _runtime_model_value(path, "ollama_cloud_model")
 
 
 def _model_routes_from_runtime(path: Path) -> dict[str, dict[str, object]]:
@@ -226,6 +236,10 @@ def get_settings() -> Settings:
     librarian_model = (
         _librarian_model_from_runtime(model_settings_path)
         or os.environ.get("MORNING_DISPATCH_LIBRARIAN_MODEL", DEFAULT_LIBRARIAN_MODEL)
+    )
+    ollama_cloud_model = (
+        _ollama_cloud_model_from_runtime(model_settings_path)
+        or os.environ.get("MORNING_DISPATCH_OLLAMA_MODEL", DEFAULT_OLLAMA_CLOUD_MODEL)
     )
     podcastindex_api_key = os.environ.get("MORNING_DISPATCH_PODCASTINDEX_API_KEY") or _secret_text(
         secrets_dir / "podcastindex" / "api_key"
@@ -295,8 +309,9 @@ def get_settings() -> Settings:
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
         ollama_api_key=ollama_api_key,
-        ollama_base_url=os.environ.get("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://ollama.com/api").rstrip("/"),
+        ollama_base_url=os.environ.get("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://api.ollama.com/v1").rstrip("/"),
         librarian_model=librarian_model,
+        ollama_cloud_model=ollama_cloud_model,
         librarian_use_model=_model_enabled(
             os.environ.get("MORNING_DISPATCH_LIBRARIAN_USE_MODEL"),
             model=librarian_model,

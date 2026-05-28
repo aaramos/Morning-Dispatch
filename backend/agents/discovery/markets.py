@@ -267,6 +267,12 @@ def _explicit_tickers(profile: TopicProfile) -> list[str]:
     )
     tickers: list[str] = []
     seen: set[str] = set()
+    for pattern, ticker in _KNOWN_COMPANY_TICKERS:
+        if re.search(pattern, raw, flags=re.IGNORECASE):
+            normalized = ticker.upper()
+            if normalized not in seen:
+                tickers.append(normalized)
+                seen.add(normalized)
     for match in re.findall(r"\b(?:[A-Z]{1,5}|[0-9]{3,6}[A-Z]?)(?:\.[A-Z]{1,3})?\b", raw):
         normalized = match.upper()
         if normalized in _TICKER_STOPWORDS or normalized in seen:
@@ -337,6 +343,12 @@ _TICKER_STOPWORDS = {
     "SK",
     "USA",
 }
+_KNOWN_COMPANY_TICKERS = (
+    (r"\bmicron\b|\bmicron technology\b", "MU"),
+    (r"\b(?:sk\s+)?hynix\b", "000660.KS"),
+    (r"\bkioxia\b", "285A.T"),
+    (r"\bsandisk\b", "SNDK"),
+)
 
 
 _AI_INFRASTRUCTURE_GROUP = {

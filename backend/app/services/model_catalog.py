@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from typing import Any
 
 import httpx
 
-from backend.app.core.config import Settings, ensure_runtime_dirs
+from backend.app.core.config import DEFAULT_LIBRARIAN_MODEL, Settings, ensure_runtime_dirs
 
 
 class ModelCatalogError(RuntimeError):
@@ -24,6 +25,8 @@ async def catalog_status(settings: Settings) -> dict[str, Any]:
             "models": [],
             "error": str(exc),
             "selected_model": settings.librarian_model,
+            "selected_local_model": settings.librarian_model,
+            "selected_ollama_cloud_model": settings.ollama_cloud_model,
             "base_url": settings.model_base_url,
             "providers": {
                 "local": {
@@ -31,6 +34,7 @@ async def catalog_status(settings: Settings) -> dict[str, Any]:
                     "models": [],
                     "error": str(exc),
                     "base_url": settings.model_base_url,
+                    "selected_model": settings.librarian_model,
                 },
                 "ollama_cloud": cloud_catalog,
             },
@@ -41,6 +45,8 @@ async def catalog_status(settings: Settings) -> dict[str, Any]:
         "models": models,
         "error": None,
         "selected_model": settings.librarian_model,
+        "selected_local_model": settings.librarian_model,
+        "selected_ollama_cloud_model": settings.ollama_cloud_model,
         "base_url": settings.model_base_url,
         "providers": {
             "local": {
@@ -48,6 +54,7 @@ async def catalog_status(settings: Settings) -> dict[str, Any]:
                 "models": models,
                 "error": None,
                 "base_url": settings.model_base_url,
+                "selected_model": settings.librarian_model,
             },
             "ollama_cloud": cloud_catalog,
         },
@@ -65,7 +72,7 @@ async def fetch_available_models(settings: Settings) -> list[dict[str, Any]]:
 
     try:
         async with httpx.AsyncClient(timeout=min(settings.model_timeout_seconds, 8.0)) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(url, headers=headers, follow_redirects=True)
             response.raise_for_status()
             payload = response.json()
     except httpx.HTTPStatusError as exc:
@@ -81,18 +88,33 @@ async def fetch_available_models(settings: Settings) -> list[dict[str, Any]]:
     return models
 
 
-def save_selected_model(settings: Settings, model_name: str) -> None:
+def save_selected_model(settings: Settings, model_name: str, *, provider: str = "local") -> None:
     ensure_runtime_dirs(settings)
     payload = _read_model_settings(settings.model_settings_path)
-    payload["librarian_model"] = model_name
+    if provider == "ollama_cloud":
+        payload["ollama_cloud_model"] = model_name
+    else:
+        payload["librarian_model"] = model_name
     payload["updated_at"] = datetime.now(UTC).isoformat(timespec="seconds")
     payload["updated_by"] = "admin"
     _write_json(settings.model_settings_path, payload)
 
 
-def selected_model_source(settings: Settings) -> str:
+def restore_default_models(settings: Settings) -> None:
+    ensure_runtime_dirs(settings)
     payload = _read_model_settings(settings.model_settings_path)
-    if payload.get("librarian_model") == settings.librarian_model:
+    payload["librarian_model"] = DEFAULT_LIBRARIAN_MODEL
+    payload["ollama_cloud_model"] = DEFAULT_LIBRARIAN_MODEL
+    payload["updated_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+    payload["updated_by"] = "admin"
+    _write_json(settings.model_settings_path, payload)
+
+
+def selected_model_source(settings: Settings, *, provider: str = "local") -> str:
+    payload = _read_model_settings(settings.model_settings_path)
+    key = "ollama_cloud_model" if provider == "ollama_cloud" else "librarian_model"
+    current = settings.ollama_cloud_model if provider == "ollama_cloud" else settings.librarian_model
+    if payload.get(key) == current:
         return "admin"
     return "environment"
 
@@ -127,6 +149,7 @@ async def _ollama_cloud_catalog_status(settings: Settings) -> dict[str, Any]:
             "models": [],
             "error": "Ollama Cloud key is not configured.",
             "base_url": settings.ollama_base_url,
+            "selected_model": settings.ollama_cloud_model,
         }
     try:
         models = await fetch_ollama_cloud_models(settings)
@@ -137,6 +160,7 @@ async def _ollama_cloud_catalog_status(settings: Settings) -> dict[str, Any]:
             "models": [],
             "error": str(exc),
             "base_url": settings.ollama_base_url,
+            "selected_model": settings.ollama_cloud_model,
         }
     return {
         "available": True,
@@ -144,19 +168,21 @@ async def _ollama_cloud_catalog_status(settings: Settings) -> dict[str, Any]:
         "models": models,
         "error": None,
         "base_url": settings.ollama_base_url,
+        "selected_model": settings.ollama_cloud_model,
     }
 
 
 async def fetch_ollama_cloud_models(settings: Settings) -> list[dict[str, Any]]:
     if not settings.ollama_base_url:
         raise ModelCatalogError("Ollama Cloud base URL is not configured.")
-    url = f"{settings.ollama_base_url.rstrip('/')}/tags"
+    base_url = _normalize_ollama_base_url(settings.ollama_base_url)
+    url = f"{base_url.rstrip('/')}/models"
     headers = {}
     if settings.ollama_api_key:
         headers["Authorization"] = f"Bearer {settings.ollama_api_key}"
     try:
         async with httpx.AsyncClient(timeout=min(settings.model_timeout_seconds, 8.0)) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(url, headers=headers, follow_redirects=True)
             response.raise_for_status()
             payload = response.json()
     except httpx.HTTPStatusError as exc:
@@ -165,10 +191,35 @@ async def fetch_ollama_cloud_models(settings: Settings) -> list[dict[str, Any]]:
         raise ModelCatalogError(f"Ollama Cloud catalog returned HTTP {exc.response.status_code}.") from exc
     except Exception as exc:
         raise ModelCatalogError("Could not reach the Ollama Cloud model catalog.") from exc
-    models = _parse_ollama_tag_list(payload)
+    models = _parse_ollama_tag_list(payload) or _parse_model_list(payload)
     if not models:
         raise ModelCatalogError("Ollama Cloud did not report any available models.")
     return models
+
+
+def _normalize_ollama_base_url(raw_url: str) -> str:
+    value = raw_url.strip()
+    if not value:
+        return value
+    parsed = urlparse(value)
+    netloc = parsed.netloc
+    path = (parsed.path or "").rstrip("/") or "/"
+    if parsed.hostname in {"ollama.com", "www.ollama.com"} and path == "/api":
+        if parsed.port:
+            netloc = f"api.ollama.com:{parsed.port}"
+        else:
+            netloc = "api.ollama.com"
+    base_path = (parsed.path or "").rstrip("/")
+    if not base_path or base_path == "/":
+        normalized_path = "/v1"
+    elif base_path in {"/chat", "/chat/completions", "/models", "/v1/models", "/tags", "/v1/tags", "/api"}:
+        normalized_path = "/v1"
+    elif not base_path.endswith("/v1"):
+        normalized_path = f"{base_path}/v1"
+    else:
+        normalized_path = base_path
+    normalized = parsed._replace(netloc=netloc, path=normalized_path, params="", query="", fragment="")
+    return urlunparse(normalized)
 
 
 def _parse_ollama_tag_list(payload: Any) -> list[dict[str, Any]]:

@@ -12,6 +12,14 @@ import httpx
 from backend.app.core.config import Settings
 
 MODEL_CAPACITY_STATUS = "model_capacity"
+_RETRYABLE_STATUSES = {"model_error", "timeout"}
+_RETRYABLE_ERROR_FRAGMENTS = (
+    "peer closed connection",
+    "incomplete chunked read",
+    "connection reset",
+    "server disconnected",
+    "remote protocol",
+)
 
 
 class ModelClientError(RuntimeError):
@@ -71,7 +79,13 @@ class ModelClient:
         self._semaphore = asyncio.Semaphore(max(1, config.concurrency))
 
     @classmethod
-    def from_settings(cls, settings: Settings, *, model: str | None = None) -> ModelClient | None:
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        model: str | None = None,
+        route_name: str | None = None,
+    ) -> ModelClient | None:
         model_name = (model or settings.librarian_model or "").strip()
         if not settings.librarian_use_model or not settings.model_base_url or not model_name:
             return None
@@ -84,6 +98,7 @@ class ModelClient:
                 concurrency=settings.model_concurrency,
                 provider="local",
                 api_mode="openai",
+                route_name=route_name,
             )
         )
 
@@ -156,6 +171,29 @@ class ModelClient:
         prompt: str,
         max_tokens: int = 900,
         on_token: Callable[[str], None] | None = None,
+    ) -> ModelResponse:
+        attempts = _retry_attempts(self.config)
+        for attempt in range(attempts):
+            try:
+                return await self._complete_response_once(
+                    system=system,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    on_token=on_token,
+                )
+            except ModelClientError as exc:
+                if attempt >= attempts - 1 or not _should_retry(exc):
+                    raise
+                await asyncio.sleep(_retry_delay_seconds(attempt))
+        raise ModelClientError("Model request failed after retry attempts", status="model_error")
+
+    async def _complete_response_once(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        max_tokens: int,
+        on_token: Callable[[str], None] | None,
     ) -> ModelResponse:
         if self.config.api_mode == "ollama":
             if on_token is None:
@@ -621,6 +659,25 @@ def _status_for_http(status_code: int) -> str:
     if status_code == 429:
         return "rate_limited"
     return "http_error"
+
+
+def _retry_attempts(config: ModelClientConfig) -> int:
+    if config.provider == "local":
+        return 3
+    return 2
+
+
+def _should_retry(exc: ModelClientError) -> bool:
+    if exc.status not in _RETRYABLE_STATUSES:
+        return False
+    text = str(exc).lower()
+    if exc.status == "timeout":
+        return True
+    return any(fragment in text for fragment in _RETRYABLE_ERROR_FRAGMENTS)
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    return min(1.5, 0.25 * (attempt + 1))
 
 
 def _http_error_message(exc: httpx.HTTPStatusError) -> str:

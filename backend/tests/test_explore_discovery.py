@@ -39,6 +39,32 @@ class FakeAdapter:
         return candidate.payload
 
 
+def test_rebuild_strengthens_market_profile_from_statement():
+    profile = TopicProfile.from_dict(
+        {
+            "topic_id": "topic-memory",
+            "statement": (
+                "As an investor I'm interested in Micron, Hynix, Kioxia, and sandisk. "
+                "Track news from the previous 3 days and avoid MSN or Yahoo news."
+            ),
+            "scope": "Track company performance.",
+            "search_queries": ["an coming company days focus hynix in intrested"],
+            "source_selection": {"web_search": True, "markets": True},
+        }
+    )
+
+    strengthened = explore._strengthen_profile_for_run(profile)
+
+    assert "MU" in strengthened.source_queries["markets"]
+    assert "000660.KS" in strengthened.source_queries["markets"]
+    assert "285A.T" in strengthened.source_queries["markets"]
+    assert "SNDK" in strengthened.source_queries["markets"]
+    assert "Micron Technology MU" in strengthened.search_queries[0]
+    assert "Micron Technology MU" in strengthened.source_queries["web_search"][0]
+    assert "MSN" in strengthened.exclusions
+    assert "Yahoo News" in strengthened.exclusions
+
+
 class SlowAdapter(FakeAdapter):
     async def query(self, *_args, **_kwargs) -> list[Candidate]:
         await asyncio.sleep(0.05)
@@ -98,9 +124,12 @@ def test_topic_profile_infers_numeric_lookback_from_interest_text() -> None:
     assert profile.lookback_hours == 72
 
 
-def test_source_window_filter_drops_stale_and_undated_web_results() -> None:
+def test_source_window_filter_allows_undated_web_results_once(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
     profile = TopicProfile.from_dict(
         {
+            "topic_id": "topic-memory",
             "statement": "Track Micron, Hynix, Kioxia and Sandisk news from the previous 3 days.",
             "scope": "Memory company performance",
         }
@@ -127,10 +156,23 @@ def test_source_window_filter_drops_stale_and_undated_web_results() -> None:
         lookback_hours=72,
     )
 
-    assert kept == [fresh]
-    assert len(issues) == 2
+    assert kept[0] == fresh
+    assert kept[1].title == undated.title
+    assert kept[1].metadata["served_once"] is True
+    assert len(issues) == 1
     assert "outside the requested source window" in issues[0]["reason"]
-    assert "No reliable publish date" in issues[1]["reason"]
+
+    database.record_served_undated_items(
+        profile.topic_id,
+        explore._served_undated_items_from_results(kept),
+    )
+    kept_again, issues_again = explore._apply_source_window_filter(
+        profile,
+        [undated],
+        lookback_hours=72,
+    )
+    assert kept_again == []
+    assert "already shown once" in issues_again[0]["reason"]
 
 
 def test_source_window_filter_leaves_default_recency_unrestricted() -> None:

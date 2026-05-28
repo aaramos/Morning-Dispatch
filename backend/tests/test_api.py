@@ -129,11 +129,11 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "Source scope: last 2 days" in html.text
         assert "Last 2 days" not in html.text
         assert "https://example.com/model-release" in html.text
-        assert "Ranked stories" in html.text
+        assert "Top stories" in html.text
         assert "Fetched Articles" not in html.text
         assert "Digest Stats" not in html.text
         assert "brief-sidebar" in html.text
-        assert "How this was made" in html.text
+        assert "About this brief" in html.text
         assert "Provenance" not in html.text
         assert "AI tokens" in html.text
         assert "AI calls" in html.text
@@ -525,7 +525,7 @@ def test_admin_reports_fetch_failures_and_review_counts(monkeypatch, tmp_path):
         html = client.get(f"/api/issues/{issue.json()['id']}/html")
         assert "Unresolved Links" not in html.text
         assert "Blocked local model article" not in html.text
-        assert "How this was made" in html.text
+        assert "About this brief" in html.text
         assert "Provenance" not in html.text
         assert "Digest Stats" not in html.text
 

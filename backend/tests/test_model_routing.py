@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 import httpx
 from httpx._content import IteratorByteStream
@@ -31,6 +32,7 @@ def test_model_routes_default_to_local(monkeypatch, tmp_path):
 
     assert status["routes"]["editorial"]["provider"] == "local"
     assert status["routes"]["editorial"]["effective_model"] == "local-default"
+    assert status["defaults"]["ollama_cloud"] == "Gemma4-MTP-26B-BF16"
 
 
 def test_model_routes_can_be_saved(monkeypatch, tmp_path):
@@ -47,10 +49,12 @@ def test_model_routes_can_be_saved(monkeypatch, tmp_path):
     assert payload["model_routes"]["editorial"]["model"] == "gpt-oss:120b"
 
 
-def test_cloud_route_uses_ollama_for_public_sources(monkeypatch, tmp_path):
+def test_cloud_route_uses_openai_api_for_public_sources(monkeypatch, tmp_path):
     configure_runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_API_KEY", "ollama-key")
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_MODEL", "cloud-default")
     settings = get_settings()
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://api.ollama.com")
     model_routing.save_routes(
         settings,
         {"editorial": {"provider": "ollama_cloud", "model": "gpt-oss:120b", "allow_private_cloud": False}},
@@ -62,8 +66,39 @@ def test_cloud_route_uses_ollama_for_public_sources(monkeypatch, tmp_path):
 
     assert resolution.client is not None
     assert resolution.client.config.provider == "ollama_cloud"
-    assert resolution.client.config.api_mode == "ollama"
+    assert resolution.client.config.api_mode == "openai"
+    assert resolution.client.config.base_url == "https://api.ollama.com/v1"
     assert resolution.client.config.model == "gpt-oss:120b"
+
+
+def test_cloud_route_uses_cloud_default_when_route_has_no_model(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_API_KEY", "ollama-key")
+    monkeypatch.setenv("MORNING_DISPATCH_OLLAMA_MODEL", "cloud-default")
+    settings = get_settings()
+    model_routing.save_routes(
+        settings,
+        {"editorial": {"provider": "ollama_cloud", "model": None, "allow_private_cloud": False}},
+    )
+    settings = get_settings()
+
+    resolution = model_routing.client_for_agent("editorial", settings=settings, items=[])
+
+    assert resolution.client is not None
+    assert resolution.client.config.model == "cloud-default"
+
+
+def test_cloud_route_rejects_invalid_key(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    settings = get_settings()
+    with pytest.raises(ValueError, match="doesn't look like an Ollama Cloud token"):
+        model_routing.save_ollama_api_key(settings, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...")
+
+
+def test_cloud_url_normalization():
+    assert model_routing._normalize_ollama_base_url("https://ollama.com/api") == "https://api.ollama.com/v1"
+    assert model_routing._normalize_ollama_base_url("https://api.ollama.com") == "https://api.ollama.com/v1"
+    assert model_routing._normalize_ollama_base_url("https://api.ollama.com/v1/models") == "https://api.ollama.com/v1"
 
 
 def test_private_source_forces_cloud_route_to_local(monkeypatch, tmp_path):
@@ -88,7 +123,7 @@ def test_private_source_forces_cloud_route_to_local(monkeypatch, tmp_path):
 def test_streaming_http_error_detail_does_not_mask_model_fallback():
     response = httpx.Response(
         401,
-        request=httpx.Request("POST", "https://ollama.com/api/chat"),
+        request=httpx.Request("POST", "https://api.ollama.com/v1/chat/completions"),
         stream=IteratorByteStream(iter([b'{"error":"invalid api key"}'])),
     )
 

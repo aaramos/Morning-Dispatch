@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+import hashlib
 from pathlib import Path
 import logging
 import re
@@ -73,6 +75,12 @@ _MONTHS = {
     "november": 11,
     "december": 12,
 }
+_MARKET_ENTITY_ALIASES: tuple[tuple[str, str, str], ...] = (
+    ("Micron Technology", "MU", r"\bmicron\b|\bmicron technology\b|\bmu\b"),
+    ("SK Hynix", "000660.KS", r"\b(?:sk\s+)?hynix\b|\b000660(?:\.ks)?\b"),
+    ("Kioxia", "285A.T", r"\bkioxia\b|\b285a(?:\.t)?\b|\bkxhcf\b"),
+    ("SanDisk", "SNDK", r"\bsandisk\b|\bsndk\b"),
+)
 
 
 async def start_build_queue() -> None:
@@ -319,7 +327,7 @@ async def run_discovery(
     if record is None:
         return None
 
-    profile = TopicProfile.from_dict(record["profile"])
+    profile = _strengthen_profile_for_run(TopicProfile.from_dict(record["profile"]))
     merged_selection = _merged_source_selection(profile, source_selection)
     resolved_lookback_hours = _resolve_lookback_hours(profile, lookback_hours)
     exploration = database.create_exploration(
@@ -441,6 +449,7 @@ def start_rebuild(
         "candidate_limit": candidate_limit,
         "lookback_hours": resolved_lookback_hours,
     }
+    database.clear_inference_metrics_for_run(exploration_id)
     rebuilt = database.reset_exploration_for_rebuild(
         exploration_id,
         source_selection=merged_selection,
@@ -615,6 +624,7 @@ async def _run_exploration(
         brief_ref = _write_exploration_brief(exploration_id, html)
         stage_seconds["publishing"] = _elapsed_stage_seconds(stage_started)
         digest_stats = build_stats()
+        _apply_model_health_to_progress(progress, digest_stats)
         html = database.render_ingested_issue(
             title,
             snapshot,
@@ -627,6 +637,10 @@ async def _run_exploration(
             newsletter_payloads=newsletter_source_notes,
         )
         brief_ref = _write_exploration_brief(exploration_id, html)
+        database.record_served_undated_items(
+            profile.topic_id,
+            _served_undated_items_from_results(article_results),
+        )
 
         progress["brief"] = {
             "title": title,
@@ -669,6 +683,42 @@ async def _run_exploration(
             status="failed",
         )
         raise
+
+
+def _apply_model_health_to_progress(progress: dict[str, Any], stats: dict[str, Any]) -> None:
+    model_calls = int(stats.get("model_call_count") or 0)
+    model_successes = int(stats.get("model_success_count") or 0)
+    model_failures = int(stats.get("model_failure_count") or 0)
+    included_articles = int(stats.get("included_article_count") or 0)
+    if not model_calls:
+        return
+    if model_successes > 0 and included_articles > 0:
+        progress["model_health"] = {
+            "status": "ok",
+            "message": f"AI completed {model_successes}/{model_calls} model call(s).",
+        }
+        return
+
+    if model_successes == 0:
+        message = "AI review did not complete; the brief was built with fallback checks."
+    elif included_articles == 0:
+        message = "AI ran, but no eligible stories survived the source checks."
+    else:
+        message = "AI review completed with some failed model calls."
+    progress["model_health"] = {
+        "status": "degraded",
+        "message": message,
+        "model_call_count": model_calls,
+        "model_success_count": model_successes,
+        "model_failure_count": model_failures,
+        "included_article_count": included_articles,
+    }
+    issues = list(progress.get("source_audit_issues") or [])
+    issue = {"source_name": "AI review", "reason": message}
+    if issue not in issues:
+        issues.append(issue)
+    progress["source_audit_issues"] = issues
+    progress["built_with_issues"] = True
 
 
 def _promote_explore_sources(
@@ -1032,7 +1082,7 @@ def _apply_source_window_filter(
     kept: list[ArticleFetchResult] = []
     issues: list[dict[str, str]] = []
     for result in article_results:
-        reason = _source_window_rejection_reason(result, cutoff)
+        reason = _source_window_rejection_reason(profile, result, cutoff)
         if reason:
             issues.append(
                 {
@@ -1041,11 +1091,11 @@ def _apply_source_window_filter(
                 }
             )
             continue
-        kept.append(result)
+        kept.append(_mark_undated_once(result) if _is_strict_undated_result(result) else result)
     return kept, issues
 
 
-def _source_window_rejection_reason(result: ArticleFetchResult, cutoff: datetime) -> str:
+def _source_window_rejection_reason(profile: TopicProfile, result: ArticleFetchResult, cutoff: datetime) -> str:
     source_type = str(result.payload.source_type or "")
     published = _article_published_at(result)
     if published is not None:
@@ -1060,8 +1110,67 @@ def _source_window_rejection_reason(result: ArticleFetchResult, cutoff: datetime
         return ""
 
     if source_type in _STRICT_SOURCE_WINDOW_TYPES:
-        return "No reliable publish date was available for the requested source window."
+        item_key = _undated_item_key(result)
+        if database.has_served_undated_item(profile.topic_id, item_key):
+            return "Undated item was already shown once and is hidden from future editions."
+        return ""
     return ""
+
+
+def _is_strict_undated_result(result: ArticleFetchResult) -> bool:
+    return (
+        str(result.payload.source_type or "") in _STRICT_SOURCE_WINDOW_TYPES
+        and _article_published_at(result) is None
+        and _article_text_or_url_date(result) is None
+    )
+
+
+def _mark_undated_once(result: ArticleFetchResult) -> ArticleFetchResult:
+    metadata = {
+        **dict(result.metadata or {}),
+        "date_status": "unknown",
+        "served_once": True,
+        "served_once_note": "Date unknown; shown once.",
+        "served_once_key": _undated_item_key(result),
+    }
+    return replace(result, metadata=metadata)
+
+
+def _served_undated_items_from_results(article_results: list[ArticleFetchResult]) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    for result in article_results:
+        if result.tier == "dropped":
+            continue
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        if metadata.get("served_once") is not True:
+            continue
+        items.append(
+            {
+                "item_key": str(metadata.get("served_once_key") or _undated_item_key(result)),
+                "title": result.title,
+                "source_name": result.payload.source_name,
+                "url": _result_identity_url(result),
+            }
+        )
+    return items
+
+
+def _undated_item_key(result: ArticleFetchResult) -> str:
+    identity = "|".join(
+        part
+        for part in (
+            _result_identity_url(result),
+            result.canonical_url or "",
+            result.title,
+            result.payload.source_name,
+        )
+        if part
+    )
+    return hashlib.sha1(identity.encode("utf-8")).hexdigest()
+
+
+def _result_identity_url(result: ArticleFetchResult) -> str:
+    return str(result.canonical_url or result.final_url or result.original_url or result.payload.original_url or "").strip()
 
 
 def _article_published_at(result: ArticleFetchResult) -> datetime | None:
@@ -1432,6 +1541,145 @@ def _resolve_lookback_hours(profile: TopicProfile, lookback_hours: int | None) -
     return 24
 
 
+def _strengthen_profile_for_run(profile: TopicProfile) -> TopicProfile:
+    """Repair older saved profiles with deterministic facts from the user's statement."""
+    entities = _market_entities_from_text(" ".join([profile.statement, profile.scope]))
+    if not entities:
+        return profile
+
+    lookback_label = _source_scope_label(_resolve_lookback_hours(profile, None))
+    exclusions = tuple(_merge_terms(profile.exclusions, _exclusions_from_text(profile.statement)))
+    entity_terms = [f"{name} {ticker}" for name, ticker in entities]
+    tickers = [ticker for _, ticker in entities]
+    market_queries = _market_queries_for_entities(entity_terms, lookback_label, exclusions)
+    source_queries = _merge_source_query_terms(
+        {
+            "web_search": tuple(market_queries),
+            "markets": tuple(tickers),
+            "reddit": (f"{' '.join(entity_terms)} memory stocks analysis", "DRAM NAND HBM stock discussion"),
+            "youtube": (f"{' '.join(entity_terms)} stock analysis memory market", "DRAM NAND HBM market analysis"),
+        },
+        {key: tuple(value) for key, value in profile.source_queries.items()},
+    )
+    requested_sources = tuple(
+        _dedupe_dict_sources(
+            [
+                *profile.requested_sources,
+                *({"adapter": "markets", "ref": ticker} for ticker in tickers),
+            ]
+        )
+    )
+    keywords = tuple(_merge_terms(profile.keywords, [item for entity in entities for item in entity]))
+    subtopics = tuple(
+        _merge_terms(
+            profile.subtopics,
+            [
+                "company performance and catalysts",
+                "memory pricing and supply-demand signals",
+                "competitive positioning across memory and storage suppliers",
+            ],
+        )
+    )
+    search_queries = tuple(_merge_terms(market_queries, profile.search_queries, limit=10))
+    source_selection = dict(profile.source_selection)
+    if source_selection.get("markets"):
+        source_selection["markets"] = True
+
+    return replace(
+        profile,
+        keywords=keywords,
+        subtopics=subtopics,
+        search_queries=search_queries,
+        source_queries=source_queries,
+        exclusions=exclusions,
+        requested_sources=requested_sources,
+        source_selection=source_selection,
+    )
+
+
+def _market_entities_from_text(text: str) -> list[tuple[str, str]]:
+    entities: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, ticker, pattern in _MARKET_ENTITY_ALIASES:
+        if not re.search(pattern, text, flags=re.IGNORECASE):
+            continue
+        key = ticker.lower()
+        if key in seen:
+            continue
+        entities.append((name, ticker))
+        seen.add(key)
+    return entities
+
+
+def _exclusions_from_text(text: str) -> list[str]:
+    lowered = text.lower()
+    exclusions: list[str] = []
+    if "msn" in lowered:
+        exclusions.append("MSN")
+    if "yahoo" in lowered:
+        exclusions.append("Yahoo News")
+    if exclusions and re.search(r"\bnot\s+(?:like|from)\b", lowered):
+        exclusions.append("syndicated aggregator reposts")
+    return exclusions
+
+
+def _market_queries_for_entities(terms: list[str], lookback_label: str, exclusions: tuple[str, ...]) -> list[str]:
+    if not terms:
+        return []
+    company_group = " ".join(terms)
+    exclude_phrase = " ".join(
+        f"-{term.replace(' ', '')}"
+        for term in exclusions
+        if term.lower() in {"msn", "yahoo news"}
+    )
+    return [
+        f"{company_group} memory chip news {lookback_label} {exclude_phrase}".strip(),
+        f"{company_group} earnings guidance NAND DRAM HBM pricing {lookback_label} {exclude_phrase}".strip(),
+        f"{company_group} supply demand capacity capex customer wins {lookback_label} {exclude_phrase}".strip(),
+    ]
+
+
+def _merge_terms(existing: tuple[str, ...] | list[str], incoming: list[str] | tuple[str, ...], *, limit: int = 16) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in [*existing, *incoming]:
+        value = str(item or "").strip()
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        merged.append(value)
+        seen.add(key)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _merge_source_query_terms(
+    existing: dict[str, tuple[str, ...]],
+    incoming: dict[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    merged = dict(existing)
+    for source, queries in incoming.items():
+        merged[source] = tuple(_merge_terms(merged.get(source, ()), queries, limit=5))
+    return merged
+
+
+def _dedupe_dict_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for source in sources:
+        adapter = str(source.get("adapter") or "").strip()
+        ref = str(source.get("ref") or "").strip()
+        if not adapter or not ref:
+            continue
+        key = (adapter, ref.lower())
+        if key in seen:
+            continue
+        merged.append({"adapter": adapter, "ref": ref})
+        seen.add(key)
+    return merged
+
+
 def _bounded_lookback_hours(value: int) -> int:
     try:
         hours = int(value)
@@ -1459,6 +1707,7 @@ def _brief_search_strategy(
     source_selection: dict[str, bool],
     lookback_hours: int,
 ) -> dict[str, Any]:
+    profile = _strengthen_profile_for_run(profile)
     selected_sources = [
         _adapter_label(name)
         for name, enabled in source_selection.items()

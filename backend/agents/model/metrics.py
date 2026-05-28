@@ -29,6 +29,7 @@ def record_model_response_metric(
             "model_tag": _model_tag(model_name),
             "quantization": _quantization(model_name),
             "backend": _backend_name(model_client),
+            "route_name": _route_name(model_client),
             "mode": mode,
             "queue_wait_ms": response.queue_wait_ms,
             "ttft_ms": response.ttft_ms,
@@ -72,6 +73,7 @@ def record_model_error_metric(
             "model_tag": _model_tag(model_name),
             "quantization": _quantization(model_name),
             "backend": _backend_name(model_client),
+            "route_name": _route_name(model_client),
             "mode": mode,
             "queue_wait_ms": queue_wait_ms,
             "ttft_ms": ttft_ms,
@@ -102,6 +104,14 @@ def _backend_name(model_client: Any) -> str:
     if "localhost" in base_url or "127.0.0.1" in base_url:
         return "local"
     return "remote" if base_url else "unknown"
+
+
+def _route_name(model_client: Any) -> str | None:
+    config = getattr(model_client, "config", None)
+    route_name = getattr(config, "route_name", None)
+    if isinstance(route_name, str):
+        route_name = route_name.strip()
+    return route_name or None
 
 
 def _model_tag(model_name: str) -> str | None:

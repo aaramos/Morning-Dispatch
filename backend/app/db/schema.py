@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS inference_metrics (
   model_tag             TEXT,
   quantization          TEXT,
   backend               TEXT,
+  route_name            TEXT,
   mode                  TEXT NOT NULL,
   queue_wait_ms         INTEGER,
   ttft_ms               INTEGER,
@@ -375,6 +376,17 @@ CREATE TABLE IF NOT EXISTS source_scout_decisions (
   created_at       TEXT NOT NULL
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS served_undated_items (
+  id              TEXT PRIMARY KEY,
+  topic_id        TEXT NOT NULL,
+  item_key        TEXT NOT NULL,
+  title           TEXT,
+  source_name     TEXT,
+  url             TEXT,
+  first_seen_at   TEXT NOT NULL,
+  UNIQUE(topic_id, item_key)
+) STRICT;
+
 CREATE INDEX IF NOT EXISTS idx_digests_profile_id ON digests(profile_id);
 CREATE INDEX IF NOT EXISTS idx_topic_profiles_updated_at ON topic_profiles(updated_at);
 CREATE INDEX IF NOT EXISTS idx_refinement_sessions_updated_at ON refinement_sessions(updated_at);
@@ -403,4 +415,5 @@ CREATE INDEX IF NOT EXISTS idx_reddit_sources_digest_id ON reddit_sources(digest
 CREATE INDEX IF NOT EXISTS idx_reddit_sources_state ON reddit_sources(state);
 CREATE INDEX IF NOT EXISTS idx_source_scout_runs_digest_id ON source_scout_runs(digest_id);
 CREATE INDEX IF NOT EXISTS idx_source_scout_decisions_digest_id ON source_scout_decisions(digest_id);
+CREATE INDEX IF NOT EXISTS idx_served_undated_items_topic ON served_undated_items(topic_id);
 """
