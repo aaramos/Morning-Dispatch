@@ -67,7 +67,7 @@ def test_cloud_route_uses_openai_api_for_public_sources(monkeypatch, tmp_path):
     assert resolution.client is not None
     assert resolution.client.config.provider == "ollama_cloud"
     assert resolution.client.config.api_mode == "openai"
-    assert resolution.client.config.base_url == "https://api.ollama.com/v1"
+    assert resolution.client.config.base_url == "https://ollama.com/v1"
     assert resolution.client.config.model == "gpt-oss:120b"
 
 
@@ -96,9 +96,9 @@ def test_cloud_route_rejects_invalid_key(monkeypatch, tmp_path):
 
 
 def test_cloud_url_normalization():
-    assert model_routing._normalize_ollama_base_url("https://ollama.com/api") == "https://api.ollama.com/v1"
-    assert model_routing._normalize_ollama_base_url("https://api.ollama.com") == "https://api.ollama.com/v1"
-    assert model_routing._normalize_ollama_base_url("https://api.ollama.com/v1/models") == "https://api.ollama.com/v1"
+    assert model_routing._normalize_ollama_base_url("https://ollama.com/api") == "https://ollama.com/v1"
+    assert model_routing._normalize_ollama_base_url("https://api.ollama.com") == "https://ollama.com/v1"
+    assert model_routing._normalize_ollama_base_url("https://api.ollama.com/v1/models") == "https://ollama.com/v1"
 
 
 def test_private_source_forces_cloud_route_to_local(monkeypatch, tmp_path):

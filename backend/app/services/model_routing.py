@@ -343,11 +343,8 @@ def _normalize_ollama_base_url(raw_url: str) -> str:
     parsed = urlparse(value)
     netloc = parsed.netloc
     path = (parsed.path or "").rstrip("/") or "/"
-    if parsed.hostname in {"ollama.com", "www.ollama.com"} and path == "/api":
-        if parsed.port:
-            netloc = f"api.ollama.com:{parsed.port}"
-        else:
-            netloc = "api.ollama.com"
+    if parsed.hostname in {"api.ollama.com", "www.ollama.com"}:
+        netloc = f"ollama.com:{parsed.port}" if parsed.port else "ollama.com"
     base_path = path
     if not base_path or base_path == "/":
         normalized_path = "/v1"

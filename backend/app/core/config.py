@@ -39,7 +39,7 @@ class Settings:
     model_base_url: str | None = None
     model_api_key: str | None = None
     ollama_api_key: str | None = None
-    ollama_base_url: str = "https://api.ollama.com/v1"
+    ollama_base_url: str = "https://ollama.com/v1"
     librarian_model: str | None = DEFAULT_LIBRARIAN_MODEL
     ollama_cloud_model: str | None = DEFAULT_OLLAMA_CLOUD_MODEL
     librarian_use_model: bool = False
@@ -309,7 +309,7 @@ def get_settings() -> Settings:
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
         ollama_api_key=ollama_api_key,
-        ollama_base_url=os.environ.get("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://api.ollama.com/v1").rstrip("/"),
+        ollama_base_url=os.environ.get("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://ollama.com/v1").rstrip("/"),
         librarian_model=librarian_model,
         ollama_cloud_model=ollama_cloud_model,
         librarian_use_model=_model_enabled(

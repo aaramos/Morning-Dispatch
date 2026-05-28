@@ -3608,17 +3608,17 @@ function refinementProgressState(progress: RefinementProgress, now: number): Ref
   const seconds = elapsedMs / 1000;
   let stage = "Preparing request";
   let detail = "Packaging your interest, selected sources, and the current refinement state.";
-  let activity = "Local request is active.";
+  let activity = "Model request is active.";
   let percent = 14;
 
   if (seconds >= 1.5) {
-    stage = "Calling oMLX";
-    detail = "Sending the refinement prompt to the local model.";
+    stage = "Calling model";
+    detail = "Sending the refinement prompt to the configured model provider.";
     percent = 30;
   }
   if (seconds >= 4) {
     stage = "Waiting for model";
-    detail = "oMLX may be loading the model or allocating memory.";
+    detail = "The selected provider may be loading the model or allocating memory.";
     activity = "Waiting for the model response.";
     percent = 48;
   }
