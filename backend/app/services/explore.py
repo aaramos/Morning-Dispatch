@@ -1552,7 +1552,7 @@ def _requested_source_found(*, adapter: str, source_name: str, discovery: Discov
             payload.original_url,
             *[str(value) for value in payload.metadata.values() if isinstance(value, (str, int, float))],
         ]
-        haystack = " ".join(haystack_parts).lower()
+        haystack = " ".join(str(value) for value in haystack_parts if value).lower()
         if needle in haystack or haystack in needle:
             return True
     return False

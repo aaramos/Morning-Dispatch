@@ -2264,6 +2264,40 @@ def test_admin_exploration_issue_details_report_source_and_reason(monkeypatch, t
     }
 
 
+def test_requested_source_matching_tolerates_sparse_candidate_fields() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Explore approved Gmail newsletters",
+            "scope": "Approved Gmail newsletters",
+        }
+    )
+    discovery = DiscoveryResult(
+        profile=profile,
+        candidates=(
+            Candidate(
+                adapter="gmail",
+                payload=NormalizedPayload(
+                    source_name=None,
+                    original_url=None,
+                    metadata={"sender_name": "Tech Brew", "message_count": 2, "empty": None},
+                ),
+            ),
+        ),
+        statuses=(),
+    )
+
+    assert explore._requested_source_found(
+        adapter="gmail",
+        source_name="Tech Brew",
+        discovery=discovery,
+    )
+    assert not explore._requested_source_found(
+        adapter="gmail",
+        source_name="Unknown Newsletter",
+        discovery=discovery,
+    )
+
+
 def test_admin_exploration_issue_details_ignore_filter_decisions(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
 
