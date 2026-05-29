@@ -76,7 +76,7 @@ def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path)
     _runtime(monkeypatch, tmp_path)
     calls: list[dict[str, object]] = []
 
-    async def fake_search_web(query: str, *, limit: int, language: str | None = None):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
         calls.append({"query": query, "limit": limit, "language": language})
         return [
             SearchHit(
@@ -155,7 +155,7 @@ def test_foreign_media_accepts_up_to_ten_languages(monkeypatch, tmp_path) -> Non
 def test_foreign_media_adapter_filters_english_and_low_quality_results(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
 
-    async def fake_search_web(query: str, *, limit: int, language: str | None = None):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
         assert language == "ko"
         return [
             SearchHit(
@@ -208,7 +208,7 @@ def test_foreign_media_adapter_filters_english_and_low_quality_results(monkeypat
 def test_foreign_media_adapter_prefers_taiwanese_native_sources(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
 
-    async def fake_search_web(query: str, *, limit: int, language: str | None = None):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
         assert language == "zh"
         return [
             SearchHit(
@@ -257,9 +257,12 @@ def test_foreign_metadata_translation_preserves_original() -> None:
 
         async def complete_json(self, **_kwargs):
             return {
+                "can_translate": True,
+                "confidence": "high",
+                "detected_language": "ko",
                 "title_en": "SK Hynix expands HBM investment",
-                "summary_en": "SK Hynix expanded investment in HBM production.",
-                "quality": "high",
+                "body_en": "SK Hynix expanded investment in HBM production.",
+                "drop_reason": "",
             }
 
     payload = NormalizedPayload(
@@ -295,18 +298,14 @@ def test_foreign_metadata_translation_preserves_original() -> None:
     assert translated.metadata["translation"]["original_title"] == "SK하이닉스 HBM 투자 확대"
 
 
-def test_foreign_metadata_translation_uses_text_fallback_when_json_fails() -> None:
+def test_foreign_translation_assess_failed_drops_article() -> None:
+    """When complete_json raises, the article is dropped with mode='assess_failed'."""
+
     class FakeFallbackModel:
         config = type("Config", (), {"model": "fake-gemma"})()
 
         async def complete_json(self, **_kwargs):
             raise ModelClientError("bad json", status="parse_error")
-
-        async def complete(self, **_kwargs):
-            return (
-                "Title: SK Hynix expands HBM investment\n"
-                "Summary: SK Hynix expanded investment in HBM production."
-            )
 
     payload = NormalizedPayload(
         source_type="foreign_web",
@@ -333,13 +332,14 @@ def test_foreign_metadata_translation_uses_text_fallback_when_json_fails() -> No
         link_score=0.8,
     )
 
-    translated = asyncio.run(enrich_article_with_model(result, model_client=FakeFallbackModel()))
+    demoted = asyncio.run(enrich_article_with_model(result, model_client=FakeFallbackModel()))
 
-    assert translated.title == "SK Hynix expands HBM investment"
-    assert translated.editor_summary == "SK Hynix expanded investment in HBM production."
-    assert translated.metadata["translation"]["translated"] is True
-    assert translated.metadata["translation"]["mode"] == "fallback_text"
-    assert translated.metadata["translation"]["original_title"] == "SK하이닉스 HBM 투자 확대"
+    # Article is dropped — original title preserved in translation metadata
+    assert demoted.title == "SK하이닉스 HBM 투자 확대"
+    assert demoted.tier == "dropped"
+    assert demoted.metadata["translation"]["translated"] is False
+    assert demoted.metadata["translation"]["mode"] == "assess_failed"
+    assert demoted.metadata["translation"]["original_title"] == "SK하이닉스 HBM 투자 확대"
 
 
 def test_non_english_web_result_is_translated_even_outside_model_item_budget() -> None:
@@ -348,9 +348,12 @@ def test_non_english_web_result_is_translated_even_outside_model_item_budget() -
 
         async def complete_json(self, **_kwargs):
             return {
+                "can_translate": True,
+                "confidence": "high",
+                "detected_language": "th",
                 "title_en": "SK Hynix Q4 results beat expectations",
-                "summary_en": "SK Hynix's strong HBM results may support Micron and Sandisk through higher memory prices.",
-                "quality": "high",
+                "body_en": "SK Hynix's strong HBM results may support Micron and Sandisk through higher memory prices.",
+                "drop_reason": "",
             }
 
     thai_title = "ผลประกอบการไตรมาส 4 ของ SK Hynix ที่รายงานดีเกินคาด"
@@ -410,7 +413,8 @@ def test_script_detection_uses_trusted_language_scripts() -> None:
     assert untranslated.metadata["translation"]["source_language_name"] == "Hindi"
 
 
-def test_untranslated_non_english_web_result_is_moved_out_of_main_ranked_list() -> None:
+def test_untranslated_non_english_web_result_is_dropped() -> None:
+    """When no model is available to translate a foreign article, it is dropped entirely."""
     thai_title = "ผลประกอบการไตรมาส 4 ของ SK Hynix ที่รายงานดีเกินคาด"
     payload = NormalizedPayload(
         source_type="gmail_link",
@@ -433,8 +437,7 @@ def test_untranslated_non_english_web_result_is_moved_out_of_main_ranked_list() 
 
     untranslated = asyncio.run(enrich_article_with_model(result, model_client=None))
 
-    assert untranslated.tier == "lower_confidence"
-    assert untranslated.section == "Needs Translation"
+    assert untranslated.tier == "dropped"
     assert untranslated.metadata["translation"]["translated"] is False
     assert untranslated.metadata["translation"]["source_language"] == "th"
 
@@ -443,8 +446,7 @@ def test_untranslated_non_english_web_result_is_moved_out_of_main_ranked_list() 
         [untranslated],
     )
 
-    assert prepared[0].tier == "lower_confidence"
-    assert prepared[0].section == "Needs Translation"
+    assert prepared == []
 
 
 def test_translated_web_story_gets_translation_badge_and_modal() -> None:

@@ -12,9 +12,11 @@ from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.librarian import enrichment
 from backend.app.db import database
 from backend.app.main import create_app
+from backend.app.api import routes
 from backend.app.services import email_delivery
 from backend.app.services import digest_runner
 from backend.app.services import verification
+from backend.app.services.brief_title import tight_brief_title
 from backend.db.queries import get_watermark
 
 
@@ -116,7 +118,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
 
         html = client.get(f"/api/issues/{issue_id}/html")
         assert html.status_code == 200
-        assert "Morning Dispatch Issue" in html.text
+        assert "Morning Dispatch Issue" not in html.text
         assert "A useful newsletter body" in html.text
         assert "May 20, 2026" in html.text
         assert "Model update" in html.text
@@ -126,6 +128,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "2026-05-20T12:00:00+00:00" not in html.text
         assert "05/20/2026" in html.text
         assert re.search(r"Generated \d{2}/\d{2}/\d{4} ", html.text)
+        assert "issue-footer" not in html.text
         assert "Source scope: last 2 days" in html.text
         assert "Last 2 days" not in html.text
         assert "https://example.com/model-release" in html.text
@@ -158,10 +161,11 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
 
         brief = client.get("/brief")
         assert brief.status_code == 200
-        assert "Morning Dispatch Issue" in brief.text
+        assert "Morning Dispatch Issue" not in brief.text
         assert "https://example.com/model-release" in brief.text
         assert "05/20/2026" in brief.text
         assert re.search(r"Generated \d{2}/\d{2}/\d{4} ", brief.text)
+        assert "issue-footer" not in brief.text
         assert "overflow-x: hidden" in brief.text
 
         admin_status = client.get("/api/admin/status")
@@ -330,6 +334,8 @@ def test_issue_renderer_includes_all_ranked_articles_and_newsletters():
     assert len(soup.select("article.story-row")) == 17
     assert len(soup.select("article.low-conf-row")) == 12
     assert len(soup.select(".img-strip img")) == 3
+    assert len(soup.select(".img-strip a.strip-link[href] img")) == 3
+    assert soup.select_one(".brief-header .snapshot") is None
     assert len(soup.select("article.newsletter")) == 10
     assert "additional fetched article" not in html
 
@@ -425,7 +431,89 @@ def test_issue_renderer_surfaces_market_snapshot_sparklines():
     assert "$900.00" in market.text
     assert "+18.4% 3M" in market.text
     assert market.select_one("svg.sparkline path") is not None
+    recency = html.find(string="Recency")
+    assert recency is not None
+    assert recency.find_parent(class_="side-stat").select_one(".side-value").text == "3 days"
     assert html.select_one(".story-list").text.strip() == "No stories were ready for this brief."
+
+
+def test_saved_issue_display_rewrites_legacy_recency_hours(monkeypatch) -> None:
+    monkeypatch.setattr(
+        routes.database,
+        "get_topic_profile",
+        lambda topic_id: {
+            "profile": {
+                "scope": (
+                    "I'm an investor and looking to refine my investment portfolio. "
+                    "Help me identify companies poised to benefit greatly from the AI buildout. "
+                    "Am especially interested in picks and shovels companies."
+                ),
+                "keywords": ["ai", "investment"],
+                "lookback_hours": 168,
+                "exclusions": ["MSN"],
+                "source_selection": {
+                    "web_search": True,
+                    "foreign_media": True,
+                    "gmail": True,
+                    "markets": True,
+                },
+            }
+        },
+    )
+    html = """
+    <html><head><title>I'm an investor and looking to refine my investment portfolio - Morning Dispatch Issue</title><style>.issue-footer { margin-top: 36px; }</style></head><body>
+      <div class="side-stat"><span>Recency</span><strong class="side-value">168h</strong></div>
+      <div class="side-stat"><span>Sources</span><strong class="side-value">7</strong></div>
+      <section class="img-strip" aria-label="Story images">
+        <figure class="strip-frame"><img src="https://example.com/story.jpg" alt="Story" loading="lazy" /></figure>
+      </section>
+      <p class="snapshot">The issue is led by Story. Top coverage clusters around AI.</p>
+      <section class="brief-header"><div class="dateline">Thursday</div><h1>I'm an investor and looking to refine my investment portfolio. Help me identify companies poised to benefit greatly from the AI buildout - Morning Dispatch Issue</h1></section>
+      <div class="side-note"><h3>Search strategy</h3><p>Focused on I'm an investor and looking to refine my investment portfolio. Help me identify companies poised to benefit greatly from the AI buildout.; searched Gmail, Reddit, Web Search; with a last 7 days source scope.</p></div>
+      <h2 class="lead-title"><a href="https://example.com/story" target="_blank" rel="noreferrer">Story</a></h2>
+      <p class="meta">AI warning: 1 model call(s) failed before completion; this token total may be incomplete.</p>
+      <footer class="issue-footer">Morning Dispatch · 05/28/2026 5:57 PM PDT</footer>
+    </body></html>
+    """
+
+    rendered = routes._issue_html_for_display(
+        html,
+        exploration={
+            "topic_id": "topic-1",
+        },
+    )
+
+    assert "168h" not in rendered
+    assert '<strong class="side-value">7 days</strong>' in rendered
+    assert "<span>Sources</span>" not in rendered
+    assert "<span>Sources searched</span>" in rendered
+    assert "The issue is led by Story" not in rendered
+    assert 'class="snapshot"' not in rendered
+    assert "Morning Dispatch Issue" not in rendered
+    assert "Focused on I'm an investor" not in rendered
+    assert "Prioritized recent AI infrastructure investment signals" in rendered
+    assert "Searched web search, foreign media, approved Gmail newsletters, and market data over the last 7 days, excluding MSN." in rendered
+    assert "AI warning:" not in rendered
+    assert "this token total may be incomplete" not in rendered
+    assert "issue-footer" not in rendered
+    assert "05/28/2026 5:57 PM PDT" not in rendered
+    assert "<title>AI Picks-and-Shovels Investment Signals</title>" in rendered
+    assert "<h1>AI Picks-and-Shovels Investment Signals</h1>" in rendered
+    assert '<h2 class="lead-title"><a href="https://example.com/story">Story</a></h2>' in rendered
+    soup = BeautifulSoup(rendered, "html.parser")
+    image_link = soup.select_one(".img-strip a.strip-link[href='https://example.com/story'] img")
+    assert image_link is not None
+    assert image_link.get("src") == "https://example.com/story.jpg"
+
+
+def test_tight_brief_title_summarizes_prompt_language() -> None:
+    title = tight_brief_title(
+        "I'm an investor and looking to refine my investment portfolio. "
+        "Help me identify companies poised to benefit greatly from the AI buildout. "
+        "Am especially interested in picks and shovels companies. - Morning Dispatch Issue"
+    )
+
+    assert title == "AI Picks-and-Shovels Investment Signals"
 
 
 def test_issue_renderer_flags_incomplete_ai_token_counts():
@@ -495,8 +583,8 @@ def test_issue_renderer_flags_incomplete_ai_token_counts():
     assert "Source scope: last 3 days" in html
     assert "Token detail: 14,808 prompt tokens recorded; completion tokens unavailable." in html
     assert "14,808 prompt + 0 completion" not in html
-    assert "AI warning: 20 model call(s) failed before completion" in html
-    assert "Completion tokens were unavailable for 20 failed call(s)." in html
+    assert "AI warning:" not in html
+    assert "Completion tokens were unavailable for 20 failed call(s)." not in html
     assert "Editorial + review: not measured" in html
     assert "Editorial: 0 ms" not in html
     assert "Model tokens" not in html

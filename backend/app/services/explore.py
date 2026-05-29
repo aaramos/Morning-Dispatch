@@ -24,6 +24,8 @@ from backend.agents.discovery import (
 )
 from backend.agents.digestor.base import NormalizedPayload
 from backend.app.services import brief_settings, mcp_status, model_routing
+from backend.app.services.brief_strategy import selected_source_labels, summarize_search_strategy
+from backend.app.services.brief_title import tight_brief_title
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
@@ -41,7 +43,7 @@ _BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
 _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 150
-_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web"}
+_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "reddit_thread", "podcast_episode"}
 _DATE_METADATA_KEYS = (
     "published_at",
     "published",
@@ -117,12 +119,13 @@ async def _build_queue_worker() -> None:
             progress = dict(exploration.get("progress") or {})
             queue_options = dict(progress.get("queue_options") or {})
             try:
+                raw_lh = queue_options.get("lookback_hours")
                 await _run_exploration(
                     str(exploration["topic_id"]),
                     mode=str(exploration.get("mode") or "show_now"),
                     source_selection=dict(exploration.get("source_selection") or {}),
                     candidate_limit=int(queue_options.get("candidate_limit") or 250),
-                    lookback_hours=int(queue_options.get("lookback_hours") or 24),
+                    lookback_hours=int(raw_lh) if raw_lh is not None else None,
                     existing_exploration=exploration,
                 )
             except Exception:
@@ -953,7 +956,7 @@ async def _run_digest_core(
     profile: TopicProfile,
     payloads: list[Any],
     fetched_articles: list[ArticleFetchResult],
-    lookback_hours: int = 24,
+    lookback_hours: int | None = 24,
     inference_run_id: str,
     progress: dict[str, Any],
     persist: Callable[[], None],
@@ -964,6 +967,7 @@ async def _run_digest_core(
         "interest": profile.search_text(),
         "threshold": 0.45,
         "content_limits": dict(profile.content_limits),
+        "recency_weighting": profile.recency_weighting,
     }
     _set_pipeline_stage(progress, "summarize", "running")
     persist()
@@ -1091,9 +1095,9 @@ def _apply_source_window_filter(
     profile: TopicProfile,
     article_results: list[ArticleFetchResult],
     *,
-    lookback_hours: int,
+    lookback_hours: int | None,
 ) -> tuple[list[ArticleFetchResult], list[dict[str, str]]]:
-    if profile.lookback_hours is None:
+    if lookback_hours is None:
         return article_results, []
     cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
     kept: list[ArticleFetchResult] = []
@@ -1558,12 +1562,14 @@ def _requested_source_found(*, adapter: str, source_name: str, discovery: Discov
     return False
 
 
-def _resolve_lookback_hours(profile: TopicProfile, lookback_hours: int | None) -> int:
+def _resolve_lookback_hours(profile: TopicProfile, lookback_hours: int | None) -> int | None:
     if lookback_hours is not None:
         return _bounded_lookback_hours(lookback_hours)
     if profile.lookback_hours is not None:
         return _bounded_lookback_hours(profile.lookback_hours)
-    if profile.recency_weighting in {"last_year", "all_available"}:
+    if profile.recency_weighting == "all_available":
+        return None  # No temporal constraint — cast widest net, skip age filtering
+    if profile.recency_weighting == "last_year":
         return 8760
     if profile.recency_weighting == "recent":
         return 72
@@ -1647,28 +1653,21 @@ def _adapter_label(adapter: str) -> str:
 def _brief_search_strategy(
     profile: TopicProfile,
     source_selection: dict[str, bool],
-    lookback_hours: int,
+    lookback_hours: int | None,
 ) -> dict[str, Any]:
     profile = _strengthen_profile_for_run(profile)
-    selected_sources = [
-        _adapter_label(name)
-        for name, enabled in source_selection.items()
-        if enabled
-    ]
+    selected_sources = selected_source_labels(source_selection)
     queries = _strategy_queries(profile)
     exclusions = [item for item in profile.exclusions[:3] if item]
     scope = _source_scope_label(lookback_hours)
-    summary_parts = [
-        f"Focused on {profile.scope or profile.statement}",
-        f"searched {', '.join(selected_sources[:5])}" if selected_sources else "",
-        f"with a {scope} source scope",
-    ]
-    if queries:
-        summary_parts.append(f"using queries like \"{queries[0]}\"")
-    if exclusions:
-        summary_parts.append("excluding " + ", ".join(exclusions))
     return {
-        "summary": "; ".join(part for part in summary_parts if part) + ".",
+        "summary": summarize_search_strategy(
+            statement=profile.scope or profile.statement,
+            sources=selected_sources,
+            source_scope=scope,
+            exclusions=exclusions,
+            keywords=list(profile.keywords),
+        ),
         "queries": queries,
         "sources": selected_sources,
         "source_scope": scope,
@@ -1694,7 +1693,9 @@ def _strategy_queries(profile: TopicProfile) -> list[str]:
     return queries[:3]
 
 
-def _source_scope_label(lookback_hours: int) -> str:
+def _source_scope_label(lookback_hours: int | None) -> str:
+    if lookback_hours is None:
+        return "all available"
     try:
         hours = max(1, int(lookback_hours))
     except (TypeError, ValueError):
@@ -1718,7 +1719,7 @@ def _elapsed_stage_seconds(started_at: float) -> float:
 
 def _brief_title(profile: TopicProfile) -> str:
     scope = profile.scope or profile.statement or "Explore"
-    return f"{scope[:96]} - Morning Dispatch Issue"
+    return tight_brief_title(scope, keywords=profile.keywords)
 
 
 def _selected_source_count(discovery: DiscoveryResult, source_selection: dict[str, bool]) -> int:

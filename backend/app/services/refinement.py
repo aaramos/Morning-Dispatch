@@ -774,7 +774,7 @@ def _build_refinement_agent_prompt(
             "source_guidance": {
                 "web_search": "Use precise web queries with location/time/source words, aliases, and concrete intent.",
                 "foreign_media": (
-                    "When selected, propose allowlisted non-English languages and idiomatic native-language queries. "
+                    "When selected, propose any non-English language the topic warrants and write idiomatic native-language queries. "
                     "Use this for public foreign media only."
                 ),
                 "reddit": "Use community phrasing, local names, problems, recommendations, and comparison language.",
@@ -790,9 +790,6 @@ def _build_refinement_agent_prompt(
                 ),
             },
             "already_inferred": _inferred_constraints(profile_snapshot),
-            "trusted_foreign_languages": [
-                {"code": item["code"], "name": item["name"]} for item in trusted_language_options()
-            ],
             "question_policy": (
                 "Ask the single question that most improves the search plan, in plain language the "
                 "user will understand without explanation. Phrase it like a curious human "
@@ -1136,22 +1133,24 @@ def _lookback_label(hours: int) -> str:
 def _normalize_foreign_language_plan(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
-    trusted = {str(item["code"]): item for item in trusted_language_options()}
+    known_languages = {str(item["code"]): item for item in trusted_language_options()}
     cleaned: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
             continue
         code = str(item.get("code") or item.get("language") or "").strip().lower()
-        if code not in trusted or code in seen:
+        if not re.match(r"^[a-z]{2,4}$", code) or code in seen:
             continue
         native_query = " ".join(str(item.get("native_query") or "").split()).strip()
         if not native_query:
             continue
+        known = known_languages.get(code)
+        name = str(item.get("name") or "").strip() or (str(known["name"]) if known else code.upper())
         cleaned.append(
             {
                 "code": code,
-                "name": str(item.get("name") or trusted[code]["name"]),
+                "name": name,
                 "native_query": native_query[:340],
                 "native_entity_terms": _string_list(item.get("native_entity_terms"), limit=8),
                 "reason": str(item.get("reason") or item.get("rationale") or "").strip()[:220],

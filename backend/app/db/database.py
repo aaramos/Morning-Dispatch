@@ -23,6 +23,7 @@ from backend.agents.editor import build_issue_snapshot
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.app.core.config import ensure_runtime_dirs, get_settings
 from backend.app.db.schema import SCHEMA_SQL
+from backend.app.services.brief_title import tight_brief_title
 
 MODEL_ENRICHMENT_CACHE_VERSION = "librarian-v1"
 PODCAST_SOURCE_TYPES = {"podcast_rss", "podcast_search"}
@@ -2255,7 +2256,7 @@ def create_ingested_run(
     run_id = new_id()
     issue_id = new_id()
     digest_id = str(digest["id"])
-    title = f"{digest['name']} - Morning Dispatch Issue"
+    title = tight_brief_title(str(digest["name"] or "Morning Brief"))
     snapshot = ingested_snapshot(payloads, configured_source_count, article_results)
     lookback_days = max(1, math.ceil(lookback_hours / 24))
     body_payloads = [payload for payload in payloads if payload.source_type == "gmail"]
@@ -2771,7 +2772,6 @@ def render_ingested_issue(
     generated_value = generated_at or utc_now()
     masthead_meta = _render_masthead_meta(generated_value, lookback_hours, effective_stats)
     dateline_label = escape(_format_brief_dateline(generated_value))
-    generated_footer = _render_generated_footer(generated_value)
     feedback_script = _render_feedback_script(issue_id)
     podcast_script = _render_podcast_modal_script()
 
@@ -2817,13 +2817,13 @@ def render_ingested_issue(
     h1, h2, h3, h4, p, a, .meta, .story-title, .side-value {{ overflow-wrap: anywhere; }}
     a {{ color: inherit; text-decoration-thickness: 1px; text-underline-offset: 4px; }}
     img, video, iframe, table {{ max-width: 100%; }}
-    .snapshot {{ font-size: clamp(1.12rem, 2vw, 1.42rem); line-height: 1.45; margin: 0; color: #3f382f; max-width: 820px; }}
     .brief-body {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); gap: 34px; align-items: start; }}
     .story-column, .brief-sidebar, .lead-block, .story-row, .media-card, .low-conf-row, .newsletter {{ min-width: 0; }}
     .story-column {{ display: grid; gap: 30px; }}
     .img-strip {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
     .strip-frame, .story-thumb, .media-thumb {{ position: relative; overflow: hidden; background: #e5dacb; border: 1px solid var(--line); }}
     .strip-frame {{ aspect-ratio: 4 / 3; }}
+    .strip-link {{ display: block; width: 100%; height: 100%; }}
     .strip-frame img, .story-thumb img, .media-thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
     .fallback-art {{ display: grid; place-items: center; min-height: 100%; color: var(--accent); background: linear-gradient(135deg, #fbf3e5, #e9ddcb); }}
     .fallback-art svg {{ width: 34px; height: 34px; }}
@@ -2920,7 +2920,6 @@ def render_ingested_issue(
     .foreign-body p {{ margin: 0 0 12px; font-size: 1rem; line-height: 1.62; color: #3f382f; }}
     body.modal-open {{ overflow: hidden; }}
     .empty {{ margin-top: 32px; padding: 24px; border: 1px dashed #b9ae9d; font: 1rem var(--body); background: var(--paper); }}
-    .issue-footer {{ margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--line); font: 700 .76rem var(--mono); color: var(--muted); text-transform: uppercase; }}
     @media (max-width: 860px) {{
       .brief-shell {{ padding: 26px 16px 48px; }}
       .brief-header h1 {{ font-size: 2.35rem; line-height: 1; max-height: 9.4rem; }}
@@ -2952,7 +2951,6 @@ def render_ingested_issue(
     <section class="brief-header">
       <div class="dateline">{dateline_label}</div>
       <h1>{escape(title)}</h1>
-      <p class="snapshot">{escape(snapshot)}</p>
     </section>
     {empty_state}
     <div class="brief-body">
@@ -2970,7 +2968,6 @@ def render_ingested_issue(
       </div>
       {sidebar_html}
     </div>
-    {generated_footer}
 	  </main>
 	  {feedback_script}
 	  {podcast_script}
@@ -2979,7 +2976,6 @@ def render_ingested_issue(
 
 
 def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None = None) -> str:
-    generated_footer = _render_generated_footer(generated_at or utc_now())
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2997,7 +2993,6 @@ def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None
     .date {{ margin-top: 12px; font: 600 0.8rem Arial, sans-serif; text-transform: uppercase; }}
     .snapshot {{ font-size: 1.3rem; line-height: 1.5; max-width: 720px; }}
     .empty {{ margin-top: 32px; padding-top: 24px; border-top: 1px solid #c8bfae; font: 1rem Arial, sans-serif; }}
-    .issue-footer {{ margin-top: 36px; padding-top: 16px; border-top: 1px solid #d4cbbd; font: 700 .76rem Arial, sans-serif; color: #5f675f; text-transform: uppercase; }}
     @media (max-width: 640px) {{
       h1 {{ font-size: 1.9rem; line-height: 1; max-height: 7.6rem; }}
     }}
@@ -3014,7 +3009,6 @@ def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None
       <strong>Your brief is on its way.</strong>
       Stories will appear here once sources have been searched and ranked. Check back in a moment.
     </section>
-    {generated_footer}
   </main>
 </body>
 </html>"""
@@ -3570,7 +3564,9 @@ def _translation_original_html(result: ArticleFetchResult) -> str:
 
 
 def _translation_quality_label(translation: dict[str, Any]) -> str:
-    quality = str(translation.get("quality") or translation.get("translation_quality") or "").strip().lower()
+    quality = str(
+        translation.get("quality") or translation.get("translation_quality") or translation.get("confidence") or ""
+    ).strip().lower()
     return quality if quality in {"high", "medium", "low"} else ""
 
 
@@ -3606,7 +3602,7 @@ def _story_title(result: ArticleFetchResult) -> str:
 def _story_link_parts(result: ArticleFetchResult, *, issue_id: str | None) -> tuple[str, str, str, str, str]:
     url = _result_url(result)
     if not _supports_foreign_article_modal(result, issue_id=issue_id):
-        return url, ' target="_blank" rel="noreferrer"', "", "", ""
+        return url, "", "", "", ""
     modal_id = _foreign_article_modal_id(result)
     attributes = _foreign_article_attributes(result, modal_id=modal_id)
     return f"#{modal_id}", "", ' class="foreign-article-link"', attributes, _render_foreign_article_modal(result, modal_id, issue_id)
@@ -3650,10 +3646,14 @@ def _render_image_strip(results: list[ArticleFetchResult]) -> str:
         image_url = _result_image_url(result)
         if not image_url:
             continue
+        link_url = _result_url(result)
+        image_html = f'<img src="{escape(image_url, quote=True)}" alt="{escape(_story_title(result), quote=True)}" loading="lazy" />'
+        if link_url and link_url != "#":
+            image_html = f'<a class="strip-link" href="{escape(link_url, quote=True)}">{image_html}</a>'
         frames.append(
             f"""
             <figure class="strip-frame">
-              <img src="{escape(image_url, quote=True)}" alt="{escape(_story_title(result), quote=True)}" loading="lazy" />
+              {image_html}
             </figure>
             """
         )
@@ -3928,9 +3928,15 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
     original_seed = "\n\n".join(part for part in (original_title, original_summary) if part)
     original_html = _render_transcript_paragraphs(original_seed)
     translation_context = _translation_context_label(translation)
-    provenance = f"Metadata translation from {source_language_name}"
+    is_full_translation = str(translation.get("mode") or "").strip() == "assess_and_translate"
+    provenance_prefix = "Machine translated" if is_full_translation else "Metadata translated"
+    provenance = f"{provenance_prefix} from {source_language_name}"
     if translation_context:
         provenance = f"{provenance} · {translation_context}"
+    if is_full_translation:
+        status_text = "Full article translated to English during brief build."
+    else:
+        status_text = "Open this article to translate the full body. The current card uses translated metadata."
     return f"""
         <div class="podcast-modal foreign-modal" id="{escape(modal_id, quote=True)}" data-foreign-exploration-id="{escape(issue_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
           <div class="podcast-panel youtube-panel">
@@ -3941,7 +3947,7 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
               <a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">View original source</a>
             </div>
             <p class="foreign-provenance" data-foreign-provenance>{escape(provenance)}</p>
-            <p class="foreign-status" aria-live="polite">Open this article to translate the full body. The current card uses translated metadata.</p>
+            <p class="foreign-status" aria-live="polite">{escape(status_text)}</p>
             <div class="foreign-tabs" role="tablist" aria-label="Article language view">
               <button type="button" class="active" data-foreign-tab="translated">Translated</button>
               <button type="button" data-foreign-tab="original">Original {escape(source_language_name)}</button>
@@ -3980,13 +3986,13 @@ def _render_brief_sidebar(
     side_stats = [
         ("Articles", _format_int(article_count)),
         ("Media", _format_int(media_count)),
-        ("Sources", _format_int(stats.get("source_count"))),
+        ("Sources searched", _format_int(stats.get("source_count"))),
         ("Newsletters", _format_int(newsletter_count)),
         ("Links", _format_int(stats.get("link_count"))),
         ("AI tokens", _format_int(stats.get("total_tokens"))),
         ("AI calls", ai_call_value),
         ("Processing", _format_duration(stats.get("processing_seconds"))),
-        ("Recency", f"{lookback_hours}h"),
+        ("Recency", _format_recency_value(lookback_hours)),
     ]
     stat_html = "\n".join(
         f'<div class="side-stat"><span>{escape(label)}</span><strong class="side-value">{escape(value)}</strong></div>'
@@ -4008,18 +4014,6 @@ def _render_brief_sidebar(
         )
         stage_html = f'<ul class="stage-list">{stage_items}</ul>'
     token_detail = _render_token_detail(stats)
-    completion_unavailable_count = int(stats.get("completion_unavailable_count") or 0)
-    token_warning = ""
-    if failed_model_calls:
-        unavailable_note = (
-            f" Completion tokens were unavailable for {_format_int(completion_unavailable_count)} failed call(s)."
-            if completion_unavailable_count
-            else ""
-        )
-        token_warning = (
-            f'<p class="meta">AI warning: {_format_int(failed_model_calls)} model call(s) failed before completion; '
-            f"this token total may be incomplete.{unavailable_note}</p>"
-        )
     source_notes_html = ""
     if newsletter_html:
         source_notes_html = f"""
@@ -4040,7 +4034,6 @@ def _render_brief_sidebar(
           {model_usage_html}
           {stage_html}
           {token_detail}
-          {token_warning}
           {source_notes_html}
         </section>
       </aside>
@@ -4668,25 +4661,12 @@ def _render_digest_stats(stats: dict[str, Any]) -> str:
         for label, value in stat_items
     )
     token_detail = _render_token_detail(stats)
-    completion_unavailable_count = int(stats.get("completion_unavailable_count") or 0)
-    token_warning = ""
-    if failed_model_calls:
-        unavailable_note = (
-            f" Completion tokens were unavailable for {_format_int(completion_unavailable_count)} failed call(s)."
-            if completion_unavailable_count
-            else ""
-        )
-        token_warning = (
-            f'<p class="meta">AI warning: {_format_int(failed_model_calls)} model call(s) failed before completion; '
-            f"this token total may be incomplete.{unavailable_note}</p>"
-        )
     return f"""
       <div class="digest-stats">
         {stat_html}
         {stage_html}
       </div>
       {token_detail}
-      {token_warning}
     """
 
 
@@ -5018,6 +4998,27 @@ def _format_source_scope(lookback_hours: int) -> str:
     if hours == 1:
         return "last hour"
     return f"last {hours} hours"
+
+
+def _format_recency_value(lookback_hours: int) -> str:
+    try:
+        hours = max(1, int(lookback_hours))
+    except (TypeError, ValueError):
+        hours = 24
+    if hours < 24:
+        return "1 hour" if hours == 1 else f"{hours} hours"
+    if hours % 24:
+        return f"{hours} hours"
+    days = hours // 24
+    if days < 14:
+        return "1 day" if days == 1 else f"{days} days"
+    if days >= 60:
+        months = max(1, round(days / 30))
+        return "1 month" if months == 1 else f"{months} months"
+    if days % 7 == 0:
+        weeks = days // 7
+        return "1 week" if weeks == 1 else f"{weeks} weeks"
+    return f"{days} days"
 
 
 def _format_brief_dateline(value: str | None) -> str:

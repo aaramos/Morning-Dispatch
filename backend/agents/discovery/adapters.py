@@ -21,7 +21,7 @@ from backend.app.db import database
 from backend.app.core.config import get_settings
 from backend.agents.discovery.collections_source import search_collections, sync_collections
 from backend.agents.discovery.markets import MarketSnapshot, fetch_market_snapshots, select_market_companies
-from backend.agents.discovery.web_search import search_web
+from backend.agents.discovery.web_search import lookback_to_days, search_web
 from backend.agents.discovery.youtube import fetch_youtube_transcript, search_youtube
 
 
@@ -132,8 +132,9 @@ class WebSearchSourceAdapter:
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         queries = _web_search_queries(profile, _requested_refs(profile, "web_search"), adapter=self.name)
         per_query_limit = max(4, min(20, max(1, context.candidate_limit)))
+        days = lookback_to_days(context.lookback_hours)
         results = await asyncio.gather(
-            *(search_web(query, limit=per_query_limit) for query in queries),
+            *(search_web(query, limit=per_query_limit, days=days) for query in queries),
             return_exceptions=True,
         )
 
@@ -202,6 +203,7 @@ class YouTubeSourceAdapter:
             limit=max(1, min(context.candidate_limit, settings.youtube_max_results)),
             recency_weighting=profile.recency_weighting,
             duration_filter=settings.youtube_duration_filter,
+            lookback_hours=context.lookback_hours,
         )
         if not result.videos:
             return []

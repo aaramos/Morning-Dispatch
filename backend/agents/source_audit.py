@@ -58,7 +58,7 @@ async def apply_source_audit(
     profile: TopicProfile | dict[str, Any],
     results: Iterable[ArticleFetchResult],
     *,
-    lookback_hours: int,
+    lookback_hours: int | None,
     model_client: ModelClient | None = None,
     inference_run_id: str | None = None,
     max_candidates: int | None = None,
@@ -147,7 +147,7 @@ async def _complete_audit(
     result_list: list[ArticleFetchResult],
     candidates: list[int],
     *,
-    lookback_hours: int,
+    lookback_hours: int | None,
     inference_run_id: str | None,
     article_id: str,
     max_tokens: int,
@@ -457,11 +457,30 @@ def _audit_prompt(
     profile: TopicProfile | dict[str, Any],
     results: list[ArticleFetchResult],
     indexes: list[int],
-    lookback_hours: int,
+    lookback_hours: int | None,
     *,
     compact: bool = False,
 ) -> str:
-    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    if lookback_hours is not None:
+        cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+        source_scope = {
+            "lookback_hours": lookback_hours,
+            "cutoff_utc": cutoff.isoformat(timespec="seconds"),
+            "instruction": (
+                "For strict recent briefs, exclude stale current-looking pages. "
+                "If an article is outside the requested window, choose exclude unless it is essential background; "
+                "essential background must be include_as_context, never ranked as fresh news."
+            ),
+        }
+    else:
+        source_scope = {
+            "lookback_hours": None,
+            "cutoff_utc": None,
+            "instruction": (
+                "No time window is set — all available content is in scope. "
+                "Do not exclude articles solely based on age."
+            ),
+        }
     profile_record = _profile_record(profile)
     records = [_article_record(index, results[index], compact=compact) for index in indexes]
     return json.dumps(
@@ -470,15 +489,7 @@ def _audit_prompt(
             "user_request": profile_record["statement"],
             "refined_scope": profile_record["scope"],
             "search_strategy": profile_record["search_queries"],
-            "source_scope": {
-                "lookback_hours": lookback_hours,
-                "cutoff_utc": cutoff.isoformat(timespec="seconds"),
-                "instruction": (
-                    "For strict recent briefs, exclude stale current-looking pages. "
-                    "If an article is outside the requested window, choose exclude unless it is essential background; "
-                    "essential background must be include_as_context, never ranked as fresh news."
-                ),
-            },
+            "source_scope": source_scope,
             "coverage_goal": _coverage_goal(profile),
             "exclusions": profile_record["exclusions"],
             "instructions": (

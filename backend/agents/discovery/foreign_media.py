@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery.language_support import trusted_language_options
 from backend.agents.discovery.types import Candidate, CostProfile, SourceAdapterContext, TopicProfile
-from backend.agents.discovery.web_search import search_web
+from backend.agents.discovery.web_search import lookback_to_days, search_web
 from backend.app.core.config import get_settings
 from backend.app.services import model_routing
 
@@ -90,9 +90,10 @@ class ForeignMediaSourceAdapter:
             return []
 
         per_language_limit = DEFAULT_RESULTS_PER_LANGUAGE
+        days = lookback_to_days(context.lookback_hours)
         results = await asyncio.gather(
             *(
-                search_web(str(item["native_query"]), limit=per_language_limit, language=str(item["code"]))
+                search_web(str(item["native_query"]), limit=per_language_limit, language=str(item["code"]), days=days)
                 for item in plan
                 if str(item.get("native_query") or "").strip()
             ),
@@ -181,26 +182,33 @@ async def foreign_language_plan_for_profile(profile: TopicProfile) -> tuple[dict
     return tuple(entry for entry in entries if entry.get("native_query"))
 
 
+def _code_to_name(code: str) -> str:
+    """Return a human-readable language name for an ISO 639 code, falling back to the uppercased code."""
+    for item in trusted_language_options():
+        if item["code"] == code:
+            return str(item["name"])
+    return code.upper()
+
+
 def _sanitize_plan(value: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(value, (list, tuple)):
         return ()
-    languages = {item["code"]: item for item in trusted_language_options()}
     cleaned: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
             continue
         code = str(item.get("code") or item.get("language") or "").strip().lower()
-        if code not in languages or code in seen or code in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
+        if not re.match(r"^[a-z]{2,4}$", code) or code in seen or code in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
             continue
         native_query = " ".join(str(item.get("native_query") or "").split()).strip()
         if not native_query:
             continue
-        language = languages[code]
+        name = str(item.get("name") or "").strip() or _code_to_name(code)
         cleaned.append(
             {
                 "code": code,
-                "name": language["name"],
+                "name": name,
                 "native_query": native_query[:340],
                 "native_entity_terms": _string_list(item.get("native_entity_terms"), limit=8),
                 "reason": str(item.get("reason") or item.get("rationale") or "").strip()[:220],
@@ -212,23 +220,23 @@ def _sanitize_plan(value: Any) -> tuple[dict[str, Any], ...]:
 
 def _derive_language_seeds(profile: TopicProfile) -> list[dict[str, Any]]:
     text = _profile_text(profile)
-    languages = {item["code"]: item for item in trusted_language_options()}
+    known_languages = {item["code"]: item for item in trusted_language_options()}
     selected: dict[str, dict[str, Any]] = {}
 
     for code, reason in _explicit_language_requests(text):
-        if code in languages and code not in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
-            selected.setdefault(code, {**languages[code], "reason": reason, "native_entity_terms": []})
+        if code not in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
+            base = known_languages.get(code) or {"code": code, "name": _code_to_name(code)}
+            selected.setdefault(code, {**base, "reason": reason, "native_entity_terms": []})
 
     for hint in ENTITY_LANGUAGE_HINTS:
         if not _contains_entity(text, hint["aliases"]):
             continue
         code = hint["code"]
-        if code not in languages:
-            continue
+        base = known_languages.get(code) or {"code": code, "name": _code_to_name(code)}
         entry = selected.setdefault(
             code,
             {
-                **languages[code],
+                **base,
                 "reason": f"because you're tracking {hint['label']}",
                 "native_entity_terms": [],
             },
@@ -236,8 +244,8 @@ def _derive_language_seeds(profile: TopicProfile) -> list[dict[str, Any]]:
         entry["native_entity_terms"] = _merge_strings(entry.get("native_entity_terms"), hint.get("native_terms"))
 
     for code, reason in _topic_language_hints(text):
-        if code in languages:
-            selected.setdefault(code, {**languages[code], "reason": reason, "native_entity_terms": []})
+        base = known_languages.get(code) or {"code": code, "name": _code_to_name(code)}
+        selected.setdefault(code, {**base, "reason": reason, "native_entity_terms": []})
 
     return list(selected.values())[:MAX_FOREIGN_LANGUAGES]
 

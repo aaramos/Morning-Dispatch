@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from backend.app.core.config import DEFAULT_LIBRARIAN_MODEL, Settings, ensure_runtime_dirs
+from backend.app.core.config import DEFAULT_LIBRARIAN_MODEL, DEFAULT_OLLAMA_CLOUD_MODEL, Settings, ensure_runtime_dirs
 
 
 class ModelCatalogError(RuntimeError):
@@ -104,7 +104,7 @@ def restore_default_models(settings: Settings) -> None:
     ensure_runtime_dirs(settings)
     payload = _read_model_settings(settings.model_settings_path)
     payload["librarian_model"] = DEFAULT_LIBRARIAN_MODEL
-    payload["ollama_cloud_model"] = DEFAULT_LIBRARIAN_MODEL
+    payload["ollama_cloud_model"] = DEFAULT_OLLAMA_CLOUD_MODEL
     payload["updated_at"] = datetime.now(UTC).isoformat(timespec="seconds")
     payload["updated_by"] = "admin"
     _write_json(settings.model_settings_path, payload)

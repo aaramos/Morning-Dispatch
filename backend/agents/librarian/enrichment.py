@@ -97,7 +97,7 @@ async def enrich_article_with_model(
 
     deterministic = enrich_article(result)
     if _needs_metadata_translation(deterministic):
-        return await _translate_foreign_metadata(deterministic, model_client=model_client)
+        return await _assess_and_translate_foreign(deterministic, model_client=model_client)
 
     if model_client is None or deterministic.tier == "dropped" or not deterministic.fetched:
         return deterministic
@@ -289,192 +289,195 @@ async def refine_ranked_articles_with_model(
     return list(await asyncio.gather(*tasks))
 
 
-async def _translate_foreign_metadata(
+async def _assess_and_translate_foreign(
     result: ArticleFetchResult,
     *,
     model_client: ModelClient | None,
 ) -> ArticleFetchResult:
+    """Assess translatability of a foreign article and fully translate it if confident.
+
+    Drops the article (tier='dropped') when the model reports low confidence or
+    cannot parse the content.  Fully translates title + body when confidence is
+    medium or high, replacing the article text so it enters the brief in English.
+    """
     source_language = _source_language(result)
     source_language_name = _source_language_name(result)
     original_title = _original_title(result)
     original_summary = _original_summary(result)
-    translation_base = {
-        "translated": False,
-        "source_language": source_language,
-        "source_language_name": source_language_name,
-        "translator": _model_name(model_client) if model_client is not None else None,
-        "mode": "fast",
-        "stage": "metadata",
-        "original_title": original_title,
-        "original_summary": original_summary,
-    }
+
+    # Best available body — prefer a fully fetched body over snippet
+    body = result.text or ""
+    if len(body) < 200:
+        body = result.excerpt or result.editor_summary or original_summary or body
+    clipped_body = body[:8000] if len(body) > 8000 else body
+
     if model_client is None:
+        # No model — cannot assess; demote rather than silently drop
         return _mark_translation_unavailable(
             result,
-            {**translation_base, "error": "translation model unavailable"},
+            {
+                "translated": False,
+                "source_language": source_language,
+                "source_language_name": source_language_name,
+                "translator": None,
+                "mode": "unavailable",
+                "stage": "assess_and_translate",
+                "original_title": original_title,
+                "original_summary": original_summary,
+                "error": "translation model unavailable",
+            },
         )
 
     prompt = json.dumps(
         {
-            "task": "Translate foreign media metadata into concise English for a Morning Dispatch brief.",
-            "source_language": source_language_name or source_language,
-            "title": original_title,
-            "summary": original_summary,
+            "task": (
+                "Assess whether you can translate this foreign-language article to English "
+                "with sufficient confidence. If yes, translate it fully."
+            ),
+            "source_language_hint": source_language_name or source_language or "unknown",
             "url": result.final_url or result.original_url,
+            "title": original_title,
+            "body": clipped_body,
             "rules": [
-                "Preserve company names, tickers, product names, and factual claims.",
-                "Do not add facts that are not present.",
-                "Keep summary under 70 words.",
-                "Return strict JSON only.",
+                "Set can_translate to true only if you can produce an accurate, fluent English translation.",
+                "Set confidence to 'low' if the text is under 30 words, mostly garbled, "
+                "or in a script you cannot reliably parse.",
+                "If can_translate is true: translate the full body faithfully — do not summarize "
+                "unless the source is repetitive boilerplate or navigation text.",
+                "Preserve company names, tickers, product names, numbers, dates, and quoted claims.",
+                "If can_translate is false or confidence is low, leave title_en and body_en empty "
+                "and set drop_reason to a short explanation.",
             ],
             "schema": {
-                "title_en": "English title",
-                "summary_en": "English summary",
-                "quality": "high|medium|low",
+                "can_translate": "boolean",
+                "confidence": "high|medium|low",
+                "detected_language": "ISO 639-1 code if identifiable, else empty string",
+                "title_en": "English title (empty string if cannot translate)",
+                "body_en": "full English translation (empty string if cannot translate)",
+                "drop_reason": "brief reason if dropping, else empty string",
             },
         },
         ensure_ascii=False,
     )
+
     try:
         payload = await model_client.complete_json(
-            system="You translate public foreign-language media metadata into English. Return strict JSON only.",
+            system=(
+                "You evaluate whether foreign-language content can be reliably translated to English, "
+                "then translate it in full when possible. Return strict JSON only."
+            ),
             prompt=prompt,
-            max_tokens=420,
+            max_tokens=2400,
         )
     except Exception as exc:
-        logger.info("Foreign metadata translation failed for %s: %s", result.original_url, exc)
-        fallback = await _translate_foreign_metadata_text_fallback(
+        logger.info("Foreign translation assessment failed for %s: %s", result.original_url, exc)
+        return _mark_translation_unavailable(
             result,
-            model_client=model_client,
-            source_language=source_language,
-            source_language_name=source_language_name,
-            original_title=original_title,
-            original_summary=original_summary,
-            translation_base=translation_base,
+            {
+                "translated": False,
+                "source_language": source_language,
+                "source_language_name": source_language_name,
+                "translator": _model_name(model_client),
+                "mode": "assess_failed",
+                "stage": "assess_and_translate",
+                "original_title": original_title,
+                "original_summary": original_summary,
+                "error": str(exc)[:220],
+            },
         )
-        if fallback is not None:
-            return fallback
-        return _mark_translation_unavailable(result, {**translation_base, "error": str(exc)[:220]})
 
     if not isinstance(payload, dict):
         payload = {}
-    translated_title = _clean_model_text(str(payload.get("title_en") or ""), max_chars=220)
-    translated_summary = _clean_model_text(str(payload.get("summary_en") or ""), max_chars=900)
-    title = translated_title or result.title
-    summary = translated_summary or result.editor_summary or result.excerpt
-    translated_ok = bool(translated_title or translated_summary)
-    quality = str(payload.get("quality") or "").strip().lower()
-    if quality not in {"high", "medium", "low"}:
-        quality = "medium"
-    translation = {
-        **translation_base,
-        "translated": translated_ok,
-        "translator": _model_name(model_client),
-        "quality": quality,
-    }
-    if not translated_ok:
-        return _mark_translation_unavailable(result, translation)
-    return replace(
-        result,
-        title=title,
-        excerpt=summary,
-        editor_summary=summary,
-        metadata={**dict(result.metadata or {}), "translation": translation},
-        enrichment_source="model",
-    )
 
+    can_translate = bool(payload.get("can_translate"))
+    confidence = str(payload.get("confidence") or "").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium" if can_translate else "low"
 
-async def _translate_foreign_metadata_text_fallback(
-    result: ArticleFetchResult,
-    *,
-    model_client: ModelClient,
-    source_language: str,
-    source_language_name: str,
-    original_title: str,
-    original_summary: str,
-    translation_base: dict[str, object],
-) -> ArticleFetchResult | None:
-    try:
-        response = await model_client.complete(
-            system="You translate public foreign-language media metadata into concise English.",
-            prompt=_metadata_text_translation_prompt(
-                source_language=source_language_name or source_language,
-                title=original_title,
-                summary=original_summary,
-            ),
-            max_tokens=320,
+    # Drop when model signals it cannot translate or confidence is low
+    if not can_translate or confidence == "low":
+        drop_reason = (
+            str(payload.get("drop_reason") or "").strip()
+            or "Content could not be translated with sufficient confidence."
         )
-    except Exception as exc:
-        logger.info("Foreign metadata fallback translation failed for %s: %s", result.original_url, exc)
-        return None
-    parsed = _parse_metadata_text_translation(response)
-    translated_title = _clean_model_text(parsed.get("title", ""), max_chars=220)
-    translated_summary = _clean_model_text(parsed.get("summary", ""), max_chars=900)
-    if not translated_title and not translated_summary:
-        return None
-    summary = translated_summary or result.editor_summary or result.excerpt
+        logger.info("Foreign article dropped (untranslatable): %s — %s", result.original_url, drop_reason)
+        return replace(
+            result,
+            tier="dropped",
+            metadata={
+                **dict(result.metadata or {}),
+                "translation": {
+                    "translated": False,
+                    "source_language": source_language,
+                    "source_language_name": source_language_name,
+                    "translator": _model_name(model_client),
+                    "confidence": confidence,
+                    "drop_reason": drop_reason,
+                    "mode": "dropped",
+                },
+            },
+        )
+
+    # Translation succeeded — build fully English article
+    translated_title = _clean_model_text(str(payload.get("title_en") or ""), max_chars=220)
+    translated_body = str(payload.get("body_en") or "").strip()
+    detected_language = str(payload.get("detected_language") or source_language or "").strip()
+
+    if not translated_title and not translated_body:
+        # Model claimed it could translate but returned nothing — demote rather than drop
+        return _mark_translation_unavailable(
+            result,
+            {
+                "translated": False,
+                "source_language": source_language,
+                "source_language_name": source_language_name,
+                "translator": _model_name(model_client),
+                "mode": "empty_output",
+                "stage": "assess_and_translate",
+                "original_title": original_title,
+                "original_summary": original_summary,
+            },
+        )
+
+    title_for_enrichment = translated_title or original_title or result.title
+    cleaned_body = _clean_article_text(title_for_enrichment, translated_body)
+    kw_text = f"{title_for_enrichment} {cleaned_body}"
+    keywords = extract_keywords(kw_text, title_for_enrichment)
+    summary = summarize(title_for_enrichment, cleaned_body, set(keywords))
+
     return replace(
         result,
         title=translated_title or result.title,
-        excerpt=summary,
-        editor_summary=summary,
+        text=cleaned_body or result.text,
+        excerpt=summary or _truncate(translated_body, MAX_SUMMARY_CHARS) or result.excerpt,
+        editor_summary=summary or _truncate(translated_body, MAX_SUMMARY_CHARS) or result.editor_summary,
+        keywords=tuple(keywords),
+        content_type="article" if result.content_type == "fallback_snippet" else result.content_type,
         metadata={
             **dict(result.metadata or {}),
             "translation": {
-                **translation_base,
                 "translated": True,
+                "source_language": detected_language or source_language,
+                "source_language_name": source_language_name,
                 "translator": _model_name(model_client),
-                "quality": "medium",
-                "mode": "fallback_text",
+                "confidence": confidence,
+                "mode": "assess_and_translate",
+                "stage": "full",
+                "original_title": original_title,
+                "original_summary": original_summary,
             },
         },
         enrichment_source="model",
     )
-
-
-def _metadata_text_translation_prompt(*, source_language: str, title: str, summary: str) -> str:
-    return (
-        f"Translate this {source_language} article metadata to English.\n"
-        "Return exactly two lines:\n"
-        "Title: <English title>\n"
-        "Summary: <English summary under 70 words>\n\n"
-        f"Title: {title}\n"
-        f"Summary: {summary}"
-    )
-
-
-def _parse_metadata_text_translation(value: str) -> dict[str, str]:
-    result = {"title": "", "summary": ""}
-    for line in str(value or "").splitlines():
-        cleaned = line.strip()
-        if not cleaned:
-            continue
-        if cleaned.lower().startswith("title:"):
-            result["title"] = cleaned.split(":", 1)[1].strip()
-        elif cleaned.lower().startswith("summary:"):
-            result["summary"] = cleaned.split(":", 1)[1].strip()
-    if not result["title"] and not result["summary"]:
-        parts = [part.strip() for part in re.split(r"\n{2,}", str(value or "")) if part.strip()]
-        if parts:
-            result["title"] = parts[0]
-        if len(parts) > 1:
-            result["summary"] = parts[1]
-    return result
 
 
 def _mark_translation_unavailable(
     result: ArticleFetchResult,
     translation: dict[str, object],
 ) -> ArticleFetchResult:
-    tier = result.tier
-    section = result.section
-    if tier not in {"dropped", "lower_confidence"}:
-        tier = "lower_confidence"
-        section = "Needs Translation"
     return replace(
         result,
-        tier=tier,
-        section=section,
+        tier="dropped",
         metadata={**dict(result.metadata or {}), "translation": translation},
     )
 

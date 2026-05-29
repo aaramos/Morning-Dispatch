@@ -46,8 +46,8 @@ class CostProfile:
 @dataclass(frozen=True)
 class SourceAdapterContext:
     exploration_id: str
-    lookback_hours: int = 24
-    candidate_limit: int = 250
+    lookback_hours: int | None = 24
+    candidate_limit: int = 150
 
 
 @dataclass(frozen=True)

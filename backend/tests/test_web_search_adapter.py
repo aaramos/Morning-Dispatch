@@ -282,7 +282,7 @@ def test_search_web_rejects_unknown_provider(monkeypatch, tmp_path) -> None:
 
 
 def test_web_search_adapter_maps_hits_to_candidates(monkeypatch, tmp_path) -> None:
-    async def fake_search_web(_query: str, limit: int):
+    async def fake_search_web(_query: str, *, limit: int, language: str | None = None, days: int | None = None):
         return [
             web_search.SearchHit(
                 title="From Adapter",
@@ -318,7 +318,7 @@ def test_web_search_adapter_maps_hits_to_candidates(monkeypatch, tmp_path) -> No
 def test_web_search_adapter_query_excludes_avoid_terms(monkeypatch, tmp_path) -> None:
     observed: dict[str, str] = {}
 
-    async def fake_search_web(query: str, limit: int):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
         observed["query"] = query
         return []
 
@@ -359,7 +359,7 @@ def test_web_search_adapter_query_excludes_avoid_terms(monkeypatch, tmp_path) ->
 def test_web_search_adapter_prefers_refinement_search_plan(monkeypatch, tmp_path) -> None:
     observed: list[str] = []
 
-    async def fake_search_web(query: str, limit: int):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
         observed.append(query)
         return []
 
@@ -391,7 +391,7 @@ def test_web_search_adapter_prefers_refinement_search_plan(monkeypatch, tmp_path
 def test_web_search_adapter_fans_out_refinement_queries_and_dedupes(monkeypatch, tmp_path) -> None:
     observed: list[tuple[str, int]] = []
 
-    async def fake_search_web(query: str, limit: int):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
         observed.append((query, limit))
         return [
             web_search.SearchHit(
@@ -450,7 +450,7 @@ def test_web_search_adapter_fans_out_refinement_queries_and_dedupes(monkeypatch,
 def test_web_search_adapter_allows_twenty_refinement_queries(monkeypatch, tmp_path) -> None:
     observed: list[tuple[str, int]] = []
 
-    async def fake_search_web(query: str, limit: int):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
         observed.append((query, limit))
         return []
 

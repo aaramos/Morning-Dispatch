@@ -201,7 +201,16 @@ def test_source_window_filter_allows_undated_web_results_once(monkeypatch, tmp_p
     assert "already shown once" in issues_again[0]["reason"]
 
 
-def test_source_window_filter_leaves_default_recency_unrestricted() -> None:
+def test_source_window_filter_marks_undated_strict_types_as_served_once(monkeypatch, tmp_path) -> None:
+    """Undated gmail_link articles are kept on first appearance but tagged served_once.
+
+    With recency_weighting="breaking" and lookback_hours=24, the filter runs and undated
+    strict-type articles (gmail_link, foreign_web, reddit_thread, podcast_episode) are
+    allowed through exactly once, tagged with served_once=True metadata.
+    """
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
     profile = TopicProfile.from_dict(
         {
             "statement": "Track local AI tooling news.",
@@ -216,7 +225,9 @@ def test_source_window_filter_leaves_default_recency_unrestricted() -> None:
 
     kept, issues = explore._apply_source_window_filter(profile, [undated], lookback_hours=24)
 
-    assert kept == [undated]
+    assert len(kept) == 1
+    assert kept[0].title == "Undated local AI story"
+    assert kept[0].metadata.get("served_once") is True
     assert issues == []
 
 
@@ -503,7 +514,7 @@ def test_show_now_run_does_not_send_email_automatically(monkeypatch, tmp_path) -
 
         rendered = client.get(html_path)
         assert rendered.status_code == 200
-        assert "No sources are configured" in rendered.text
+        assert "No source content was found for this brief." in rendered.text
 
 
 def test_create_topic_profile_and_queue_build_is_atomic(monkeypatch, tmp_path) -> None:
@@ -582,14 +593,14 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         assert updated.json()["profile"]["content_limits"] == {
             "lead_items": 2,
             "per_source": {
-                "collections": 4,
-                "foreign_media": 4,
-                "gmail": 4,
-                "markets": 2,
-                "podcasts": 5,
+                "collections": 15,
+                "foreign_media": 15,
+                "gmail": 15,
+                "markets": 15,
+                "podcasts": 15,
                 "reddit": 2,
                 "web_search": 5,
-                "youtube": 5,
+                "youtube": 15,
             },
             "quality_floor": "strong",
             "target_items": 6,
@@ -835,8 +846,8 @@ def test_scheduled_run_promotes_kept_sources(monkeypatch, tmp_path) -> None:
     assert stage_seconds["editorial"] > 0
     assert stage_seconds["publishing"] > 0
     strategy = result["brief"]["stats"]["search_strategy"]
-    assert "Local AI ecosystem" in strategy["summary"]
-    assert "Web Search" in strategy["summary"]
+    assert "local ai ecosystem" in strategy["summary"]
+    assert "web search" in strategy["summary"]
 
     promoted_sources = database.list_promoted_sources(topic["topic_id"])
     assert len(promoted_sources) == 3
@@ -1430,8 +1441,7 @@ def test_explore_api_creates_topic_profile(monkeypatch, tmp_path) -> None:
         brief = client.get(run_body["progress"]["brief"]["html_path"])
 
     assert brief.status_code == 200
-    assert "Apple Silicon inference tools" in brief.text
-    assert "No sources are configured" in brief.text
+    assert "No source content was found for this brief." in brief.text
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         email = client.post(

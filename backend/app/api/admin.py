@@ -79,7 +79,7 @@ class DeliverySettingsPayload(BaseModel):
 
 
 class BriefDefaultsPayload(BaseModel):
-    lookback_hours: int = Field(default=72, ge=1, le=8760)
+    lookback_hours: int = Field(default=168, ge=1, le=8760)
     content_limits: dict[str, Any] = Field(default_factory=dict)
 
 

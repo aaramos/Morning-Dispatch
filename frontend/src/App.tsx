@@ -428,24 +428,31 @@ const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
 };
 
 const defaultContentLimits: ContentLimitsDraft = {
-  total_items: 40,
-  target_items: 12,
-  lead_items: 3,
+  total_items: 150,
+  target_items: 25,
+  lead_items: 5,
   per_source: {
     web_search: 15,
-    foreign_media: 4,
-    gmail: 4,
+    foreign_media: 15,
+    gmail: 15,
     reddit: 15,
-    podcasts: 5,
-    youtube: 5,
-    collections: 4,
-    markets: 2,
+    podcasts: 15,
+    youtube: 15,
+    collections: 15,
+    markets: 15,
   },
   quality_floor: "standard",
 };
 const defaultBriefControls: BriefControlsDraft = {
-  lookback_hours: 72,
+  lookback_hours: 168,
   content_limits: defaultContentLimits,
+};
+const briefControlBounds = {
+  source_window_days: { min: 1, max: 365 },
+  total_items: { min: 1, max: 250 },
+  target_items: { min: 1, max: 250 },
+  lead_items: { min: 0, max: 20 },
+  per_source: { min: 1, max: 100 },
 };
 const defaultPipelineLimits: PipelineLimitsDraft = {
   article_fetches: 250,
@@ -1860,6 +1867,7 @@ function ConfirmationPanel(props: {
   onBuild: () => void;
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const contentLimitErrors = validateContentLimits(props.draft.content_limits, props.sources);
 
   function updateContentLimits(next: ContentLimitsDraft) {
     props.onDraftChange({ ...props.draft, content_limits: next });
@@ -1949,17 +1957,20 @@ function ConfirmationPanel(props: {
           onToggle={() => setAdvancedOpen((open) => !open)}
         />
         {advancedOpen ? (
-          <ContentLimitsPanel
-            limits={props.draft.content_limits}
-            defaults={props.defaultContentLimits}
-            sourceSelection={props.sources}
-            resetLabel="Use system defaults"
-            onChange={updateContentLimits}
-          />
+          <>
+            <ContentLimitsPanel
+              limits={props.draft.content_limits}
+              defaults={props.defaultContentLimits}
+              sourceSelection={props.sources}
+              resetLabel="Use system defaults"
+              onChange={updateContentLimits}
+            />
+            <SettingsErrorList errors={contentLimitErrors} />
+          </>
         ) : null}
       </div>
       <div className="confirmation-actions">
-        <button type="button" className="primary-action build-brief-action" onClick={props.onBuild} disabled={props.busy}>
+        <button type="button" className="primary-action build-brief-action" onClick={props.onBuild} disabled={props.busy || contentLimitErrors.length > 0}>
           Build brief
         </button>
       </div>
@@ -1979,10 +1990,7 @@ function ContentLimitsPanel(props: {
   const defaults = props.defaults ?? defaultContentLimits;
 
   function updateNumber(key: "total_items" | "target_items" | "lead_items", value: number) {
-    const max = key === "lead_items" ? 20 : 250;
-    const min = key === "lead_items" ? 0 : 1;
-    const nextValue = clampContentLimit(value, min, max);
-    props.onChange({ ...props.limits, [key]: nextValue });
+    props.onChange({ ...props.limits, [key]: value });
   }
 
   function updateSourceLimit(source: SourceKey, value: number) {
@@ -1990,7 +1998,7 @@ function ContentLimitsPanel(props: {
       ...props.limits,
       per_source: {
         ...props.limits.per_source,
-        [source]: clampContentLimit(value, 1, 100),
+        [source]: value,
       },
     });
   }
@@ -2001,22 +2009,22 @@ function ContentLimitsPanel(props: {
         <NumberStepper
           label="Candidate budget"
           value={props.limits.total_items}
-          min={1}
-          max={250}
+          min={briefControlBounds.total_items.min}
+          max={briefControlBounds.total_items.max}
           onChange={(value) => updateNumber("total_items", value)}
         />
         <NumberStepper
           label="Target visible stories"
           value={props.limits.target_items}
-          min={1}
-          max={250}
+          min={briefControlBounds.target_items.min}
+          max={briefControlBounds.target_items.max}
           onChange={(value) => updateNumber("target_items", value)}
         />
         <NumberStepper
           label="Lead stories"
           value={props.limits.lead_items}
-          min={0}
-          max={20}
+          min={briefControlBounds.lead_items.min}
+          max={briefControlBounds.lead_items.max}
           onChange={(value) => updateNumber("lead_items", value)}
         />
         <label>
@@ -2038,8 +2046,8 @@ function ContentLimitsPanel(props: {
               key={source.key}
               label={source.label}
               value={props.limits.per_source[source.key] ?? defaults.per_source[source.key] ?? 3}
-              min={1}
-              max={100}
+              min={briefControlBounds.per_source.min}
+              max={briefControlBounds.per_source.max}
               compact
               onChange={(value) => updateSourceLimit(source.key, value)}
             />
@@ -2062,15 +2070,16 @@ function BriefControlsPanel(props: {
   showReset?: boolean;
   onChange: (controls: BriefControlsDraft) => void;
 }) {
+  const sourceWindowDays = Math.max(0, Math.round((Number(props.controls.lookback_hours) || 0) / 24));
   return (
     <div className="brief-controls-panel">
       <div className="content-limit-grid">
         <NumberStepper
-          label="Source window (hours)"
-          value={props.controls.lookback_hours}
-          min={1}
-          max={8760}
-          onChange={(lookback_hours) => props.onChange({ ...props.controls, lookback_hours })}
+          label="Source window (days)"
+          value={sourceWindowDays}
+          min={briefControlBounds.source_window_days.min}
+          max={briefControlBounds.source_window_days.max}
+          onChange={(days) => props.onChange({ ...props.controls, lookback_hours: days * 24 })}
         />
       </div>
       <ContentLimitsPanel
@@ -2106,6 +2115,20 @@ function SystemLimitsPanel(props: { groups: SystemLimitGroup[] }) {
           </div>
         </section>
       ))}
+    </div>
+  );
+}
+
+function SettingsErrorList(props: { errors: string[] }) {
+  if (!props.errors.length) return null;
+  return (
+    <div className="settings-error-box" role="alert">
+      <strong>Fix these values before saving:</strong>
+      <ul>
+        {props.errors.map((error) => (
+          <li key={error}>{error}</li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -2167,24 +2190,25 @@ function NumberStepper(props: {
   compact?: boolean;
   onChange: (value: number) => void;
 }) {
-  const changeValue = (value: number) => props.onChange(clampNumber(value, props.min, props.max));
+  const changeValue = (rawValue: string) => {
+    const digits = rawValue.replace(/\D/g, "");
+    props.onChange(digits ? Number(digits) : 0);
+  };
   return (
     <label className={props.compact ? "number-stepper compact" : "number-stepper"}>
       {props.label}
       <span>
-        <button type="button" onClick={() => changeValue(props.value - 1)} disabled={props.value <= props.min} aria-label={`Decrease ${props.label}`}>
-          -
-        </button>
         <input
-          type="number"
-          min={props.min}
-          max={props.max}
+          type="text"
+          inputMode="numeric"
+          pattern="[0-9]*"
+          aria-invalid={props.value < props.min || props.value > props.max}
           value={props.value}
-          onChange={(event) => changeValue(Number(event.target.value))}
+          onChange={(event) => changeValue(event.target.value)}
+          onBlur={() => {
+            if (!Number.isFinite(props.value)) props.onChange(0);
+          }}
         />
-        <button type="button" onClick={() => changeValue(props.value + 1)} disabled={props.value >= props.max} aria-label={`Increase ${props.label}`}>
-          +
-        </button>
       </span>
     </label>
   );
@@ -3091,6 +3115,14 @@ function AdminApp() {
 
   async function saveAdvancedSettings() {
     if (!editingAdvancedSettings) return;
+    const errors = validateBriefControls(
+      editingAdvancedSettings.controls,
+      sourceSelectionFromRecord(editingAdvancedSettings.topic.profile.source_selection),
+    );
+    if (errors.length) {
+      setMessage("Fix the advanced settings errors before saving.");
+      return;
+    }
     setBusy(true);
     try {
       const saved = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${editingAdvancedSettings.topic.topic_id}/content-limits`, {
@@ -3112,6 +3144,11 @@ function AdminApp() {
   }
 
   async function saveDefaultBriefSettings() {
+    const errors = validateBriefControls(defaultControlsDraft, defaultSourceSelectionForControls);
+    if (errors.length) {
+      setMessage("Fix the default brief settings errors before saving.");
+      return;
+    }
     setBusy(true);
     try {
       const saved = await api<BriefSettingsResponse>("/api/admin/brief-settings/defaults", {
@@ -3359,6 +3396,14 @@ function AdminApp() {
       setBusy(false);
     }
   }
+
+  const defaultControlsErrors = validateBriefControls(defaultControlsDraft, defaultSourceSelectionForControls);
+  const advancedControlsErrors = editingAdvancedSettings
+    ? validateBriefControls(
+        editingAdvancedSettings.controls,
+        sourceSelectionFromRecord(editingAdvancedSettings.topic.profile.source_selection),
+      )
+    : [];
 
   return (
     <main className="admin-page">
@@ -3838,7 +3883,7 @@ function AdminApp() {
               <h1>Brief defaults</h1>
               <p className="muted">These defaults apply to new briefs and to any saved brief that is reset to system defaults.</p>
             </div>
-            <button type="button" className="primary-action" onClick={() => void saveDefaultBriefSettings()} disabled={busy}>
+            <button type="button" className="primary-action" onClick={() => void saveDefaultBriefSettings()} disabled={busy || defaultControlsErrors.length > 0}>
               Save defaults
             </button>
           </div>
@@ -3848,6 +3893,7 @@ function AdminApp() {
             sourceSelection={defaultSourceSelectionForControls}
             onChange={setDefaultControlsDraft}
           />
+          <SettingsErrorList errors={defaultControlsErrors} />
           <section className="settings-subsection">
             <div className="panel-title-row compact-title-row">
               <div>
@@ -4106,13 +4152,16 @@ function AdminApp() {
               </button>
             </div>
             {editingAdvancedSettings.tab === "brief" ? (
-              <BriefControlsPanel
-                controls={editingAdvancedSettings.controls}
-                defaults={defaultControlsDraft}
-                sourceSelection={sourceSelectionFromRecord(editingAdvancedSettings.topic.profile.source_selection)}
-                showReset={false}
-                onChange={(controls) => setEditingAdvancedSettings({ ...editingAdvancedSettings, controls })}
-              />
+              <>
+                <BriefControlsPanel
+                  controls={editingAdvancedSettings.controls}
+                  defaults={defaultControlsDraft}
+                  sourceSelection={sourceSelectionFromRecord(editingAdvancedSettings.topic.profile.source_selection)}
+                  showReset={false}
+                  onChange={(controls) => setEditingAdvancedSettings({ ...editingAdvancedSettings, controls })}
+                />
+                <SettingsErrorList errors={advancedControlsErrors} />
+              </>
             ) : (
               <div className="advanced-system-limits">
                 <section>
@@ -4151,7 +4200,7 @@ function AdminApp() {
               >
                 Use system defaults
               </button>
-              <button type="button" className="primary-action" onClick={() => void saveAdvancedSettings()} disabled={busy}>
+              <button type="button" className="primary-action" onClick={() => void saveAdvancedSettings()} disabled={busy || advancedControlsErrors.length > 0}>
                 Save settings
               </button>
             </div>
@@ -4316,6 +4365,35 @@ function pipelineLimitsFromProfile(profile: TopicProfile, defaults = defaultPipe
 function clampContentLimit(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+function validateBriefControls(controls: BriefControlsDraft, sourceSelection: Record<SourceKey, boolean>): string[] {
+  const errors: string[] = [];
+  const sourceWindowDays = Number(controls.lookback_hours) / 24;
+  addBoundsError(errors, "Source window", sourceWindowDays, briefControlBounds.source_window_days.min, briefControlBounds.source_window_days.max, "days");
+  errors.push(...validateContentLimits(controls.content_limits, sourceSelection));
+  return errors;
+}
+
+function validateContentLimits(contentLimits: ContentLimitsDraft, sourceSelection: Record<SourceKey, boolean>): string[] {
+  const errors: string[] = [];
+  addBoundsError(errors, "Candidate budget", contentLimits.total_items, briefControlBounds.total_items.min, briefControlBounds.total_items.max);
+  addBoundsError(errors, "Target visible stories", contentLimits.target_items, briefControlBounds.target_items.min, briefControlBounds.target_items.max);
+  addBoundsError(errors, "Lead stories", contentLimits.lead_items, briefControlBounds.lead_items.min, briefControlBounds.lead_items.max);
+  sourceOptions
+    .filter((source) => sourceSelection[source.key])
+    .forEach((source) => {
+      const value = contentLimits.per_source[source.key] ?? 0;
+      addBoundsError(errors, `${source.label} maximum`, value, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
+    });
+  return errors;
+}
+
+function addBoundsError(errors: string[], label: string, value: number, min: number, max: number, suffix = "") {
+  const valueLabel = suffix ? `${min}-${max} ${suffix}` : `${min}-${max}`;
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < min || value > max) {
+    errors.push(`${label} must be a whole number from ${valueLabel}.`);
+  }
 }
 
 function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number {

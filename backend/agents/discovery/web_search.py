@@ -22,7 +22,7 @@ class SearchHit:
 class WebSearchBackend(Protocol):
     name: str
 
-    async def search(self, query: str, limit: int, *, language: str | None = None) -> list[SearchHit]:
+    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
         ...
 
 
@@ -33,7 +33,7 @@ class TavilyBackend:
     name: str = "tavily"
     endpoint: str = "https://api.tavily.com/search"
 
-    async def search(self, query: str, limit: int, *, language: str | None = None) -> list[SearchHit]:
+    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
         clean_query = _clean_query(query)
         if not clean_query:
             return []
@@ -46,6 +46,8 @@ class TavilyBackend:
             "include_answer": False,
             "include_raw_content": False,
         }
+        if days is not None:
+            payload["days"] = max(1, int(days))
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(self.endpoint, json=payload)
             response.raise_for_status()
@@ -83,7 +85,7 @@ class BraveBackend:
     name: str = "brave"
     endpoint: str = "https://api.search.brave.com/res/v1/web/search"
 
-    async def search(self, query: str, limit: int, *, language: str | None = None) -> list[SearchHit]:
+    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
         clean_query = _clean_query(query)
         if not clean_query:
             return []
@@ -93,6 +95,9 @@ class BraveBackend:
             "count": max(1, min(limit, 25)),
             "search_lang": _brave_search_language(language),
         }
+        freshness = _brave_freshness(days)
+        if freshness:
+            params["freshness"] = freshness
         headers = {"X-Subscription-Token": self.api_key, "Accept": "application/json"}
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.get(self.endpoint, params=params, headers=headers)
@@ -129,7 +134,7 @@ class SerpAPIBackend:
     name: str = "serpapi"
     endpoint: str = "https://serpapi.com/search.json"
 
-    async def search(self, query: str, limit: int, *, language: str | None = None) -> list[SearchHit]:
+    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
         clean_query = _clean_query(query)
         if not clean_query:
             return []
@@ -143,6 +148,9 @@ class SerpAPIBackend:
         serp_language = _serpapi_language(language)
         if serp_language:
             params.update(serp_language)
+        tbs = _serpapi_tbs(days)
+        if tbs:
+            params["tbs"] = tbs
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.get(self.endpoint, params=params)
             response.raise_for_status()
@@ -221,6 +229,36 @@ def _read_secret(settings: Any, *parts: str) -> str:
         return ""
 
 
+def _brave_freshness(days: int | None) -> str:
+    if days is None:
+        return ""
+    d = int(days)
+    if d <= 1:
+        return "pd"
+    if d <= 7:
+        return "pw"
+    if d <= 31:
+        return "pm"
+    if d <= 365:
+        return "py"
+    return ""
+
+
+def _serpapi_tbs(days: int | None) -> str:
+    if days is None:
+        return ""
+    d = int(days)
+    if d <= 1:
+        return "qdr:d"
+    if d <= 7:
+        return "qdr:w"
+    if d <= 31:
+        return "qdr:m"
+    if d <= 365:
+        return "qdr:y"
+    return ""
+
+
 def _brave_search_language(language: str | None) -> str:
     code = str(language or "en").strip().lower()
     return {
@@ -244,6 +282,18 @@ def _serpapi_language(language: str | None) -> dict[str, str]:
     return params
 
 
-async def search_web(query: str, *, limit: int, language: str | None = None) -> list[SearchHit]:
+def lookback_to_days(lookback_hours: int | None) -> int | None:
+    """Convert lookback_hours to a days integer for web search freshness filters.
+
+    Returns None when lookback_hours is None (all_available / no constraint) to omit date
+    filtering entirely, or when the window is wider than 365 days.
+    """
+    if lookback_hours is None:
+        return None
+    days = max(1, int(lookback_hours) // 24)
+    return days if days <= 365 else None
+
+
+async def search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None) -> list[SearchHit]:
     backend = _provider_from_config()
-    return await backend.search(query=query, limit=limit, language=language)
+    return await backend.search(query=query, limit=limit, language=language, days=days)

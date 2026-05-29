@@ -50,6 +50,7 @@ async def search_youtube(
     limit: int,
     recency_weighting: RecencyWeighting = "recent",
     duration_filter: str = "medium",
+    lookback_hours: int | None = None,
 ) -> YouTubeSearchResult:
     clean_query = " ".join(str(query or "").split()).strip()
     if not api_key:
@@ -68,7 +69,10 @@ async def search_youtube(
         "videoDuration": _duration_filter(duration_filter),
         "relevanceLanguage": "en",
     }
-    published_after = _published_after(recency_weighting)
+    if lookback_hours is not None:
+        published_after = (datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))).isoformat(timespec="seconds").replace("+00:00", "Z")
+    else:
+        published_after = _published_after(recency_weighting)
     if published_after:
         params["publishedAfter"] = published_after
     quota_units = 100

@@ -15,17 +15,18 @@ def prepare_issue_articles(digest: dict[str, Any], results: Iterable[ArticleFetc
     interest_tokens = _filtered_interest_tokens(interest)
     exclusion_phrases = _exclusion_phrases(interest)
     threshold = float(digest.get("threshold") or 0.45)
+    recency_weighting = str(digest.get("recency_weighting") or "recent")
     prepared: list[ArticleFetchResult] = []
 
     for result in results:
         if result.tier == "dropped":
             continue
-        enriched = _prepare_result(result, interest_tokens, threshold, exclusion_phrases)
+        enriched = _prepare_result(result, interest_tokens, threshold, exclusion_phrases, recency_weighting)
         if enriched.tier == "dropped":
             continue
         prepared.append(enriched)
 
-    prepared.sort(key=_sort_key, reverse=True)
+    prepared.sort(key=lambda r: _sort_key(r, recency_weighting), reverse=True)
     for index, result in enumerate(prepared):
         if result.fetched and result.tier != "lower_confidence":
             prepared[index] = replace(result, tier="lead", section=result.section or "Lead Story")
@@ -65,6 +66,7 @@ def _prepare_result(
     interest_tokens: set[str],
     threshold: float,
     exclusion_phrases: tuple[str, ...] = (),
+    recency_weighting: str = "recent",
 ) -> ArticleFetchResult:
     source_text = result.text or result.excerpt or fallback_text(result)
     keywords = list(result.keywords)
@@ -74,7 +76,7 @@ def _prepare_result(
         section = "Podcast Signals"
     else:
         section = _section_for(result.title, source_text, keywords, interest_tokens)
-    relevance = _relevance_score(result, interest_tokens, keywords)
+    relevance = _relevance_score(result, interest_tokens, keywords, recency_weighting)
     topic_signal = _has_ai_topic_signal(result)
     if topic_signal and result.payload.source_type == "gmail_link":
         relevance = min(1.0, relevance + 0.18)
@@ -82,8 +84,7 @@ def _prepare_result(
     if _matches_exclusion(result, source_text, exclusion_phrases):
         tier = "dropped"
     elif _translation_unavailable(result):
-        tier = "lower_confidence"
-        section = "Needs Translation"
+        tier = "dropped"
     elif (
         _requires_ai_topic_gate(interest_tokens)
         and result.payload.source_type == "gmail_link"
@@ -134,7 +135,7 @@ def _translation_unavailable(result: ArticleFetchResult) -> bool:
     return bool(source_language and not translation.get("translated"))
 
 
-def _relevance_score(result: ArticleFetchResult, interest_tokens: set[str], keywords: list[str]) -> float:
+def _relevance_score(result: ArticleFetchResult, interest_tokens: set[str], keywords: list[str], recency_weighting: str = "recent") -> float:
     haystack = keyword_set(" ".join([result.title, result.text, result.excerpt, fallback_text(result)]))
     if not haystack:
         return 0.0
@@ -144,7 +145,7 @@ def _relevance_score(result: ArticleFetchResult, interest_tokens: set[str], keyw
     title_overlap = len(title_tokens & interest_tokens) / max(1, len(title_tokens)) if title_tokens and interest_tokens else 0
     keyword_tokens = keyword_set(" ".join(keywords))
     keyword_overlap = len(keyword_tokens & interest_tokens) / max(1, len(keyword_tokens)) if keyword_tokens and interest_tokens else 0
-    recency = _recency_score(result.payload.published_at)
+    recency = _recency_score(result.payload.published_at, recency_weighting)
     quality = 0.07 if result.fetched else -0.08
     score = 0.06 + quality + (0.36 * overlap) + (0.16 * title_overlap) + (0.12 * keyword_overlap)
     score += 0.08 * min(max(result.link_score, 0.0), 1.0)
@@ -227,8 +228,13 @@ def _section_for(title: str, text: str, keywords: list[str], interest_tokens: se
     return "Noteworthy"
 
 
-def _recency_score(published_at: str | None) -> float:
+def _recency_score(published_at: str | None, recency_weighting: str = "recent") -> float:
     if not published_at:
+        # Undated content: penalize heavily for breaking news, neutral for all_available
+        if recency_weighting == "breaking":
+            return 0.1
+        if recency_weighting == "all_available":
+            return 0.5
         return 0.3
     try:
         parsed = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
@@ -236,7 +242,23 @@ def _recency_score(published_at: str | None) -> float:
             parsed = parsed.replace(tzinfo=UTC)
         age_hours = max(0.0, (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds() / 3600)
     except ValueError:
+        if recency_weighting == "breaking":
+            return 0.1
+        if recency_weighting == "all_available":
+            return 0.5
         return 0.3
+    if recency_weighting == "all_available":
+        return 0.5  # Flat — no age penalty when browsing archives
+    if recency_weighting == "breaking":
+        # Steep cliff: only content from the last 6h is truly fresh
+        if age_hours <= 6:
+            return 1.0
+        if age_hours <= 24:
+            return 0.75
+        if age_hours <= 48:
+            return 0.40
+        return 0.1
+    # Default / recent / last_year
     if age_hours <= 24:
         return 1.0
     if age_hours <= 72:
@@ -249,10 +271,10 @@ def _top_sections(results: list[ArticleFetchResult]) -> list[str]:
     return [section for section, _count in counts.most_common(4)] or ["noteworthy stories"]
 
 
-def _sort_key(result: ArticleFetchResult) -> tuple[float, float, float]:
+def _sort_key(result: ArticleFetchResult, recency_weighting: str = "recent") -> tuple[float, float, float]:
     fetched = 1.0 if result.fetched else 0.0
     score = result.relevance_score if result.relevance_score is not None else 0.0
-    recency = _recency_score(result.payload.published_at)
+    recency = _recency_score(result.payload.published_at, recency_weighting)
     return (fetched, score, recency)
 
 

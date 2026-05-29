@@ -70,7 +70,11 @@ def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
         )
 
     assert initial.status_code == 200
-    assert initial.json()["defaults"]["content_limits"]["total_items"] == 40
+    assert initial.json()["defaults"]["lookback_hours"] == 168
+    assert initial.json()["defaults"]["content_limits"]["total_items"] == 150
+    assert initial.json()["defaults"]["content_limits"]["target_items"] == 25
+    assert initial.json()["defaults"]["content_limits"]["lead_items"] == 5
+    assert initial.json()["defaults"]["content_limits"]["per_source"]["gmail"] == 15
     assert initial.json()["pipeline_limits"]["article_fetches"] == 250
     assert any(group["group"] == "AI review caps" for group in initial.json()["system_limits"])
     assert updated.status_code == 200
@@ -168,7 +172,7 @@ def test_admin_can_restore_model_defaults(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     payload = json.loads((runtime / "data" / "model-settings.json").read_text(encoding="utf-8"))
-    assert payload["librarian_model"] == "Gemma4-MTP-26B-BF16"
+    assert payload["librarian_model"] == "Gemma4-MTP-26B-8Bit"
     assert payload["ollama_cloud_model"] == "Gemma4-MTP-26B-BF16"
 
 

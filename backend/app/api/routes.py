@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -9,6 +10,8 @@ from pydantic import BaseModel, Field
 from backend.app.core.config import get_settings
 from backend.app.db import database
 from backend.app.services import brief_settings, digest_runner, email_delivery, explore, foreign_article_translation, refinement, scheduler
+from backend.app.services.brief_strategy import selected_source_labels, summarize_search_strategy
+from backend.app.services.brief_title import tight_brief_title
 
 router = APIRouter(prefix="/api")
 delivery_router = APIRouter()
@@ -65,7 +68,7 @@ class TopicProfileCreate(BaseModel):
 class ExplorationCreate(BaseModel):
     mode: Literal["show_now", "scheduled"] = "show_now"
     source_selection: dict[str, bool] = Field(default_factory=dict)
-    candidate_limit: int = Field(default=250, ge=1, le=250)
+    candidate_limit: int = Field(default=150, ge=1, le=250)
     lookback_hours: int | None = Field(default=None, ge=1, le=8760)
 
 
@@ -76,7 +79,7 @@ class ExplorationRebuildCreate(ExplorationCreate):
 
 class TopicProfileBuildCreate(TopicProfileCreate):
     mode: Literal["show_now", "scheduled"] = "show_now"
-    candidate_limit: int = Field(default=250, ge=1, le=250)
+    candidate_limit: int = Field(default=150, ge=1, le=250)
     lookback_hours: int | None = Field(default=None, ge=1, le=8760)
     refinement_session_id: str | None = None
 
@@ -667,8 +670,16 @@ def _issue_html_for_display(
     cleaned = database.clean_issue_html_for_display(html)
     if exploration and explore.exploration_build_issues(exploration):
         cleaned = _inject_requested_source_warning(cleaned, str(exploration.get("exploration_id") or ""))
-    with_footer = database.ensure_generated_footer(cleaned, generated_at)
-    return _with_issue_overflow_guards(with_footer)
+    cleaned = _rewrite_legacy_recency_hours(cleaned)
+    cleaned = _rewrite_legacy_sidebar_labels(cleaned)
+    cleaned = _rewrite_legacy_story_link_targets(cleaned)
+    cleaned = _rewrite_legacy_image_strip_links(cleaned)
+    cleaned = _remove_legacy_snapshot_paragraph(cleaned)
+    cleaned = _rewrite_legacy_brief_title(cleaned, exploration=exploration)
+    cleaned = _rewrite_legacy_search_strategy(cleaned, exploration=exploration)
+    cleaned = _remove_legacy_issue_footer(cleaned)
+    cleaned = _remove_legacy_ai_warning(cleaned)
+    return _with_issue_overflow_guards(cleaned)
 
 
 def _brief_contains_url(html: str, url: str) -> bool:
@@ -696,6 +707,175 @@ def _inject_requested_source_warning(html: str, exploration_id: str) -> str:
     if "<main>" in html:
         return html.replace("<main>", f"<main>\n    {warning}", 1)
     return f"{warning}{html}"
+
+
+def _rewrite_legacy_recency_hours(html: str) -> str:
+    def replacement(match: re.Match[str]) -> str:
+        hours = int(match.group("hours"))
+        return f'{match.group("prefix")}{_format_recency_value(hours)}{match.group("suffix")}'
+
+    return re.sub(
+        r'(?P<prefix><div class="side-stat"><span>Recency</span><strong class="side-value">)'
+        r'(?P<hours>\d+)h'
+        r'(?P<suffix></strong></div>)',
+        replacement,
+        html,
+    )
+
+
+def _rewrite_legacy_sidebar_labels(html: str) -> str:
+    return html.replace(
+        '<div class="side-stat"><span>Sources</span><strong class="side-value">',
+        '<div class="side-stat"><span>Sources searched</span><strong class="side-value">',
+    )
+
+
+def _rewrite_legacy_story_link_targets(html: str) -> str:
+    return re.sub(
+        r'(<h[23] class="(?:lead-title|story-title)"><a href="[^"]+") target="_blank" rel="noreferrer"',
+        r"\1",
+        html,
+    )
+
+
+def _rewrite_legacy_image_strip_links(html: str) -> str:
+    story_links = {
+        match.group("title"): match.group("href")
+        for match in re.finditer(
+            r'<h[23] class="(?:lead-title|story-title)"><a href="(?P<href>[^"#][^"]*)"[^>]*>(?P<title>.*?)</a></h[23]>',
+            html,
+        )
+    }
+    if not story_links:
+        return html
+
+    def replacement(match: re.Match[str]) -> str:
+        img_tag = match.group("img")
+        alt = match.group("alt")
+        href = story_links.get(alt)
+        if not href:
+            return match.group(0)
+        return (
+            '<figure class="strip-frame">\n'
+            f'              <a class="strip-link" href="{href}">{img_tag}</a>\n'
+            "            </figure>"
+        )
+
+    return re.sub(
+        r'<figure class="strip-frame">\s*(?P<img><img [^>]*alt="(?P<alt>[^"]+)"[^>]*/>)\s*</figure>',
+        replacement,
+        html,
+    )
+
+
+def _remove_legacy_snapshot_paragraph(html: str) -> str:
+    return re.sub(r'\s*<p class="snapshot">.*?</p>', "", html, flags=re.DOTALL)
+
+
+def _rewrite_legacy_brief_title(html: str, *, exploration: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_exploration(exploration)
+    compact_title = ""
+
+    def replacement(match: re.Match[str]) -> str:
+        nonlocal compact_title
+        title = match.group("title")
+        if "Morning Dispatch Issue" not in title and len(title.split()) <= 10:
+            return match.group(0)
+        seed = str(profile.get("scope") or profile.get("statement") or title) if profile else title
+        keywords = tuple(str(keyword) for keyword in profile.get("keywords") or ()) if profile else ()
+        compact_title = tight_brief_title(seed, keywords=keywords)
+        return f"{match.group('prefix')}{compact_title}{match.group('suffix')}"
+
+    rewritten = re.sub(
+        r'(?P<prefix><section class="brief-header">\s*<div class="dateline">.*?</div>\s*<h1>)'
+        r'(?P<title>.*?)'
+        r'(?P<suffix></h1>)',
+        replacement,
+        html,
+        flags=re.DOTALL,
+    )
+    if not compact_title:
+        return rewritten
+    return re.sub(r"<title>.*?</title>", f"<title>{compact_title}</title>", rewritten, count=1, flags=re.DOTALL)
+
+
+def _remove_legacy_issue_footer(html: str) -> str:
+    cleaned = re.sub(r'\s*<footer class="issue-footer">.*?</footer>', "", html, flags=re.DOTALL)
+    cleaned = re.sub(r'\s*<style id="morning-dispatch-generated-footer-style">.*?</style>', "", cleaned, flags=re.DOTALL)
+    return re.sub(r"\s*\.issue-footer\s*\{[^}]*\}", "", cleaned)
+
+
+def _remove_legacy_ai_warning(html: str) -> str:
+    return re.sub(
+        r'\s*<p class="meta">AI warning: .*?</p>',
+        "",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def _rewrite_legacy_search_strategy(html: str, *, exploration: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_exploration(exploration)
+
+    def replacement(match: re.Match[str]) -> str:
+        body = match.group("body").strip()
+        if not body.startswith("Focused on "):
+            return match.group(0)
+        statement = str(profile.get("scope") or profile.get("statement") or body)
+        sources = selected_source_labels(
+            profile.get("source_selection") if isinstance(profile.get("source_selection"), dict) else {}
+        )
+        if not sources and isinstance(exploration, dict):
+            selection = exploration.get("source_selection")
+            sources = selected_source_labels(selection if isinstance(selection, dict) else {})
+        source_scope = _format_recency_value(int(profile.get("lookback_hours") or 168))
+        source_scope = f"the last {source_scope}" if not source_scope.startswith("last ") else source_scope
+        summary = summarize_search_strategy(
+            statement=statement,
+            sources=sources,
+            source_scope=source_scope,
+            exclusions=[str(item) for item in profile.get("exclusions") or ()],
+            keywords=[str(item) for item in profile.get("keywords") or ()],
+        )
+        return f'{match.group("prefix")}{summary}{match.group("suffix")}'
+
+    return re.sub(
+        r'(?P<prefix><div class="side-note">\s*<h3>Search strategy</h3>\s*<p>)'
+        r'(?P<body>.*?)'
+        r'(?P<suffix></p>\s*</div>)',
+        replacement,
+        html,
+        flags=re.DOTALL,
+    )
+
+
+def _profile_for_exploration(exploration: dict[str, Any] | None) -> dict[str, Any]:
+    if not exploration:
+        return {}
+    topic_id = str(exploration.get("topic_id") or "")
+    if not topic_id:
+        return {}
+    topic = database.get_topic_profile(topic_id)
+    profile = topic.get("profile") if isinstance(topic, dict) else None
+    return profile if isinstance(profile, dict) else {}
+
+
+def _format_recency_value(lookback_hours: int) -> str:
+    hours = max(1, int(lookback_hours))
+    if hours < 24:
+        return "1 hour" if hours == 1 else f"{hours} hours"
+    if hours % 24:
+        return f"{hours} hours"
+    days = hours // 24
+    if days < 14:
+        return "1 day" if days == 1 else f"{days} days"
+    if days >= 60:
+        months = max(1, round(days / 30))
+        return "1 month" if months == 1 else f"{months} months"
+    if days % 7 == 0:
+        weeks = days // 7
+        return "1 week" if weeks == 1 else f"{weeks} weeks"
+    return f"{days} days"
 
 
 def _with_issue_overflow_guards(html: str) -> str:

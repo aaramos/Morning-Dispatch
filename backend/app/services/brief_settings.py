@@ -20,27 +20,28 @@ from backend.app.core.config import Settings
 MAX_CANDIDATE_BUDGET = 250
 MAX_LEAD_ITEMS = 20
 MAX_LOOKBACK_HOURS = 8760
+MAX_LOOKBACK_DAYS = MAX_LOOKBACK_HOURS // 24
 MAX_PER_SOURCE_LIMIT = 100
 MAX_TARGET_ITEMS = 250
 MODEL_REFINEMENT_LIMIT = 150
 MAX_ARTICLE_FETCH_CONCURRENCY = 20
 
 DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
-    "lookback_hours": 72,
+    "lookback_hours": 168,
     "content_limits": {
-        "total_items": 40,
-        "target_items": 12,
-        "lead_items": 3,
+        "total_items": 150,
+        "target_items": 25,
+        "lead_items": 5,
         "quality_floor": "standard",
         "per_source": {
             "web_search": 15,
-            "foreign_media": 4,
-            "gmail": 4,
+            "foreign_media": 15,
+            "gmail": 15,
             "reddit": 15,
-            "podcasts": 5,
-            "youtube": 5,
-            "collections": 4,
-            "markets": 2,
+            "podcasts": 15,
+            "youtube": 15,
+            "collections": 15,
+            "markets": 15,
         },
     },
 }
@@ -152,7 +153,7 @@ def system_limits(settings: Settings) -> list[dict[str, Any]]:
                 {"label": "Candidate budget", "value": f"1-{MAX_CANDIDATE_BUDGET}", "note": "Maximum deduped candidates a brief can request."},
                 {"label": "Target visible stories", "value": f"1-{MAX_TARGET_ITEMS}", "note": "Maximum visible-story target a brief can request."},
                 {"label": "Lead stories", "value": f"0-{MAX_LEAD_ITEMS}", "note": "Maximum preferred lead count."},
-                {"label": "Lookback window", "value": f"1-{MAX_LOOKBACK_HOURS} hours", "note": "365-day maximum source window."},
+                {"label": "Source window", "value": f"1-{MAX_LOOKBACK_DAYS} days", "note": "365-day maximum source window."},
                 {"label": "Per-source maximum", "value": f"1-{MAX_PER_SOURCE_LIMIT}", "note": "Maximum per-source diversity target."},
             ],
         },
