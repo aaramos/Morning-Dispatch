@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery import adapters, markets
 from backend.agents.discovery.adapters import MarketsSourceAdapter
-from backend.agents.discovery.markets import MarketCompany, MarketSnapshot, select_market_companies
+from backend.agents.discovery.markets import (
+    MarketCompany,
+    MarketSnapshot,
+    resolve_tickers_from_text,
+    select_market_companies,
+)
 from backend.agents.discovery.types import SourceAdapterContext, TopicProfile
 from backend.agents.librarian.articles import direct_article_results
 from backend.agents.librarian.enrichment import enrich_article
@@ -59,6 +64,14 @@ def test_select_market_companies_accepts_inferred_exchange_tickers() -> None:
     selected = select_market_companies(profile, max_core=8, max_related=0)
 
     assert [company.ticker for company in selected[:4]] == ["MU", "000660.KS", "285A.T", "SNDK"]
+
+
+def test_resolve_tickers_from_text_ignores_market_acronyms() -> None:
+    tickers = resolve_tickers_from_text(
+        "HBM memory market - Micron, SK Hynix, Samsung. Track ASP, DRAM, NAND, CAPEX, Nvidia and AMD."
+    )
+
+    assert tickers == ["MU", "000660.KS", "005930.KS", "NVDA", "AMD"]
 
 
 def test_fetch_market_snapshot_maps_yfinance_payload(monkeypatch, tmp_path) -> None:

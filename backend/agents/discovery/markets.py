@@ -407,11 +407,16 @@ def _int_or_none(value: Any) -> int | None:
 _TICKER_STOPWORDS = {
     "AI",
     "API",
+    "ASP",
+    "CAPEX",
     "CEO",
     "CFO",
+    "DRAM",
     "GPU",
+    "HBM",
     "LLM",
     "MCP",
+    "NAND",
     "SEC",
     "SK",
     "USA",
@@ -419,6 +424,9 @@ _TICKER_STOPWORDS = {
 _KNOWN_COMPANY_TICKERS = (
     (r"\bmicron\b|\bmicron technology\b", "MU"),
     (r"\b(?:sk\s+)?hynix\b", "000660.KS"),
+    (r"\bsamsung(?: electronics)?\b", "005930.KS"),
+    (r"\bnvidia\b", "NVDA"),
+    (r"\bamd\b|\badvanced micro devices\b", "AMD"),
     (r"\bkioxia\b", "285A.T"),
     (r"\bsandisk\b", "SNDK"),
 )
