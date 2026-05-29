@@ -1647,13 +1647,17 @@ label {
 
 .library-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  align-items: stretch;
   padding: 16px;
   border: 1px solid #d8d7cf;
   border-radius: 8px;
   background: #fdfdfb;
+}
+
+.library-row > .button-row {
+  margin: 8px 0 0;
 }
 
 .library-progress {
