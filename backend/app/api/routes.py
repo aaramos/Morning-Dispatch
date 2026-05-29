@@ -699,7 +699,12 @@ def _inject_requested_source_warning(html: str, exploration_id: str) -> str:
 
 
 def _with_issue_overflow_guards(html: str) -> str:
-    if not html or ("overflow-x: hidden" in html and "overflow-wrap: anywhere" in html):
+    if not html:
+        return html
+
+    has_overflow_guard = "overflow-x: hidden" in html and "overflow-wrap: anywhere" in html
+    has_modal_close_guard = "body:not(.modal-open) .podcast-modal" in html
+    if has_overflow_guard and has_modal_close_guard:
         return html
 
     guard = """
@@ -710,6 +715,7 @@ def _with_issue_overflow_guards(html: str) -> str:
     img, video, iframe, table { max-width: 100%; }
     h1, h2, h3, p, a, .meta { overflow-wrap: anywhere; }
     .grid, .section, .article-card, .newsletter, .link-item { min-width: 0; }
+    body:not(.modal-open) .podcast-modal { display: none !important; }
   </style>
 """
     if "</head>" in html:
