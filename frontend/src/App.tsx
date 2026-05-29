@@ -2682,7 +2682,10 @@ function AdminApp() {
   const [deletedExpanded, setDeletedExpanded] = useState(() => loadSessionValue("admin.deletedExpanded", false));
   const [digestsExpanded, setDigestsExpanded] = useState(() => loadSessionValue("admin.digestsExpanded", false));
 
-  const topicById = useMemo(() => new Map(library.topics.map((topic) => [topic.topic_id, topic])), [library.topics]);
+  const topicById = useMemo(
+    () => new Map([...library.topics, ...library.digests].map((topic) => [topic.topic_id, topic])),
+    [library.digests, library.topics],
+  );
   const sortedExplorations = useMemo<ExplorationLibraryItem[]>(() => {
     const explorationTopicIds = new Set(library.explorations.map((exploration) => exploration.topic_id));
     const explorationRows: ExplorationLibraryItem[] = library.explorations.map((exploration) => ({
@@ -3182,7 +3185,7 @@ function AdminApp() {
   async function scheduleExploration(exploration: Exploration) {
     const topic = topicById.get(exploration.topic_id);
     if (topic?.schedule) {
-      setMessage("Digest already scheduled");
+      startEditingDigest(topic);
       return;
     }
     setBusy(true);
@@ -3259,6 +3262,7 @@ function AdminApp() {
       preset: ((topic.schedule ?? "daily") as SchedulePreset),
       time: typeof config.time_of_day === "string" ? config.time_of_day : "08:00",
     });
+    setMessage("Editing schedule");
   }
 
   async function saveDigestSchedule(topic: TopicProfileResponse) {
@@ -3653,15 +3657,40 @@ function AdminApp() {
                     <button
                       type="button"
                       className="secondary-action"
-                      onClick={() => void scheduleExploration(item.exploration)}
-                      disabled={busy || item.exploration.status !== "complete" || isScheduledDigest || !item.topic}
+                      onClick={() => {
+                        if (isScheduledDigest && item.topic) {
+                          startEditingDigest(item.topic);
+                          return;
+                        }
+                        void scheduleExploration(item.exploration);
+                      }}
+                      disabled={busy || item.exploration.status !== "complete" || !item.topic}
                     >
-                      {isScheduledDigest ? "Scheduled" : "Schedule"}
+                      {isScheduledDigest ? "Edit schedule" : "Schedule"}
                     </button>
                     <button type="button" className="secondary-action destructive" onClick={() => void deleteExplorationFromAdmin(item.exploration)} disabled={busy}>Delete</button>
                   </div>
                   {item.exploration.status === "queued" || item.exploration.status === "running" || isModelDegraded(item.exploration) ? (
                     <LibraryBuildProgress exploration={item.exploration} />
+                  ) : null}
+                  {item.topic && editingDigest?.topicId === item.topic.topic_id ? (
+                    <div className="inline-schedule-editor">
+                      <select
+                        value={editingDigest.preset}
+                        onChange={(event) => setEditingDigest({ ...editingDigest, preset: event.target.value as SchedulePreset })}
+                      >
+                        {schedulePresets.map((preset) => (
+                          <option value={preset.value} key={preset.value}>{preset.label}</option>
+                        ))}
+                      </select>
+                      <input
+                        type="time"
+                        value={editingDigest.time}
+                        onChange={(event) => setEditingDigest({ ...editingDigest, time: event.target.value })}
+                      />
+                      <button type="button" onClick={() => void saveDigestSchedule(item.topic!)} disabled={busy}>Save</button>
+                      <button type="button" className="ghost-action" onClick={() => setEditingDigest(null)} disabled={busy}>Cancel</button>
+                    </div>
                   ) : null}
                   {item.exploration.status === "complete" ? (
                     <div className="inline-email-editor">
