@@ -96,6 +96,34 @@ def test_extract_article_harvests_published_date_from_jsonld():
     assert extracted.published_at == "2026-04-01T10:00:00+00:00"
 
 
+def test_extract_article_harvests_published_date_from_byline_element():
+    html = ARTICLE_HTML.replace(
+        "<h1>Useful AI Article</h1>",
+        '<span class="entry-date updated">May 04, 2026</span><h1>Useful AI Article</h1>',
+    )
+    extracted = articles.extract_article(html, "https://example.com/final-article")
+    assert extracted.published_at == "2026-05-04"
+
+
+def test_extract_article_handles_js_date_string_meta():
+    html = ARTICLE_HTML.replace(
+        "</head>",
+        '<meta property="pagefind:date" '
+        'content="Thu Mar 12 2026 00:00:00 GMT+0000 (Coordinated Universal Time)" /></head>',
+    )
+    extracted = articles.extract_article(html, "https://example.com/final-article")
+    assert "Mar 12 2026" in (extracted.published_at or "")
+
+
+def test_normalize_date_text_formats():
+    assert articles._normalize_date_text("April 23, 2026") == "2026-04-23"
+    assert articles._normalize_date_text("30 April 2026") == "2026-04-30"
+    assert articles._normalize_date_text("2026/04/20") == "2026-04-20"
+    assert articles._normalize_date_text("Published 2026-01-27 by staff") == "2026-01-27"
+    assert articles._normalize_date_text("no date here") is None
+    assert articles._normalize_date_text("2026/01/50") is None  # invalid day rejected
+
+
 def test_extract_article_published_date_absent_when_undated():
     extracted = articles.extract_article(ARTICLE_HTML, "https://example.com/final-article")
     assert extracted.published_at is None

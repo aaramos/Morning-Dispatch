@@ -131,11 +131,15 @@ async def apply_source_audit(
         else:
             return _heuristic_audit_result(profile, result_list, candidates, model_name=model_name, error=first_error)
 
+    cutoff = None
+    if lookback_hours is not None:
+        cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
     updated, decisions, audit_summary = _apply_audit_payload(
         result_list,
         payload,
         model_name=model_name,
         elapsed_ms=elapsed_ms,
+        cutoff=cutoff,
     )
     audit_summary["candidate_count"] = len(candidates)
     return updated, decisions, audit_summary
@@ -498,6 +502,9 @@ def _audit_prompt(
                 "when the candidate pool is below the desired item count, prefer include_as_context for useful "
                 "but overlapping background and exclude only stale, off-topic, inaccessible, or clearly promotional items. "
                 "Treat provider dates as weak evidence when URL paths, snippets, or article text imply an older date. "
+                "When published_at is null/empty, infer the publication date from the dateline, body text, "
+                "url_date_hint, metadata_dates, or snippet and report it in resolved_published_date as ISO YYYY-MM-DD. "
+                "Only fill resolved_published_date when you are reasonably confident; otherwise leave it an empty string. "
                 "Treat MSN/Yahoo-like instructions as a request to avoid syndicated aggregator reposts, even on adjacent domains. "
                 "Translated foreign-media items are allowed; judge them on the translated summary and provenance quality, "
                 "but do not reject an item solely because it was translated. "
@@ -512,6 +519,7 @@ def _audit_prompt(
                         "decision": "include|exclude|include_as_context",
                         "confidence": "0.0-1.0",
                         "constraint_failures": ["recency|source_quality|topic_fit|duplicate|thin_content"],
+                        "resolved_published_date": "ISO YYYY-MM-DD if you can determine when it was published; empty string if unknown",
                         "reason": "short, user-readable reason",
                     }
                 ],
@@ -630,6 +638,7 @@ def _apply_audit_payload(
     *,
     model_name: str,
     elapsed_ms: int,
+    cutoff: datetime | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision], dict[str, Any]]:
     updated = list(results)
     decisions: list[AgentDecision] = []
@@ -653,11 +662,25 @@ def _apply_audit_payload(
         failures = _string_list(raw.get("constraint_failures"))
         reason = str(raw.get("reason") or "").strip()[:320]
         action = "include"
+
+        # AI date fallback: when the rule-based extractor found no date, trust the
+        # date the model inferred from the text/URL/snippet, and enforce the window
+        # on it. Items the model also cannot date keep show-once handling downstream.
+        result, model_date, model_recency_reason = _apply_model_resolved_date(
+            result, str(raw.get("resolved_published_date") or "").strip(), cutoff
+        )
+        if model_recency_reason:
+            decision = "exclude"
+            confidence = max(confidence, 0.9)
+            failures = sorted(set(failures) | {"recency"})
+            reason = model_recency_reason
+
         metadata = {**dict(result.metadata or {}), "source_audit": {
             "decision": decision,
             "confidence": confidence,
             "constraint_failures": failures,
             "reason": reason,
+            "resolved_published_date": model_date or "",
         }}
 
         if decision == "exclude" and confidence >= 0.5:
@@ -705,6 +728,73 @@ def _apply_audit_payload(
         "issues": issues,
         "summary": str(payload.get("summary") or "").strip()[:500],
     }
+
+
+_AUDIT_DATE_METADATA_KEYS = (
+    "published_at",
+    "published",
+    "publication_date",
+    "date",
+    "pub_date",
+    "search_result_date",
+)
+_SERVED_ONCE_METADATA_KEYS = ("served_once", "served_once_note", "served_once_key", "date_status")
+
+
+def _apply_model_resolved_date(
+    result: ArticleFetchResult,
+    raw_date: str,
+    cutoff: datetime | None,
+) -> tuple[ArticleFetchResult, str, str]:
+    """Backfill a model-inferred publish date, but only when no deterministic date exists.
+
+    Returns the (possibly updated) result, the ISO date applied (or ""), and a
+    recency-rejection reason when that date falls outside the requested window.
+    """
+    if not raw_date or _has_existing_date(result):
+        return result, "", ""
+    parsed = _parse_model_date(raw_date)
+    if parsed is None:
+        return result, "", ""
+    iso = parsed.date().isoformat()
+    payload = replace(result.payload, published_at=iso)
+    # A real date supersedes the "shown once" placeholder so it displays the date
+    # and is not recorded as an undated item.
+    metadata = {
+        key: value
+        for key, value in dict(result.metadata or {}).items()
+        if key not in _SERVED_ONCE_METADATA_KEYS
+    }
+    metadata["date_source"] = "model"
+    updated = replace(result, payload=payload, metadata=metadata)
+    reason = ""
+    if cutoff is not None and parsed < cutoff:
+        reason = f"Published {iso}; outside the requested recency window."
+    return updated, iso, reason
+
+
+def _has_existing_date(result: ArticleFetchResult) -> bool:
+    if str(getattr(result.payload, "published_at", "") or "").strip():
+        return True
+    for meta in (result.payload.metadata, result.metadata):
+        if isinstance(meta, dict):
+            for key in _AUDIT_DATE_METADATA_KEYS:
+                if str(meta.get(key) or "").strip():
+                    return True
+    return False
+
+
+def _parse_model_date(raw: str) -> datetime | None:
+    match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", str(raw or ""))
+    if not match:
+        return None
+    try:
+        # End-of-day UTC so a same-day article is not excluded on a time boundary.
+        return datetime(
+            int(match.group(1)), int(match.group(2)), int(match.group(3)), 23, 59, 59, tzinfo=UTC
+        )
+    except ValueError:
+        return None
 
 
 def _target_for(result: ArticleFetchResult) -> str:

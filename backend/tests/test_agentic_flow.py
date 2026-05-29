@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 from backend.agents.critic import apply_critic_repairs
 from backend.agents.digestor.base import NormalizedPayload
@@ -295,6 +296,88 @@ def test_source_audit_agent_can_exclude_stale_or_low_fit_sources():
     assert updated[1].tier == "dropped"
     assert summary["excluded_count"] == 1
     assert any(decision.agent == "source_audit" and decision.action == "drop_article" for decision in decisions)
+
+
+def test_source_audit_uses_model_date_to_enforce_window_for_undated_items():
+    """When the rule-based extractor found no date, the audit trusts the date the
+    model infers and enforces the recency window on it."""
+    stale = result("Undated stale roadmap")  # no published_at on payload/metadata
+    fresh = result("Undated fresh briefing")
+    model = FakeModelClient(
+        {
+            "decisions": [
+                {
+                    "index": 0,
+                    "decision": "include",
+                    "confidence": 0.8,
+                    "constraint_failures": [],
+                    "resolved_published_date": "2026-03-12",
+                    "reason": "Looks relevant.",
+                },
+                {
+                    "index": 1,
+                    "decision": "include",
+                    "confidence": 0.8,
+                    "constraint_failures": [],
+                    "resolved_published_date": "2026-05-28",
+                    "reason": "Fresh and relevant.",
+                },
+            ],
+            "summary": "Inferred dates for two undated items.",
+        }
+    )
+
+    # lookback covers anything on/after ~2026-05-22 (run relative to 'now'); the
+    # 2026-03-12 item must drop, the recent one must stay with its date applied.
+    updated, decisions, summary = asyncio.run(
+        apply_source_audit(
+            {"statement": "Track AI memory supply over the last 7 days", "interest": "memory"},
+            [stale, fresh],
+            lookback_hours=24 * 7,
+            model_client=model,
+            inference_run_id="audit-date-test",
+        )
+    )
+
+    assert updated[0].tier == "dropped"
+    assert "recency" in updated[0].metadata["source_audit"]["constraint_failures"]
+    assert updated[1].tier != "dropped"
+    assert updated[1].payload.published_at == "2026-05-28"
+    assert updated[1].metadata.get("date_source") == "model"
+
+
+def test_source_audit_does_not_override_existing_date_with_model_guess():
+    """A deterministic date already on the payload is authoritative; the model's
+    guess must not replace it."""
+    article = result("Already dated story")
+    article = replace(article, payload=replace(article.payload, published_at="2026-05-27"))
+    model = FakeModelClient(
+        {
+            "decisions": [
+                {
+                    "index": 0,
+                    "decision": "include",
+                    "confidence": 0.8,
+                    "resolved_published_date": "2020-01-01",
+                    "reason": "ok",
+                }
+            ],
+            "summary": "ok",
+        }
+    )
+
+    updated, _decisions, _summary = asyncio.run(
+        apply_source_audit(
+            {"statement": "x", "interest": "y"},
+            [article],
+            lookback_hours=24 * 7,
+            model_client=model,
+            inference_run_id="audit-date-test-2",
+        )
+    )
+
+    assert updated[0].tier != "dropped"
+    assert updated[0].payload.published_at == "2026-05-27"
 
 
 def test_source_audit_records_failed_model_attempts(monkeypatch, tmp_path):

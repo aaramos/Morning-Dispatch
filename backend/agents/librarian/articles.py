@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field, replace
+from datetime import date
 from typing import Iterable
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
@@ -427,10 +428,34 @@ _DATE_META_SELECTORS = (
     ("meta[name='dc.date.issued']", "content"),
     ("meta[name='dc.date']", "content"),
     ("meta[name='date']", "content"),
+    ("meta[name='cxenseparse:recs:publishtime']", "content"),
+    ("meta[property='pagefind:date']", "content"),
     ("meta[property='article:modified_time']", "content"),
     ("meta[property='og:updated_time']", "content"),
 )
 _JSONLD_DATE_KEYS = ("datePublished", "dateCreated", "uploadDate", "dateModified")
+# Visible publish-date bylines, in priority order. Many sites expose the date
+# only here (not in <meta>/JSON-LD), e.g. <span class="entry-date">May 04, 2026</span>
+# or <div class="date">April 23, 2026</div>. The generic ".date" is last because
+# it is the least specific.
+_DATE_ELEMENT_SELECTORS = (
+    "time[datetime]",
+    "[itemprop='datePublished']",
+    ".entry-date",
+    ".published",
+    ".post-date",
+    ".posted-on",
+    ".article-date",
+    ".publish-date",
+    "time",
+    ".date",
+)
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 
 def _extract_published_at(soup: BeautifulSoup) -> str | None:
@@ -443,12 +468,49 @@ def _extract_published_at(soup: BeautifulSoup) -> str | None:
         found = _jsonld_date(script.string or script.get_text() or "")
         if found:
             return found
-    time_tag = soup.find("time", attrs={"datetime": True})
-    if time_tag:
-        value = str(time_tag.get("datetime") or "").strip()
-        if value:
-            return value
+    for selector in _DATE_ELEMENT_SELECTORS:
+        for element in soup.select(selector):
+            candidate = str(
+                element.get("datetime") or element.get("content") or element.get_text(" ", strip=True) or ""
+            )
+            normalized = _normalize_date_text(candidate)
+            if normalized:
+                return normalized
     return None
+
+
+def _normalize_date_text(value: str) -> str | None:
+    """Pull a recognizable date out of byline text and return it as ISO `YYYY-MM-DD`.
+
+    Returns None when no valid date is present, so callers can keep scanning
+    lower-priority elements rather than latch onto non-date text.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    iso = re.search(r"\b20\d{2}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?", text)
+    if iso:
+        return iso.group(0)
+    iso_date = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", text)
+    if iso_date:
+        return _iso_or_none(iso_date.group(1), iso_date.group(2), iso_date.group(3))
+    slash = re.search(r"\b(20\d{2})/(\d{1,2})/(\d{1,2})\b", text)
+    if slash:
+        return _iso_or_none(slash.group(1), slash.group(2), slash.group(3))
+    month_first = re.search(r"\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(20\d{2})\b", text)
+    if month_first and month_first.group(1).lower() in _MONTHS:
+        return _iso_or_none(month_first.group(3), _MONTHS[month_first.group(1).lower()], month_first.group(2))
+    day_first = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(20\d{2})\b", text)
+    if day_first and day_first.group(2).lower() in _MONTHS:
+        return _iso_or_none(day_first.group(3), _MONTHS[day_first.group(2).lower()], day_first.group(1))
+    return None
+
+
+def _iso_or_none(year: int | str, month: int | str, day: int | str) -> str | None:
+    try:
+        return date(int(year), int(month), int(day)).isoformat()
+    except ValueError:
+        return None
 
 
 def _jsonld_date(raw: str) -> str | None:
