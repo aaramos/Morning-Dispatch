@@ -860,8 +860,20 @@ def _apply_agent_update(
         if not next_question and turn_count >= MIN_REFINEMENT_TURNS:
             ready = True
     if ready:
+        readiness_reason = _readiness_reason(
+            ready_requested=ready_requested,
+            just_go_now=just_go_now,
+            turn_count=turn_count,
+        )
         patched = _fill_defaults(patched)
+        pre_critique = _diagnostics_query_snapshot(patched)
         patched = _critique_search_plan(patched)
+        patched["refinement_diagnostics"] = _enrich_diagnostics(
+            patched,
+            model_profile_patch=agent_update.get("profile_patch"),
+            pre_critique=pre_critique,
+            readiness_reason=readiness_reason,
+        )
         next_question = None
     return _coerce_profile(patched), next_question, ready
 
@@ -1511,6 +1523,7 @@ def _fill_defaults(profile: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(updated.get("exclusions"), list):
         updated["exclusions"] = []
     updated = _ensure_source_query_coverage(updated)
+    updated["refinement_diagnostics"] = _baseline_diagnostics(updated)
     return _coerce_profile(updated)
 
 
@@ -1547,16 +1560,143 @@ def _ensure_source_query_coverage(profile: dict[str, Any]) -> dict[str, Any]:
     ]))
     resolved_tickers = resolve_tickers_from_text(profile_text)
 
+    foreign_fallback = _foreign_media_fallback_queries(profile)
     for source, enabled in selection.items():
         if not enabled or queries.get(source):
             continue
-        if source == "markets":
-            fallback = resolved_tickers or phrase_queries[:2]
-        else:
-            fallback = phrase_queries[:3]
+        fallback = _source_specific_fallback(
+            source,
+            phrase_queries=phrase_queries,
+            resolved_tickers=resolved_tickers,
+            foreign_fallback=foreign_fallback,
+        )
         if fallback:
-            queries[source] = list(fallback)
+            queries[source] = fallback
     return {**profile, "source_queries": queries}
+
+
+def _foreign_media_fallback_queries(profile: dict[str, Any]) -> list[str]:
+    """Native-language fallback for foreign media — never English search phrases."""
+    out: list[str] = []
+    for lane in _normalize_foreign_language_plan(profile.get("foreign_language_plan")):
+        native_query = str(lane.get("native_query") or "").strip()
+        if native_query:
+            out.append(native_query)
+        out.extend(lane.get("native_entity_terms") or [])
+    return _string_list(out, limit=6)
+
+
+def _source_specific_fallback(
+    source: str,
+    *,
+    phrase_queries: list[str],
+    resolved_tickers: list[str],
+    foreign_fallback: list[str],
+) -> list[str]:
+    """Shape fallback queries to how each source is actually searched.
+
+    Avoids copying one identical phrase into every source: markets gets ticker
+    symbols only (never descriptive text), foreign media gets native-language
+    terms only (never English), and community/video/audio sources get lightly
+    differentiated phrasing instead of the raw web phrase.
+    """
+    if source == "markets":
+        return list(resolved_tickers)
+    if source == "foreign_media":
+        return list(foreign_fallback)
+    base = phrase_queries[:3]
+    if source == "reddit":
+        return [f"{query} discussion" for query in base]
+    if source == "youtube":
+        return [f"{query} explained" for query in base]
+    if source == "podcasts":
+        return [f"{query} podcast" for query in base]
+    return list(base)
+
+
+def _baseline_diagnostics(profile: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic, side-effect-free snapshot of the finalized strategy.
+
+    Records what each source will actually run so a developer can audit why a
+    brief retrieved what it did. The model path enriches this with the agent's
+    raw patch and the critique diff via _apply_agent_update.
+    """
+    selection = _source_selection_dict(profile.get("source_selection"))
+    source_queries = _clean_source_queries(profile.get("source_queries"))
+    availability = {
+        source: {
+            "selected": bool(selection.get(source)),
+            "query_count": len(source_queries.get(source, [])),
+        }
+        for source in sorted(VALID_SOURCE_ADAPTERS)
+    }
+    existing = profile.get("refinement_diagnostics")
+    diagnostics = dict(existing) if isinstance(existing, dict) else {}
+    diagnostics.update(
+        {
+            "source_availability": availability,
+            "final_source_queries": {src: list(qs) for src, qs in source_queries.items()},
+            "final_search_queries": _string_list(profile.get("search_queries"), limit=20),
+        }
+    )
+    diagnostics.setdefault("readiness_reason", "defaults_filled")
+    return diagnostics
+
+
+def _readiness_reason(*, ready_requested: bool, just_go_now: bool, turn_count: int) -> str:
+    if just_go_now:
+        return "just_go_now"
+    if turn_count >= MAX_REFINEMENT_TURNS:
+        return "max_turns"
+    if ready_requested:
+        return "model_ready"
+    return "defaults_filled"
+
+
+def _diagnostics_query_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "search_queries": _string_list(profile.get("search_queries"), limit=20),
+        "source_queries": _clean_source_queries(profile.get("source_queries")),
+    }
+
+
+def _trim_for_diagnostics(value: Any, *, _depth: int = 0) -> Any:
+    if isinstance(value, dict):
+        if _depth >= 4:
+            return "…"
+        return {str(key): _trim_for_diagnostics(item, _depth=_depth + 1) for key, item in list(value.items())[:24]}
+    if isinstance(value, list):
+        return [_trim_for_diagnostics(item, _depth=_depth + 1) for item in value[:24]]
+    if isinstance(value, str):
+        return value[:300]
+    return value
+
+
+def _enrich_diagnostics(
+    profile: dict[str, Any],
+    *,
+    model_profile_patch: Any,
+    pre_critique: dict[str, Any],
+    readiness_reason: str,
+) -> dict[str, Any]:
+    diagnostics = _baseline_diagnostics(profile)
+    diagnostics["readiness_reason"] = readiness_reason
+    if isinstance(model_profile_patch, dict):
+        diagnostics["model_profile_patch"] = _trim_for_diagnostics(model_profile_patch)
+    pre_source = pre_critique.get("source_queries") if isinstance(pre_critique, dict) else {}
+    pre_search = pre_critique.get("search_queries") if isinstance(pre_critique, dict) else []
+    post_source = _clean_source_queries(profile.get("source_queries"))
+    post_search = _string_list(profile.get("search_queries"), limit=20)
+    source_added: dict[str, int] = {}
+    for src, queries in post_source.items():
+        added = max(0, len(queries) - len((pre_source or {}).get(src, [])))
+        if added:
+            source_added[src] = added
+    diagnostics["critique_changes"] = {
+        "search_queries_added": max(0, len(post_search) - len(pre_search or [])),
+        "source_queries_added": source_added,
+    }
+    return diagnostics
 
 
 def _is_conversational_sentence(text: str) -> bool:
@@ -1983,6 +2123,9 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "requested_sources": requested_sources,
         "gmail_rules": _normalize_gmail_rules(profile.get("gmail_rules")),
         "reasoning_summary": str(profile.get("reasoning_summary") or "").strip()[:600],
+        "refinement_diagnostics": dict(profile.get("refinement_diagnostics"))
+        if isinstance(profile.get("refinement_diagnostics"), dict)
+        else {},
         "related_interests_answered": bool(profile.get("related_interests_answered")),
         "requested_sources_answered": bool(profile.get("requested_sources_answered")),
         "depth_answered": bool(profile.get("depth_answered")),
@@ -2200,6 +2343,9 @@ def _strategy_preview(profile: dict[str, Any]) -> dict[str, Any]:
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
         "recency_weighting": str(profile.get("recency_weighting") or ""),
         "exclusions": _string_list(profile.get("exclusions")),
+        "diagnostics": dict(profile.get("refinement_diagnostics"))
+        if isinstance(profile.get("refinement_diagnostics"), dict)
+        else {},
         "reasoning_summary": str(profile.get("reasoning_summary") or "").strip(),
     }
 
@@ -2216,6 +2362,9 @@ def _session_response(session: dict[str, Any]) -> dict[str, Any]:
         "profile": session["profile"],
         "topic_id": session.get("topic_id"),
         "reasoning_summary": str(profile.get("reasoning_summary") or "").strip(),
+        "refinement_diagnostics": dict(profile.get("refinement_diagnostics"))
+        if isinstance(profile.get("refinement_diagnostics"), dict)
+        else {},
         "strategy_preview": _strategy_preview(profile),
     }
     if session.get("topic_id"):
