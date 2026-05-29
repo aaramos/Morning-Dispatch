@@ -3180,6 +3180,11 @@ function AdminApp() {
   }
 
   async function scheduleExploration(exploration: Exploration) {
+    const topic = topicById.get(exploration.topic_id);
+    if (topic?.schedule) {
+      setMessage("Digest already scheduled");
+      return;
+    }
     setBusy(true);
     try {
       await api(`/api/explore/topic-profiles/${exploration.topic_id}/schedule`, {
@@ -3623,6 +3628,7 @@ function AdminApp() {
                   </article>
                 );
               }
+              const isScheduledDigest = Boolean(item.topic?.schedule);
               return (
                 <article className="library-row" key={item.exploration.exploration_id}>
                   <div>
@@ -3635,13 +3641,23 @@ function AdminApp() {
                     ) : hasActionableBuildIssues(item.exploration) ? (
                       <p className="warning-text">Source issues detected so far.</p>
                     ) : null}
+                    {isScheduledDigest ? (
+                      <p className="muted">Scheduled digest · {formatStage(item.topic?.schedule ?? "daily")}</p>
+                    ) : null}
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => openPath(briefPath(item.exploration))} disabled={!briefPath(item.exploration)}>Open</button>
                     <button type="button" className="secondary-action" onClick={() => item.topic && openAdvancedSettings(item.topic)} disabled={busy || !item.topic}>Advanced Settings</button>
                     <button type="button" className="secondary-action" onClick={() => refineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildFromAdmin(item.exploration)} disabled={busy}>Rebuild</button>
-                    <button type="button" className="secondary-action" onClick={() => void scheduleExploration(item.exploration)} disabled={busy || item.exploration.status !== "complete"}>Schedule</button>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() => void scheduleExploration(item.exploration)}
+                      disabled={busy || item.exploration.status !== "complete" || isScheduledDigest || !item.topic}
+                    >
+                      {isScheduledDigest ? "Scheduled" : "Schedule"}
+                    </button>
                     <button type="button" className="secondary-action destructive" onClick={() => void deleteExplorationFromAdmin(item.exploration)} disabled={busy}>Delete</button>
                   </div>
                   {item.exploration.status === "queued" || item.exploration.status === "running" || isModelDegraded(item.exploration) ? (
