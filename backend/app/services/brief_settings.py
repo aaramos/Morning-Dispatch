@@ -48,7 +48,10 @@ DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
 
 DEFAULT_PIPELINE_LIMITS: dict[str, int] = {
     "article_fetches": MAX_ARTICLE_FETCHES,
-    "article_fetch_concurrency": 10,
+    # Fetch is I/O-bound; 15 in-flight shortens the fetch stage on large candidate
+    # pools. Kept modest to avoid tripping per-site rate limits (which would reduce
+    # successful fetches). Tunable per-profile up to MAX_ARTICLE_FETCH_CONCURRENCY.
+    "article_fetch_concurrency": 15,
     "model_refinement_items": MODEL_REFINEMENT_LIMIT,
     "source_audit_candidates": MAX_AUDIT_CANDIDATES,
     "editorial_candidates": MAX_EDITORIAL_CANDIDATES,

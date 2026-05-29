@@ -105,6 +105,15 @@ def test_extract_article_harvests_published_date_from_byline_element():
     assert extracted.published_at == "2026-05-04"
 
 
+def test_extract_article_harvests_published_date_from_visible_header_text():
+    html = ARTICLE_HTML.replace(
+        "<h1>Useful AI Article</h1>",
+        "<h1>Useful AI Article</h1><div>2026-01-29 · 22 mins · Written by Jason Huang</div>",
+    )
+    extracted = articles.extract_article(html, "https://example.com/final-article")
+    assert extracted.published_at == "2026-01-29"
+
+
 def test_extract_article_handles_js_date_string_meta():
     html = ARTICLE_HTML.replace(
         "</head>",
@@ -149,6 +158,85 @@ def test_fetch_articles_backfills_published_at_from_page(monkeypatch):
     results = asyncio.run(articles.fetch_articles_for_payloads([payload]))
 
     assert results[0].payload.published_at == "2026-05-20T08:00:00Z"
+
+
+def test_fetch_articles_prefers_page_published_date_over_provider_date(monkeypatch):
+    class DatedResponse(FakeResponse):
+        text = ARTICLE_HTML.replace(
+            "<h1>Useful AI Article</h1>",
+            "<h1>Useful AI Article</h1><div>2026-01-29 · 22 mins · Written by Jason Huang</div>",
+        )
+
+    class DatedClient(FakeAsyncClient):
+        response = DatedResponse()
+
+    monkeypatch.setattr(articles.httpx, "AsyncClient", DatedClient)
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="web search hit",
+        original_url="https://example.com/article",
+        published_at="2026-05-29",
+    )
+
+    results = asyncio.run(articles.fetch_articles_for_payloads([payload]))
+
+    assert results[0].payload.published_at == "2026-01-29"
+
+
+def test_fetch_cache_reuses_body_and_force_refresh_bypasses(monkeypatch, tmp_path):
+    monkeypatch.setattr(articles, "_fetch_cache_dir", lambda: tmp_path)
+    calls = {"n": 0}
+
+    class CountingClient:
+        async def get(self, _url):
+            calls["n"] += 1
+            return FakeResponse()
+
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="web hit",
+        original_url="https://example.com/cache-me",
+        metadata={"link_quality_score": 0.9},
+    )
+
+    async def run():
+        sem = asyncio.Semaphore(2)
+        client = CountingClient()
+        miss = await articles._fetch_one(client, sem, payload, cache_ttl=3600, force_refresh=False)
+        hit = await articles._fetch_one(client, sem, payload, cache_ttl=3600, force_refresh=False)
+        forced = await articles._fetch_one(client, sem, payload, cache_ttl=3600, force_refresh=True)
+        return miss, hit, forced
+
+    miss, hit, forced = asyncio.run(run())
+    assert calls["n"] == 2  # miss fetched, hit served from cache, forced re-fetched
+    assert miss.status == hit.status == "fetched"
+    assert hit.title == miss.title  # re-extracted from cached HTML, identical content
+
+
+def test_fetch_cache_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(articles, "_fetch_cache_dir", lambda: tmp_path)
+    calls = {"n": 0}
+
+    class CountingClient:
+        async def get(self, _url):
+            calls["n"] += 1
+            return FakeResponse()
+
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="web hit",
+        original_url="https://example.com/no-cache",
+        metadata={"link_quality_score": 0.9},
+    )
+
+    async def run():
+        sem = asyncio.Semaphore(2)
+        client = CountingClient()
+        await articles._fetch_one(client, sem, payload, cache_ttl=0)
+        await articles._fetch_one(client, sem, payload, cache_ttl=0)
+
+    asyncio.run(run())
+    assert calls["n"] == 2  # ttl=0 => every call hits the network
 
 
 def test_fetch_articles_resolves_and_extracts(monkeypatch):

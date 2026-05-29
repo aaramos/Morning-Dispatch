@@ -380,6 +380,84 @@ def test_source_audit_does_not_override_existing_date_with_model_guess():
     assert updated[0].payload.published_at == "2026-05-27"
 
 
+def test_source_audit_overrides_fresh_provider_date_on_conflict_and_excludes():
+    """When the provider date looks fresh but the model flags an explicit conflict
+    with a credibly older page date, the older date wins and the stale item is
+    excluded from a strict recent brief."""
+    article = result("7 Best Memory Stocks - 2026 Investment Guide")
+    article = replace(article, payload=replace(article.payload, published_at="2026-05-29"))
+    model = FakeModelClient(
+        {
+            "decisions": [
+                {
+                    "index": 0,
+                    "decision": "include",
+                    "confidence": 0.7,
+                    "resolved_published_date": "2026-01-29",
+                    "date_conflict": True,
+                    "date_conflict_reason": "Article body dateline reads 2026-01-29.",
+                    "reason": "Provider date looks fresh but the body says January.",
+                }
+            ],
+            "summary": "Corrected a stale provider date.",
+        }
+    )
+
+    updated, _decisions, summary = asyncio.run(
+        apply_source_audit(
+            {"statement": "memory stocks over the last 7 days", "interest": "memory"},
+            [article],
+            lookback_hours=24 * 7,
+            model_client=model,
+            inference_run_id="audit-conflict",
+        )
+    )
+
+    assert updated[0].tier == "dropped"
+    assert updated[0].payload.published_at == "2026-01-29"
+    assert "recency" in updated[0].metadata["source_audit"]["constraint_failures"]
+    assert updated[0].metadata["date_source"] == "source_audit"
+    assert updated[0].metadata["date_conflict_original"] == "2026-05-29"
+    assert updated[0].metadata["date_conflict_resolved"] == "2026-01-29"
+    assert summary["excluded_count"] == 1
+
+
+def test_source_audit_conflict_flag_does_not_apply_a_newer_date():
+    """A conflict flag only justifies moving to an OLDER date; a newer model date
+    never overrides the existing one (prefer the older, safer evidence)."""
+    article = result("Already dated story")
+    article = replace(article, payload=replace(article.payload, published_at="2026-05-27"))
+    model = FakeModelClient(
+        {
+            "decisions": [
+                {
+                    "index": 0,
+                    "decision": "include",
+                    "confidence": 0.8,
+                    "resolved_published_date": "2026-05-29",
+                    "date_conflict": True,
+                    "date_conflict_reason": "model thinks it is newer",
+                    "reason": "ok",
+                }
+            ],
+            "summary": "ok",
+        }
+    )
+
+    updated, _decisions, _summary = asyncio.run(
+        apply_source_audit(
+            {"statement": "x", "interest": "y"},
+            [article],
+            lookback_hours=24 * 7,
+            model_client=model,
+            inference_run_id="audit-conflict-newer",
+        )
+    )
+
+    assert updated[0].tier != "dropped"
+    assert updated[0].payload.published_at == "2026-05-27"
+
+
 def test_source_audit_records_failed_model_attempts(monkeypatch, tmp_path):
     monkeypatch.setenv("MORNING_DISPATCH_HOME", str(tmp_path))
     database.init_database()

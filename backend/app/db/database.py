@@ -3953,7 +3953,7 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
             <div class="section-kicker">Machine translated from {escape(source_language_name)}</div>
             <h3 id="{escape(modal_id, quote=True)}-title">{escape(_story_title(result))}</h3>
             <div class="podcast-actions">
-              <a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">View original source</a>
+              <a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer" data-external-source>View original source</a>
             </div>
             <p class="foreign-provenance" data-foreign-provenance>{escape(provenance)}</p>
             <p class="foreign-status" aria-live="polite">{escape(status_text)}</p>
@@ -4584,6 +4584,17 @@ def _render_podcast_modal_script() -> str:
       };
 
       document.addEventListener("click", (event) => {
+        const externalSource = event.target.closest("[data-external-source]");
+        if (externalSource) {
+          const url = externalSource.getAttribute("href");
+          if (url) {
+            event.preventDefault();
+            const opened = window.open(url, "_blank", "noopener,noreferrer");
+            if (!opened) window.location.href = url;
+          }
+          return;
+        }
+
         const tab = event.target.closest("[data-foreign-tab]");
         if (tab) {
           const modal = tab.closest(".foreign-modal");

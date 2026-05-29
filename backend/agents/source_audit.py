@@ -504,7 +504,12 @@ def _audit_prompt(
                 "Treat provider dates as weak evidence when URL paths, snippets, or article text imply an older date. "
                 "When published_at is null/empty, infer the publication date from the dateline, body text, "
                 "url_date_hint, metadata_dates, or snippet and report it in resolved_published_date as ISO YYYY-MM-DD. "
-                "Only fill resolved_published_date when you are reasonably confident; otherwise leave it an empty string. "
+                "Also report resolved_published_date when published_at IS set but the article text, dateline, "
+                "url_date_hint, or snippet shows a credibly OLDER date that conflicts with it — in that case set "
+                "date_conflict to true and explain the evidence in date_conflict_reason. Prefer the older, "
+                "evidence-backed date over an optimistic provider/search date. "
+                "Never invent or guess dates: only fill resolved_published_date from explicit evidence in the "
+                "supplied fields, and leave it an empty string (with date_conflict false) when you are not confident. "
                 "Treat MSN/Yahoo-like instructions as a request to avoid syndicated aggregator reposts, even on adjacent domains. "
                 "Translated foreign-media items are allowed; judge them on the translated summary and provenance quality, "
                 "but do not reject an item solely because it was translated. "
@@ -519,7 +524,9 @@ def _audit_prompt(
                         "decision": "include|exclude|include_as_context",
                         "confidence": "0.0-1.0",
                         "constraint_failures": ["recency|source_quality|topic_fit|duplicate|thin_content"],
-                        "resolved_published_date": "ISO YYYY-MM-DD if you can determine when it was published; empty string if unknown",
+                        "resolved_published_date": "ISO YYYY-MM-DD from explicit evidence (dateline/text/url/snippet); empty if unknown",
+                        "date_conflict": "true only when published_at is set but evidence shows a credibly older date",
+                        "date_conflict_reason": "short note on the date evidence when date_conflict is true; else empty",
                         "reason": "short, user-readable reason",
                     }
                 ],
@@ -663,11 +670,16 @@ def _apply_audit_payload(
         reason = str(raw.get("reason") or "").strip()[:320]
         action = "include"
 
-        # AI date fallback: when the rule-based extractor found no date, trust the
-        # date the model inferred from the text/URL/snippet, and enforce the window
-        # on it. Items the model also cannot date keep show-once handling downstream.
+        # AI date resolution: backfill a date when the rule-based extractor found
+        # none, AND override an existing date when the model reports an explicit
+        # conflict (a credibly older date from the supplied text/url/snippet). The
+        # window is then enforced on the resolved date.
         result, model_date, model_recency_reason = _apply_model_resolved_date(
-            result, str(raw.get("resolved_published_date") or "").strip(), cutoff
+            result,
+            str(raw.get("resolved_published_date") or "").strip(),
+            cutoff,
+            date_conflict=_truthy(raw.get("date_conflict")),
+            conflict_reason=str(raw.get("date_conflict_reason") or "").strip()[:200],
         )
         if model_recency_reason:
             decision = "exclude"
@@ -745,18 +757,53 @@ def _apply_model_resolved_date(
     result: ArticleFetchResult,
     raw_date: str,
     cutoff: datetime | None,
+    *,
+    date_conflict: bool = False,
+    conflict_reason: str = "",
 ) -> tuple[ArticleFetchResult, str, str]:
-    """Backfill a model-inferred publish date, but only when no deterministic date exists.
+    """Resolve a publish date from the model and enforce the recency window on it.
+
+    Two cases:
+      * Backfill — no deterministic date exists: trust the model's inferred date.
+      * Conflict override — a date already exists, but the model flagged
+        date_conflict and supplied a credibly OLDER date from the article
+        text/url/snippet. We prefer the older, evidence-backed date.
+
+    A random model guess never overrides an existing date: an override requires
+    both the conflict flag AND a date strictly older than the current one.
 
     Returns the (possibly updated) result, the ISO date applied (or ""), and a
     recency-rejection reason when that date falls outside the requested window.
     """
-    if not raw_date or _has_existing_date(result):
+    if not raw_date:
         return result, "", ""
     parsed = _parse_model_date(raw_date)
     if parsed is None:
         return result, "", ""
     iso = parsed.date().isoformat()
+
+    existing_raw = _existing_date_text(result)
+    existing_dt = _existing_published_datetime(result)
+    conflict_meta: dict[str, str] = {}
+    if existing_raw:
+        # Only override an existing date with explicit conflict evidence, and only
+        # toward an older date (prefer the more reliable, older page evidence).
+        if not date_conflict:
+            return result, "", ""
+        if existing_dt is not None and parsed >= existing_dt:
+            return result, "", ""
+        if existing_dt is not None and iso == existing_dt.date().isoformat():
+            return result, "", ""
+        date_source = "source_audit"
+        conflict_meta = {
+            "date_conflict_original": existing_dt.date().isoformat() if existing_dt else existing_raw,
+            "date_conflict_resolved": iso,
+        }
+        if conflict_reason:
+            conflict_meta["date_conflict_reason"] = conflict_reason
+    else:
+        date_source = "model"
+
     payload = replace(result.payload, published_at=iso)
     # A real date supersedes the "shown once" placeholder so it displays the date
     # and is not recorded as an undated item.
@@ -765,23 +812,45 @@ def _apply_model_resolved_date(
         for key, value in dict(result.metadata or {}).items()
         if key not in _SERVED_ONCE_METADATA_KEYS
     }
-    metadata["date_source"] = "model"
+    metadata["date_source"] = date_source
+    metadata.update(conflict_meta)
     updated = replace(result, payload=payload, metadata=metadata)
     reason = ""
     if cutoff is not None and parsed < cutoff:
-        reason = f"Published {iso}; outside the requested recency window."
+        if date_source == "source_audit":
+            reason = f"Published {iso} based on article text; outside the requested recency window."
+        else:
+            reason = f"Published {iso}; outside the requested recency window."
     return updated, iso, reason
 
 
 def _has_existing_date(result: ArticleFetchResult) -> bool:
-    if str(getattr(result.payload, "published_at", "") or "").strip():
-        return True
+    return bool(_existing_date_text(result))
+
+
+def _existing_date_text(result: ArticleFetchResult) -> str:
+    value = str(getattr(result.payload, "published_at", "") or "").strip()
+    if value:
+        return value
     for meta in (result.payload.metadata, result.metadata):
         if isinstance(meta, dict):
             for key in _AUDIT_DATE_METADATA_KEYS:
-                if str(meta.get(key) or "").strip():
-                    return True
-    return False
+                candidate = str(meta.get(key) or "").strip()
+                if candidate:
+                    return candidate
+    return ""
+
+
+def _existing_published_datetime(result: ArticleFetchResult) -> datetime | None:
+    return _parse_model_date(_existing_date_text(result))
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"true", "yes", "1"}
 
 
 def _parse_model_date(raw: str) -> datetime | None:

@@ -639,6 +639,8 @@ async def _run_exploration(
         )
         brief_ref = _write_exploration_brief(exploration_id, html)
         stage_seconds["publishing"] = _elapsed_stage_seconds(stage_started)
+        # Re-build stats and re-render so the just-measured publishing duration is
+        # reflected in the brief's stats sidebar.
         digest_stats = build_stats()
         _apply_model_health_to_progress(progress, digest_stats)
         html = database.render_ingested_issue(

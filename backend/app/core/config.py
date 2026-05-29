@@ -47,6 +47,11 @@ class Settings:
     librarian_model_max_items: int = DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS
     model_timeout_seconds: float = DEFAULT_MODEL_TIMEOUT_SECONDS
     model_concurrency: int = 1
+    # Seconds to reuse a previously fetched article body (keyed by canonical URL).
+    # 0 disables the cache. Re-extraction always runs on the cached HTML, so
+    # extraction/date improvements are never masked. Kept short so it cannot
+    # resurrect content outside a multi-day recency window.
+    article_fetch_cache_ttl_seconds: int = 0
     model_routes: dict[str, dict[str, object]] = field(default_factory=lambda: dict(DEFAULT_MODEL_ROUTES))
     web_search_provider: str = "auto"
     web_search_tavily_api_key: str | None = None
@@ -331,6 +336,7 @@ def get_settings() -> Settings:
         ),
         model_timeout_seconds=_float_from_env("MORNING_DISPATCH_MODEL_TIMEOUT_SECONDS", DEFAULT_MODEL_TIMEOUT_SECONDS),
         model_concurrency=max(1, _int_from_env("MORNING_DISPATCH_MODEL_CONCURRENCY", 1)),
+        article_fetch_cache_ttl_seconds=max(0, _int_from_env("MORNING_DISPATCH_ARTICLE_FETCH_CACHE_TTL_SECONDS", 0)),
         model_routes=_model_routes_from_runtime(model_settings_path),
         web_search_provider=web_search_provider,
         web_search_tavily_api_key=web_search_tavily_api_key,

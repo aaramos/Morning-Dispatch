@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field, replace
 from datetime import date
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
@@ -15,6 +18,16 @@ from bs4 import BeautifulSoup
 from backend.agents.digestor.base import NormalizedPayload
 
 logger = logging.getLogger(__name__)
+
+# lxml is ~3-5x faster than the pure-Python parser on large article pages and
+# produces equivalent extraction (validated for parity on real pages). Falls back
+# to the stdlib parser if lxml is unavailable.
+try:  # pragma: no cover - import-time capability probe
+    import lxml  # noqa: F401
+
+    _HTML_PARSER = "lxml"
+except ImportError:  # pragma: no cover
+    _HTML_PARSER = "html.parser"
 
 MAX_ARTICLE_FETCHES = 250
 MIN_ARTICLE_TEXT_CHARS = 450
@@ -55,6 +68,7 @@ async def fetch_articles_for_payloads(
     *,
     max_articles: int = MAX_ARTICLE_FETCHES,
     concurrency: int = 10,
+    force_refresh: bool = False,
 ) -> list[ArticleFetchResult]:
     payload_list = list(payloads)
     direct_results = direct_article_results(payload_list)
@@ -62,13 +76,19 @@ async def fetch_articles_for_payloads(
     if not selected_payloads:
         return direct_results
 
+    from backend.app.core.config import get_settings
+
+    cache_ttl = max(0, int(get_settings().article_fetch_cache_ttl_seconds))
     semaphore = asyncio.Semaphore(concurrency)
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=REQUEST_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
     ) as client:
-        tasks = [_fetch_one(client, semaphore, payload) for payload in selected_payloads]
+        tasks = [
+            _fetch_one(client, semaphore, payload, cache_ttl=cache_ttl, force_refresh=force_refresh)
+            for payload in selected_payloads
+        ]
         results = await asyncio.gather(*tasks)
 
     deduped: list[ArticleFetchResult] = []
@@ -252,27 +272,39 @@ async def _fetch_one(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
     payload: NormalizedPayload,
+    *,
+    cache_ttl: int = 0,
+    force_refresh: bool = False,
 ) -> ArticleFetchResult:
     original_url = canonicalize_url(unwrap_redirect_url(str(payload.original_url)))
     link_score = float((payload.metadata or {}).get("link_quality_score") or score_link_candidate(original_url, _payload_title(payload)))
     async with semaphore:
         try:
-            response = await client.get(original_url)
-            content_type = response.headers.get("content-type", "")
-            final_url = canonicalize_url(str(response.url))
-            if response.status_code >= 400:
-                return _failed(
-                    payload,
-                    original_url,
-                    final_url,
-                    _http_failure_status(response.status_code),
-                    f"HTTP {response.status_code}",
-                    link_score,
-                )
-            if "html" not in content_type.lower():
-                return _failed(payload, original_url, final_url, "non_html", content_type, link_score)
+            cached = _read_fetch_cache(original_url, cache_ttl) if cache_ttl > 0 and not force_refresh else None
+            if cached is not None:
+                final_url, html = cached
+            else:
+                response = await client.get(original_url)
+                content_type = response.headers.get("content-type", "")
+                final_url = canonicalize_url(str(response.url))
+                if response.status_code >= 400:
+                    return _failed(
+                        payload,
+                        original_url,
+                        final_url,
+                        _http_failure_status(response.status_code),
+                        f"HTTP {response.status_code}",
+                        link_score,
+                    )
+                if "html" not in content_type.lower():
+                    return _failed(payload, original_url, final_url, "non_html", content_type, link_score)
+                html = response.text
+                if cache_ttl > 0:
+                    _write_fetch_cache(original_url, final_url, html)
 
-            article = extract_article(response.text, final_url, fallback_title=_payload_title(payload))
+            # Extraction always runs on the (possibly cached) HTML, so extraction
+            # and date-parsing improvements are never masked by a cache hit.
+            article = extract_article(html, final_url, fallback_title=_payload_title(payload))
             payload = _with_published_at(payload, article)
             if len(article.text) < MIN_ARTICLE_TEXT_CHARS:
                 context = _newsletter_context(payload)
@@ -325,6 +357,46 @@ async def _fetch_one(
             return _failed(payload, original_url, None, "fetch_error", str(exc), link_score)
 
 
+def _fetch_cache_dir() -> Path:
+    from backend.app.core.config import get_settings
+
+    return get_settings().data_dir / "article-fetch-cache"
+
+
+def _fetch_cache_path(url: str) -> Path:
+    key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return _fetch_cache_dir() / f"{key}.json"
+
+
+def _read_fetch_cache(url: str, ttl_seconds: int) -> tuple[str, str] | None:
+    """Return (final_url, html) for a fresh cache entry, else None."""
+    path = _fetch_cache_path(url)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    cached_at = float(payload.get("cached_at") or 0)
+    if time.time() - cached_at > ttl_seconds:
+        return None
+    html = payload.get("html")
+    final_url = payload.get("final_url") or url
+    if not isinstance(html, str) or not html:
+        return None
+    return final_url, html
+
+
+def _write_fetch_cache(url: str, final_url: str, html: str) -> None:
+    path = _fetch_cache_path(url)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"cached_at": time.time(), "final_url": final_url, "html": html}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:  # pragma: no cover - disk/permission edge cases
+        logger.info("Could not write article fetch cache for %s: %s", url, exc)
+
+
 @dataclass(frozen=True)
 class ExtractedArticle:
     title: str
@@ -336,7 +408,7 @@ class ExtractedArticle:
 
 
 def extract_article(html: str, url: str, *, fallback_title: str = "") -> ExtractedArticle:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, _HTML_PARSER)
     image_url, image_source = _extract_image(soup, url)
     # Harvest the publish date before scripts/headers are decomposed — many pages
     # only expose it via <meta>, JSON-LD, or <time> tags, not in visible body text.
@@ -476,6 +548,10 @@ def _extract_published_at(soup: BeautifulSoup) -> str | None:
             normalized = _normalize_date_text(candidate)
             if normalized:
                 return normalized
+    body_text = soup.body.get_text(" ", strip=True) if soup.body else ""
+    visible_date = _normalize_date_text(body_text[:5000])
+    if visible_date:
+        return visible_date
     return None
 
 
@@ -585,8 +661,8 @@ def _payload_title(payload: NormalizedPayload) -> str:
 
 
 def _with_published_at(payload: NormalizedPayload, article: ExtractedArticle) -> NormalizedPayload:
-    """Backfill a publish date harvested from the page when the source lacked one."""
-    if not article.published_at or payload.published_at:
+    """Prefer a publish date harvested from the article page over provider metadata."""
+    if not article.published_at:
         return payload
     return replace(payload, published_at=article.published_at)
 

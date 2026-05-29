@@ -11,6 +11,7 @@ dependencies = [
     "google-auth-oauthlib>=1.0.0",
     "google-auth>=2.0.0",
     "httpx>=0.28.0",
+    "lxml>=5.0.0",
     "langgraph>=0.2.76",
     "mcp>=1.23.0",
     "uvicorn[standard]>=0.38.0",

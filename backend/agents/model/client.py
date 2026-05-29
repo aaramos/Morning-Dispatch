@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -12,6 +13,50 @@ import httpx
 from backend.app.core.config import Settings
 
 MODEL_CAPACITY_STATUS = "model_capacity"
+
+# Process-wide pool of httpx clients so model calls reuse keep-alive connections
+# instead of paying connection/TLS setup on every request. Keyed by endpoint +
+# timeout and bound to the event loop that created the client (a different loop —
+# e.g. a fresh asyncio.run in tests — transparently gets its own client). Closed
+# at app shutdown via aclose_shared_model_clients().
+_SHARED_HTTP_CLIENTS: dict[tuple[str, float], tuple[Any, httpx.AsyncClient]] = {}
+
+
+def _shared_http_client(config: "ModelClientConfig") -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    key = (config.base_url, float(config.timeout_seconds))
+    existing = _SHARED_HTTP_CLIENTS.get(key)
+    if existing is not None:
+        bound_loop, client = existing
+        if bound_loop is loop and not client.is_closed:
+            return client
+    client = httpx.AsyncClient(
+        timeout=config.timeout_seconds,
+        limits=httpx.Limits(
+            max_keepalive_connections=max(4, config.concurrency),
+            max_connections=max(8, config.concurrency * 2),
+        ),
+    )
+    _SHARED_HTTP_CLIENTS[key] = (loop, client)
+    return client
+
+
+@asynccontextmanager
+async def _leased_http_client(config: "ModelClientConfig") -> AsyncIterator[httpx.AsyncClient]:
+    # Yields a pooled client WITHOUT closing it on exit, so connections persist
+    # across calls. Lifecycle is owned by the process-wide pool.
+    yield _shared_http_client(config)
+
+
+async def aclose_shared_model_clients() -> None:
+    clients = list(_SHARED_HTTP_CLIENTS.values())
+    _SHARED_HTTP_CLIENTS.clear()
+    for _loop, client in clients:
+        if not client.is_closed:
+            try:
+                await client.aclose()
+            except Exception:  # pragma: no cover - best-effort shutdown
+                pass
 _RETRYABLE_STATUSES = {"model_error", "timeout"}
 _RETRYABLE_ERROR_FRAGMENTS = (
     "peer closed connection",
@@ -236,7 +281,7 @@ class ModelClient:
         async with self._semaphore:
             queue_wait_ms = _elapsed_ms(submitted_at)
             try:
-                async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
+                async with _leased_http_client(self.config) as client:
                     response = await asyncio.wait_for(
                         client.post(url, headers=headers, json=payload),
                         timeout=self.config.timeout_seconds,
@@ -325,7 +370,7 @@ class ModelClient:
         async with self._semaphore:
             queue_wait_ms = _elapsed_ms(submitted_at)
             try:
-                async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
+                async with _leased_http_client(self.config) as client:
                     async with client.stream("POST", url, headers=headers, json=payload) as response:
                         response.raise_for_status()
                         async for line in response.aiter_lines():
@@ -425,7 +470,7 @@ class ModelClient:
         async with self._semaphore:
             queue_wait_ms = _elapsed_ms(submitted_at)
             try:
-                async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
+                async with _leased_http_client(self.config) as client:
                     response = await asyncio.wait_for(
                         client.post(url, headers=headers, json=payload),
                         timeout=self.config.timeout_seconds,
@@ -531,7 +576,7 @@ class ModelClient:
         async with self._semaphore:
             queue_wait_ms = _elapsed_ms(submitted_at)
             try:
-                async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
+                async with _leased_http_client(self.config) as client:
                     async with client.stream("POST", url, headers=headers, json=payload) as response:
                         response.raise_for_status()
                         async for line in response.aiter_lines():
