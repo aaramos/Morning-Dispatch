@@ -1709,6 +1709,62 @@ def test_refinement_agent_does_not_reask_stated_market_recency_and_exclusions(mo
     assert "previous 3 days" in prompt_payload
 
 
+def test_refinement_agent_does_not_repeat_same_strategy_question(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    repeated_question = (
+        "What would make this brief actionable for you: catalysts, risks, valuation context, "
+        "or company-by-company comparisons?"
+    )
+
+    class _RepeatingQuestionModelClient:
+        async def complete_json(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "profile_patch": {
+                    "scope": "AI memory supply-chain investment signals",
+                    "keywords": ["Micron", "SK Hynix", "Kioxia", "HBM"],
+                    "search_queries": ["AI memory supply chain investment signals"],
+                    "source_queries": {"web_search": ["Micron SK Hynix Kioxia HBM catalysts"]},
+                    "depth": "practitioner",
+                    "recency_weighting": "recent",
+                },
+                "ready_to_build": False,
+                "next_question": repeated_question,
+                "reasoning_summary": "The plan needs decision criteria.",
+            }
+
+    monkeypatch.setattr(
+        "backend.app.services.refinement.ModelClient.from_settings",
+        lambda *_args, **_kwargs: _RepeatingQuestionModelClient(),
+    )
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Find investable signals for AI memory picks and shovels.",
+                "source_selection": {"web_search": True, "markets": True},
+            },
+        )
+        session_id = started.json()["session_id"]
+        updated = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/messages",
+            json={"answer": "catalysts, risks, and company-by-company comparisons"},
+        )
+
+    assert started.status_code == 201
+    assert updated.status_code == 200
+    assistant_questions = [
+        message["content"]
+        for message in updated.json()["messages"]
+        if message["role"] == "assistant" and message["content"].endswith("?")
+    ]
+    assert assistant_questions[0] == repeated_question
+    assert assistant_questions[-1] != repeated_question
+    assert len(set(assistant_questions)) == len(assistant_questions)
+
+
 def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()

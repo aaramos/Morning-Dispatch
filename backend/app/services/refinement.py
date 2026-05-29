@@ -841,19 +841,24 @@ def _apply_agent_update(
     next_question = _clean_next_question(agent_update.get("next_question"))
     if next_question and _question_repeats_answered_constraint(next_question, patched):
         next_question = _strategy_deepening_question(patched, messages)
+    next_question = _dedupe_next_question(next_question, patched, messages)
 
     if ready and not just_go_now and turn_count < MIN_REFINEMENT_TURNS:
         ready = False
         if not next_question:
             fallback_pending = _next_missing(patched)
             next_question = _deterministic_question(fallback_pending, patched) if fallback_pending else _search_strategy_question(patched)
+            next_question = _dedupe_next_question(next_question, patched, messages)
 
     if not next_question and not ready:
         fallback_pending = _next_missing(patched)
         next_question = _deterministic_question(fallback_pending, patched) if fallback_pending else None
         if next_question and _question_repeats_answered_constraint(next_question, patched):
             next_question = _strategy_deepening_question(patched, messages)
+        next_question = _dedupe_next_question(next_question, patched, messages)
         ready = fallback_pending is None
+        if not next_question and turn_count >= MIN_REFINEMENT_TURNS:
+            ready = True
     if ready:
         patched = _fill_defaults(patched)
         patched = _critique_search_plan(patched)
@@ -1766,10 +1771,67 @@ def _search_strategy_question(profile: dict[str, Any]) -> str:
 def _strategy_deepening_question(profile: dict[str, Any], messages: list[dict[str, str]]) -> str:
     text = _user_authored_text(profile, messages)
     if _market_tracking_interest(text):
-        return "What would make this brief actionable for you: catalysts, risks, valuation context, or company-by-company comparisons?"
+        return _first_unasked_question(
+            messages,
+            [
+                "What would make this brief actionable for you: catalysts, risks, valuation context, or company-by-company comparisons?",
+                "Which evidence should carry the most weight: earnings commentary, pricing data, supply-chain capacity, customer demand, or analyst revisions?",
+                "Do you want the final brief organized by company, by signal type, or by near-term catalyst?",
+            ],
+        )
     if _string_list(profile.get("search_queries")) or _clean_source_queries(profile.get("source_queries")):
-        return "What kind of evidence should I trust most for this brief: primary reporting, expert analysis, community signal, or practical examples?"
-    return _search_strategy_question(profile)
+        return _first_unasked_question(
+            messages,
+            [
+                "What kind of evidence should I trust most for this brief: primary reporting, expert analysis, community signal, or practical examples?",
+                "Should the brief prioritize breadth across sources or depth on the strongest few items?",
+                "What would make the final brief useful enough to act on?",
+            ],
+        )
+    return _first_unasked_question(
+        messages,
+        [
+            _search_strategy_question(profile),
+            "What would make the final brief useful enough to act on?",
+            "Should I prioritize breadth across sources or depth on the strongest few items?",
+        ],
+    )
+
+
+def _dedupe_next_question(question: str | None, profile: dict[str, Any], messages: list[dict[str, str]]) -> str | None:
+    if not question:
+        return None
+    if not _question_was_recently_asked(question, messages):
+        return question
+    replacement = _strategy_deepening_question(profile, messages)
+    if replacement and not _question_was_recently_asked(replacement, messages):
+        return replacement
+    return None
+
+
+def _first_unasked_question(messages: list[dict[str, str]], candidates: list[str]) -> str:
+    for candidate in candidates:
+        if candidate and not _question_was_recently_asked(candidate, messages):
+            return candidate
+    return candidates[-1] if candidates else "What else would make this brief more useful?"
+
+
+def _question_was_recently_asked(question: str, messages: list[dict[str, str]]) -> bool:
+    normalized = _normalize_question_for_repeat_check(question)
+    if not normalized:
+        return False
+    for message in messages[-12:]:
+        if message.get("role") != "assistant":
+            continue
+        if _normalize_question_for_repeat_check(message.get("content") or "") == normalized:
+            return True
+    return False
+
+
+def _normalize_question_for_repeat_check(question: str) -> str:
+    lowered = str(question or "").lower()
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return " ".join(lowered.split())
 
 
 def _question_repeats_answered_constraint(question: str, profile: dict[str, Any]) -> bool:
