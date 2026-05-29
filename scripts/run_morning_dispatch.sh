@@ -2,9 +2,9 @@
 set -euo pipefail
 umask 077
 
-PROJECT_DIR="/Users/macstudio/Apps/personal_intel"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUNTIME_HOME="$PROJECT_DIR/runtime"
-SECRETS_HOME="${MORNING_DISPATCH_SECRETS_DIR:-/Users/macstudio/.morning-dispatch/secrets}"
+SECRETS_HOME="${MORNING_DISPATCH_SECRETS_DIR:-$HOME/.morning-dispatch/secrets}"
 
 mkdir -p \
   "$RUNTIME_HOME/data/db" \
@@ -29,13 +29,21 @@ chmod 700 \
   "$SECRETS_HOME/ollama"
 cd "$PROJECT_DIR"
 
+# Source machine-local overrides (gitignored). Put MORNING_DISPATCH_PUBLIC_BASE_URL
+# and any other machine-specific values here instead of editing this script.
+# Example: echo 'MORNING_DISPATCH_PUBLIC_BASE_URL=https://your-machine.ts.net' > runtime/local.env
+if [[ -f "$RUNTIME_HOME/local.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$RUNTIME_HOME/local.env"
+fi
+
 export MORNING_DISPATCH_HOME="$RUNTIME_HOME"
 export MORNING_DISPATCH_DATA_DIR="$RUNTIME_HOME/data"
 export MORNING_DISPATCH_SECRETS_DIR="$SECRETS_HOME"
 export MORNING_DISPATCH_DB_PATH="$RUNTIME_HOME/data/db/morning_dispatch.sqlite3"
 export MORNING_DISPATCH_GMAIL_CLIENT_SECRET_PATH="${MORNING_DISPATCH_GMAIL_CLIENT_SECRET_PATH:-$SECRETS_HOME/gmail/gmail_client_secret.json}"
 export MORNING_DISPATCH_GMAIL_CREDENTIALS_PATH="${MORNING_DISPATCH_GMAIL_CREDENTIALS_PATH:-$SECRETS_HOME/gmail/gmail_credentials.json}"
-export MORNING_DISPATCH_PUBLIC_BASE_URL="https://ultras-mac-studio-2.tail4aeef0.ts.net"
+export MORNING_DISPATCH_PUBLIC_BASE_URL="${MORNING_DISPATCH_PUBLIC_BASE_URL:-http://127.0.0.1:8000}"
 export MORNING_DISPATCH_GMAIL_REMOTE_MCP_ENABLED="false"
 export MORNING_DISPATCH_LIBRARIAN_USE_MODEL="auto"
 export MORNING_DISPATCH_MODEL_BASE_URL="http://127.0.0.1:1234/v1"
@@ -74,8 +82,13 @@ if [[ -z "${MORNING_DISPATCH_OLLAMA_API_KEY:-}" && -f "$SECRETS_HOME/ollama/api_
   export MORNING_DISPATCH_OLLAMA_API_KEY="$(< "$SECRETS_HOME/ollama/api_key")"
 fi
 
-if [[ -f "/Users/macstudio/.omlx/settings.json" ]]; then
-  export MORNING_DISPATCH_MODEL_API_KEY="$("$PROJECT_DIR/.venv/bin/python" -c 'import json; print(json.load(open("/Users/macstudio/.omlx/settings.json"))["auth"]["api_key"])')"
+# Read local model API key from oMLX settings if not already set.
+# Override the settings path with OMLX_SETTINGS_PATH if your install differs.
+if [[ -z "${MORNING_DISPATCH_MODEL_API_KEY:-}" ]]; then
+  _omlx_settings="${OMLX_SETTINGS_PATH:-$HOME/.omlx/settings.json}"
+  if [[ -f "$_omlx_settings" ]]; then
+    export MORNING_DISPATCH_MODEL_API_KEY="$("$PROJECT_DIR/.venv/bin/python" -c "import json; print(json.load(open('$_omlx_settings'))['auth']['api_key'])")"
+  fi
 fi
 
 exec "$PROJECT_DIR/.venv/bin/python" -m uvicorn backend.app.main:create_app --factory --host "$MORNING_DISPATCH_HOST" --port "$MORNING_DISPATCH_PORT"

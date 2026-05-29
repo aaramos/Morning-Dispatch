@@ -18,7 +18,7 @@ def configure_runtime(monkeypatch, tmp_path):
         "MORNING_DISPATCH_DB_PATH",
         str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
     )
-    monkeypatch.setenv("MORNING_DISPATCH_PUBLIC_BASE_URL", "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000")
+    monkeypatch.setenv("MORNING_DISPATCH_PUBLIC_BASE_URL", "https://dispatch.example.ts.net:8000")
     monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
     return runtime
 
@@ -32,7 +32,7 @@ def client_secret_json() -> str:
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
                 "redirect_uris": [
-                    "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000/api/admin/gmail/oauth/callback"
+                    "https://dispatch.example.ts.net:8000/api/admin/gmail/oauth/callback"
                 ],
             }
         }
@@ -59,7 +59,7 @@ def test_gmail_admin_status_and_client_secret_upload(monkeypatch, tmp_path):
         assert updated_status.status_code == 200
         assert updated_status.json()["configured"] is True
         assert updated_status.json()["oauth_redirect_ready"] is True
-        assert updated_status.json()["redirect_uri"].startswith("https://ultras-mac-studio-2.tail4aeef0.ts.net")
+        assert updated_status.json()["redirect_uri"].startswith("https://dispatch.example.ts.net")
 
 
 def test_gmail_admin_rejects_invalid_client_secret(monkeypatch, tmp_path):
@@ -131,7 +131,7 @@ def test_gmail_admin_can_complete_from_pasted_redirect_url(monkeypatch, tmp_path
             "/api/admin/gmail/oauth/complete",
             json={
                 "callback_url": (
-                    "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000"
+                    "https://dispatch.example.ts.net:8000"
                     "/api/admin/gmail/oauth/callback?state=known-state&code=returned-code"
                 )
             },
@@ -186,7 +186,7 @@ def test_gmail_oauth_accepts_extra_returned_scopes(monkeypatch, tmp_path):
             "/api/admin/gmail/oauth/complete",
             json={
                 "callback_url": (
-                    "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000"
+                    "https://dispatch.example.ts.net:8000"
                     "/api/admin/gmail/oauth/callback?state=known-state&code=returned-code"
                 )
             },

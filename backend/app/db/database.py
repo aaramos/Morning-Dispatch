@@ -140,7 +140,7 @@ def _ensure_default_profile(connection: sqlite3.Connection) -> None:
         INSERT INTO profiles (id, name, is_default, created_at, updated_at)
         VALUES (?, ?, 1, ?, ?)
         """,
-        (new_id(), "Adrian", now, now),
+        (new_id(), "Default", now, now),
     )
 
 

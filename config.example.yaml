@@ -4,17 +4,18 @@ app:
   port: 8000
 
 paths:
-  home: "/Users/macstudio/.morning-dispatch"
-  data_dir: "/Users/macstudio/.morning-dispatch/data"
-  secrets_dir: "/Users/macstudio/.morning-dispatch/secrets"
-  database_path: "/Users/macstudio/.morning-dispatch/data/db/morning_dispatch.sqlite3"
-  gmail_client_secret_path: "/Users/macstudio/.morning-dispatch/secrets/gmail/gmail_client_secret.json"
-  gmail_credentials_path: "/Users/macstudio/.morning-dispatch/secrets/gmail/gmail_credentials.json"
+  home: "~/.morning-dispatch"
+  data_dir: "~/.morning-dispatch/data"
+  secrets_dir: "~/.morning-dispatch/secrets"
+  database_path: "~/.morning-dispatch/data/db/morning_dispatch.sqlite3"
+  gmail_client_secret_path: "~/.morning-dispatch/secrets/gmail/gmail_client_secret.json"
+  gmail_credentials_path: "~/.morning-dispatch/secrets/gmail/gmail_credentials.json"
 
 network:
   public_base_url: "http://127.0.0.1:8000"
-  tailscale_example: "https://ultras-mac-studio-2.tail4aeef0.ts.net:8000"
+  # For Tailscale use, set this to your MagicDNS hostname in runtime/local.env (gitignored).
+  # tailscale_example: "https://your-machine.ts.net:8000"
 
 defaults:
-  profile_name: "Adrian"
+  profile_name: "Default"
   digest_threshold: 0.45

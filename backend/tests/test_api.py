@@ -86,7 +86,7 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
 
         profiles = client.get("/api/profiles")
         assert profiles.status_code == 200
-        assert profiles.json()[0]["name"] == "Adrian"
+        assert profiles.json()[0]["name"] == "Default"
 
         created = client.post(
             "/api/digests",

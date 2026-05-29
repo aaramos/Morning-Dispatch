@@ -27,10 +27,9 @@ The MVP is usable end to end: connect Gmail, run a digest, open the generated is
 
 ## Runtime Layout
 
-The project folder is safe for GitHub. Runtime data and secrets are outside the repo:
+The project folder is safe for GitHub. Runtime data and secrets live outside the repo:
 
 ```text
-/Users/macstudio/Apps/personal_intel/
 ~/.morning-dispatch/data/
 ~/.morning-dispatch/secrets/
 ```
@@ -41,10 +40,8 @@ Use absolute paths in `.env`; Docker Compose does not reliably expand `~`.
 
 ```bash
 uv sync
-MORNING_DISPATCH_HOME=/Users/macstudio/Apps/personal_intel/runtime \
-MORNING_DISPATCH_DATA_DIR=/Users/macstudio/Apps/personal_intel/runtime/data \
-MORNING_DISPATCH_SECRETS_DIR=/Users/macstudio/.morning-dispatch/secrets \
-MORNING_DISPATCH_DB_PATH=/Users/macstudio/Apps/personal_intel/runtime/data/db/morning_dispatch.sqlite3 \
+MORNING_DISPATCH_HOME=~/path/to/runtime \
+MORNING_DISPATCH_SECRETS_DIR=~/.morning-dispatch/secrets \
 uv run uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -59,7 +56,7 @@ bash scripts/install_launchd.sh
 It runs `scripts/run_morning_dispatch.sh`, enables scheduled digest checks, runs daily digests at `05:00` Pacific by default, and keeps runtime data under:
 
 ```text
-/Users/macstudio/Apps/personal_intel/runtime/
+<project>/runtime/
 ```
 
 Useful checks:
@@ -67,7 +64,16 @@ Useful checks:
 ```bash
 launchctl print gui/$(id -u)/com.morning-dispatch
 curl http://127.0.0.1:8000/api/health
-curl https://ultras-mac-studio-2.tail4aeef0.ts.net/api/health
+curl https://your-machine.ts.net/api/health
+```
+
+## Machine-Local Overrides
+
+Put any values that are specific to your machine in `runtime/local.env` (gitignored). The startup script sources this file before setting defaults. Minimum for Tailscale use:
+
+```bash
+# runtime/local.env  — never committed
+MORNING_DISPATCH_PUBLIC_BASE_URL=https://your-machine.ts.net
 ```
 
 ## Admin Gmail Login
@@ -84,12 +90,11 @@ From there you can upload a Google OAuth client secret JSON file and start the G
 ~/.morning-dispatch/secrets/gmail/gmail_credentials.json
 ```
 
-Google OAuth redirect URLs generally need HTTPS unless they are localhost. For Tailscale use, set `MORNING_DISPATCH_PUBLIC_BASE_URL` to the HTTPS MagicDNS URL you registered in Google Cloud, for example:
+Google OAuth redirect URLs generally need HTTPS unless they are localhost. For Tailscale use, set `MORNING_DISPATCH_PUBLIC_BASE_URL` to the HTTPS MagicDNS URL you registered in Google Cloud, for example via `runtime/local.env`:
 
 ```bash
-MORNING_DISPATCH_PUBLIC_BASE_URL=https://ultras-mac-studio-2.tail4aeef0.ts.net \
-MORNING_DISPATCH_HOST=0.0.0.0 \
-uv run python -m backend.app.server
+MORNING_DISPATCH_PUBLIC_BASE_URL=https://your-machine.ts.net
+MORNING_DISPATCH_HOST=0.0.0.0
 ```
 
 The admin API accepts requests from loopback and Tailscale client addresses only.
@@ -115,7 +120,7 @@ Morning Dispatch now supports a second flow for one-off exploration:
 
 - Start with a plain-English statement in the frontend Explore panel.
 - The refinement chat gathers a minimal topic profile (`scope`, `depth`, `recency_weighting`, `exclusions`).
-- Run immediately (“show now”) for a rendered brief, then optionally save and mail it.
+- Run immediately ("show now") for a rendered brief, then optionally save and mail it.
 - Or save a `topic profile` and schedule it for recurring exploration.
 
 The same digest core does the candidate ranking and brief quality checks, so scheduled and ad-hoc flows stay consistent.
@@ -132,7 +137,6 @@ Configure with environment variables (or equivalent secret files in `${MORNING_D
 
 ```bash
 MORNING_DISPATCH_WEB_SEARCH_PROVIDER=auto \
-MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH=/Users/macstudio/.hermes/.env \
 MORNING_DISPATCH_TAVILY_API_KEY=... \
 MORNING_DISPATCH_BRAVE_API_KEY=... \
 MORNING_DISPATCH_SERPAPI_API_KEY=...
@@ -140,7 +144,8 @@ MORNING_DISPATCH_SERPAPI_API_KEY=...
 
 `auto` selects the first configured key in this order: `tavily`, `brave`, `serpapi`.
 Setting a specific provider name forces that adapter.
-If no Morning Dispatch key is saved, the app also checks the shared search env file for names like
+If no Morning Dispatch key is saved, the app also checks the shared search env file
+(`MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH`, defaults to `~/.hermes/.env`) for names like
 `TAVILY_API_KEY`, `BRAVE_SEARCH_API_KEY`, and `SERPAPI_API_KEY`.
 
 ## YouTube Adapter
@@ -160,7 +165,7 @@ You can also paste the API key in Admin -> Sources. YouTube is off by default an
 Collections is an optional local source for briefs. First slice support indexes text-like files from top-level folders under the Collections root and sends relevant chunks into the shared brief pipeline.
 
 ```bash
-MORNING_DISPATCH_COLLECTIONS_ROOT=/Users/macstudio/Documents/Collections \
+MORNING_DISPATCH_COLLECTIONS_ROOT=~/Documents/Collections \
 MORNING_DISPATCH_COLLECTIONS_MAX_RESULTS=12 \
 MORNING_DISPATCH_COLLECTIONS_MAX_FILE_BYTES=1000000
 ```

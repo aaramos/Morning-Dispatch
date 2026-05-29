@@ -28,3 +28,5 @@ secrets/
 *.key
 *credentials*.json
 *client_secret*.json
+Docs/
+deploy/com.morning-dispatch.plist

@@ -1,8 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-SECRETS_HOME="${MORNING_DISPATCH_SECRETS_DIR:-/Users/macstudio/.morning-dispatch/secrets}"
-SHARED_ENV_PATH="${MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH:-/Users/macstudio/.hermes/.env}"
+SECRETS_HOME="${MORNING_DISPATCH_SECRETS_DIR:-$HOME/.morning-dispatch/secrets}"
+SHARED_ENV_PATH="${MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH:-$HOME/.hermes/.env}"
 
 read_env_value() {
   local key="$1"

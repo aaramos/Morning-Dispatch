@@ -16,7 +16,7 @@ from backend.app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
-REDDIT_MCP_SERVER = Path(os.environ.get("MORNING_DISPATCH_REDDIT_MCP_SERVER", "/Users/macstudio/Apps/reddit-mcp-buddy/dist/index.js"))
+REDDIT_MCP_SERVER = Path(os.environ.get("MORNING_DISPATCH_REDDIT_MCP_SERVER", ""))
 REDDIT_MCP_COMMAND = os.environ.get("MORNING_DISPATCH_REDDIT_MCP_COMMAND", "/opt/homebrew/bin/node")
 
 

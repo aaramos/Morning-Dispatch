@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
-SECRETS_HOME="${MORNING_DISPATCH_SECRETS_DIR:-/Users/macstudio/.morning-dispatch/secrets}"
+SECRETS_HOME="${MORNING_DISPATCH_SECRETS_DIR:-$HOME/.morning-dispatch/secrets}"
 
 if [[ -z "${TAVILY_API_KEY:-}" ]]; then
   if [[ -f "$SECRETS_HOME/tavily/api_key" ]]; then

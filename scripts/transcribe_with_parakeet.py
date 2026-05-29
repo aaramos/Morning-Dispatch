@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 
-LECTURE_PROCESSOR_SRC = Path("/Users/macstudio/Apps/Lecture Transcriber/src")
+LECTURE_PROCESSOR_SRC = Path(os.environ.get("LECTURE_PROCESSOR_SRC", ""))
 
 
 def main() -> int:
