@@ -19,6 +19,10 @@ from backend.app.db import database
 
 MAX_SUMMARY_CHARS = 620
 MAX_MODEL_TEXT_CHARS = 2500
+# Foreign full-article translation: translate the whole body, not a clipped lead,
+# so a selected article is delivered in full English rather than a partial pass.
+FOREIGN_TRANSLATION_BODY_CHARS = 16000
+FOREIGN_TRANSLATION_MAX_TOKENS = 4000
 logger = logging.getLogger(__name__)
 MODEL_ENRICHED_SOURCES = {"model", "model_cache", "model_fallback"}
 
@@ -309,7 +313,7 @@ async def _assess_and_translate_foreign(
     body = result.text or ""
     if len(body) < 200:
         body = result.excerpt or result.editor_summary or original_summary or body
-    clipped_body = body[:8000] if len(body) > 8000 else body
+    clipped_body = body[:FOREIGN_TRANSLATION_BODY_CHARS]
 
     if model_client is None:
         # No model — cannot assess; demote rather than silently drop
@@ -367,7 +371,7 @@ async def _assess_and_translate_foreign(
                 "then translate it in full when possible. Return strict JSON only."
             ),
             prompt=prompt,
-            max_tokens=2400,
+            max_tokens=FOREIGN_TRANSLATION_MAX_TOKENS,
         )
     except Exception as exc:
         logger.info("Foreign translation assessment failed for %s: %s", result.original_url, exc)
@@ -465,6 +469,7 @@ async def _assess_and_translate_foreign(
                 "stage": "full",
                 "original_title": original_title,
                 "original_summary": original_summary,
+                "original_body": clipped_body,
             },
         },
         enrichment_source="model",

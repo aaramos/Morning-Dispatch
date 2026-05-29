@@ -59,8 +59,9 @@ _URL_DATE_RE = re.compile(
     r"(?:[/-](?P<day>0?[1-9]|[12]\d|3[01]))?(?:[^\d]|$)"
 )
 _TEXT_DATE_RE = re.compile(
-    r"\b(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)"
-    r"\s+(?P<day>0?[1-9]|[12]\d|3[01]),\s+(?P<year>20\d{2})\b",
+    r"\b(?P<month>January|February|March|April|May|June|July|August|September|October|November|December"
+    r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?"
+    r"\s+(?P<day>0?[1-9]|[12]\d|3[01]),?\s+(?P<year>20\d{2})\b",
     re.IGNORECASE,
 )
 _MONTHS = {
@@ -76,6 +77,18 @@ _MONTHS = {
     "october": 10,
     "november": 11,
     "december": 12,
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "sept": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
 }
 async def start_build_queue() -> None:
     global _BUILD_QUEUE_TASK, _BUILD_QUEUE_EVENT
@@ -1268,6 +1281,9 @@ def _parse_datetime_string(text: str) -> datetime | None:
                 59,
                 tzinfo=UTC,
             )
+    for pattern in ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y"):
+        with suppress(ValueError):
+            return datetime.strptime(cleaned, pattern).replace(hour=23, minute=59, second=59, tzinfo=UTC)
     return _date_from_text(cleaned)
 
 

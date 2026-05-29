@@ -17,6 +17,7 @@ class SearchHit:
     snippet: str = ""
     score: float = 0.5
     provider: str = "unknown"
+    published_at: str | None = None
 
 
 class WebSearchBackend(Protocol):
@@ -73,6 +74,7 @@ class TavilyBackend:
                     url=parsed_url,
                     snippet=str(result.get("content") or result.get("snippet") or "").strip()[:600],
                     score=float(result.get("score") if isinstance(result.get("score"), (int, float)) else 0.58),
+                    published_at=_clean_hit_date(result.get("published_date")),
                 )
             )
         return parsed
@@ -122,6 +124,7 @@ class BraveBackend:
                     url=parsed_url,
                     snippet=str(result.get("description") or result.get("extra_snippets") or "").strip()[:600],
                     score=float(result.get("score") if isinstance(result.get("score"), (int, float)) else 0.58),
+                    published_at=_clean_hit_date(result.get("page_age") or result.get("age")),
                 )
             )
         return parsed
@@ -179,9 +182,15 @@ class SerpAPIBackend:
                     url=parsed_url,
                     snippet=str(result.get("snippet") or "").strip()[:600],
                     score=score,
+                    published_at=_clean_hit_date(result.get("date")),
                 )
             )
         return parsed
+
+
+def _clean_hit_date(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def _normalize_url(value: str) -> str:

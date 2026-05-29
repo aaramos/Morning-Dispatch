@@ -3925,7 +3925,8 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
     source_language_name = str(translation.get("source_language_name") or payload_metadata.get("source_language_name") or "Original").strip()
     original_title = str(translation.get("original_title") or payload_metadata.get("original_search_title") or _story_title(result)).strip()
     original_summary = str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or "").strip()
-    original_seed = "\n\n".join(part for part in (original_title, original_summary) if part)
+    original_body = str(translation.get("original_body") or "").strip()
+    original_seed = "\n\n".join(part for part in (original_title, original_body or original_summary) if part)
     original_html = _render_transcript_paragraphs(original_seed)
     translation_context = _translation_context_label(translation)
     is_full_translation = str(translation.get("mode") or "").strip() == "assess_and_translate"
@@ -3933,12 +3934,20 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
     provenance = f"{provenance_prefix} from {source_language_name}"
     if translation_context:
         provenance = f"{provenance} · {translation_context}"
-    if is_full_translation:
+    # When the full body was translated during the build, bake it straight into the
+    # modal and mark it loaded so the reader gets the entire article immediately —
+    # no on-open round trip to re-translate.
+    full_translated_body = result.text if is_full_translation and (result.text or "").strip() else ""
+    if full_translated_body:
+        translated_body_html = _render_transcript_paragraphs(full_translated_body)
         status_text = "Full article translated to English during brief build."
+        loaded_attr = ' data-foreign-loaded="true"'
     else:
+        translated_body_html = f"<p>{escape(_story_summary(result))}</p>"
         status_text = "Open this article to translate the full body. The current card uses translated metadata."
+        loaded_attr = ""
     return f"""
-        <div class="podcast-modal foreign-modal" id="{escape(modal_id, quote=True)}" data-foreign-exploration-id="{escape(issue_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
+        <div class="podcast-modal foreign-modal" id="{escape(modal_id, quote=True)}" data-foreign-exploration-id="{escape(issue_id, quote=True)}"{loaded_attr} role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
           <div class="podcast-panel youtube-panel">
             <a class="podcast-close" data-foreign-close href="#">Close</a>
             <div class="section-kicker">Machine translated from {escape(source_language_name)}</div>
@@ -3955,7 +3964,7 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
             <section class="foreign-view" data-foreign-view="translated">
               <div class="foreign-notice"></div>
               <div class="foreign-body" data-foreign-translated-body>
-                <p>{escape(_story_summary(result))}</p>
+                {translated_body_html}
               </div>
             </section>
             <section class="foreign-view" data-foreign-view="original" hidden>

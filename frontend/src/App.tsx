@@ -678,6 +678,13 @@ function DispatchApp() {
   const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
   const canBuild = activeInterest.length > 0 && !busy;
   const currentIssues = buildAttentionIssues(exploration);
+  const backgroundBuild = useMemo(
+    () => recentExplorations.find((item) => item.status === "queued" || item.status === "running") ?? null,
+    [recentExplorations],
+  );
+  const visibleBuild = flow === "building"
+    ? exploration
+    : (flow === "idle" || flow === "ready") ? backgroundBuild : null;
   const refinementWorking = busy && !enableSource && !exploration && flow === "refining";
   const activeRefinementProgress = useMemo<RefinementProgress | null>(() => {
     if (refinementProgress) return refinementProgress;
@@ -711,6 +718,14 @@ function DispatchApp() {
   useEffect(() => {
     void loadHome();
   }, [loadHome]);
+
+  useEffect(() => {
+    if (!backgroundBuild) return;
+    const timer = window.setInterval(() => {
+      void loadHome();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [backgroundBuild, loadHome]);
 
   useEffect(() => {
     if (flow !== "idle") return;
@@ -1476,8 +1491,12 @@ function DispatchApp() {
             />
           ) : null}
 
-          {flow === "building" && exploration ? (
-            <ProgressPanel exploration={exploration} sourceSelection={selectedEnabledSources} />
+          {flow === "building" && !exploration ? (
+            <BuildStartingPanel />
+          ) : null}
+
+          {visibleBuild ? (
+            <ProgressPanel exploration={visibleBuild} sourceSelection={visibleBuild.source_selection ?? selectedEnabledSources} />
           ) : null}
 
           {flow === "ready" && exploration ? (
@@ -2289,6 +2308,28 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
         </details>
       ) : null}
       {pipeline.length ? <p className="muted">{formatPipeline(pipeline)}</p> : null}
+    </section>
+  );
+}
+
+function BuildStartingPanel() {
+  return (
+    <section className="progress-panel" role="status" aria-live="polite">
+      <div className="progress-heading">
+        <div>
+          <p className="section-kicker">Starting build</p>
+          <h2>Starting the newsletter build</h2>
+        </div>
+        <span className="status-pill good">Starting</span>
+      </div>
+      <p className="queue-note">Creating the build job. Progress will appear here as soon as the server accepts it.</p>
+      <div className="pipeline-row">
+        {["discovery", "fetch", "summarize", "audit", "rank", "review", "done"].map((stage) => (
+          <span className="pipeline-pill pending" key={stage}>
+            {formatStage(stage)}
+          </span>
+        ))}
+      </div>
     </section>
   );
 }

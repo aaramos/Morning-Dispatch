@@ -298,6 +298,87 @@ def test_foreign_metadata_translation_preserves_original() -> None:
     assert translated.metadata["translation"]["original_title"] == "SK하이닉스 HBM 투자 확대"
 
 
+def test_full_translation_is_baked_into_modal_without_lazy_fetch() -> None:
+    """A fully-translated foreign article delivers its whole body in the modal,
+    marked loaded so the on-open re-translation fetch is skipped."""
+    payload = NormalizedPayload(
+        source_type="foreign_web",
+        source_name="sedaily.com",
+        original_url="https://sedaily.com/news/1",
+        metadata={"source_language": "ko", "source_language_name": "Korean"},
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://sedaily.com/news/1",
+        final_url="https://sedaily.com/news/1",
+        title="Samsung 1c DRAM update",
+        text=(
+            "First translated paragraph about Samsung 1c DRAM.\n\n"
+            "Second translated paragraph covering the full body details."
+        ),
+        excerpt="Short summary only.",
+        editor_summary="Short summary only.",
+        domain="sedaily.com",
+        status="fetched",
+        metadata={
+            "translation": {
+                "translated": True,
+                "mode": "assess_and_translate",
+                "source_language": "ko",
+                "source_language_name": "Korean",
+                "confidence": "high",
+                "translator": "fake-gemma",
+                "original_title": "삼성 1c DRAM",
+                "original_summary": "요약",
+                "original_body": "원문 본문 전체",
+            }
+        },
+    )
+
+    html = database._render_foreign_article_modal(result, "foreign-abc", "expl-1")
+
+    assert 'data-foreign-loaded="true"' in html
+    assert "First translated paragraph about Samsung 1c DRAM." in html
+    assert "Second translated paragraph covering the full body details." in html
+    assert "원문 본문 전체" in html  # full original preserved for the Original tab
+    assert "Short summary only." not in html  # the summary stub is replaced by the full body
+
+
+def test_metadata_only_translation_modal_still_lazy_loads() -> None:
+    """Metadata-only translations have no full body, so the modal must keep the
+    lazy fetch (no loaded flag) and fall back to the summary stub."""
+    payload = NormalizedPayload(
+        source_type="foreign_web",
+        source_name="sedaily.com",
+        original_url="https://sedaily.com/news/2",
+        metadata={"source_language": "ko", "source_language_name": "Korean"},
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://sedaily.com/news/2",
+        final_url="https://sedaily.com/news/2",
+        title="Headline",
+        text="",
+        excerpt="Translated summary stub.",
+        editor_summary="Translated summary stub.",
+        domain="sedaily.com",
+        status="fetched",
+        metadata={
+            "translation": {
+                "translated": True,
+                "mode": "metadata",
+                "source_language": "ko",
+                "source_language_name": "Korean",
+            }
+        },
+    )
+
+    html = database._render_foreign_article_modal(result, "foreign-def", "expl-1")
+
+    assert 'data-foreign-loaded="true"' not in html
+    assert "Translated summary stub." in html
+
+
 def test_foreign_translation_assess_failed_drops_article() -> None:
     """When complete_json raises, the article is dropped with mode='assess_failed'."""
 

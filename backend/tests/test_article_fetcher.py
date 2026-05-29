@@ -75,6 +75,54 @@ def test_extract_article_prefers_article_content():
     assert extracted.image_source == "og:image"
 
 
+def test_extract_article_harvests_published_date_from_meta():
+    html = ARTICLE_HTML.replace(
+        '<meta property="og:image" content="/images/useful-ai.jpg" />',
+        '<meta property="og:image" content="/images/useful-ai.jpg" />'
+        '<meta property="article:published_time" content="2026-05-20T08:00:00Z" />',
+    )
+    extracted = articles.extract_article(html, "https://example.com/final-article")
+    assert extracted.published_at == "2026-05-20T08:00:00Z"
+
+
+def test_extract_article_harvests_published_date_from_jsonld():
+    html = ARTICLE_HTML.replace(
+        "</head>",
+        '<script type="application/ld+json">'
+        '{"@type":"NewsArticle","datePublished":"2026-04-01T10:00:00+00:00"}'
+        "</script></head>",
+    )
+    extracted = articles.extract_article(html, "https://example.com/final-article")
+    assert extracted.published_at == "2026-04-01T10:00:00+00:00"
+
+
+def test_extract_article_published_date_absent_when_undated():
+    extracted = articles.extract_article(ARTICLE_HTML, "https://example.com/final-article")
+    assert extracted.published_at is None
+
+
+def test_fetch_articles_backfills_published_at_from_page(monkeypatch):
+    class DatedResponse(FakeResponse):
+        text = ARTICLE_HTML.replace(
+            "</head>",
+            '<meta property="article:published_time" content="2026-05-20T08:00:00Z" /></head>',
+        )
+
+    class DatedClient(FakeAsyncClient):
+        response = DatedResponse()
+
+    monkeypatch.setattr(articles.httpx, "AsyncClient", DatedClient)
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="web search hit",
+        original_url="https://example.com/article",
+    )
+
+    results = asyncio.run(articles.fetch_articles_for_payloads([payload]))
+
+    assert results[0].payload.published_at == "2026-05-20T08:00:00Z"
+
+
 def test_fetch_articles_resolves_and_extracts(monkeypatch):
     monkeypatch.setattr(articles.httpx, "AsyncClient", FakeAsyncClient)
     payload = NormalizedPayload(

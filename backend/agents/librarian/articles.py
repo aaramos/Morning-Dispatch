@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
@@ -271,6 +272,7 @@ async def _fetch_one(
                 return _failed(payload, original_url, final_url, "non_html", content_type, link_score)
 
             article = extract_article(response.text, final_url, fallback_title=_payload_title(payload))
+            payload = _with_published_at(payload, article)
             if len(article.text) < MIN_ARTICLE_TEXT_CHARS:
                 context = _newsletter_context(payload)
                 if _substantial_newsletter_context(context):
@@ -329,11 +331,15 @@ class ExtractedArticle:
     excerpt: str
     image_url: str = ""
     image_source: str = ""
+    published_at: str | None = None
 
 
 def extract_article(html: str, url: str, *, fallback_title: str = "") -> ExtractedArticle:
     soup = BeautifulSoup(html, "html.parser")
     image_url, image_source = _extract_image(soup, url)
+    # Harvest the publish date before scripts/headers are decomposed — many pages
+    # only expose it via <meta>, JSON-LD, or <time> tags, not in visible body text.
+    published_at = _extract_published_at(soup)
     for tag in soup(["script", "style", "noscript", "svg", "canvas", "form", "iframe"]):
         tag.decompose()
     for selector in ("nav", "header", "footer", "aside", "[role='navigation']", ".sidebar", ".newsletter"):
@@ -346,7 +352,14 @@ def extract_article(html: str, url: str, *, fallback_title: str = "") -> Extract
     if len(text) < MIN_ARTICLE_TEXT_CHARS and root is not soup.body and soup.body:
         text = _extract_text(soup.body)
     excerpt = _truncate(text, 520)
-    return ExtractedArticle(title=title, text=text, excerpt=excerpt, image_url=image_url, image_source=image_source)
+    return ExtractedArticle(
+        title=title,
+        text=text,
+        excerpt=excerpt,
+        image_url=image_url,
+        image_source=image_source,
+        published_at=published_at,
+    )
 
 
 def _best_content_root(soup: BeautifulSoup):
@@ -398,6 +411,75 @@ def _extract_image(soup: BeautifulSoup, url: str) -> tuple[str, str]:
     return "", ""
 
 
+# Ordered by trust: explicit publish dates first, "modified/updated" only as a
+# last resort so a recently-touched old page does not masquerade as fresh.
+_DATE_META_SELECTORS = (
+    ("meta[property='article:published_time']", "content"),
+    ("meta[property='og:article:published_time']", "content"),
+    ("meta[name='article:published_time']", "content"),
+    ("meta[itemprop='datePublished']", "content"),
+    ("meta[name='datePublished']", "content"),
+    ("meta[name='parsely-pub-date']", "content"),
+    ("meta[name='sailthru.date']", "content"),
+    ("meta[name='publish-date']", "content"),
+    ("meta[name='publication_date']", "content"),
+    ("meta[name='pubdate']", "content"),
+    ("meta[name='dc.date.issued']", "content"),
+    ("meta[name='dc.date']", "content"),
+    ("meta[name='date']", "content"),
+    ("meta[property='article:modified_time']", "content"),
+    ("meta[property='og:updated_time']", "content"),
+)
+_JSONLD_DATE_KEYS = ("datePublished", "dateCreated", "uploadDate", "dateModified")
+
+
+def _extract_published_at(soup: BeautifulSoup) -> str | None:
+    for selector, attr in _DATE_META_SELECTORS:
+        tag = soup.select_one(selector)
+        value = str(tag.get(attr)).strip() if tag and tag.get(attr) else ""
+        if value:
+            return value
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        found = _jsonld_date(script.string or script.get_text() or "")
+        if found:
+            return found
+    time_tag = soup.find("time", attrs={"datetime": True})
+    if time_tag:
+        value = str(time_tag.get("datetime") or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _jsonld_date(raw: str) -> str | None:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return _find_jsonld_date(data)
+
+
+def _find_jsonld_date(obj) -> str | None:
+    if isinstance(obj, dict):
+        for key in _JSONLD_DATE_KEYS:
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in obj.values():
+            found = _find_jsonld_date(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_jsonld_date(item)
+            if found:
+                return found
+    return None
+
+
 def _extract_text(root) -> str:
     chunks: list[str] = []
     for tag in root.find_all(["h1", "h2", "h3", "p", "li", "blockquote"]):
@@ -438,6 +520,13 @@ def _payload_title(payload: NormalizedPayload) -> str:
         or metadata.get("subject")
         or ""
     )
+
+
+def _with_published_at(payload: NormalizedPayload, article: ExtractedArticle) -> NormalizedPayload:
+    """Backfill a publish date harvested from the page when the source lacked one."""
+    if not article.published_at or payload.published_at:
+        return payload
+    return replace(payload, published_at=article.published_at)
 
 
 def _article_result_metadata(article: ExtractedArticle) -> dict[str, object]:
