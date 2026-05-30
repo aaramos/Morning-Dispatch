@@ -58,6 +58,10 @@ async def fetch_reddit_threads(
 
     source_by_name = {source.subreddit.lower(): source for source in sources}
     candidates: dict[str, tuple[float, NormalizedPayload]] = {}
+    if (active_sources or search_only_sources) and not any(browse_results) and not search_results:
+        searched = ", ".join(f"r/{source.subreddit}" for source in sources[:8])
+        raise RuntimeError(f"Reddit returned no usable threads from {searched or 'the selected communities'}.")
+
     for post in [post for batch in browse_results for post in batch] + search_results:
         payload_score = _score_post(post, digest_interest, source_by_name)
         if payload_score < MIN_THREAD_SCORE:
@@ -96,16 +100,12 @@ def _sources_for_digest(digest_id: str) -> list[RedditSource]:
 
 
 async def _browse_source(source: RedditSource, *, time_filter: str) -> list[dict[str, Any]]:
-    try:
-        return await reddit_mcp_client.browse_subreddit(
-            source.subreddit,
-            sort="top",
-            time=time_filter,
-            limit=POSTS_PER_ACTIVE_SOURCE,
-        )
-    except Exception as exc:  # pragma: no cover - client already handles recoverable errors.
-        logger.info("Reddit browse failed for r/%s: %s", source.subreddit, exc)
-        return []
+    return await reddit_mcp_client.browse_subreddit(
+        source.subreddit,
+        sort="top",
+        time=time_filter,
+        limit=POSTS_PER_ACTIVE_SOURCE,
+    )
 
 
 async def _search_sources(
@@ -120,16 +120,31 @@ async def _search_sources(
     if not query:
         return []
     try:
-        return await reddit_mcp_client.search_reddit(
+        posts = await reddit_mcp_client.search_reddit(
             query,
             subreddits=[source.subreddit for source in sources],
             sort="relevance",
             time=time_filter,
             limit=SEARCH_ONLY_LIMIT,
         )
-    except Exception as exc:  # pragma: no cover - client already handles recoverable errors.
-        logger.info("Reddit search failed for Source Scout communities: %s", exc)
-        return []
+    except Exception:
+        posts = []
+    if posts:
+        return posts
+    browse_results = await asyncio.gather(
+        *[_browse_source(source, time_filter=time_filter) for source in sources[:MAX_ACTIVE_SOURCES]],
+        return_exceptions=True,
+    )
+    usable: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for source, result in zip(sources[:MAX_ACTIVE_SOURCES], browse_results, strict=True):
+        if isinstance(result, Exception):
+            errors.append(f"r/{source.subreddit}: {result}")
+            continue
+        usable.extend(result)
+    if errors and not usable:
+        raise RuntimeError("; ".join(errors[:3]))
+    return usable
 
 
 async def _empty_post_batches() -> list[list[dict[str, Any]]]:

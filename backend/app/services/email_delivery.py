@@ -181,6 +181,21 @@ def _email_html(html: str) -> str:
         element.decompose()
     for element in soup.select(".feedback-controls"):
         element.decompose()
+
+    # Convert YouTube modal links to direct links for email
+    for a_tag in soup.find_all("a", attrs={"data-youtube-url": True}):
+        yt_url = a_tag["data-youtube-url"]
+        a_tag["href"] = yt_url
+        a_tag["target"] = "_blank"
+        a_tag["rel"] = "noreferrer"
+        del a_tag["data-youtube-url"]
+        if "data-youtube-modal-target" in a_tag.attrs:
+            del a_tag["data-youtube-modal-target"]
+
+    # Remove modals from email body to keep markup lightweight and avoid broken hashes
+    for modal in soup.select(".youtube-modal"):
+        modal.decompose()
+
     return str(soup)
 
 

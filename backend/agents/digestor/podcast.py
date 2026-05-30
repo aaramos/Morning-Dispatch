@@ -28,7 +28,8 @@ from backend.db.queries import get_watermark, upsert_watermark
 logger = logging.getLogger(__name__)
 
 MAX_PODCAST_EPISODES = 8
-MAX_DISCOVERED_FEEDS = 3
+MAX_DISCOVERED_FEEDS = 8
+MAX_DISCOVERY_LANES = 8
 REQUEST_TIMEOUT_SECONDS = 20
 MIN_EPISODE_SCORE = 0.22
 USER_AGENT = "MorningDispatch/0.1 (+https://tailnet.local)"
@@ -113,7 +114,7 @@ async def _fetch_podcast_episodes(
     feed_sources = [source for source in podcast_sources if _source_feed_url(source)]
     search_sources = [source for source in podcast_sources if not _source_feed_url(source)]
 
-    discovered = await _discover_sources(search_sources, digest_interest)
+    discovered = await _discover_sources(search_sources, digest_interest) if search_sources else []
     for source in discovered:
         decisions.append(
             _decision(
@@ -386,8 +387,9 @@ async def _discover_sources(sources: list[dict[str, Any]], digest_interest: str)
             queries.append(query)
     if not queries:
         queries = [_discovery_query(digest_interest)]
+    queries = _podcast_discovery_lanes(queries, digest_interest)
     discovered: dict[str, dict[str, Any]] = {}
-    for query in queries[:3]:
+    for query in queries[:MAX_DISCOVERY_LANES]:
         try:
             query_results = await discover_podcasts(query, limit=MAX_DISCOVERED_FEEDS)
         except Exception as exc:
@@ -396,7 +398,117 @@ async def _discover_sources(sources: list[dict[str, Any]], digest_interest: str)
         for source in query_results:
             feed_url = str(source.get("feed_url") or "")
             discovered.setdefault(feed_url, source)
+        if len(discovered) >= MAX_DISCOVERED_FEEDS:
+            break
+    if len(discovered) < MAX_DISCOVERED_FEEDS:
+        for source in await _discover_sources_from_web(queries, digest_interest):
+            feed_url = str(source.get("feed_url") or "")
+            if feed_url:
+                discovered.setdefault(feed_url, source)
+            if len(discovered) >= MAX_DISCOVERED_FEEDS:
+                break
     return list(discovered.values())[:MAX_DISCOVERED_FEEDS]
+
+
+def _podcast_discovery_lanes(queries: list[str], digest_interest: str) -> list[str]:
+    lanes: list[str] = []
+    for query in [*queries, _discovery_query(digest_interest)]:
+        clean = _clean_text(query)
+        if not clean:
+            continue
+        for lane in (
+            clean,
+            f"{clean} podcast",
+            f"{clean} interview",
+            f"{clean} audio show",
+        ):
+            key = lane.casefold()
+            if key not in {existing.casefold() for existing in lanes}:
+                lanes.append(lane[:180])
+        tokens = [token for token in keyword_set(clean) if len(token) > 2]
+        if len(tokens) >= 3:
+            compact = " ".join(tokens[:6])
+            if compact.casefold() not in {existing.casefold() for existing in lanes}:
+                lanes.append(compact[:180])
+    return lanes[:MAX_DISCOVERY_LANES]
+
+
+async def _discover_sources_from_web(queries: list[str], digest_interest: str) -> list[dict[str, Any]]:
+    from backend.agents.discovery.web_search import lookback_to_days, search_web
+
+    days = lookback_to_days(24 * 365)
+    discovered: dict[str, dict[str, Any]] = {}
+    for query in queries[:3]:
+        web_query = f"{query} podcast RSS feed"
+        try:
+            hits = await search_web(web_query, limit=8, days=days)
+        except Exception as exc:
+            logger.info("Podcast web discovery failed for %s: %s", web_query, exc)
+            continue
+        for hit in hits:
+            feed_url = _feed_url_from_search_hit(hit.url)
+            if feed_url:
+                discovered.setdefault(
+                    feed_url,
+                    {
+                        "type": "podcast_rss",
+                        "title": hit.title or "Podcast",
+                        "feed_url": feed_url,
+                        "site_url": hit.url,
+                        "aggregator": hit.provider,
+                    },
+                )
+                continue
+            title = _podcast_title_from_search_hit(hit.title, hit.url)
+            if not title:
+                continue
+            try:
+                for source in await discover_podcasts(title, limit=3):
+                    candidate_text = " ".join(
+                        str(source.get(field) or "")
+                        for field in ("title", "author", "site_url")
+                    )
+                    if _feed_fit_score(candidate_text, digest_interest) < 0.08:
+                        continue
+                    feed_url = str(source.get("feed_url") or "")
+                    if feed_url:
+                        discovered.setdefault(feed_url, {**source, "aggregator": f"{hit.provider}+podcastindex"})
+            except Exception as exc:
+                logger.info("Podcast title lookup failed for %s: %s", title, exc)
+        if len(discovered) >= MAX_DISCOVERED_FEEDS:
+            break
+    return list(discovered.values())[:MAX_DISCOVERED_FEEDS]
+
+
+def _feed_url_from_search_hit(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    lowered = url.lower()
+    if any(marker in lowered for marker in ("rss", "feed", ".xml", "podcast.xml")):
+        return url
+    return ""
+
+
+def _podcast_title_from_search_hit(title: str, url: str) -> str:
+    clean_title = re.sub(r"\s*[-|•]\s*(apple podcasts|spotify|podcast addict|listen notes|podcasts?)\s*$", "", str(title or ""), flags=re.I).strip()
+    if clean_title and len(clean_title.split()) <= 12:
+        return clean_title
+    parsed = urlparse(str(url or ""))
+    path = parsed.path.strip("/")
+    if not path:
+        return ""
+    slug = path.rsplit("/", 1)[-1]
+    slug = re.sub(r"[-_]+", " ", slug).strip()
+    return slug[:120]
+
+
+def _feed_fit_score(text: str, digest_interest: str) -> float:
+    interest = keyword_set(digest_interest)
+    if not interest:
+        return 0.2
+    tokens = keyword_set(text)
+    return len(tokens & interest) / max(1, len(interest))
 
 
 async def _fetch_feed_episodes(client: httpx.AsyncClient, source: dict[str, Any]) -> list[PodcastEpisode]:

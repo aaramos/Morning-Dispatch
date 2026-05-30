@@ -3919,7 +3919,9 @@ def _render_media_card(result: ArticleFetchResult, *, issue_id: str | None = Non
     elif result.payload.source_type == "youtube_video":
         modal_id = _youtube_modal_id(result)
         url = f"#{modal_id}"
-        title_attributes = f' data-youtube-modal-target="{escape(modal_id, quote=True)}"'
+        yt_metadata = result.payload.metadata or {}
+        yt_watch_url = yt_metadata.get("youtube_url") or _result_url(result) or ""
+        title_attributes = f' data-youtube-modal-target="{escape(modal_id, quote=True)}" data-youtube-url="{escape(yt_watch_url, quote=True)}"'
         title_class = ' class="youtube-modal-link"'
         title_target = ""
         modal_html = _render_youtube_modal(result, modal_id)
@@ -4451,8 +4453,8 @@ def _render_feedback_controls(issue_id: str | None, url: str | None) -> str:
         return ""
     return f"""
         <div class="feedback-controls" data-feedback-url="{escape(url, quote=True)}">
-          <button type="button" data-feedback-signal="up">Useful</button>
-          <button type="button" data-feedback-signal="down">Not useful</button>
+          <button type="button" data-feedback-signal="up" title="Save a positive signal for future ranking">Useful</button>
+          <button type="button" data-feedback-signal="down" title="Save a negative signal for future ranking">Not useful</button>
           <span class="feedback-state" aria-live="polite"></span>
         </div>
     """
@@ -4484,7 +4486,7 @@ def _render_feedback_script(issue_id: str | None) -> str:
           }});
           if (!response.ok) throw new Error("Feedback failed");
           controls.setAttribute("data-feedback", "sent");
-          if (state) state.textContent = "Saved";
+          if (state) state.textContent = signal === "up" ? "Saved for future ranking" : "Downrank signal saved";
         }} catch (_error) {{
           controls.querySelectorAll("button").forEach((item) => item.disabled = false);
           if (state) state.textContent = "Try again";

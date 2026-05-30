@@ -731,11 +731,31 @@ def _detect_non_english_script(result: ArticleFetchResult) -> tuple[str, str] | 
 
 
 def _librarian_prompt(result: ArticleFetchResult) -> str:
+    metadata = result.payload.metadata or {}
+    if metadata.get("content_basis") == "youtube_metadata":
+        title = metadata.get("youtube_title") or result.title
+        channel = metadata.get("channel_name") or result.payload.source_name or "YouTube"
+        desc = metadata.get("description") or ""
+        return f"""You are summarizing a YouTube video based ONLY on its metadata (title and description) because the transcript is unavailable.
+Generate a summary of the video content.
+Title: {title}
+Channel: {channel}
+Metadata Description:
+{desc}
+
+Rules:
+1. Do NOT imply the video was watched, transcribed, or analyzed directly.
+2. Use phrasing that makes it clear the summary is based on metadata/description (e.g. "A video by {channel} titled '{title}' describes...", "According to the description, this video discusses...").
+3. Keep the summary under 70 words. Keep keyword labels short. Return compact JSON only.
+"""
+
     text = (result.text or result.excerpt or fallback_text(result))[:MAX_MODEL_TEXT_CHARS]
     if result.payload.source_type == "reddit_thread":
         source_label = "Source"
     elif result.payload.source_type == "podcast_episode":
         source_label = "Podcast"
+    elif result.payload.source_type == "youtube_video":
+        source_label = "YouTube Video"
     else:
         source_label = "Source newsletter"
     return f"""Title: {result.title}

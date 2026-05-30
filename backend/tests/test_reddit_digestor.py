@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from backend.agents.digestor import reddit as reddit_digestor
+from backend.agents.digestor import reddit_mcp_client
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.articles import fetch_articles_for_payloads
 
@@ -102,3 +103,149 @@ def test_reddit_payload_materializes_as_article_result() -> None:
     assert results[0].title == "Local coding agents are getting useful"
     assert results[0].payload.source_type == "reddit_thread"
     assert results[0].content_type == "reddit_thread"
+
+
+def test_reddit_mcp_client_uses_jordanburke_tool_contract(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        calls.append((tool_name, arguments))
+        if tool_name in {"fetch_reddit_hot_threads", "browse_subreddit"}:
+            raise RuntimeError("legacy tool unavailable")
+        return {
+            "text": """# Top Posts from r/LocalLLaMA (week)
+
+### 1. MLX and llama.cpp benchmark notes
+- Author: u/builder
+- Score: 123 (97.0% upvoted)
+- Comments: 45
+- Posted: 5/29/2026, 1:00:00 PM
+- Link: https://reddit.com/r/LocalLLaMA/comments/abc123/mlx_bench/
+"""
+        }
+
+    monkeypatch.setattr(reddit_mcp_client, "_call_reddit_tool", fake_call)
+
+    posts = asyncio.run(reddit_mcp_client.browse_subreddit("LocalLLaMA", time="week", limit=5))
+
+    assert calls == [
+        ("fetch_reddit_hot_threads", {"subreddit": "LocalLLaMA", "limit": 5}),
+        (
+            "browse_subreddit",
+            {
+                "subreddit": "LocalLLaMA",
+                "sort": "top",
+                "time": "week",
+                "limit": 5,
+                "include_nsfw": False,
+                "include_subreddit_info": False,
+            },
+        ),
+        ("get_top_posts", {"subreddit": "LocalLLaMA", "time_filter": "week", "limit": 5}),
+    ]
+    assert posts[0]["title"] == "MLX and llama.cpp benchmark notes"
+    assert posts[0]["subreddit"] == "LocalLLaMA"
+    assert posts[0]["score"] == 123
+    assert posts[0]["num_comments"] == 45
+    assert posts[0]["id"] == "abc123"
+
+
+def test_reddit_mcp_client_searches_subreddits_one_at_a_time(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        calls.append((tool_name, arguments))
+        if "subreddits" in arguments:
+            raise RuntimeError("jordan server expects one subreddit at a time")
+        if tool_name == "fetch_reddit_hot_threads":
+            raise RuntimeError("new server unavailable in this test")
+        subreddit = str(arguments.get("subreddit"))
+        return {
+            "text": f"""# Reddit Search Results for: "local LLM" in r/{subreddit}
+
+### 1. {subreddit} local model discussion
+- Author: u/builder
+- Subreddit: r/{subreddit}
+- Score: 90 (95.0% upvoted)
+- Comments: 20
+- Posted: 5/29/2026, 2:00:00 PM
+- Link: https://reddit.com/r/{subreddit}/comments/{subreddit.lower()}1/thread/
+"""
+        }
+
+    monkeypatch.setattr(reddit_mcp_client, "_call_reddit_tool", fake_call)
+
+    posts = asyncio.run(
+        reddit_mcp_client.search_reddit("local LLM", subreddits=["LocalLLaMA", "MachineLearning"], limit=10)
+    )
+
+    per_subreddit_calls = [call for call in calls if call[0] == "search_reddit" and "subreddit" in call[1]]
+    assert [call[1]["subreddit"] for call in per_subreddit_calls] == ["LocalLLaMA", "MachineLearning"]
+    assert all(call[1]["time_filter"] == "week" for call in per_subreddit_calls)
+    assert {post["subreddit"] for post in posts} == {"LocalLLaMA", "MachineLearning"}
+
+
+def test_reddit_mcp_client_uses_adhikasp_hot_threads_contract(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        calls.append((tool_name, arguments))
+        return {
+            "text": """Title: MLX benchmark notes
+Score: 123
+Comments: 45
+Author: builder
+Type: text
+Content: Local builders compare MLX and llama.cpp.
+Link: https://reddit.com/r/LocalLLaMA/comments/abc123/mlx_bench/
+---"""
+        }
+
+    monkeypatch.setattr(reddit_mcp_client, "_call_reddit_tool", fake_call)
+
+    posts = asyncio.run(reddit_mcp_client.browse_subreddit("LocalLLaMA", time="week", limit=5))
+
+    assert calls == [("fetch_reddit_hot_threads", {"subreddit": "LocalLLaMA", "limit": 5})]
+    assert posts[0]["title"] == "MLX benchmark notes"
+    assert posts[0]["subreddit"] == "LocalLLaMA"
+    assert posts[0]["score"] == 123
+    assert posts[0]["num_comments"] == 45
+    assert posts[0]["id"] == "abc123"
+
+
+def test_reddit_mcp_client_keeps_reddit_buddy_contract(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        calls.append((tool_name, arguments))
+        return {
+            "results": [
+                {
+                    "id": "abc123",
+                    "title": "Local model discussion",
+                    "subreddit": "LocalLLaMA",
+                    "author": "builder",
+                    "score": 10,
+                    "num_comments": 5,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(reddit_mcp_client, "_call_reddit_tool", fake_call)
+
+    posts = asyncio.run(reddit_mcp_client.search_reddit("local LLM", subreddits=["LocalLLaMA"], limit=10))
+
+    assert calls == [
+        (
+            "search_reddit",
+            {
+                "query": "local LLM",
+                "sort": "relevance",
+                "time_filter": "week",
+                "limit": 10,
+                "type": "link",
+                "subreddits": ["LocalLLaMA"],
+            },
+        )
+    ]
+    assert posts[0]["id"] == "abc123"

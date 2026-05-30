@@ -248,3 +248,220 @@ def test_youtube_brief_card_opens_video_review_modal() -> None:
     assert "AI summary for a transcript-backed video." in html
     assert "Transcript text about local AI evaluation and deployment." in html
     assert "Watch" in html
+
+
+def test_youtube_adapter_inclusion_transcript_unavailable(monkeypatch, tmp_path) -> None:
+    async def fake_search_youtube(**_kwargs: object) -> youtube.YouTubeSearchResult:
+        return youtube.YouTubeSearchResult(
+            videos=(
+                youtube.YouTubeVideo(
+                    video_id="video-no-transcript",
+                    title="Local AI Systems Talk (No Transcript)",
+                    channel_name="Local AI Channel",
+                    published_at="2026-05-21T12:00:00Z",
+                    description="A metadata description of the talk.",
+                    thumbnail_url="https://img.example.com/1.jpg",
+                    duration_seconds=900,
+                    score=0.91,
+                ),
+            ),
+            quota_units=101,
+        )
+
+    async def fake_fetch_transcript(_video_id: str) -> youtube.YouTubeTranscript | None:
+        return None
+
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_YOUTUBE_API_KEY", "key")
+    monkeypatch.setattr(adapters, "search_youtube", fake_search_youtube)
+    monkeypatch.setattr(adapters, "fetch_youtube_transcript", fake_fetch_transcript)
+
+    candidates = asyncio.run(
+        YouTubeSourceAdapter().query(
+            TopicProfile.from_dict(
+                {
+                    "statement": "local AI systems",
+                    "scope": "local AI systems",
+                    "source_selection": {"youtube": True},
+                }
+            ),
+            SourceAdapterContext(exploration_id="explore-1", candidate_limit=3),
+        )
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.adapter == "youtube"
+    assert candidate.payload.source_type == "youtube_video"
+    assert candidate.payload.source_name == "Local AI Channel"
+    assert candidate.payload.original_url == "https://www.youtube.com/watch?v=video-no-transcript"
+    assert candidate.payload.metadata["youtube_title"] == "Local AI Systems Talk (No Transcript)"
+    assert candidate.payload.metadata["transcript_source"] == "unavailable"
+    assert candidate.payload.metadata["content_basis"] == "youtube_metadata"
+    assert candidate.payload.metadata["description"] == "A metadata description of the talk."
+    assert candidate.payload.raw_text == "A metadata description of the talk."
+
+
+def test_youtube_librarian_prompt_metadata_only() -> None:
+    from backend.agents.librarian.enrichment import _librarian_prompt
+    
+    payload = NormalizedPayload(
+        source_type="youtube_video",
+        source_name="Local AI Channel",
+        raw_text="A metadata description of the talk.",
+        original_url="https://www.youtube.com/watch?v=video-no-transcript",
+        published_at="2026-05-21T12:00:00Z",
+        metadata={
+            "youtube_quality_score": 0.91,
+            "video_id": "video-no-transcript",
+            "youtube_title": "Local AI Systems Talk (No Transcript)",
+            "channel_name": "Local AI Channel",
+            "thumbnail_url": "https://img.example.com/1.jpg",
+            "duration_seconds": 900,
+            "transcript_source": "unavailable",
+            "content_basis": "youtube_metadata",
+            "description": "A metadata description of the talk.",
+            "youtube_url": "https://www.youtube.com/watch?v=video-no-transcript",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url,
+        final_url=payload.original_url,
+        title="Local AI Systems Talk (No Transcript)",
+        text=payload.raw_text,
+        excerpt="A metadata description of the talk.",
+        domain="youtube.com",
+        status="fetched",
+        link_score=0.91,
+    )
+    
+    prompt = _librarian_prompt(result)
+    assert "You are summarizing a YouTube video based ONLY on its metadata" in prompt
+    assert "Title: Local AI Systems Talk (No Transcript)" in prompt
+    assert "Channel: Local AI Channel" in prompt
+    assert "Metadata Description:" in prompt
+    assert "Do NOT imply the video was watched" in prompt
+
+
+def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
+    from backend.app.services.brief_settings import (
+        brief_settings_status,
+        save_brief_defaults,
+    )
+    
+    _runtime(monkeypatch, tmp_path)
+    database.init_database()
+    settings = get_settings()
+    
+    status = brief_settings_status(settings)
+    assert status["youtube_presets"] == {"max": 10, "large": 8, "medium": 5, "focused": 3}
+    
+    # Save modified defaults
+    modified_defaults = {
+        "lookback_hours": 168,
+        "content_limits": {
+            "total_items": 150,
+            "target_items": 25,
+            "lead_items": 5,
+            "quality_floor": "standard",
+            "per_source": {"youtube": 8},
+        },
+        "youtube_presets": {"max": 10, "large": 9, "medium": 6, "focused": 4},
+    }
+    
+    updated_status = save_brief_defaults(settings, modified_defaults)
+    assert updated_status["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
+    # Verify the YouTube preset limit is correctly saved
+    assert updated_status["defaults"]["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
+
+
+def test_youtube_email_html_link_transformation() -> None:
+    from backend.app.services.email_delivery import _email_html
+    
+    html_input = """
+    <html>
+      <body>
+        <div class="feedback-controls">Rate this brief</div>
+        <a href="#modal-123" data-youtube-modal-target="modal-123" data-youtube-url="https://www.youtube.com/watch?v=123">
+          Watch Local AI Systems Talk
+        </a>
+        <div class="youtube-modal" id="modal-123">
+          <iframe class="youtube-player" src="https://www.youtube-nocookie.com/embed/123"></iframe>
+        </div>
+        <script>alert('hello');</script>
+      </body>
+    </html>
+    """
+    
+    transformed_html = _email_html(html_input)
+    
+    assert "feedback-controls" not in transformed_html
+    assert "youtube-modal" not in transformed_html
+    assert "<script>" not in transformed_html
+    assert 'href="https://www.youtube.com/watch?v=123"' in transformed_html
+    assert 'target="_blank"' in transformed_html
+    assert 'data-youtube-url' not in transformed_html
+    assert 'data-youtube-modal-target' not in transformed_html
+
+
+def test_youtube_capacity_protection_and_lane_sorting() -> None:
+    from backend.agents.discovery.runner import DiscoveryRunner
+    from backend.agents.discovery.registry import SourceRegistry
+    from backend.agents.discovery.types import TopicProfile, SourceAdapterContext
+    from backend.tests.test_explore_discovery import FakeAdapter, candidate
+    
+    # 1. Create a YouTube adapter returning 12 videos (more than system max of 10)
+    yt_candidates = [
+        candidate("youtube", f"https://youtube.com/watch?v=yt-{i}", 0.5 + i * 0.03)
+        for i in range(12)
+    ]
+    yt_adapter = FakeAdapter("youtube", yt_candidates)
+    yt_adapter.good_for = ("broad_discovery",)
+    
+    # 2. Create a web search adapter returning 5 candidates
+    web_candidates = [
+        candidate("web_search", f"https://example.com/web-{i}", 0.7 + i * 0.02)
+        for i in range(5)
+    ]
+    web_adapter = FakeAdapter("web_search", web_candidates)
+    web_adapter.good_for = ("breaking_news",)
+    
+    # 3. Create topic profile with youtube and web_search enabled
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "test topic",
+            "scope": "test topic",
+            "source_selection": {"youtube": True, "web_search": True},
+            "content_limits": {
+                "per_source": {"youtube": 5}, # youtube limit is set to 5
+                "total_items": 10,
+            }
+        }
+    )
+    
+    # Run discovery runner with limit of 8 candidates in context
+    registry = SourceRegistry([yt_adapter, web_adapter])
+    runner = DiscoveryRunner(registry)
+    result = asyncio.run(
+        runner.run(
+            profile,
+            context=SourceAdapterContext(exploration_id="explore-yt-lane", candidate_limit=8),
+        )
+    )
+    
+    candidates = result.candidates
+    assert len(candidates) == 8
+    
+    yt_results = [c for c in candidates if c.adapter == "youtube"]
+    web_results = [c for c in candidates if c.adapter == "web_search"]
+    
+    assert len(yt_results) == 5
+    assert len(web_results) == 3
+    
+    # Verify that the youtube candidates selected are the ones with highest scores
+    yt_urls = {c.payload.original_url for c in yt_results}
+    assert "https://youtube.com/watch?v=yt-11" in yt_urls
+    assert "https://youtube.com/watch?v=yt-7" in yt_urls
+    assert "https://youtube.com/watch?v=yt-0" not in yt_urls
+

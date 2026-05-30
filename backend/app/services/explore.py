@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import hashlib
+import json
 from pathlib import Path
 import logging
 import re
@@ -171,7 +172,7 @@ async def source_status() -> dict[str, Any]:
             gmail_reason = "Upload a Gmail OAuth client in Admin Sources, then connect Gmail."
         else:
             gmail_reason = "Finish the Gmail connection in Admin Sources."
-    reddit_enabled = bool((mcp.get("reddit") or {}).get("connected"))
+    reddit_enabled = False
     reddit_source_count = sum(
         len(database.list_reddit_sources(str(digest.get("id") or ""), include_retired=False))
         for digest in database.list_digests(include_archived=False)
@@ -224,9 +225,11 @@ async def source_status() -> dict[str, Any]:
             "reddit": {
                 "label": "Reddit",
                 "enabled": reddit_enabled,
-                "setup_required": not reddit_enabled,
-                "reason": None if reddit_enabled else "Reddit MCP is not connected.",
+                "setup_required": False,
+                "reason": "Reddit is disabled because Reddit no longer supports the API path this connector used.",
                 "configured_source_count": reddit_source_count,
+                "authenticated": False,
+                "auth_mode": "disabled",
             },
             "podcasts": {
                 "label": "Podcast",
@@ -312,11 +315,117 @@ def save_youtube_credentials(*, api_key: str) -> dict[str, Any]:
     }
 
 
+def save_reddit_credentials(
+    *,
+    client_id: str,
+    client_secret: str,
+    username: str | None = None,
+    password: str | None = None,
+    user_agent: str | None = None,
+) -> dict[str, Any]:
+    settings = get_settings()
+    reddit_dir = settings.secrets_dir / "reddit"
+    _write_secret_text(reddit_dir / "client_id", client_id)
+    _write_secret_text(reddit_dir / "client_secret", client_secret)
+    if username and username.strip():
+        _write_secret_text(reddit_dir / "username", username)
+    if password and password.strip():
+        _write_secret_text(reddit_dir / "password", password)
+    if user_agent and user_agent.strip():
+        _write_secret_text(reddit_dir / "user_agent", user_agent)
+    _sync_reddit_mcp_env(settings)
+    return {
+        "configured": True,
+        "authenticated": True,
+        "mode": "authenticated",
+        "restart_required": True,
+    }
+
+
 def setup_collections() -> dict[str, Any]:
     settings = get_settings()
     if settings.collections_root is None:
         raise ValueError("Collections root is not configured")
     return setup_collections_root(settings.collections_root)
+
+
+def reddit_credentials_status(settings: Any | None = None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    return {
+        "configured": bool(settings.reddit_client_id and settings.reddit_client_secret),
+        "authenticated": bool(settings.reddit_client_id and settings.reddit_client_secret),
+        "user_configured": bool(settings.reddit_username and settings.reddit_password),
+        "user_agent_configured": bool(settings.reddit_user_agent),
+        "mode": "authenticated" if settings.reddit_client_id and settings.reddit_client_secret else "anonymous",
+        "client_id_path": str(settings.secrets_dir / "reddit" / "client_id"),
+        "client_secret_path": str(settings.secrets_dir / "reddit" / "client_secret"),
+        "mcp_restart_required": True,
+    }
+
+
+def _write_secret_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path.parent)
+    path.write_text(value.strip() + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        logger.warning("Could not tighten permissions on %s", path)
+
+
+def _sync_reddit_mcp_env(settings: Any) -> None:
+    env = {
+        "REDDIT_CLIENT_ID": settings.reddit_client_id or _secret_text(settings.secrets_dir / "reddit" / "client_id"),
+        "REDDIT_CLIENT_SECRET": settings.reddit_client_secret or _secret_text(settings.secrets_dir / "reddit" / "client_secret"),
+        "REDDIT_USERNAME": settings.reddit_username or _secret_text(settings.secrets_dir / "reddit" / "username"),
+        "REDDIT_PASSWORD": settings.reddit_password or _secret_text(settings.secrets_dir / "reddit" / "password"),
+        "REDDIT_USER_AGENT": settings.reddit_user_agent or _secret_text(settings.secrets_dir / "reddit" / "user_agent"),
+        "REDDIT_AUTH_MODE": "authenticated",
+    }
+    clean_env = {key: value for key, value in env.items() if value}
+    _update_mcp_json(
+        Path.home() / ".lmstudio" / "mcp.json",
+        ["mcpServers", "reddit"],
+        clean_env,
+    )
+    _update_mcp_json(
+        Path.home() / ".lmstudio" / "extensions" / "plugins" / "mcp" / "reddit" / "mcp-bridge-config.json",
+        [],
+        clean_env,
+    )
+
+
+def _secret_text(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _update_mcp_json(path: Path, key_path: list[str], env: dict[str, str]) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    target: Any = payload
+    for key in key_path:
+        if not isinstance(target, dict):
+            return
+        target = target.get(key)
+    if not isinstance(target, dict):
+        return
+    target["command"] = "/opt/homebrew/bin/node"
+    target["command"] = "/Users/macstudio/Apps/mcp-reddit/.venv/bin/mcp-reddit"
+    target["args"] = []
+    existing_env = target.get("env") if isinstance(target.get("env"), dict) else {}
+    target["env"] = {**existing_env, **env}
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def cleanup_expired_exploration_briefs(retention_days: int = 90) -> int:

@@ -159,20 +159,43 @@ class DiscoveryRunner:
             ],
         )
         statuses = [status for _candidates, status in results]
-        candidates, exclusions = _apply_exclusions(
-            profile,
-            [candidate for adapter_candidates, _status in results for candidate in adapter_candidates],
-        )
+        all_raw_candidates = [candidate for adapter_candidates, _status in results for candidate in adapter_candidates]
+        candidates, exclusions = _apply_exclusions(profile, all_raw_candidates)
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
-        candidates = _apply_source_limits(
+
+        # Dedicated YouTube ranking/refinement lane & capacity reservation
+        youtube_selected = selection.get("youtube") is True
+        youtube_candidates = [c for c in candidates if c.adapter == "youtube"]
+        other_candidates = [c for c in candidates if c.adapter != "youtube"]
+
+        # 1. Evaluate YouTube candidates against other YouTube candidates first (sorted by score descending)
+        youtube_candidates = sorted(youtube_candidates, key=lambda c: c.score, reverse=True)
+
+        # 2. Determine YouTube limit
+        per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else None
+        yt_limit = 10  # Default to 10
+        if isinstance(per_source, dict) and "youtube" in per_source:
+            yt_limit = _source_limit(per_source["youtube"]) or 10
+        yt_limit = min(yt_limit, 10)  # YouTube system max is 10
+
+        protected_youtube = youtube_candidates[:yt_limit]
+
+        # 3. Apply source limits to non-YouTube candidates
+        other_candidates = _apply_source_limits(
             profile,
-            candidates,
+            other_candidates,
             target_limit=_explicit_total_limit(profile),
         )
-        candidates = _dedupe_candidates(
-            candidates,
-            limit=context.candidate_limit,
-        )
+
+        # 4. Deduplicate non-YouTube candidates leaving room for protected YouTube candidates
+        target_capacity = max(1, context.candidate_limit)
+        non_yt_capacity = max(0, target_capacity - len(protected_youtube))
+        deduped_other = _dedupe_candidates(other_candidates, limit=non_yt_capacity)
+
+        # 5. Combine and sort
+        combined = list(protected_youtube) + list(deduped_other)
+        candidates = sorted(combined, key=lambda c: c.score, reverse=True)
+
         excluded_statuses = [
             AdapterStatus(name=name, status="skipped", message="Source was turned off for this exploration.")
             for name, enabled in selection.items()
@@ -262,6 +285,8 @@ def _apply_source_limits(profile: TopicProfile, candidates: list[Candidate], *, 
     kept_ids: set[int] = set()
     for candidate in ranked:
         limit = _source_limit(per_source.get(candidate.adapter))
+        if candidate.adapter == "youtube":
+            limit = min(limit or 10, 10)
         if limit is None:
             kept.append(candidate)
             kept_ids.add(id(candidate))

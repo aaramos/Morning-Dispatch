@@ -7,7 +7,6 @@ from backend.agents.discovery.adapters import (
     GmailSourceAdapter,
     MarketsSourceAdapter,
     PodcastSourceAdapter,
-    RedditSourceAdapter,
     WebSearchSourceAdapter,
     YouTubeSourceAdapter,
 )
@@ -42,7 +41,6 @@ def default_source_registry() -> SourceRegistry:
     return SourceRegistry(
         [
             GmailSourceAdapter(),
-            RedditSourceAdapter(),
             PodcastSourceAdapter(),
             WebSearchSourceAdapter(),
             ForeignMediaSourceAdapter(),

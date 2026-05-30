@@ -53,7 +53,9 @@ def test_fallback_does_not_copy_same_phrase_into_every_source():
     assert sq["podcasts"] != sq["web_search"]
     assert all(q.endswith("discussion") for q in sq["reddit"])
     assert all(q.endswith("explained") for q in sq["youtube"])
-    assert all(q.endswith("podcast") for q in sq["podcasts"])
+    assert any(q.endswith("podcast") for q in sq["podcasts"])
+    assert any(q.endswith("interview") for q in sq["podcasts"])
+    assert all(q not in {"AI Daily", "Latent Space AI", "The AI Podcast", "Hard Fork", "Practical AI"} for q in sq["podcasts"])
 
 
 def test_markets_fallback_is_tickers_only_never_descriptive():

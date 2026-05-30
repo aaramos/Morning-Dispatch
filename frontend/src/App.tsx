@@ -196,6 +196,14 @@ type Digest = {
 };
 
 type AdminStatus = {
+  system?: {
+    environment?: string;
+    release?: {
+      timestamp?: string | null;
+      revision?: string | null;
+      source?: string | null;
+    };
+  };
   health?: {
     headline: string;
     safe_for_overnight: boolean;
@@ -367,6 +375,12 @@ type ContentLimitsDraft = {
 type BriefControlsDraft = {
   lookback_hours: number;
   content_limits: ContentLimitsDraft;
+  youtube_presets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 };
 
 type SystemLimitGroup = {
@@ -388,6 +402,12 @@ type BriefSettingsResponse = {
   defaults: BriefControlsDraft;
   pipeline_limits: PipelineLimitsDraft;
   system_limits: SystemLimitGroup[];
+  youtube_presets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 };
 
 type RefinementProgress = {
@@ -423,7 +443,7 @@ const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   web_search: true,
   foreign_media: true,
   gmail: true,
-  reddit: true,
+  reddit: false,
   podcasts: true,
   youtube: true,
   collections: true,
@@ -431,24 +451,30 @@ const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
 };
 
 const defaultContentLimits: ContentLimitsDraft = {
-  total_items: 150,
+  total_items: 250,
   target_items: 25,
   lead_items: 5,
   per_source: {
-    web_search: 15,
-    foreign_media: 15,
-    gmail: 15,
-    reddit: 15,
-    podcasts: 15,
-    youtube: 15,
-    collections: 15,
-    markets: 15,
+    web_search: 25,
+    foreign_media: 25,
+    gmail: 25,
+    reddit: 25,
+    podcasts: 25,
+    youtube: 10,
+    collections: 25,
+    markets: 25,
   },
   quality_floor: "standard",
 };
 const defaultBriefControls: BriefControlsDraft = {
   lookback_hours: 168,
   content_limits: defaultContentLimits,
+  youtube_presets: {
+    max: 10,
+    large: 8,
+    medium: 5,
+    focused: 3,
+  },
 };
 const briefControlBounds = {
   source_window_days: { min: 1, max: 365 },
@@ -636,6 +662,8 @@ function DispatchApp() {
   const [refinementFallbackStartedAt, setRefinementFallbackStartedAt] = useState(0);
   const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(null);
   const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
+  const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
+  const [strategyConfirmation, setStrategyConfirmation] = useState("");
   const [initialRefineExplorationId] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     const refineExplorationId = params.get("refine_exploration");
@@ -707,6 +735,7 @@ function DispatchApp() {
       api<BriefSettingsResponse>("/api/admin/brief-settings").catch(() => null),
     ]);
     if (sources) setSourceStatus(sources);
+    if (admin) setAdminStatus(admin);
     if (settings) setBriefSettings(settings);
     setRecentExplorations(explorations);
     setScheduledTopics(scheduled);
@@ -791,6 +820,7 @@ function DispatchApp() {
     }
     const interest = statement.trim();
     clearInterestDraft();
+    setStrategyConfirmation("");
     setSubmittedInterest(interest);
     setRefinementTargetExplorationId(null);
     setStatement("");
@@ -894,6 +924,8 @@ function DispatchApp() {
       setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
       if (updated.topic_profile) setTopicProfile(updated.topic_profile);
       setFlow("confirm");
+      const assistantNote = [...updated.messages].reverse().find((item) => item.role === "assistant")?.content;
+      setStrategyConfirmation(strategyUpdateConfirmation(assistantNote, updated.profile));
       setMessage("Search strategy updated");
     } catch (error) {
       setMessage(errorMessage(error, "Could not update search strategy"));
@@ -1231,6 +1263,7 @@ function DispatchApp() {
 
   function resetForNewBrief() {
     clearInterestDraft();
+    setStrategyConfirmation("");
     setRefinementTargetExplorationId(null);
     setStatement("");
     setSubmittedInterest("");
@@ -1438,6 +1471,7 @@ function DispatchApp() {
             <span className="brand-mark">◔</span>
             <span>Dispatch</span>
           </a>
+          <span className="release-stamp">{releaseStamp(adminStatus)}</span>
           <a className="icon-menu" href="/admin" aria-label="Open Admin">•••</a>
         </header>
 
@@ -1526,6 +1560,7 @@ function DispatchApp() {
               draft={draft}
               profile={session?.profile ?? topicProfile?.profile ?? null}
               strategyPreview={session?.strategy_preview ?? null}
+              strategyConfirmation={strategyConfirmation}
               sources={sourceSelection}
               sourceStatus={sourceStatus}
               defaultContentLimits={defaultControls.content_limits}
@@ -1534,6 +1569,7 @@ function DispatchApp() {
               onSourceClick={updateSource}
               onStrategyRefine={(instruction) => void refineSearchStrategy(instruction)}
               onBuild={() => void buildBrief()}
+              youtubePresets={briefSettings?.youtube_presets ?? defaultBriefControls.youtube_presets}
             />
           ) : null}
 
@@ -1923,6 +1959,7 @@ function ConfirmationPanel(props: {
   draft: ConfirmationDraft;
   profile: TopicProfile | null;
   strategyPreview: StrategyPreview | null;
+  strategyConfirmation: string;
   sources: Record<SourceKey, boolean>;
   sourceStatus: SourceStatusResponse | null;
   defaultContentLimits: ContentLimitsDraft;
@@ -1931,6 +1968,12 @@ function ConfirmationPanel(props: {
   onSourceClick: (source: SourceKey) => void;
   onStrategyRefine: (instruction: string) => void;
   onBuild: () => void;
+  youtubePresets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [strategyInstruction, setStrategyInstruction] = useState("");
@@ -1951,6 +1994,12 @@ function ConfirmationPanel(props: {
         </div>
       </div>
       {props.strategyPreview ? <StrategyReviewCard preview={props.strategyPreview} /> : null}
+      {props.strategyConfirmation ? (
+        <div className="strategy-confirmation">
+          <strong>AI update</strong>
+          <p>{props.strategyConfirmation}</p>
+        </div>
+      ) : null}
       <div className="confirm-grid">
         <label>
           Scope
@@ -2079,6 +2128,7 @@ function ConfirmationPanel(props: {
               sourceSelection={props.sources}
               resetLabel="Use system defaults"
               onChange={updateContentLimits}
+              youtubePresets={props.youtubePresets}
             />
             <SettingsErrorList errors={contentLimitErrors} />
           </>
@@ -2100,6 +2150,12 @@ function ContentLimitsPanel(props: {
   resetLabel?: string;
   showReset?: boolean;
   onChange: (limits: ContentLimitsDraft) => void;
+  youtubePresets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 }) {
   const selectedSources = sourceOptions.filter((source) => props.sourceSelection[source.key]);
   const defaults = props.defaults ?? defaultContentLimits;
@@ -2121,9 +2177,20 @@ function ContentLimitsPanel(props: {
   function applyPreset(scale: number) {
     const scaled = (value: number, min: number, max: number) => clampContentLimit(Math.round(value * scale), min, max);
     const nextPerSource: Partial<Record<SourceKey, number>> = {};
+    const presets = props.youtubePresets ?? { max: 10, large: 8, medium: 5, focused: 3 };
+    
     for (const source of sourceOptions) {
-      const maxValue = defaults.per_source[source.key] ?? briefControlBounds.per_source.max;
-      nextPerSource[source.key] = scaled(maxValue, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
+      if (source.key === "youtube") {
+        let ytVal = presets.medium;
+        if (scale === 1.0) ytVal = presets.max;
+        else if (scale === 0.8) ytVal = presets.large;
+        else if (scale === 0.6) ytVal = presets.medium;
+        else if (scale === 0.4) ytVal = presets.focused;
+        nextPerSource[source.key] = ytVal;
+      } else {
+        const maxValue = defaults.per_source[source.key] ?? briefControlBounds.per_source.max;
+        nextPerSource[source.key] = scaled(maxValue, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
+      }
     }
     props.onChange({
       ...props.limits,
@@ -2209,6 +2276,8 @@ function BriefControlsPanel(props: {
   onChange: (controls: BriefControlsDraft) => void;
 }) {
   const sourceWindowDays = Math.max(0, Math.round((Number(props.controls.lookback_hours) || 0) / 24));
+  const presets = props.controls.youtube_presets ?? { max: 10, large: 8, medium: 5, focused: 3 };
+
   return (
     <div className="brief-controls-panel">
       <div className="content-limit-grid">
@@ -2226,7 +2295,54 @@ function BriefControlsPanel(props: {
         sourceSelection={props.sourceSelection}
         showReset={false}
         onChange={(content_limits) => props.onChange({ ...props.controls, content_limits })}
+        youtubePresets={props.controls.youtube_presets}
       />
+      <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
+        <strong>YouTube scale presets</strong>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source video limits for YouTube for each profile scale (Max 10).</p>
+        <div className="content-limit-grid">
+          <NumberStepper
+            label="Max profile"
+            value={presets.max}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              youtube_presets: { ...presets, max: val }
+            })}
+          />
+          <NumberStepper
+            label="Large profile"
+            value={presets.large}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              youtube_presets: { ...presets, large: val }
+            })}
+          />
+          <NumberStepper
+            label="Medium profile"
+            value={presets.medium}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              youtube_presets: { ...presets, medium: val }
+            })}
+          />
+          <NumberStepper
+            label="Focused profile"
+            value={presets.focused}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              youtube_presets: { ...presets, focused: val }
+            })}
+          />
+        </div>
+      </div>
       {props.showReset !== false ? (
         <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(props.defaults)}>
           Reset to defaults
@@ -2745,8 +2861,7 @@ function EnableSourceModal(props: {
         ) : null}
         {props.source === "reddit" ? (
           <div className="enable-stack">
-            <p>Reddit is enabled through the local MCP connection. Retry after the connector is running.</p>
-            <button type="button" onClick={props.onRetry} disabled={props.busy}>Retry Reddit</button>
+            <p>Reddit is disabled because Reddit no longer supports the API path this connector used.</p>
           </div>
         ) : null}
       </section>
@@ -4969,6 +5084,30 @@ function formatDateTime(value: string | null | undefined): string {
     hour: "numeric",
     minute: "2-digit",
   }).format(date);
+}
+
+function releaseStamp(status: AdminStatus | null): string {
+  const release = status?.system?.release;
+  const timestamp = release?.timestamp ? formatDateTime(release.timestamp) : "";
+  const revision = release?.revision ? release.revision : "";
+  if (timestamp && revision) return `Release ${timestamp} · ${revision}`;
+  if (timestamp) return `Release ${timestamp}`;
+  if (revision) return `Release ${revision}`;
+  return "Release unknown";
+}
+
+function strategyUpdateConfirmation(note: string | undefined, profile: TopicProfile): string {
+  const sourceQueries = profile.source_queries ?? {};
+  const changedSources = Object.entries(sourceQueries)
+    .filter(([, queries]) => Array.isArray(queries) && queries.length > 0)
+    .map(([source]) => formatSourceLabel(source))
+    .slice(0, 5);
+  const summary = (note ?? "").trim();
+  if (summary && summary !== "Search strategy updated.") return summary;
+  if (changedSources.length) {
+    return `Updated the strategy and refreshed the visible plan for ${changedSources.join(", ")}.`;
+  }
+  return "I applied the instruction, but it did not add a visible source query. Review the plan before building.";
 }
 
 function relativeDate(value: string | null | undefined): string {

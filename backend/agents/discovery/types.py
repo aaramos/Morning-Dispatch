@@ -16,7 +16,7 @@ VALID_SCHEDULES: set[str] = {"hourly", "daily", "weekdays", "weekly", "monthly"}
 
 DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
     "gmail": True,
-    "reddit": True,
+    "reddit": False,
     "podcasts": True,
     "web_search": True,
     "foreign_media": False,
@@ -340,6 +340,7 @@ def _source_selection(value: Any) -> dict[str, bool]:
             clean_key = _clean_text(key)
             if clean_key:
                 selection[clean_key] = bool(enabled)
+    selection["reddit"] = False
     return selection
 
 

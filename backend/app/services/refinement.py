@@ -596,10 +596,10 @@ def _strategy_refinement_patch(profile: dict[str, Any], instruction: str) -> dic
                 "reason": "User asked to broaden Chinese AI lab coverage.",
             }
         ]
-    if any(term in text for term in ("podcast", "ai daily", "latent space", "hard fork")):
+    if any(term in text for term in ("podcast", "show", "audio", "interview", "ai daily", "latent space", "hard fork")):
         source_queries["podcasts"] = _merge_string_lists(
             profile.get("source_queries", {}).get("podcasts") if isinstance(profile.get("source_queries"), dict) else [],
-            _string_list(instruction, limit=8) + _podcast_show_hints(profile),
+            _string_list(instruction, limit=8),
             limit=10,
         )
     if any(term in text for term in ("youtube", "video", "channel")):
@@ -1048,6 +1048,8 @@ def _apply_agent_update(
     ready_requested = bool(agent_update.get("ready_to_build"))
     ready = ready_requested or just_go_now or turn_count >= MAX_REFINEMENT_TURNS
     next_question = _clean_next_question(agent_update.get("next_question"))
+    if next_question and _is_generic_actionable_question(next_question):
+        next_question = _strategy_deepening_question(patched, messages)
     if next_question and _question_repeats_answered_constraint(next_question, patched):
         next_question = _strategy_deepening_question(patched, messages)
     next_question = _dedupe_next_question(next_question, patched, messages)
@@ -1160,6 +1162,19 @@ def _clean_next_question(value: Any) -> str | None:
     if not question.endswith("?"):
         question = f"{question}?"
     return question[:260]
+
+
+def _is_generic_actionable_question(question: str) -> bool:
+    lowered = question.casefold()
+    return (
+        "what would make this brief actionable" in lowered
+        or (
+            "actionable" in lowered
+            and "catalysts" in lowered
+            and "valuation" in lowered
+            and "company" in lowered
+        )
+    )
 
 
 def _source_selection_dict(value: Any) -> dict[str, bool]:
@@ -1776,13 +1791,6 @@ def _ensure_source_query_coverage(profile: dict[str, Any]) -> dict[str, Any]:
         if source == "foreign_media" and queries.get(source) and foreign_fallback:
             queries[source] = _merge_string_lists(queries[source], foreign_fallback, limit=8)
             continue
-        if source == "podcasts" and queries.get(source):
-            queries[source] = _merge_string_lists(
-                queries[source],
-                _podcast_show_hints(profile),
-                limit=10,
-            )
-            continue
         if queries.get(source):
             continue
         fallback = _source_specific_fallback(
@@ -1849,22 +1857,21 @@ def _source_specific_fallback(
     if source == "youtube":
         return [f"{query} explained" for query in base]
     if source == "podcasts":
-        return [f"{query} podcast" for query in base]
+        return _podcast_discovery_fallback_queries(base)
     return list(base)
 
 
-def _podcast_show_hints(profile: dict[str, Any]) -> list[str]:
-    text = " ".join(
-        [
-            str(profile.get("statement") or ""),
-            str(profile.get("scope") or ""),
-            " ".join(_string_list(profile.get("keywords"))),
-            " ".join(_string_list(profile.get("search_queries"))),
-        ]
-    ).casefold()
-    if profile and not any(term in text for term in ("ai", "llm", "model", "openai", "anthropic", "local")):
-        return []
-    return ["AI Daily", "Latent Space AI", "The AI Podcast", "Hard Fork", "Practical AI"]
+def _podcast_discovery_fallback_queries(base: list[str]) -> list[str]:
+    out: list[str] = []
+    for query in base[:4]:
+        out.extend(
+            [
+                f"{query} podcast",
+                f"{query} interview",
+                f"{query} audio analysis",
+            ]
+        )
+    return _string_list(out, limit=8)
 
 
 def _baseline_diagnostics(profile: dict[str, Any]) -> dict[str, Any]:

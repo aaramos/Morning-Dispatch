@@ -4,6 +4,7 @@ import asyncio
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes
@@ -65,12 +66,26 @@ class RedditSourceAdapter:
         planned_sources = _reddit_sources_from_plan(profile)
         if source_digest_id is None and not planned_sources:
             return []
-        payloads = await fetch_reddit_threads(
-            digest_id=source_digest_id or context.exploration_id,
-            digest_interest=profile.query_for_source(self.name),
-            lookback_hours=context.lookback_hours or 24 * 365,
-            sources_override=planned_sources or None,
-        )
+        try:
+            payloads = await fetch_reddit_threads(
+                digest_id=source_digest_id or context.exploration_id,
+                digest_interest=profile.query_for_source(self.name),
+                lookback_hours=context.lookback_hours or 24 * 365,
+                sources_override=planned_sources or None,
+            )
+        except Exception as exc:
+            fallback = await _reddit_web_fallback_candidates(profile, context, planned_sources, error=str(exc))
+            if fallback:
+                return fallback
+            raise
+        if not payloads:
+            fallback = await _reddit_web_fallback_candidates(profile, context, planned_sources)
+            if fallback:
+                return fallback
+            planned = ", ".join(f"r/{source.subreddit}" for source in planned_sources[:6])
+            if planned:
+                raise AdapterUnavailable(f"Reddit searched {planned} but no usable threads entered the candidate pool.")
+            raise AdapterUnavailable("Reddit was selected but no usable threads entered the candidate pool.")
         return [
             Candidate(
                 adapter=self.name,
@@ -92,7 +107,7 @@ class PodcastSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         sources = _approved_podcast_sources()
-        for ref in _source_plan_refs(profile, "podcasts"):
+        for ref in _podcast_discovery_refs(profile):
             sources.append({
                 "type": "podcast_search",
                 "title": ref,
@@ -100,8 +115,6 @@ class PodcastSourceAdapter:
                 "aggregator": "podcastindex",
                 "transcription": "auto",
             })
-        if not sources:
-            return []
         payloads, _decisions = await fetch_podcast_episodes(
             digest_id=context.exploration_id,
             digest_interest=profile.query_for_source(self.name),
@@ -112,6 +125,15 @@ class PodcastSourceAdapter:
             seen_requires_published=True,
             include_seen=True,
         )
+        if not payloads:
+            fallback = await _podcast_web_fallback_candidates(profile, context)
+            if fallback:
+                return fallback
+            lanes = _source_plan_refs(profile, "podcasts")[:4]
+            lane_text = ", ".join(lanes)
+            if lane_text:
+                raise AdapterUnavailable(f"Podcast discovery searched {lane_text} but found no usable recent episodes.")
+            raise AdapterUnavailable("Podcast discovery found no usable recent episodes.")
         return [
             Candidate(
                 adapter=self.name,
@@ -389,6 +411,136 @@ def _payload_score(metadata: dict[str, Any] | None) -> float:
     return 0.5
 
 
+async def _reddit_web_fallback_candidates(
+    profile: TopicProfile,
+    context: SourceAdapterContext,
+    planned_sources: list[RedditSource],
+    *,
+    error: str | None = None,
+) -> list[Candidate]:
+    refs = _source_plan_refs(profile, "reddit") or [profile.query_for_source("reddit")]
+    days = lookback_to_days(context.lookback_hours)
+    queries: list[tuple[str, str]] = []
+    for ref in refs[:6]:
+        subreddit = _subreddit_from_ref(ref)
+        clean_ref = re.sub(r"(?:^|\s)r/[A-Za-z0-9_]{2,40}\b", " ", ref).strip() or profile.statement
+        if subreddit:
+            queries.append((f"site:reddit.com/r/{subreddit} {clean_ref}", subreddit))
+        else:
+            queries.append((f"site:reddit.com/r/ {ref} reddit discussion", "reddit"))
+    if not queries and planned_sources:
+        queries = [(f"site:reddit.com/r/{source.subreddit} {profile.statement}", source.subreddit) for source in planned_sources[:6]]
+    results = await asyncio.gather(
+        *(search_web(query, limit=6, days=days) for query, _subreddit in queries),
+        return_exceptions=True,
+    )
+    candidates: dict[str, Candidate] = {}
+    for (query, planned_subreddit), result in zip(queries, results, strict=True):
+        if isinstance(result, BaseException):
+            continue
+        for hit in result:
+            if not _is_reddit_thread_url(hit.url):
+                continue
+            key = _dedupe_url_key(hit.url)
+            subreddit = _subreddit_from_url(hit.url) or planned_subreddit
+            score = max(0.46, min(0.82, _search_score(hit.score) * 0.9))
+            payload = NormalizedPayload(
+                source_type="reddit_thread",
+                source_name=f"r/{subreddit}" if subreddit and subreddit != "reddit" else "Reddit",
+                raw_text="\n\n".join(part for part in (hit.title, hit.snippet, hit.url) if part),
+                original_url=hit.url,
+                published_at=hit.published_at,
+                metadata={
+                    "thread_quality_score": score,
+                    "title": hit.title,
+                    "subreddit": subreddit,
+                    "search_query": query,
+                    "search_provider": hit.provider,
+                    "fallback_source": "web_search",
+                    "fallback_reason": error,
+                },
+            )
+            candidate = Candidate(
+                adapter="reddit",
+                payload=payload,
+                score=score,
+                reason=f"Reddit thread discovered via {hit.provider} fallback.",
+            )
+            existing = candidates.get(key)
+            if existing is None or candidate.score > existing.score:
+                candidates[key] = candidate
+    return sorted(candidates.values(), key=lambda candidate: candidate.score, reverse=True)[
+        : max(1, min(context.candidate_limit, 20))
+    ]
+
+
+async def _podcast_web_fallback_candidates(profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
+    refs = _podcast_discovery_refs(profile)
+    days = lookback_to_days(context.lookback_hours)
+    queries = [f"{ref} podcast episode interview AI" for ref in refs[:6] if ref]
+    results = await asyncio.gather(
+        *(search_web(query, limit=6, days=days) for query in queries),
+        return_exceptions=True,
+    )
+    candidates: dict[str, Candidate] = {}
+    for query, result in zip(queries, results, strict=True):
+        if isinstance(result, BaseException):
+            continue
+        for hit in result:
+            if not _is_podcast_url(hit.url, hit.title):
+                continue
+            key = _dedupe_url_key(hit.url)
+            score = max(0.42, min(0.78, _search_score(hit.score) * 0.85))
+            payload = NormalizedPayload(
+                source_type="podcast_episode",
+                source_name=_podcast_source_name(hit.title, hit.url),
+                raw_text="\n\n".join(part for part in (hit.title, hit.snippet, hit.url) if part),
+                original_url=hit.url,
+                published_at=hit.published_at,
+                metadata={
+                    "episode_quality_score": score,
+                    "title": hit.title,
+                    "podcast_title": _podcast_source_name(hit.title, hit.url),
+                    "search_query": query,
+                    "search_provider": hit.provider,
+                    "transcript_source": "web_search_snippet",
+                    "fallback_source": "web_search",
+                },
+            )
+            candidate = Candidate(
+                adapter="podcasts",
+                payload=payload,
+                score=score,
+                reason=f"Podcast episode discovered via {hit.provider} fallback.",
+            )
+            existing = candidates.get(key)
+            if existing is None or candidate.score > existing.score:
+                candidates[key] = candidate
+    return sorted(candidates.values(), key=lambda candidate: candidate.score, reverse=True)[
+        : max(1, min(context.candidate_limit, 20))
+    ]
+
+
+def _podcast_discovery_refs(profile: TopicProfile) -> list[str]:
+    refs = list(_source_plan_refs(profile, "podcasts"))
+    if not refs:
+        refs.extend(_trim_query(query, limit=140) for query in profile.search_queries)
+        if profile.keywords:
+            refs.append(_trim_query(" ".join(profile.keywords[:8]), limit=140))
+        refs.extend(
+            _trim_query(value, limit=140)
+            for value in (profile.scope, profile.statement, profile.query_for_source("podcasts"))
+        )
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for ref in refs:
+        key = ref.casefold()
+        if ref and key not in seen:
+            cleaned.append(ref)
+            seen.add(key)
+    return cleaned[:8]
+
+
 def _search_score(value: float) -> float:
     try:
         score = float(value)
@@ -397,15 +549,82 @@ def _search_score(value: float) -> float:
     return round(max(0.0, min(score, 0.98)), 3)
 
 
+def _is_reddit_thread_url(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    host = parsed.netloc.lower()
+    return host.endswith("reddit.com") and "/r/" in parsed.path.lower()
+
+
+def _subreddit_from_url(url: str) -> str:
+    match = re.search(r"/r/([^/\s]+)/", urlparse(str(url or "")).path, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _is_podcast_url(url: str, title: str = "") -> bool:
+    parsed = urlparse(str(url or ""))
+    host = parsed.netloc.lower()
+    podcast_hosts = (
+        "podcasts.apple.com",
+        "open.spotify.com",
+        "podcasts.google.com",
+        "podcastaddict.com",
+        "podbay.fm",
+        "podtail.com",
+        "listennotes.com",
+        "overcast.fm",
+        "castbox.fm",
+        "podbean.com",
+        "simplecast.com",
+        "transistor.fm",
+        "captivate.fm",
+    )
+    if any(host.endswith(podcast_host) for podcast_host in podcast_hosts):
+        return True
+    text = f"{host} {title}".lower()
+    return "podcast" in text and any(word in text for word in ("episode", "interview", "show", "listen"))
+
+
+def _podcast_source_name(title: str, url: str) -> str:
+    cleaned = str(title or "").split("|", 1)[0].split(" - ", 1)[0].strip()
+    if cleaned:
+        return cleaned[:120]
+    host = urlparse(str(url or "")).netloc
+    return host or "Podcast"
+
+
 async def _youtube_candidates(videos: tuple[Any, ...]) -> list[Candidate]:
     semaphore = asyncio.Semaphore(4)
 
     async def build(video: Any) -> Candidate | None:
         async with semaphore:
             transcript = await fetch_youtube_transcript(video.video_id)
-        if transcript is None:
-            return None
         url = f"https://www.youtube.com/watch?v={video.video_id}"
+        if transcript is None:
+            return Candidate(
+                adapter="youtube",
+                payload=NormalizedPayload(
+                    source_type="youtube_video",
+                    source_name=video.channel_name,
+                    raw_text=video.description,
+                    original_url=url,
+                    published_at=video.published_at,
+                    metadata={
+                        "youtube_quality_score": video.score,
+                        "video_id": video.video_id,
+                        "youtube_title": video.title,
+                        "title": video.title,
+                        "channel_name": video.channel_name,
+                        "thumbnail_url": video.thumbnail_url,
+                        "duration_seconds": video.duration_seconds,
+                        "transcript_source": "unavailable",
+                        "content_basis": "youtube_metadata",
+                        "description": video.description,
+                        "youtube_url": url,
+                    },
+                ),
+                score=video.score,
+                reason="YouTube metadata signal.",
+            )
         return Candidate(
             adapter="youtube",
             payload=NormalizedPayload(

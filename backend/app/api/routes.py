@@ -139,6 +139,14 @@ class ApiKeyPayload(BaseModel):
     api_key: str = Field(min_length=1, max_length=1000)
 
 
+class RedditCredentialsPayload(BaseModel):
+    client_id: str = Field(min_length=1, max_length=1000)
+    client_secret: str = Field(min_length=1, max_length=1000)
+    username: str | None = Field(default=None, max_length=120)
+    password: str | None = Field(default=None, max_length=1000)
+    user_agent: str | None = Field(default=None, max_length=300)
+
+
 @router.get("/health")
 def health() -> dict[str, Any]:
     settings = get_settings()
@@ -507,6 +515,17 @@ def save_web_search_credentials(payload: SourceSetupPayload) -> dict[str, Any]:
 @router.post("/admin/youtube/credentials")
 def save_youtube_credentials(payload: ApiKeyPayload) -> dict[str, Any]:
     return explore.save_youtube_credentials(api_key=payload.api_key)
+
+
+@router.post("/admin/reddit/credentials")
+def save_reddit_credentials(payload: RedditCredentialsPayload) -> dict[str, Any]:
+    return explore.save_reddit_credentials(
+        client_id=payload.client_id,
+        client_secret=payload.client_secret,
+        username=payload.username,
+        password=payload.password,
+        user_agent=payload.user_agent,
+    )
 
 
 @router.post("/admin/collections/setup")

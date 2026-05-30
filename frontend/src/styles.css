@@ -86,6 +86,15 @@ a {
   font-size: 1.25rem;
 }
 
+.release-stamp {
+  margin-left: auto;
+  color: #78756d;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-align: right;
+}
+
 .icon-menu {
   min-width: 48px;
   min-height: 40px;
@@ -661,6 +670,22 @@ label {
   border: 1px solid #d8d7cf;
   border-radius: 8px;
   background: #f7f7f4;
+}
+
+.strategy-confirmation {
+  display: grid;
+  gap: 4px;
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid #b9d1c6;
+  border-radius: 8px;
+  background: #eef8f3;
+  color: #123528;
+}
+
+.strategy-confirmation p {
+  margin: 0;
+  color: #2f4d42;
 }
 
 .preset-control-row {

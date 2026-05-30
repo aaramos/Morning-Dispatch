@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.agents.digestor.base import NormalizedPayload
+from backend.agents.discovery import adapters
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.discovery.runner import DiscoveryRunner
 from backend.agents.discovery.registry import SourceRegistry
@@ -20,6 +21,7 @@ from backend.agents.discovery.types import (
     SourceAdapterContext,
     TopicProfile,
 )
+from backend.agents.discovery.web_search import SearchHit
 from backend.app.db import database
 from backend.app.main import create_app
 from backend.app.services import email_delivery, explore, refinement
@@ -229,6 +231,123 @@ def test_source_window_filter_marks_undated_strict_types_as_served_once(monkeypa
     assert kept[0].title == "Undated local AI story"
     assert kept[0].metadata.get("served_once") is True
     assert issues == []
+
+
+def test_reddit_adapter_uses_web_fallback_when_mcp_fails(monkeypatch) -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track LocalLLaMA Apple Silicon local LLM threads",
+            "source_selection": {"reddit": True},
+            "source_queries": {"reddit": ["r/LocalLLaMA Apple Silicon MLX"]},
+        }
+    )
+    context = SourceAdapterContext(exploration_id="run-1", lookback_hours=336, candidate_limit=5)
+
+    async def fake_fetch_reddit_threads(**_kwargs):
+        raise RuntimeError("Reddit API returned HTTP 403")
+
+    async def fake_search_web(query: str, **_kwargs):
+        assert "site:reddit.com/r/LocalLLaMA" in query
+        return [
+            SearchHit(
+                title="MLX benchmark thread",
+                url="https://www.reddit.com/r/LocalLLaMA/comments/abc123/mlx_benchmark/",
+                snippet="Local builders compare MLX and llama.cpp.",
+                score=0.75,
+                provider="brave",
+            )
+        ]
+
+    monkeypatch.setattr(adapters, "fetch_reddit_threads", fake_fetch_reddit_threads)
+    monkeypatch.setattr(adapters, "search_web", fake_search_web)
+    monkeypatch.setattr(adapters.database, "list_digests", lambda **_kwargs: [])
+
+    candidates = asyncio.run(adapters.RedditSourceAdapter().query(profile, context))
+
+    assert len(candidates) == 1
+    assert candidates[0].payload.source_type == "reddit_thread"
+    assert candidates[0].payload.metadata["fallback_source"] == "web_search"
+    assert candidates[0].payload.metadata["subreddit"] == "LocalLLaMA"
+
+
+def test_podcast_adapter_uses_web_fallback_when_directory_is_empty(monkeypatch) -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track local LLM podcast discussions",
+            "source_selection": {"podcasts": True},
+            "source_queries": {"podcasts": ["local LLM Apple Silicon podcast"]},
+        }
+    )
+    context = SourceAdapterContext(exploration_id="run-1", lookback_hours=336, candidate_limit=5)
+
+    async def fake_fetch_podcast_episodes(**_kwargs):
+        return [], []
+
+    async def fake_search_web(_query: str, **_kwargs):
+        return [
+            SearchHit(
+                title="Local LLMs on Apple Silicon - Example Podcast",
+                url="https://podcasts.apple.com/us/podcast/local-llms-on-apple-silicon/id123",
+                snippet="A technical podcast episode about MLX and local inference.",
+                score=0.72,
+                provider="brave",
+            )
+        ]
+
+    monkeypatch.setattr(adapters, "fetch_podcast_episodes", fake_fetch_podcast_episodes)
+    monkeypatch.setattr(adapters, "search_web", fake_search_web)
+    monkeypatch.setattr(adapters.database, "list_digests", lambda **_kwargs: [])
+
+    candidates = asyncio.run(adapters.PodcastSourceAdapter().query(profile, context))
+
+    assert len(candidates) == 1
+    assert candidates[0].payload.source_type == "podcast_episode"
+    assert candidates[0].payload.metadata["fallback_source"] == "web_search"
+    assert candidates[0].payload.metadata["transcript_source"] == "web_search_snippet"
+
+
+def test_podcast_adapter_discovers_from_profile_when_podcast_plan_is_empty(monkeypatch) -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track local LLM deployment discussions from expert podcasts",
+            "scope": "Apple Silicon MLX llama.cpp local inference",
+            "source_selection": {"podcasts": True},
+            "source_queries": {"podcasts": []},
+        }
+    )
+    context = SourceAdapterContext(exploration_id="run-1", lookback_hours=336, candidate_limit=5)
+    seen_sources: list[list[dict[str, object]]] = []
+    seen_queries: list[str] = []
+
+    async def fake_fetch_podcast_episodes(**kwargs):
+        seen_sources.append(list(kwargs["sources"]))
+        return [], []
+
+    async def fake_search_web(query: str, **_kwargs):
+        seen_queries.append(query)
+        return [
+            SearchHit(
+                title="MLX and local inference - Example Podcast",
+                url="https://podcasts.apple.com/us/podcast/mlx-and-local-inference/id456",
+                snippet="A podcast episode about Apple Silicon, MLX, and local LLM deployment.",
+                score=0.74,
+                provider="brave",
+            )
+        ]
+
+    monkeypatch.setattr(adapters, "fetch_podcast_episodes", fake_fetch_podcast_episodes)
+    monkeypatch.setattr(adapters, "search_web", fake_search_web)
+    monkeypatch.setattr(adapters.database, "list_digests", lambda **_kwargs: [])
+
+    candidates = asyncio.run(adapters.PodcastSourceAdapter().query(profile, context))
+
+    assert seen_sources
+    assert seen_sources[0][0]["type"] == "podcast_search"
+    assert "Apple Silicon MLX" in str(seen_sources[0][0]["query"])
+    assert seen_queries
+    assert len(candidates) == 1
+    assert candidates[0].payload.source_type == "podcast_episode"
+    assert candidates[0].payload.metadata["fallback_source"] == "web_search"
 
 
 class _TestStreamingModelClient:
@@ -600,7 +719,7 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                 "podcasts": 15,
                 "reddit": 2,
                 "web_search": 5,
-                "youtube": 15,
+                "youtube": 10,
             },
             "quality_floor": "strong",
             "target_items": 6,
@@ -1427,8 +1546,8 @@ def test_discovery_runner_applies_good_for_ranking_weights() -> None:
     )
     fresh_adapter.good_for = ("breaking_news", "fresh_sources")
     steady_adapter = FakeAdapter(
-        "reddit",
-        [candidate("reddit", "https://example.com/steady", 0.62)],
+        "podcasts",
+        [candidate("podcasts", "https://example.com/steady", 0.62)],
     )
     steady_adapter.good_for = ("deep_context",)
 
@@ -1823,7 +1942,8 @@ def test_refinement_agent_does_not_repeat_same_strategy_question(monkeypatch, tm
         for message in updated.json()["messages"]
         if message["role"] == "assistant" and message["content"].endswith("?")
     ]
-    assert assistant_questions[0] == repeated_question
+    assert assistant_questions[0] != repeated_question
+    assert "what kind of evidence" in assistant_questions[0].lower()
     assert assistant_questions[-1] != repeated_question
     assert len(set(assistant_questions)) == len(assistant_questions)
 

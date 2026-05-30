@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from datetime import UTC, datetime
 from ipaddress import ip_address, ip_network
 from pathlib import Path
@@ -81,6 +82,7 @@ class DeliverySettingsPayload(BaseModel):
 class BriefDefaultsPayload(BaseModel):
     lookback_hours: int = Field(default=168, ge=1, le=8760)
     content_limits: dict[str, Any] = Field(default_factory=dict)
+    youtube_presets: dict[str, int] = Field(default_factory=dict)
 
 
 class PipelineLimitsPayload(BaseModel):
@@ -202,6 +204,7 @@ async def admin_status(request: Request) -> dict[str, Any]:
             "data_dir": str(settings.data_dir),
             "secrets_dir": str(settings.secrets_dir),
             "public_base_url": settings.public_base_url,
+            "release": _release_info(),
         },
         "delivery": delivery_status,
         "podcasts": podcast_status,
@@ -257,6 +260,38 @@ async def admin_status(request: Request) -> dict[str, Any]:
     }
 
 
+def _release_info() -> dict[str, str | None]:
+    repo_root = Path(__file__).resolve().parents[3]
+    env_timestamp = os.environ.get("MORNING_DISPATCH_RELEASE_TIMESTAMP", "").strip()
+    env_revision = os.environ.get("MORNING_DISPATCH_RELEASE_REVISION", "").strip()
+    timestamp = env_timestamp
+    revision = env_revision
+    if not timestamp:
+        timestamp = _git_value(repo_root, ["log", "-1", "--format=%cI"])
+    if not revision:
+        revision = _git_value(repo_root, ["rev-parse", "--short", "HEAD"])
+    return {
+        "timestamp": timestamp or None,
+        "revision": revision or None,
+        "source": "environment" if env_timestamp or env_revision else "git",
+    }
+
+
+def _git_value(repo_root: Path, args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip()
+
+
 @router.get("/secrets/status")
 def secrets_status() -> dict[str, Any]:
     return secret_health.status(_settings())
@@ -285,13 +320,7 @@ def _admin_health(
         add("Gmail", "warning", "Gmail needs a reconnect to grant the required permissions.")
     else:
         add("Gmail", "ok", "Connected and ready to read newsletters.")
-    add(
-        "Reddit",
-        "ok" if (mcp.get("reddit") or {}).get("connected") else "warning",
-        "Reddit MCP is connected."
-        if (mcp.get("reddit") or {}).get("connected")
-        else "Reddit MCP is not connected; community signals may be skipped.",
-    )
+    add("Reddit", "ok", "Disabled. Reddit no longer supports the API path this connector used.")
 
     model_catalog = model.get("catalog") if isinstance(model.get("catalog"), dict) else {}
     model_ready = bool(model.get("enabled") and model.get("api_key_configured") and model_catalog.get("available"))
@@ -341,13 +370,7 @@ def _admin_health(
     else:
         add("Model capacity", "ok", "No recent model-capacity errors recorded.")
 
-    scout_run = source_scout.get("latest_run") if isinstance(source_scout.get("latest_run"), dict) else None
-    if scout_run and scout_run.get("status") == "partial":
-        add("Source Scout", "warning", "Last Reddit source review was partial; some communities were kept conservative.")
-    elif scout_run and scout_run.get("status") == "completed":
-        add("Source Scout", "ok", "Reddit source review completed.")
-    else:
-        add("Source Scout", "warning", "Reddit source review has not completed yet.")
+    add("Source Scout", "ok", "Disabled with Reddit.")
 
     email_status = delivery.get("email") if isinstance(delivery.get("email"), dict) else {}
     if email_status.get("enabled") and email_status.get("gmail_send_ready"):
