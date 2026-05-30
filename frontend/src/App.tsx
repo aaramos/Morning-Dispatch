@@ -381,6 +381,12 @@ type BriefControlsDraft = {
     medium: number;
     focused: number;
   };
+  podcast_presets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 };
 
 type SystemLimitGroup = {
@@ -403,6 +409,12 @@ type BriefSettingsResponse = {
   pipeline_limits: PipelineLimitsDraft;
   system_limits: SystemLimitGroup[];
   youtube_presets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
+  podcast_presets?: {
     max: number;
     large: number;
     medium: number;
@@ -459,7 +471,7 @@ const defaultContentLimits: ContentLimitsDraft = {
     foreign_media: 25,
     gmail: 25,
     reddit: 25,
-    podcasts: 25,
+    podcasts: 10,
     youtube: 10,
     collections: 25,
     markets: 25,
@@ -472,6 +484,12 @@ const defaultBriefControls: BriefControlsDraft = {
   youtube_presets: {
     max: 10,
     large: 8,
+    medium: 5,
+    focused: 3,
+  },
+  podcast_presets: {
+    max: 10,
+    large: 7,
     medium: 5,
     focused: 3,
   },
@@ -978,6 +996,7 @@ function DispatchApp() {
     setFlow("building");
     setMessage("Building the brief...");
     setBriefHtml("");
+    let startedExploration: Exploration | null = null;
     try {
       const profilePayload = {
         ...confirmedProfilePayload(),
@@ -1002,16 +1021,18 @@ function DispatchApp() {
       if (returnedTopic) setTopicProfile(returnedTopic);
       setSession(null);
       setAnswer("");
+      startedExploration = started.exploration;
       setExploration(started.exploration);
-      const finished = await pollExploration(started.exploration.exploration_id);
+      const { exploration: finished, html } = await waitForBriefReady(started.exploration.exploration_id);
       setExploration(finished);
-      await loadBriefHtml(finished);
+      setBriefHtml(html);
       await loadHome();
       setFlow("ready");
       setRefinementTargetExplorationId(null);
       setMessage(finished.progress.built_with_issues ? "Brief ready with issues" : refinementTargetExplorationId ? "Refined brief rebuilt" : "Brief ready");
+      openBrief(finished);
     } catch (error) {
-      setFlow("confirm");
+      setFlow(startedExploration ? "building" : "confirm");
       setMessage(errorMessage(error, "Could not build brief"));
     } finally {
       setBusy(false);
@@ -1024,6 +1045,7 @@ function DispatchApp() {
     setFlow("building");
     setMessage("Rebuilding the brief...");
     setBriefHtml("");
+    let startedExploration: Exploration | null = null;
     try {
       const started = await api<{ exploration: Exploration }>(`/api/explore/explorations/${exploration.exploration_id}/rebuild`, {
         method: "POST",
@@ -1033,15 +1055,17 @@ function DispatchApp() {
           lookback_hours: lookbackHoursForBuild(topicProfile?.profile ?? session?.profile, draft, defaultControls.lookback_hours),
         }),
       });
+      startedExploration = started.exploration;
       setExploration(started.exploration);
-      const finished = await pollExploration(started.exploration.exploration_id);
+      const { exploration: finished, html } = await waitForBriefReady(started.exploration.exploration_id);
       setExploration(finished);
-      await loadBriefHtml(finished);
+      setBriefHtml(html);
       await loadHome();
       setFlow("ready");
       setMessage(finished.progress.built_with_issues ? "Brief rebuilt with issues" : "Brief rebuilt");
+      openBrief(finished);
     } catch (error) {
-      setFlow("ready");
+      setFlow(startedExploration ? "building" : "ready");
       setMessage(errorMessage(error, "Could not rebuild brief"));
     } finally {
       setBusy(false);
@@ -1090,23 +1114,36 @@ function DispatchApp() {
     }
   }, [beginRefinementProgress, defaultControls.content_limits, endRefinementProgress, exploration, topicProfile]);
 
-  async function pollExploration(explorationId: string): Promise<Exploration> {
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+  async function waitForBriefReady(explorationId: string): Promise<{ exploration: Exploration; html: string }> {
+    for (let attempt = 0; attempt < 667; attempt += 1) {
       const next = await api<Exploration>(`/api/explore/explorations/${explorationId}`);
       setExploration(next);
-      if (next.status !== "queued" && next.status !== "running") return next;
+      if (next.status === "failed") {
+        throw new Error(next.progress.error || "Brief build failed");
+      }
+      if (next.status === "complete") {
+        const html = await fetchBriefHtml(next);
+        if (html) return { exploration: next, html };
+      }
       await sleep(1800);
     }
-    throw new Error("Brief build timed out while waiting for results");
+    throw new Error("Brief build timed out while waiting for the finished brief");
   }
 
   async function loadBriefHtml(record: Exploration) {
+    const html = await fetchBriefHtml(record);
+    if (html) setBriefHtml(html);
+  }
+
+  async function fetchBriefHtml(record: Exploration): Promise<string | null> {
     const path = briefPath(record);
-    if (!path) return;
+    if (!path) return null;
     const response = await fetch(path);
     if (response.ok) {
-      setBriefHtml(await response.text());
+      const html = await response.text();
+      return html.trim() ? html : null;
     }
+    return null;
   }
 
   async function scheduleBrief() {
@@ -1223,12 +1260,13 @@ function DispatchApp() {
       setFlow("building");
       setMessage(item.exploration.status === "queued" ? "Brief is queued..." : "Brief is still building...");
       try {
-        const finished = await pollExploration(item.exploration.exploration_id);
+        const { exploration: finished, html } = await waitForBriefReady(item.exploration.exploration_id);
         setExploration(finished);
-        await loadBriefHtml(finished);
+        setBriefHtml(html);
         await loadHome();
         setFlow("ready");
         setMessage(finished.progress.built_with_issues ? "Brief ready with issues" : "Brief ready");
+        openBrief(finished);
       } catch (error) {
         setMessage(errorMessage(error, "Could not refresh the building brief"));
       }
@@ -2156,6 +2194,12 @@ function ContentLimitsPanel(props: {
     medium: number;
     focused: number;
   };
+  podcastPresets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 }) {
   const selectedSources = sourceOptions.filter((source) => props.sourceSelection[source.key]);
   const defaults = props.defaults ?? defaultContentLimits;
@@ -2178,6 +2222,7 @@ function ContentLimitsPanel(props: {
     const scaled = (value: number, min: number, max: number) => clampContentLimit(Math.round(value * scale), min, max);
     const nextPerSource: Partial<Record<SourceKey, number>> = {};
     const presets = props.youtubePresets ?? { max: 10, large: 8, medium: 5, focused: 3 };
+    const podcastPresets = props.podcastPresets ?? { max: 10, large: 7, medium: 5, focused: 3 };
     
     for (const source of sourceOptions) {
       if (source.key === "youtube") {
@@ -2187,6 +2232,13 @@ function ContentLimitsPanel(props: {
         else if (scale === 0.6) ytVal = presets.medium;
         else if (scale === 0.4) ytVal = presets.focused;
         nextPerSource[source.key] = ytVal;
+      } else if (source.key === "podcasts") {
+        let podcastVal = podcastPresets.medium;
+        if (scale === 1.0) podcastVal = podcastPresets.max;
+        else if (scale === 0.8) podcastVal = podcastPresets.large;
+        else if (scale === 0.6) podcastVal = podcastPresets.medium;
+        else if (scale === 0.4) podcastVal = podcastPresets.focused;
+        nextPerSource[source.key] = podcastVal;
       } else {
         const maxValue = defaults.per_source[source.key] ?? briefControlBounds.per_source.max;
         nextPerSource[source.key] = scaled(maxValue, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
@@ -2277,6 +2329,7 @@ function BriefControlsPanel(props: {
 }) {
   const sourceWindowDays = Math.max(0, Math.round((Number(props.controls.lookback_hours) || 0) / 24));
   const presets = props.controls.youtube_presets ?? { max: 10, large: 8, medium: 5, focused: 3 };
+  const podcastPresets = props.controls.podcast_presets ?? { max: 10, large: 7, medium: 5, focused: 3 };
 
   return (
     <div className="brief-controls-panel">
@@ -2296,6 +2349,7 @@ function BriefControlsPanel(props: {
         showReset={false}
         onChange={(content_limits) => props.onChange({ ...props.controls, content_limits })}
         youtubePresets={props.controls.youtube_presets}
+        podcastPresets={props.controls.podcast_presets}
       />
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>YouTube scale presets</strong>
@@ -2339,6 +2393,52 @@ function BriefControlsPanel(props: {
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, focused: val }
+            })}
+          />
+        </div>
+      </div>
+      <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
+        <strong>Podcast scale presets</strong>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for podcast items for each profile scale (Max 10).</p>
+        <div className="content-limit-grid">
+          <NumberStepper
+            label="Max profile"
+            value={podcastPresets.max}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              podcast_presets: { ...podcastPresets, max: val }
+            })}
+          />
+          <NumberStepper
+            label="Large profile"
+            value={podcastPresets.large}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              podcast_presets: { ...podcastPresets, large: val }
+            })}
+          />
+          <NumberStepper
+            label="Medium profile"
+            value={podcastPresets.medium}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              podcast_presets: { ...podcastPresets, medium: val }
+            })}
+          />
+          <NumberStepper
+            label="Focused profile"
+            value={podcastPresets.focused}
+            min={1}
+            max={10}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              podcast_presets: { ...podcastPresets, focused: val }
             })}
           />
         </div>

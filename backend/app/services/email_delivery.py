@@ -192,8 +192,19 @@ def _email_html(html: str) -> str:
         if "data-youtube-modal-target" in a_tag.attrs:
             del a_tag["data-youtube-modal-target"]
 
+    for a_tag in soup.find_all("a", attrs={"data-podcast-url": True}):
+        podcast_url = a_tag["data-podcast-url"]
+        a_tag["href"] = podcast_url
+        a_tag["target"] = "_blank"
+        a_tag["rel"] = "noreferrer"
+        del a_tag["data-podcast-url"]
+        if "data-podcast-modal-target" in a_tag.attrs:
+            del a_tag["data-podcast-modal-target"]
+
     # Remove modals from email body to keep markup lightweight and avoid broken hashes
     for modal in soup.select(".youtube-modal"):
+        modal.decompose()
+    for modal in soup.select(".podcast-modal"):
         modal.decompose()
 
     return str(soup)

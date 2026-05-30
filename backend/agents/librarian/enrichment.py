@@ -732,6 +732,8 @@ def _detect_non_english_script(result: ArticleFetchResult) -> tuple[str, str] | 
 
 def _librarian_prompt(result: ArticleFetchResult) -> str:
     metadata = result.payload.metadata or {}
+    text = (result.text or result.excerpt or fallback_text(result))[:MAX_MODEL_TEXT_CHARS]
+
     if metadata.get("content_basis") == "youtube_metadata":
         title = metadata.get("youtube_title") or result.title
         channel = metadata.get("channel_name") or result.payload.source_name or "YouTube"
@@ -749,7 +751,33 @@ Rules:
 3. Keep the summary under 70 words. Keep keyword labels short. Return compact JSON only.
 """
 
-    text = (result.text or result.excerpt or fallback_text(result))[:MAX_MODEL_TEXT_CHARS]
+    if result.payload.source_type == "podcast_episode":
+        show_name = metadata.get("podcast_title") or result.payload.source_name or "Podcast"
+        episode_title = metadata.get("title") or result.title or "Podcast episode"
+        source_basis = str(metadata.get("transcript_source") or "show_notes").strip()
+        basis_label = "transcript" if source_basis in {"transcript", "transcript_cache"} else "show notes"
+        existing_summary = str(result.excerpt or result.editor_summary or "").strip()
+        summary_seed = (
+            f"\nExisting summary:\n{existing_summary}\n"
+            if existing_summary
+            else ""
+        )
+
+        return f"""You are summarizing a podcast episode.
+Use the most useful source material available and keep the summary concise.
+Title: {episode_title}
+Podcast: {show_name}
+Basis: {basis_label}
+{summary_seed}
+Text:
+{text}
+
+        Rules:
+1. Prefer the existing summary when it is accurate and useful.
+2. If the provided summary is missing or weak, generate one that is close and practical.
+3. Keep the summary under 70 words. Keep keyword labels short. Return compact JSON only.
+"""
+
     if result.payload.source_type == "reddit_thread":
         source_label = "Source"
     elif result.payload.source_type == "podcast_episode":

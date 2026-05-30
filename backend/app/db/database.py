@@ -2874,7 +2874,7 @@ def render_ingested_issue(
     .story-num {{ font-family: var(--display); font-size: 2.45rem; line-height: .9; color: var(--accent); font-weight: 900; }}
     .story-copy {{ display: grid; gap: 9px; }}
     .story-title {{ font-family: var(--display); font-size: clamp(1.42rem, 2.5vw, 2.05rem); line-height: 1.02; font-weight: 800; }}
-    .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-transcript p {{ font-size: .98rem; line-height: 1.58; margin: 0; color: #4a4138; }}
+    .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-summary p, .podcast-transcript p {{ font-size: .98rem; line-height: 1.58; margin: 0; color: #4a4138; }}
     .market-snapshot {{ border-top: 1px solid var(--ink); border-bottom: 1px solid var(--line); padding: 20px 0 8px; }}
     .market-snapshot h2 {{ font-size: clamp(1.8rem, 3vw, 2.65rem); margin-bottom: 14px; }}
     .market-grid {{ display: grid; gap: 10px; }}
@@ -2932,11 +2932,14 @@ def render_ingested_issue(
     .podcast-panel h3 {{ font-size: clamp(1.8rem, 4vw, 3.1rem); line-height: .95; margin: 0 0 10px; }}
     .podcast-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 18px; font: 800 .75rem var(--body); text-transform: uppercase; }}
     .podcast-actions a {{ color: var(--accent-dark); }}
+    .podcast-speed-controls {{ display: flex; gap: 8px; margin: 0 0 16px; align-items: center; flex-wrap: wrap; }}
+    .podcast-speed-controls button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); padding: 6px 10px; font: 700 .72rem var(--body); cursor: pointer; }}
+    .podcast-speed-controls button.active {{ border-color: var(--ink); background: var(--ink); color: var(--paper); }}
     .podcast-player {{ width: 100%; margin: 4px 0 20px; }}
     .youtube-panel {{ width: min(1040px, 100%); }}
     .youtube-player {{ width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--ink); background: var(--ink); margin: 8px 0 20px; }}
-    .youtube-summary, .podcast-transcript {{ border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }}
-    .youtube-summary h4, .podcast-transcript h4 {{ margin: 0 0 10px; font: 800 .78rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .youtube-summary, .podcast-summary, .podcast-transcript {{ border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }}
+    .youtube-summary h4, .podcast-summary h4, .podcast-transcript h4 {{ margin: 0 0 10px; font: 800 .78rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
     .foreign-tabs {{ display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }}
     .foreign-tabs button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); padding: 8px 12px; font: 800 .74rem/1 var(--body); cursor: pointer; }}
     .foreign-tabs button.active {{ background: var(--ink); color: var(--paper); border-color: var(--ink); }}
@@ -3623,6 +3626,21 @@ def _story_summary(result: ArticleFetchResult) -> str:
 
 
 def _story_title(result: ArticleFetchResult) -> str:
+    if result.payload.source_type == "podcast_episode":
+        return _podcast_story_title(result)
+    return _clean_newsletter_text(result.title) or result.title or _result_url(result)
+
+
+def _podcast_story_title(result: ArticleFetchResult) -> str:
+    metadata = result.payload.metadata or {}
+    show_name = str(metadata.get("podcast_title") or result.payload.source_name or "").strip()
+    episode_title = str(metadata.get("title") or result.title or "").strip()
+    if show_name and episode_title:
+        return f"{_clean_newsletter_text(show_name)}: {_clean_newsletter_text(episode_title)}"
+    if show_name:
+        return _clean_newsletter_text(show_name)
+    if episode_title:
+        return _clean_newsletter_text(episode_title)
     return _clean_newsletter_text(result.title) or result.title or _result_url(result)
 
 
@@ -3911,7 +3929,15 @@ def _render_media_card(result: ArticleFetchResult, *, issue_id: str | None = Non
     if result.payload.source_type == "podcast_episode":
         modal_id = _podcast_modal_id(result)
         url = f"#{modal_id}"
+        podcast_url = str(
+            result.payload.metadata.get("episode_url")
+            or result.payload.metadata.get("apple_podcasts_url")
+            or _result_url(result)
+            or ""
+        ).strip()
         title_attributes = f' data-podcast-modal-target="{escape(modal_id, quote=True)}"'
+        if podcast_url:
+            title_attributes += f' data-podcast-url="{escape(_safe_web_url(podcast_url) or podcast_url, quote=True)}"'
         title_class = ' class="podcast-modal-link"'
         title_target = ""
         modal_html = _render_podcast_modal(result, modal_id)
@@ -4268,6 +4294,17 @@ def _render_podcast_modal(result: ArticleFetchResult, modal_id: str) -> str:
     transcript_label = "Transcript" if transcript_source in {"transcript", "transcript_cache"} else "Show Notes"
     transcript_html = _render_transcript_paragraphs(_podcast_transcript_text(result))
     duration = _format_duration(metadata.get("duration_seconds"))
+    summary = _clean_newsletter_text(result.editor_summary or result.excerpt)
+    summary_html = (
+        f"""
+        <section class="podcast-summary">
+          <h4>Summary</h4>
+          <p>{escape(summary)}</p>
+        </section>
+        """
+        if summary
+        else ""
+    )
     meta_parts = [show_name]
     if duration:
         meta_parts.append(duration)
@@ -4279,7 +4316,7 @@ def _render_podcast_modal(result: ArticleFetchResult, modal_id: str) -> str:
         else f'<div class="podcast-art fallback" aria-hidden="true">{escape(_podcast_initials(show_name))}</div>'
     )
     player_html = (
-        f'<audio class="podcast-player" controls preload="none" src="{escape(audio_url, quote=True)}"></audio>'
+        f'<audio class="podcast-player" data-podcast-player controls preload="none" src="{escape(audio_url, quote=True)}"></audio>'
         if audio_url
         else '<p class="meta">Audio is not available for this episode.</p>'
     )
@@ -4289,6 +4326,17 @@ def _render_podcast_modal(result: ArticleFetchResult, modal_id: str) -> str:
     if episode_url and episode_url != apple_url:
         action_links.append(f'<a href="{escape(episode_url, quote=True)}" target="_blank" rel="noreferrer">Listen</a>')
     actions_html = f'<div class="podcast-actions">{" ".join(action_links)}</div>' if action_links else ""
+    speed_controls_html = (
+        """
+          <div class="podcast-speed-controls">
+            <button type="button" data-podcast-speed="0.75">Slow</button>
+            <button type="button" data-podcast-speed="1" class="active">Normal</button>
+            <button type="button" data-podcast-speed="1.25">Speed up</button>
+          </div>
+        """
+        if audio_url
+        else ""
+    )
     return f"""
         <div class="podcast-modal" id="{escape(modal_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
           <div class="podcast-panel">
@@ -4301,7 +4349,9 @@ def _render_podcast_modal(result: ArticleFetchResult, modal_id: str) -> str:
                 {actions_html}
               </div>
             </div>
+            {summary_html}
             {player_html}
+            {speed_controls_html}
             <section class="podcast-transcript">
               <h4>{escape(transcript_label)}</h4>
               {transcript_html}
@@ -4510,6 +4560,16 @@ def _render_podcast_modal_script() -> str:
       const syncModalState = () => {
         const modal = activeModal();
         document.body.classList.toggle("modal-open", Boolean(modal && modal.classList.contains("podcast-modal")));
+        if (modal && modal.classList.contains("podcast-modal")) {
+          const player = modal.querySelector(".podcast-player");
+          const activeSpeed = modal.querySelector(".podcast-speed-controls .active[data-podcast-speed]");
+          if (player && activeSpeed) {
+            const rate = Number(activeSpeed.getAttribute("data-podcast-speed"));
+            if (Number.isFinite(rate) && rate > 0) {
+              player.playbackRate = rate;
+            }
+          }
+        }
         document.querySelectorAll(".podcast-modal audio").forEach((player) => {
           if (!modal || !modal.contains(player)) player.pause();
         });
@@ -4552,6 +4612,22 @@ def _render_podcast_modal_script() -> str:
         });
         modal.querySelectorAll("[data-foreign-tab]").forEach((button) => {
           button.classList.toggle("active", button.getAttribute("data-foreign-tab") === viewName);
+        });
+      };
+
+      const setPodcastSpeed = (modal, speedValue) => {
+        const player = modal ? modal.querySelector("audio[data-podcast-player]") : null;
+        const rate = Number(speedValue);
+        if (!player || !Number.isFinite(rate) || rate <= 0) return;
+        player.playbackRate = rate;
+        modal.querySelectorAll("[data-podcast-speed]").forEach((button) => {
+          const value = Number(button.getAttribute("data-podcast-speed"));
+          const selected = Number.isFinite(value) && value === rate;
+          if (selected) {
+            button.classList.add("active");
+          } else {
+            button.classList.remove("active");
+          }
         });
       };
 
@@ -4628,6 +4704,16 @@ def _render_podcast_modal_script() -> str:
         if (tab) {
           const modal = tab.closest(".foreign-modal");
           if (modal) setForeignView(modal, tab.getAttribute("data-foreign-tab"));
+          return;
+        }
+
+        const speedButton = event.target.closest("[data-podcast-speed]");
+        if (speedButton) {
+          const modal = speedButton.closest(".podcast-modal");
+          if (modal) {
+            event.preventDefault();
+            setPodcastSpeed(modal, speedButton.getAttribute("data-podcast-speed"));
+          }
           return;
         }
 

@@ -83,6 +83,7 @@ class BriefDefaultsPayload(BaseModel):
     lookback_hours: int = Field(default=168, ge=1, le=8760)
     content_limits: dict[str, Any] = Field(default_factory=dict)
     youtube_presets: dict[str, int] = Field(default_factory=dict)
+    podcast_presets: dict[str, int] = Field(default_factory=dict)
 
 
 class PipelineLimitsPayload(BaseModel):

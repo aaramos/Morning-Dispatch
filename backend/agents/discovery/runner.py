@@ -163,38 +163,50 @@ class DiscoveryRunner:
         candidates, exclusions = _apply_exclusions(profile, all_raw_candidates)
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
 
-        # Dedicated YouTube ranking/refinement lane & capacity reservation
-        youtube_selected = selection.get("youtube") is True
-        youtube_candidates = [c for c in candidates if c.adapter == "youtube"]
-        other_candidates = [c for c in candidates if c.adapter != "youtube"]
+        # Dedicated source ranking lanes (sorted against each other before competing with
+        # other sources for pipeline capacity). YouTube and podcast lanes are each capped
+        # to system ceilings for isolation.
+        target_capacity = max(1, context.candidate_limit)
+        profile_total_limit = _explicit_total_limit(profile)
+        if profile_total_limit is not None:
+            target_capacity = min(target_capacity, profile_total_limit)
+        source_plan: tuple[tuple[str, int], ...] = (
+            ("youtube", _lane_limit(profile, "youtube", default=10, system_max=10)),
+            ("podcasts", _lane_limit(profile, "podcasts", default=10, system_max=10)),
+        )
 
-        # 1. Evaluate YouTube candidates against other YouTube candidates first (sorted by score descending)
-        youtube_candidates = sorted(youtube_candidates, key=lambda c: c.score, reverse=True)
+        lane_candidates: list[Candidate] = []
+        lane_adapters: set[str] = set()
+        for source, source_limit in source_plan:
+            if selection.get(source) is not True:
+                continue
+            raw_candidates = [candidate for candidate in candidates if candidate.adapter == source]
+            lane_adapters.add(source)
+            lane_capacity = max(0, target_capacity - len(lane_candidates))
+            if lane_capacity <= 0:
+                break
+            lane_cap_for_source = min(source_limit, lane_capacity)
+            lane_candidates.extend(
+                _dedupe_candidates(
+                    sorted(raw_candidates, key=lambda c: c.score, reverse=True),
+                    limit=lane_cap_for_source,
+                )
+            )
 
-        # 2. Determine YouTube limit
-        per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else None
-        yt_limit = 10  # Default to 10
-        if isinstance(per_source, dict) and "youtube" in per_source:
-            yt_limit = _source_limit(per_source["youtube"]) or 10
-        yt_limit = min(yt_limit, 10)  # YouTube system max is 10
+        other_candidates = [candidate for candidate in candidates if candidate.adapter not in lane_adapters]
 
-        protected_youtube = youtube_candidates[:yt_limit]
-
-        # 3. Apply source limits to non-YouTube candidates
+        # Apply source limits to non-lane candidates first, then trim to the remaining
+        # capacity after reserved lane quotas.
         other_candidates = _apply_source_limits(
             profile,
             other_candidates,
             target_limit=_explicit_total_limit(profile),
         )
+        non_lane_capacity = max(0, target_capacity - len(lane_candidates))
+        deduped_other = _dedupe_candidates(other_candidates, limit=non_lane_capacity)
 
-        # 4. Deduplicate non-YouTube candidates leaving room for protected YouTube candidates
-        target_capacity = max(1, context.candidate_limit)
-        non_yt_capacity = max(0, target_capacity - len(protected_youtube))
-        deduped_other = _dedupe_candidates(other_candidates, limit=non_yt_capacity)
-
-        # 5. Combine and sort
-        combined = list(protected_youtube) + list(deduped_other)
-        candidates = sorted(combined, key=lambda c: c.score, reverse=True)
+        # Combine reserved lane results with the backfilled candidate stream.
+        candidates = sorted(list(lane_candidates) + list(deduped_other), key=lambda c: c.score, reverse=True)
 
         excluded_statuses = [
             AdapterStatus(name=name, status="skipped", message="Source was turned off for this exploration.")
@@ -260,6 +272,8 @@ class DiscoveryRunner:
 
 
 def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candidate]:
+    if limit <= 0:
+        return []
     ranked = sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
     seen: set[str] = set()
     deduped: list[Candidate] = []
@@ -269,7 +283,7 @@ def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candi
             continue
         seen.add(key)
         deduped.append(candidate)
-        if len(deduped) >= max(1, limit):
+        if len(deduped) >= limit:
             break
     return deduped
 
@@ -319,6 +333,16 @@ def _explicit_total_limit(profile: TopicProfile) -> int | None:
     if total < 1:
         return None
     return min(total, 250)
+
+
+def _lane_limit(profile: TopicProfile, adapter_name: str, *, default: int, system_max: int) -> int:
+    per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else None
+    if not isinstance(per_source, dict):
+        return min(default, system_max)
+    raw_limit = _source_limit(per_source.get(adapter_name))
+    if raw_limit is None:
+        return min(default, system_max)
+    return min(raw_limit, system_max)
 
 
 def _source_limit(value: Any) -> int | None:

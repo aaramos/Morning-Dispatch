@@ -692,11 +692,11 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                     "total_items": 9,
                     "target_items": 6,
                     "lead_items": 2,
-                    "per_source": {"web_search": 5, "reddit": 2},
-                    "quality_floor": "strong",
-                },
-                "lookback_hours": 168,
-                "pipeline_limits": {
+                "per_source": {"web_search": 5, "reddit": 2},
+                "quality_floor": "strong",
+            },
+            "lookback_hours": 168,
+            "pipeline_limits": {
                     "article_fetches": 90,
                     "article_fetch_concurrency": 4,
                     "model_refinement_items": 30,
@@ -711,16 +711,16 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         assert updated.status_code == 200
         assert updated.json()["profile"]["content_limits"] == {
             "lead_items": 2,
-            "per_source": {
-                "collections": 15,
-                "foreign_media": 15,
-                "gmail": 15,
-                "markets": 15,
-                "podcasts": 15,
-                "reddit": 2,
-                "web_search": 5,
-                "youtube": 10,
-            },
+                "per_source": {
+                    "collections": 15,
+                    "foreign_media": 15,
+                    "gmail": 15,
+                    "markets": 15,
+                    "podcasts": 10,
+                    "reddit": 2,
+                    "web_search": 5,
+                    "youtube": 10,
+                },
             "quality_floor": "strong",
             "target_items": 6,
             "total_items": 9,

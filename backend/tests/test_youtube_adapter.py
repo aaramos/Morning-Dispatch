@@ -356,6 +356,7 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
     
     status = brief_settings_status(settings)
     assert status["youtube_presets"] == {"max": 10, "large": 8, "medium": 5, "focused": 3}
+    assert status["podcast_presets"] == {"max": 10, "large": 7, "medium": 5, "focused": 3}
     
     # Save modified defaults
     modified_defaults = {
@@ -368,12 +369,15 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
             "per_source": {"youtube": 8},
         },
         "youtube_presets": {"max": 10, "large": 9, "medium": 6, "focused": 4},
+        "podcast_presets": {"max": 10, "large": 7, "medium": 4, "focused": 2},
     }
     
     updated_status = save_brief_defaults(settings, modified_defaults)
     assert updated_status["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
+    assert updated_status["podcast_presets"] == {"max": 10, "large": 7, "medium": 4, "focused": 2}
     # Verify the YouTube preset limit is correctly saved
     assert updated_status["defaults"]["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
+    assert updated_status["defaults"]["podcast_presets"] == {"max": 10, "large": 7, "medium": 4, "focused": 2}
 
 
 def test_youtube_email_html_link_transformation() -> None:
@@ -403,6 +407,94 @@ def test_youtube_email_html_link_transformation() -> None:
     assert 'target="_blank"' in transformed_html
     assert 'data-youtube-url' not in transformed_html
     assert 'data-youtube-modal-target' not in transformed_html
+
+
+def test_podcast_media_card_modal_summary_transcript_and_controls() -> None:
+    payload = NormalizedPayload(
+        source_type="podcast_episode",
+        source_name="AI Insight Podcast",
+        raw_text="Transcript text about practical podcast engineering workflows and validation.",
+        original_url="https://podcast.example.com/show/episode-1",
+        published_at="2026-05-21T12:00:00Z",
+        metadata={
+            "podcast_title": "AI Insight Podcast",
+            "title": "The Future of local model orchestration",
+            "duration_seconds": 1680,
+            "podcast_episode_id": "ep-101",
+            "transcript_source": "transcript",
+            "episode_url": "https://podcast.example.com/show/episode-1",
+            "audio_url": "https://cdn.example.com/audio.mp3",
+            "apple_podcasts_url": "https://podcasts.apple.com/podcast/ep-1",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://podcast.example.com/show/episode-1",
+        final_url="https://podcast.example.com/show/episode-1",
+        canonical_url="https://podcast.example.com/show/episode-1",
+        title="The Future of local model orchestration",
+        text=payload.raw_text,
+        excerpt="A practical discussion of local model orchestration workflows.",
+        domain="podcast.example.com",
+        status="fetched",
+        link_score=0.95,
+        section="Podcasts",
+        content_type="podcast",
+        editor_summary="A practical summary of local model orchestration.",
+    )
+
+    html = database.render_ingested_issue(
+        "Podcast Brief",
+        "Production-ready podcast test",
+        [payload],
+        [result],
+        lookback_hours=48,
+    )
+
+    assert "data-podcast-modal-target" in html
+    assert "podcast-modal" in html
+    assert "podcast-player" in html
+    assert "A practical summary of local model orchestration." in html
+    assert "Summary" in html
+    assert "Transcript" in html
+    assert "data-podcast-speed=\"0.75\"" in html
+    assert "data-podcast-speed=\"1.25\"" in html
+    assert "data-podcast-url" in html
+
+
+def test_podcast_email_html_link_transformation() -> None:
+    from backend.app.services.email_delivery import _email_html
+
+    html_input = """
+    <html>
+      <body>
+        <div class="feedback-controls">Rate this brief</div>
+        <a href="#podcast-episode" data-podcast-modal-target="podcast-episode" data-podcast-url="https://podcasts.apple.com/podcast/ep-1">
+          Listen to AI Insight with Jane
+        </a>
+        <div class="podcast-modal" id="podcast-episode">
+          <section class="podcast-summary">
+            <h4>Summary</h4>
+            <p>Episode summary</p>
+          </section>
+          <section class="podcast-transcript">
+            <p>Transcript content</p>
+          </section>
+        </div>
+        <script>alert('hello');</script>
+      </body>
+    </html>
+    """
+    
+    transformed_html = _email_html(html_input)
+    
+    assert "feedback-controls" not in transformed_html
+    assert "podcast-modal" not in transformed_html
+    assert "<script>" not in transformed_html
+    assert 'href="https://podcasts.apple.com/podcast/ep-1"' in transformed_html
+    assert 'target="_blank"' in transformed_html
+    assert 'data-podcast-url' not in transformed_html
+    assert 'data-podcast-modal-target' not in transformed_html
 
 
 def test_youtube_capacity_protection_and_lane_sorting() -> None:
@@ -465,3 +557,57 @@ def test_youtube_capacity_protection_and_lane_sorting() -> None:
     assert "https://youtube.com/watch?v=yt-7" in yt_urls
     assert "https://youtube.com/watch?v=yt-0" not in yt_urls
 
+
+def test_podcast_lane_isolation_from_web_candidates() -> None:
+    from backend.agents.discovery.runner import DiscoveryRunner
+    from backend.agents.discovery.registry import SourceRegistry
+    from backend.agents.discovery.types import TopicProfile, SourceAdapterContext
+    from backend.tests.test_explore_discovery import FakeAdapter, candidate
+
+    podcast_candidates = [
+        candidate("podcasts", f"https://podcast.example.com/episode-{i}", 0.55 + i * 0.02)
+        for i in range(12)
+    ]
+    podcast_adapter = FakeAdapter("podcasts", podcast_candidates)
+    podcast_adapter.good_for = ("breaking_news",)
+
+    web_candidates = [
+        candidate("web_search", f"https://example.com/web-{i}", 0.9 - i * 0.01)
+        for i in range(8)
+    ]
+    web_adapter = FakeAdapter("web_search", web_candidates)
+    web_adapter.good_for = ("breaking_news",)
+
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "AI agents for local infrastructure",
+            "scope": "AI agents for local infrastructure",
+            "source_selection": {"podcasts": True, "web_search": True},
+            "content_limits": {
+                "per_source": {"podcasts": 10},
+                "total_items": 10,
+            },
+        }
+    )
+
+    registry = SourceRegistry([podcast_adapter, web_adapter])
+    runner = DiscoveryRunner(registry)
+    result = asyncio.run(
+        runner.run(
+            profile,
+            context=SourceAdapterContext(exploration_id="explore-podcast-lane", candidate_limit=4),
+        )
+    )
+
+    candidates = result.candidates
+    podcast_results = [c for c in candidates if c.adapter == "podcasts"]
+    web_results = [c for c in candidates if c.adapter == "web_search"]
+
+    assert len(candidates) == 4
+    assert len(podcast_results) == 4
+    assert len(web_results) == 0
+
+    # podcast items should come from highest scoring podcast candidates
+    assert "https://podcast.example.com/episode-11" in {c.payload.original_url for c in podcast_results}
+    assert "https://podcast.example.com/episode-10" in {c.payload.original_url for c in podcast_results}
+    assert "https://podcast.example.com/episode-0" not in {c.payload.original_url for c in podcast_results}
