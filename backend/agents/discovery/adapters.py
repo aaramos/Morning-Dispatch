@@ -7,7 +7,7 @@ from typing import Any
 
 from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes
-from backend.agents.digestor.reddit import fetch_reddit_threads
+from backend.agents.digestor.reddit import RedditSource, fetch_reddit_threads
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.text_utils import STOPWORDS
 from backend.agents.discovery.types import (
@@ -62,12 +62,14 @@ class RedditSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         source_digest_id = _digest_id_with_reddit_sources()
-        if source_digest_id is None:
+        planned_sources = _reddit_sources_from_plan(profile)
+        if source_digest_id is None and not planned_sources:
             return []
         payloads = await fetch_reddit_threads(
-            digest_id=source_digest_id,
+            digest_id=source_digest_id or context.exploration_id,
             digest_interest=profile.query_for_source(self.name),
-            lookback_hours=context.lookback_hours,
+            lookback_hours=context.lookback_hours or 24 * 365,
+            sources_override=planned_sources or None,
         )
         return [
             Candidate(
@@ -90,7 +92,7 @@ class PodcastSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         sources = _approved_podcast_sources()
-        for ref in _requested_refs(profile, "podcasts"):
+        for ref in _source_plan_refs(profile, "podcasts"):
             sources.append({
                 "type": "podcast_search",
                 "title": ref,
@@ -197,20 +199,38 @@ class YouTubeSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         settings = get_settings()
-        query = _web_search_query(profile, _requested_refs(profile, "youtube"), adapter=self.name)
-        result = await search_youtube(
-            api_key=settings.youtube_api_key,
-            query=query,
-            limit=max(1, min(context.candidate_limit, settings.youtube_max_results)),
-            recency_weighting=profile.recency_weighting,
-            duration_filter=settings.youtube_duration_filter,
-            lookback_hours=context.lookback_hours,
-        )
-        if not result.videos:
+        queries = _web_search_queries(profile, _requested_refs(profile, "youtube"), adapter=self.name)[:6]
+        if not queries:
             return []
-
-        candidates = await _youtube_candidates(result.videos)
-        return candidates
+        per_query_limit = max(1, min(12, settings.youtube_max_results, max(1, context.candidate_limit)))
+        results = await asyncio.gather(
+            *(
+                search_youtube(
+                    api_key=settings.youtube_api_key,
+                    query=query,
+                    limit=per_query_limit,
+                    recency_weighting=profile.recency_weighting,
+                    duration_filter=settings.youtube_duration_filter,
+                    lookback_hours=context.lookback_hours,
+                )
+                for query in queries
+            ),
+            return_exceptions=True,
+        )
+        videos_by_id: dict[str, Any] = {}
+        errors: list[BaseException] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                errors.append(result)
+                continue
+            for video in result.videos:
+                videos_by_id.setdefault(video.video_id, video)
+        if not videos_by_id and errors:
+            raise errors[0]
+        if not videos_by_id:
+            return []
+        videos = tuple(videos_by_id.values())[: max(1, min(context.candidate_limit, settings.youtube_max_results))]
+        return await _youtube_candidates(videos)
 
     async def fetch(self, candidate: Candidate) -> Any:
         return candidate.payload
@@ -292,6 +312,45 @@ def _approved_podcast_sources() -> list[dict[str, Any]]:
             records.append(dict(source))
             seen.add(key)
     return records
+
+
+def _source_plan_refs(profile: TopicProfile, adapter: str) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for value in [*_requested_refs(profile, adapter), *profile.source_queries.get(adapter, ())]:
+        ref = _trim_query(str(value or ""), limit=180)
+        key = ref.casefold()
+        if ref and key not in seen:
+            refs.append(ref)
+            seen.add(key)
+    return refs
+
+
+def _reddit_sources_from_plan(profile: TopicProfile) -> list[RedditSource]:
+    sources: list[RedditSource] = []
+    seen: set[str] = set()
+    for ref in _source_plan_refs(profile, "reddit"):
+        subreddit = _subreddit_from_ref(ref)
+        if not subreddit:
+            continue
+        key = subreddit.lower()
+        if key in seen:
+            continue
+        sources.append(RedditSource(subreddit=subreddit, state="search_only", score=0.62, category="strategy_plan"))
+        seen.add(key)
+        if len(sources) >= 20:
+            break
+    return sources
+
+
+def _subreddit_from_ref(value: str) -> str:
+    match = re.search(r"(?:^|\s)r/([A-Za-z0-9_]{2,40})\b", value)
+    if match:
+        return match.group(1)
+    stripped = value.strip().strip("/")
+    if re.fullmatch(r"[A-Za-z0-9_]{2,40}", stripped):
+        return stripped
+    return ""
 
 
 def _sources(digest: dict[str, Any]) -> list[dict[str, Any]]:

@@ -253,6 +253,53 @@ Return only sources you are improving; omit keys you are not changing.
 """.strip()
 
 
+STRATEGY_REFINEMENT_SYSTEM_PROMPT = """
+You revise an already-confirmed Morning Dispatch search strategy from a user's
+natural-language instruction.
+
+Apply the instruction directly to the retrieval plan. Preserve the user's
+original intent and selected sources unless the instruction explicitly changes
+them. Prefer concrete, executable queries over abstract themes. Use
+source-shaped phrasing: native-language terms for foreign media, subreddit or
+community phrasing for Reddit, show/channel/topic phrasing for podcasts and
+YouTube, and ticker symbols for markets.
+
+Return strict JSON only:
+{
+  "profile_patch": {
+    "scope": "optional refined scope",
+    "subtopics": ["new facet"],
+    "keywords": ["new term"],
+    "search_queries": ["general query"],
+    "source_queries": {
+      "web_search": ["query"],
+      "foreign_media": ["native-language query"],
+      "reddit": ["r/Subreddit topic phrase"],
+      "youtube": ["video/channel query"],
+      "podcasts": ["show or episode topic"],
+      "collections": ["local document query"],
+      "markets": ["TICKER"]
+    },
+    "foreign_language_plan": [
+      {
+        "code": "zh",
+        "name": "Chinese",
+        "native_query": "idiomatic native-language query",
+        "native_entity_terms": ["native entity"],
+        "reason": "why this language helps"
+      }
+    ],
+    "requested_sources": [{"adapter": "reddit|podcasts|youtube|web_search|foreign_media|gmail|collections|markets", "ref": "specific source named by the user"}],
+    "recency_weighting": "breaking|recent|last_year|all_available",
+    "lookback_hours": 336,
+    "exclusions": ["thing to avoid"]
+  },
+  "reasoning_summary": "one concise sentence describing what changed"
+}
+Only include fields that should change.
+""".strip()
+
+
 def start_session(payload: dict[str, Any]) -> dict[str, Any]:
     statement = str(payload.get("statement") or "").strip()
     if not statement:
@@ -424,6 +471,168 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         topic_id=topic_id,
     )
     return _session_response(updated) if updated else None
+
+
+def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    session = database.get_refinement_session(session_id)
+    if session is None:
+        return None
+    instruction = " ".join(str(payload.get("instruction") or "").split()).strip()
+    if not instruction:
+        raise ValueError("Strategy refinement instruction is required")
+    profile = dict(session["profile"])
+    profile = _apply_models(profile, payload.get("models"))
+    deterministic_patch = _strategy_refinement_patch(profile, instruction)
+    agent_update = _run_strategy_refinement_agent(profile=profile, instruction=instruction)
+    profile = _merge_agent_profile_patch(profile, deterministic_patch, user_text=instruction)
+    model_patch = agent_update.get("profile_patch") if isinstance(agent_update, dict) else None
+    if model_patch:
+        profile = _merge_agent_profile_patch(profile, model_patch, user_text=instruction)
+    reasoning_summary = str((agent_update or {}).get("reasoning_summary") or "").strip() if isinstance(agent_update, dict) else ""
+    if reasoning_summary:
+        profile["reasoning_summary"] = reasoning_summary
+    profile = _fill_defaults(profile)
+    pre_critique = _diagnostics_query_snapshot(profile)
+    profile = _critique_search_plan(profile)
+    profile["refinement_diagnostics"] = _enrich_diagnostics(
+        profile,
+        model_profile_patch=model_patch or deterministic_patch,
+        pre_critique=pre_critique,
+        readiness_reason="strategy_refined",
+    )
+    saved = explore.save_topic_profile(profile)
+    messages = [
+        *_messages(session),
+        {"role": "user", "content": instruction},
+        {"role": "assistant", "content": reasoning_summary or "Search strategy updated."},
+    ]
+    updated = database.update_refinement_session(
+        session_id,
+        profile=profile,
+        messages=messages,
+        pending_field=None,
+        turn_count=int(session.get("turn_count") or 0),
+        status="finalized",
+        topic_id=str(saved["topic_id"]),
+    )
+    return _session_response(updated) if updated else None
+
+
+def _run_strategy_refinement_agent(*, profile: dict[str, Any], instruction: str) -> dict[str, Any] | None:
+    client = _refinement_model_client(profile)
+    if client is None:
+        return None
+    prompt = _build_strategy_refinement_prompt(profile=profile, instruction=instruction)
+    try:
+        parsed = _run_sync_complete_json(
+            client.complete_json(
+                system=STRATEGY_REFINEMENT_SYSTEM_PROMPT,
+                prompt=prompt,
+                max_tokens=1600,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to run strategy refinement agent")
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: str) -> str:
+    selected_sources = [
+        source
+        for source, enabled in _source_selection_dict(profile.get("source_selection")).items()
+        if enabled
+    ]
+    return json.dumps(
+        {
+            "task": "Revise the current search strategy using the user's instruction.",
+            "instruction": instruction,
+            "current_profile": {
+                "statement": str(profile.get("statement") or ""),
+                "scope": str(profile.get("scope") or ""),
+                "subtopics": _string_list(profile.get("subtopics")),
+                "keywords": _string_list(profile.get("keywords")),
+                "search_queries": _string_list(profile.get("search_queries"), limit=20),
+                "source_queries": _clean_source_queries(profile.get("source_queries")),
+                "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+                "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
+                "source_selection": _source_selection_dict(profile.get("source_selection")),
+                "selected_sources": selected_sources,
+                "recency_weighting": _normalize_recency(profile.get("recency_weighting")),
+                "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
+                "exclusions": _string_list(profile.get("exclusions")),
+            },
+            "constraints": [
+                "Only add source_queries for selected sources unless the instruction explicitly names a source type to add.",
+                "Do not remove existing useful queries unless the instruction asks to narrow or exclude them.",
+                "Specific named sources may be added to requested_sources.",
+                "Foreign media queries must be native-language or idiomatic local-language terms.",
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _strategy_refinement_patch(profile: dict[str, Any], instruction: str) -> dict[str, Any]:
+    text = instruction.casefold()
+    patch: dict[str, Any] = {
+        "search_queries": _queries_from_statement(instruction)[:4],
+        "source_queries": {},
+    }
+    source_queries: dict[str, list[str]] = {}
+    if any(term in text for term in ("foreign", "china", "chinese", "qwen", "deepseek", "kimi", "minimax", "moonshot")):
+        source_queries["foreign_media"] = [
+            "中国大模型 最新进展 DeepSeek 通义千问 Kimi MiniMax",
+            "DeepSeek 通义千问 Kimi MiniMax 性能评测",
+            "月之暗面 Kimi MiniMax 智谱 百度 文心一言 豆包 混元",
+            "国产大模型 竞争 OpenAI Anthropic 最新消息",
+        ]
+        patch["foreign_language_plan"] = [
+            {
+                "code": "zh",
+                "name": "Chinese",
+                "native_query": "中国大模型 最新进展 DeepSeek 通义千问 Kimi MiniMax",
+                "native_entity_terms": ["DeepSeek", "通义千问", "Kimi", "MiniMax", "智谱", "文心一言", "豆包", "混元"],
+                "reason": "User asked to broaden Chinese AI lab coverage.",
+            }
+        ]
+    if any(term in text for term in ("podcast", "ai daily", "latent space", "hard fork")):
+        source_queries["podcasts"] = _merge_string_lists(
+            profile.get("source_queries", {}).get("podcasts") if isinstance(profile.get("source_queries"), dict) else [],
+            _string_list(instruction, limit=8) + _podcast_show_hints(profile),
+            limit=10,
+        )
+    if any(term in text for term in ("youtube", "video", "channel")):
+        source_queries["youtube"] = _merge_string_lists(
+            profile.get("source_queries", {}).get("youtube") if isinstance(profile.get("source_queries"), dict) else [],
+            _string_list(instruction, limit=8),
+            limit=10,
+        )
+    if "reddit" in text or "subreddit" in text or "r/" in instruction:
+        source_queries["reddit"] = _merge_string_lists(
+            profile.get("source_queries", {}).get("reddit") if isinstance(profile.get("source_queries"), dict) else [],
+            _string_list(instruction, limit=8),
+            limit=10,
+        )
+    lookback = _coerce_lookback_hours_from_instruction(instruction)
+    if lookback:
+        patch["lookback_hours"] = lookback
+    patch["source_queries"] = source_queries
+    return patch
+
+
+def _coerce_lookback_hours_from_instruction(value: str) -> int | None:
+    lowered = value.lower()
+    match = re.search(r"\b(\d{1,3})\s*(hour|hours|day|days|week|weeks)\b", lowered)
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("hour"):
+        return _coerce_lookback_hours(amount)
+    if unit.startswith("day"):
+        return _coerce_lookback_hours(amount * 24)
+    return _coerce_lookback_hours(amount * 7 * 24)
 
 
 def _gmail_refinement_question(profile: dict[str, Any]) -> str | None:
@@ -1562,7 +1771,19 @@ def _ensure_source_query_coverage(profile: dict[str, Any]) -> dict[str, Any]:
 
     foreign_fallback = _foreign_media_fallback_queries(profile)
     for source, enabled in selection.items():
-        if not enabled or queries.get(source):
+        if not enabled:
+            continue
+        if source == "foreign_media" and queries.get(source) and foreign_fallback:
+            queries[source] = _merge_string_lists(queries[source], foreign_fallback, limit=8)
+            continue
+        if source == "podcasts" and queries.get(source):
+            queries[source] = _merge_string_lists(
+                queries[source],
+                _podcast_show_hints(profile),
+                limit=10,
+            )
+            continue
+        if queries.get(source):
             continue
         fallback = _source_specific_fallback(
             source,
@@ -1583,6 +1804,24 @@ def _foreign_media_fallback_queries(profile: dict[str, Any]) -> list[str]:
         if native_query:
             out.append(native_query)
         out.extend(lane.get("native_entity_terms") or [])
+    profile_text = " ".join(
+        [
+            str(profile.get("statement") or ""),
+            str(profile.get("scope") or ""),
+            " ".join(_string_list(profile.get("keywords"))),
+            " ".join(_string_list(profile.get("search_queries"))),
+        ]
+    ).casefold()
+    if any(term in profile_text for term in ("china", "chinese", "qwen", "deepseek", "kimi", "minimax", "moonshot")):
+        out.extend(
+            [
+                "中国大模型 最新进展 DeepSeek 通义千问 Kimi MiniMax",
+                "DeepSeek 通义千问 Kimi MiniMax 性能评测",
+                "国产大模型 竞争 OpenAI Anthropic 最新消息",
+                "月之暗面 Kimi MiniMax 智谱 百度 文心一言 豆包 混元",
+                "华为昇腾 国产算力 大模型 训练 推理",
+            ]
+        )
     return _string_list(out, limit=6)
 
 
@@ -1612,6 +1851,20 @@ def _source_specific_fallback(
     if source == "podcasts":
         return [f"{query} podcast" for query in base]
     return list(base)
+
+
+def _podcast_show_hints(profile: dict[str, Any]) -> list[str]:
+    text = " ".join(
+        [
+            str(profile.get("statement") or ""),
+            str(profile.get("scope") or ""),
+            " ".join(_string_list(profile.get("keywords"))),
+            " ".join(_string_list(profile.get("search_queries"))),
+        ]
+    ).casefold()
+    if profile and not any(term in text for term in ("ai", "llm", "model", "openai", "anthropic", "local")):
+        return []
+    return ["AI Daily", "Latent Space AI", "The AI Podcast", "Hard Fork", "Practical AI"]
 
 
 def _baseline_diagnostics(profile: dict[str, Any]) -> dict[str, Any]:
@@ -1914,9 +2167,9 @@ def _strategy_deepening_question(profile: dict[str, Any], messages: list[dict[st
         return _first_unasked_question(
             messages,
             [
-                "What would make this brief actionable for you: catalysts, risks, valuation context, or company-by-company comparisons?",
-                "Which evidence should carry the most weight: earnings commentary, pricing data, supply-chain capacity, customer demand, or analyst revisions?",
-                "Do you want the final brief organized by company, by signal type, or by near-term catalyst?",
+                "I have market signals in the plan; which companies, suppliers, or catalysts are missing from the search strategy?",
+                "Which evidence should carry the most weight: company filings, earnings commentary, pricing data, supply-chain capacity, customer demand, or analyst revisions?",
+                "Should the market section be organized by company, signal type, or near-term catalyst?",
             ],
         )
     if _string_list(profile.get("search_queries")) or _clean_source_queries(profile.get("source_queries")):
@@ -1925,14 +2178,14 @@ def _strategy_deepening_question(profile: dict[str, Any], messages: list[dict[st
             [
                 "What kind of evidence should I trust most for this brief: primary reporting, expert analysis, community signal, or practical examples?",
                 "Should the brief prioritize breadth across sources or depth on the strongest few items?",
-                "What would make the final brief useful enough to act on?",
+                "Looking at this search strategy, what sources, entities, or angles are missing?",
             ],
         )
     return _first_unasked_question(
         messages,
         [
             _search_strategy_question(profile),
-            "What would make the final brief useful enough to act on?",
+            "What sources, entities, or angles should the search strategy add before I build?",
             "Should I prioritize breadth across sources or depth on the strongest few items?",
         ],
     )

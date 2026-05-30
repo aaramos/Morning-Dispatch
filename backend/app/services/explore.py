@@ -172,6 +172,10 @@ async def source_status() -> dict[str, Any]:
         else:
             gmail_reason = "Finish the Gmail connection in Admin Sources."
     reddit_enabled = bool((mcp.get("reddit") or {}).get("connected"))
+    reddit_source_count = sum(
+        len(database.list_reddit_sources(str(digest.get("id") or ""), include_retired=False))
+        for digest in database.list_digests(include_archived=False)
+    )
     podcast_sources = _all_configured_podcast_sources()
     podcast_enabled = bool(
         settings.podcastindex_api_key
@@ -222,18 +226,21 @@ async def source_status() -> dict[str, Any]:
                 "enabled": reddit_enabled,
                 "setup_required": not reddit_enabled,
                 "reason": None if reddit_enabled else "Reddit MCP is not connected.",
+                "configured_source_count": reddit_source_count,
             },
             "podcasts": {
                 "label": "Podcast",
                 "enabled": podcast_enabled,
                 "setup_required": not podcast_enabled,
                 "reason": None if podcast_enabled else "Add Podcast Index credentials in Admin Sources.",
+                "configured_source_count": len(podcast_sources),
             },
             "youtube": {
                 "label": "YouTube",
                 "enabled": youtube_enabled,
                 "setup_required": not youtube_enabled,
                 "reason": youtube_reason,
+                "quota_units_used": youtube_units,
             },
             "collections": {
                 "label": "Collections",
@@ -551,7 +558,7 @@ async def _run_exploration(
         )
         _set_pipeline_stage(progress, "discovery", "done")
         _set_exclusion_reasons(progress, discovery.exclusions)
-        _set_requested_source_issues(progress, _requested_source_issues(profile, discovery, merged_selection))
+        _set_requested_source_issues(progress, _build_source_issues(profile, discovery, merged_selection))
         _persist_progress(exploration_id, progress)
 
         for status in discovery.statuses:
@@ -600,6 +607,7 @@ async def _run_exploration(
             persist=lambda: _persist_progress(exploration_id, progress),
         )
         stage_seconds["editorial"] = _elapsed_stage_seconds(stage_started)
+        _add_final_source_mix_issues(progress, discovery, article_results, merged_selection)
         if mode == "scheduled":
             _promote_explore_sources(topic_id=topic_id, discovery=discovery, article_results=article_results)
         _set_pipeline_stage(progress, "done", "running")
@@ -737,6 +745,70 @@ def _apply_model_health_to_progress(progress: dict[str, Any], stats: dict[str, A
         issues.append(issue)
     progress["source_audit_issues"] = issues
     progress["built_with_issues"] = True
+
+
+def _add_final_source_mix_issues(
+    progress: dict[str, Any],
+    discovery: DiscoveryResult,
+    article_results: list[ArticleFetchResult],
+    source_selection: dict[str, bool],
+) -> None:
+    payload_adapters = {candidate.payload.id: candidate.adapter for candidate in discovery.candidates}
+    included_counts: dict[str, int] = {}
+    for result in article_results:
+        if result.fetched and result.tier != "dropped":
+            adapter = payload_adapters.get(result.payload.id, _adapter_from_payload_type(result.payload.source_type))
+            if adapter:
+                included_counts[adapter] = included_counts.get(adapter, 0) + 1
+    candidate_counts = {status.name: status.candidate_count for status in discovery.statuses}
+    selected_non_gmail = {
+        source
+        for source, enabled in source_selection.items()
+        if enabled and source not in {"gmail", "collections"}
+    }
+    if not selected_non_gmail:
+        return
+    issues = list(progress.get("requested_source_issues") or [])
+    for source in sorted(selected_non_gmail):
+        if included_counts.get(source, 0) > 0:
+            continue
+        candidate_count = candidate_counts.get(source, 0)
+        if candidate_count > 0:
+            reason = (
+                f"{_adapter_label(source)} returned {candidate_count} candidate(s), "
+                "but none survived fetch, audit, ranking, and review into the final brief."
+            )
+        else:
+            reason = f"{_adapter_label(source)} was selected but returned no usable candidates for this run."
+        issue = {"source_name": _adapter_label(source), "reason": reason}
+        if issue not in issues:
+            issues.append(issue)
+    if issues != list(progress.get("requested_source_issues") or []):
+        progress["requested_source_issues"] = issues
+        progress["built_with_issues"] = True
+    if not any(included_counts.get(source, 0) for source in selected_non_gmail) and included_counts.get("gmail", 0):
+        issues = list(progress.get("requested_source_issues") or [])
+        issue = {
+            "source_name": "Source mix",
+            "reason": "Requested non-Gmail sources produced no included stories; this brief is relying on Gmail/newsletter fallback content.",
+        }
+        if issue not in issues:
+            issues.append(issue)
+        progress["requested_source_issues"] = issues
+        progress["built_with_issues"] = True
+
+
+def _adapter_from_payload_type(source_type: str) -> str:
+    return {
+        "gmail": "gmail",
+        "gmail_link": "gmail",
+        "reddit_thread": "reddit",
+        "podcast_episode": "podcasts",
+        "youtube_video": "youtube",
+        "foreign_web": "foreign_media",
+        "market_snapshot": "markets",
+        "collection_chunk": "collections",
+    }.get(source_type, "")
 
 
 def _promote_explore_sources(
@@ -1553,11 +1625,52 @@ def _requested_source_issues(
         status = next((item for item in discovery.statuses if item.name == adapter), None)
         if status and status.message:
             reason = status.message
+        elif adapter == "markets":
+            reason = "Markets price data was requested, but no usable ticker or price items were returned for this run."
         elif status and status.status in {"timed_out", "failed", "skipped"}:
             reason = f"{_adapter_label(adapter)} {status.status.replace('_', ' ')}."
         else:
             reason = "Source could not be found or returned no usable items."
         issues.append({"source_name": source_name, "reason": reason})
+    return issues
+
+
+def _build_source_issues(
+    profile: TopicProfile,
+    discovery: DiscoveryResult,
+    source_selection: dict[str, bool],
+) -> list[dict[str, str]]:
+    issues = _requested_source_issues(profile, discovery, source_selection)
+    statuses = {status.name: status for status in discovery.statuses}
+    for source, enabled in source_selection.items():
+        if not enabled or source in {"collections"}:
+            continue
+        status = statuses.get(source)
+        if status is None:
+            continue
+        if status.candidate_count > 0:
+            continue
+        if status.status == "failed" and status.message:
+            reason = status.message
+        elif source == "markets":
+            reason = "Markets price data returned no usable ticker items."
+        elif source == "reddit":
+            reason = "Reddit was selected but returned no usable threads. Check subreddit targets or broaden the query."
+        elif source == "podcasts":
+            reason = "Podcasts were selected but returned no usable episodes. Check show targets or broaden the query."
+        elif source == "youtube":
+            reason = "YouTube was selected but returned no videos with usable transcripts."
+        elif source == "foreign_media":
+            reason = "Foreign media was selected but no native-language results survived filtering."
+        elif source == "web_search":
+            reason = "Web search returned no usable results."
+        elif source == "gmail":
+            reason = "Gmail was selected but no approved newsletter items were usable."
+        else:
+            reason = f"{_adapter_label(source)} returned no usable items."
+        issue = {"source_name": _adapter_label(source), "reason": reason}
+        if issue not in issues:
+            issues.append(issue)
     return issues
 
 

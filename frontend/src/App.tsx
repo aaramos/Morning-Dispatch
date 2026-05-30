@@ -13,6 +13,8 @@ type SourceStatus = {
   enabled: boolean;
   setup_required: boolean;
   reason: string | null;
+  configured_source_count?: number;
+  quota_units_used?: number;
   root_path?: string;
   collection_count?: number;
   indexed_count?: number;
@@ -348,6 +350,7 @@ type ConfirmationDraft = {
   scope: string;
   depth: "practitioner" | "informed-generalist";
   recency_weighting: SourceScope;
+  lookback_hours: number;
   exclusions: string;
   content_limits: ContentLimitsDraft;
   sourceScopeTouched?: boolean;
@@ -684,7 +687,9 @@ function DispatchApp() {
   );
   const visibleBuild = flow === "building"
     ? exploration
-    : (flow === "idle" || flow === "ready") ? backgroundBuild : null;
+    : flow === "ready"
+      ? exploration
+      : flow === "idle" ? backgroundBuild : null;
   const refinementWorking = busy && !enableSource && !exploration && flow === "refining";
   const activeRefinementProgress = useMemo<RefinementProgress | null>(() => {
     if (refinementProgress) return refinementProgress;
@@ -859,11 +864,52 @@ function DispatchApp() {
     }
   }
 
+  async function refineSearchStrategy(instruction: string) {
+    const cleanInstruction = instruction.trim();
+    if (!cleanInstruction) return;
+    const baseStatement = activeInterest || topicProfile?.statement || session?.statement || "";
+    if (!baseStatement) return;
+    setBusy(true);
+    setMessage("Updating search strategy...");
+    beginRefinementProgress("answering", "Updating search strategy");
+    try {
+      const currentSession = session ?? await api<RefinementSession>("/api/explore/refinement-sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          statement: baseStatement,
+          topic_id: topicProfile?.topic_id,
+          revisit: Boolean(topicProfile?.topic_id),
+          source_selection: selectedEnabledSources,
+          models: {},
+        }),
+      });
+      const updated = await api<RefinementSession>(`/api/explore/refinement-sessions/${currentSession.session_id}/strategy`, {
+        method: "POST",
+        body: JSON.stringify({
+          instruction: cleanInstruction,
+          models: {},
+        }),
+      });
+      setSession(updated);
+      setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
+      if (updated.topic_profile) setTopicProfile(updated.topic_profile);
+      setFlow("confirm");
+      setMessage("Search strategy updated");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not update search strategy"));
+    } finally {
+      setBusy(false);
+      endRefinementProgress();
+    }
+  }
+
   function confirmedProfilePayload(): ConfirmedProfilePayload {
     const baseProfile = session?.profile ?? topicProfile?.profile;
     const topicId = topicProfile?.topic_id ?? session?.topic_id ?? baseProfile?.topic_id;
     const interest = activeInterest || baseProfile?.statement || "";
-    const lookbackHours = lookbackHoursForConfirmedDraft(baseProfile, draft, defaultControls.lookback_hours);
+    const lookbackHours = draft.recency_weighting === "all_available"
+      ? null
+      : lookbackHoursForConfirmedDraft(baseProfile, draft, defaultControls.lookback_hours);
     return {
       ...(topicId ? { topic_id: topicId } : {}),
       ...(session?.session_id ? { refinement_session_id: session.session_id } : {}),
@@ -1396,22 +1442,7 @@ function DispatchApp() {
         </header>
 
         <section className="dispatch-body">
-          {activeDigest ? (
-            <div className="active-digest-row">
-              <span className="live-dot" />
-              <strong>{profileName(activeDigest)}</strong>
-              <button
-                type="button"
-                className="active-digest-link"
-                onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}
-                disabled={!activeDigest.latest_exploration}
-              >
-                Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}
-              </button>
-            </div>
-          ) : null}
-
-          {homeRecentItems.length ? (
+          {homeRecentItems.length || activeDigest ? (
             <div className="recent-block">
               <div className="section-header-row">
                 <p className="section-kicker">Recent Briefs</p>
@@ -1423,6 +1454,20 @@ function DispatchApp() {
               </div>
               {recentExpanded ? (
                 <>
+                  {activeDigest ? (
+                    <div className="active-digest-row">
+                      <span className="live-dot" />
+                      <strong>{profileName(activeDigest)}</strong>
+                      <button
+                        type="button"
+                        className="active-digest-link"
+                        onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}
+                        disabled={!activeDigest.latest_exploration}
+                      >
+                        Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}
+                      </button>
+                    </div>
+                  ) : null}
                   <div className="recent-list">
                     {homeRecentItems.map((item) => (
                       <div className="recent-pill-row" key={homeRecentKey(item)}>
@@ -1487,6 +1532,7 @@ function DispatchApp() {
               busy={busy}
               onDraftChange={setDraft}
               onSourceClick={updateSource}
+              onStrategyRefine={(instruction) => void refineSearchStrategy(instruction)}
               onBuild={() => void buildBrief()}
             />
           ) : null}
@@ -1883,10 +1929,14 @@ function ConfirmationPanel(props: {
   busy: boolean;
   onDraftChange: (draft: ConfirmationDraft) => void;
   onSourceClick: (source: SourceKey) => void;
+  onStrategyRefine: (instruction: string) => void;
   onBuild: () => void;
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [strategyInstruction, setStrategyInstruction] = useState("");
   const contentLimitErrors = validateContentLimits(props.draft.content_limits, props.sources);
+  const searchPlanGroups = sourceSearchPlanGroups(props.profile);
+  const readinessItems = sourceReadinessItems(props.sources, props.sourceStatus, props.profile);
 
   function updateContentLimits(next: ContentLimitsDraft) {
     props.onDraftChange({ ...props.draft, content_limits: next });
@@ -1926,6 +1976,7 @@ function ConfirmationPanel(props: {
             onChange={(event) => props.onDraftChange({
               ...props.draft,
               recency_weighting: event.target.value as ConfirmationDraft["recency_weighting"],
+              lookback_hours: lookbackHoursFromSourceScope(event.target.value as SourceScope),
               sourceScopeTouched: true,
             })}
           >
@@ -1934,8 +1985,19 @@ function ConfirmationPanel(props: {
             <option value="last_year">Within Last Year</option>
             <option value="all_available">As Much as possible</option>
           </select>
-          <small>{sourceScopeConfirmation(props.draft.recency_weighting)}</small>
+          <small>{sourceScopeConfirmation(props.draft.recency_weighting, props.draft.lookback_hours)}</small>
         </label>
+        <NumberStepper
+          label="Recency window (days)"
+          value={Math.max(1, Math.round(props.draft.lookback_hours / 24))}
+          min={briefControlBounds.source_window_days.min}
+          max={briefControlBounds.source_window_days.max}
+          onChange={(days) => props.onDraftChange({
+            ...props.draft,
+            lookback_hours: clampContentLimit(days, 1, 365) * 24,
+            sourceScopeTouched: true,
+          })}
+        />
         <label>
           Exclusions
           <input
@@ -1946,6 +2008,12 @@ function ConfirmationPanel(props: {
         </label>
       </div>
       <SourceChips selection={props.sources} status={props.sourceStatus} locked={false} onToggle={props.onSourceClick} />
+      <div className="source-readiness-list">
+        <strong>Source readiness</strong>
+        {readinessItems.map((item) => (
+          <span className={item.ready ? "ready" : "warning"} key={item.key}>{item.label}: {item.message}</span>
+        ))}
+      </div>
       {props.profile?.requested_sources?.length ? (
         <div className="requested-source-list">
           <strong>Requested sources</strong>
@@ -1961,14 +2029,42 @@ function ConfirmationPanel(props: {
           <span>{gmailLookbackLabel(props.profile.gmail_rules.lookback_hours)} · {props.profile.gmail_rules.include_senders.join(", ")}</span>
         </div>
       ) : null}
-      {searchPlanItems(props.profile).length ? (
+      {searchPlanGroups.length ? (
         <div className="search-plan-list">
           <strong>Search plan</strong>
-          {searchPlanItems(props.profile).map((query) => (
-            <span key={query}>{query}</span>
+          {searchPlanGroups.map((group) => (
+            <div className="search-plan-group" key={group.key}>
+              <b>{group.label}</b>
+              <div>
+                {group.queries.map((query) => (
+                  <span key={`${group.key}-${query}`}>{query}</span>
+                ))}
+              </div>
+            </div>
           ))}
         </div>
       ) : null}
+      <div className="strategy-refine-box">
+        <label>
+          Refine search strategy
+          <textarea
+            value={strategyInstruction}
+            onChange={(event) => setStrategyInstruction(event.target.value)}
+            placeholder="Add missing sources, entities, recency, countries, channels, podcasts, or search terms..."
+          />
+        </label>
+        <button
+          type="button"
+          className="secondary-action"
+          onClick={() => {
+            props.onStrategyRefine(strategyInstruction);
+            setStrategyInstruction("");
+          }}
+          disabled={props.busy || !strategyInstruction.trim()}
+        >
+          Update strategy
+        </button>
+      </div>
       <div className="advanced-settings-shell">
         <DisclosureButton
           expanded={advancedOpen}
@@ -2022,8 +2118,31 @@ function ContentLimitsPanel(props: {
     });
   }
 
+  function applyPreset(scale: number) {
+    const scaled = (value: number, min: number, max: number) => clampContentLimit(Math.round(value * scale), min, max);
+    const nextPerSource: Partial<Record<SourceKey, number>> = {};
+    for (const source of sourceOptions) {
+      const maxValue = defaults.per_source[source.key] ?? briefControlBounds.per_source.max;
+      nextPerSource[source.key] = scaled(maxValue, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
+    }
+    props.onChange({
+      ...props.limits,
+      total_items: scaled(defaults.total_items, briefControlBounds.total_items.min, briefControlBounds.total_items.max),
+      target_items: scaled(defaults.target_items, briefControlBounds.target_items.min, briefControlBounds.target_items.max),
+      lead_items: scaled(defaults.lead_items, briefControlBounds.lead_items.min, briefControlBounds.lead_items.max),
+      per_source: nextPerSource,
+    });
+  }
+
   return (
     <div className="content-limits-panel">
+      <div className="preset-control-row">
+        <strong>Load preset</strong>
+        <button type="button" onClick={() => applyPreset(1)}>Max</button>
+        <button type="button" onClick={() => applyPreset(0.8)}>Large</button>
+        <button type="button" onClick={() => applyPreset(0.6)}>Medium</button>
+        <button type="button" onClick={() => applyPreset(0.4)}>Focused</button>
+      </div>
       <div className="content-limit-grid">
         <NumberStepper
           label="Candidate budget"
@@ -2384,10 +2503,6 @@ function BriefReadyPanel(props: {
 }) {
   return (
     <section className="brief-ready-panel">
-      <div className="ready-footer">
-        <strong>{isModelDegraded(props.exploration) ? "Brief ready with AI issues" : "Brief ready"}</strong>
-        <button type="button" onClick={props.onOpen}>Open brief</button>
-      </div>
       {props.issues.length ? (
         <a className="brief-issue-link" href={`/admin?tab=library&issue_run=${props.exploration.exploration_id}`}>
           Issue Built without request sources; click here for details
@@ -4115,7 +4230,10 @@ function AdminApp() {
                 {status.inference_metrics.routes.map((route) => (
                   <article className="metrics-table-row" key={`${route.route_name}-${route.model}-${route.backend ?? "unknown"}`}>
                     <span>{formatStage(route.route_name)}</span>
-                    <strong>{route.model}</strong>
+                    <strong>
+                      {route.model}
+                      {currentRouteModel(status, route.route_name) === route.model ? <em>Current</em> : <em>Historical</em>}
+                    </strong>
                     <span>{route.record_count}</span>
                     <span>{formatMetricMs(route.avg_total_ms)}</span>
                     <span>{formatMetricMs(route.p95_total_ms ?? null)}</span>
@@ -4349,6 +4467,7 @@ function emptyDraft(defaults = defaultContentLimits): ConfirmationDraft {
     scope: "",
     depth: "informed-generalist",
     recency_weighting: "recent",
+    lookback_hours: defaultBriefControls.lookback_hours,
     exclusions: "",
     content_limits: defaults,
     sourceScopeTouched: false,
@@ -4360,6 +4479,7 @@ function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits
     scope: profile.scope || profile.statement || "",
     depth: profile.depth === "practitioner" ? "practitioner" : "informed-generalist",
     recency_weighting: sourceScopeFromProfile(profile),
+    lookback_hours: lookbackHoursForBuild(profile, undefined, defaultBriefControls.lookback_hours),
     exclusions: (profile.exclusions ?? []).join(", "),
     content_limits: contentLimitsFromProfile(profile, defaults),
     sourceScopeTouched: false,
@@ -4438,11 +4558,14 @@ function addBoundsError(errors: string[], label: string, value: number, min: num
 }
 
 function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number {
-  if (draft.sourceScopeTouched) return lookbackHoursFromSourceScope(draft.recency_weighting);
+  if (draft.sourceScopeTouched) return clampContentLimit(Number(draft.lookback_hours || 0), 1, 8760);
   return lookbackHoursForBuild(profile, draft, defaultLookbackHours);
 }
 
 function lookbackHoursForBuild(profile: TopicProfile | null | undefined, draft?: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number {
+  if (draft?.sourceScopeTouched && Number.isFinite(Number(draft.lookback_hours)) && Number(draft.lookback_hours) >= 1) {
+    return Math.min(8760, Math.floor(Number(draft.lookback_hours)));
+  }
   const explicit = Number(profile?.lookback_hours ?? 0);
   if (Number.isFinite(explicit) && explicit >= 1) return Math.min(8760, Math.floor(explicit));
   if (!draft && Number.isFinite(defaultLookbackHours) && defaultLookbackHours >= 1) {
@@ -4467,7 +4590,11 @@ function lookbackHoursFromSourceScope(sourceScope: SourceScope): number {
   return 24;
 }
 
-function sourceScopeConfirmation(sourceScope: SourceScope): string {
+function sourceScopeConfirmation(sourceScope: SourceScope, lookbackHours?: number): string {
+  if (lookbackHours && sourceScope !== "all_available") {
+    const days = Math.max(1, Math.round(lookbackHours / 24));
+    return `I’ll look for sources dated within the last ${days === 1 ? "day" : `${days} days`}.`;
+  }
   if (sourceScope === "breaking") return "I’ll look for sources dated within the last 24 hours.";
   if (sourceScope === "recent") return "I’ll look for sources dated within the last 3 days.";
   if (sourceScope === "last_year") return "I’ll look for sources dated within the last year.";
@@ -4479,6 +4606,35 @@ function normalizeSourceScope(value: string | undefined): SourceScope {
   if (value === "last_year") return "last_year";
   if (value === "all_available" || value === "evergreen") return "all_available";
   return "recent";
+}
+
+function sourceReadinessItems(
+  selection: Record<SourceKey, boolean>,
+  status: SourceStatusResponse | null,
+  profile: TopicProfile | null,
+): Array<{ key: SourceKey; label: string; ready: boolean; message: string }> {
+  return sourceOptions
+    .filter((source) => selection[source.key])
+    .map((source) => {
+      const sourceStatus = status?.sources[source.key];
+      const queries = profile?.source_queries?.[source.key] ?? [];
+      if (!sourceStatus?.enabled) {
+        return { key: source.key, label: source.label, ready: false, message: sourceStatus?.reason || "not configured" };
+      }
+      if (source.key === "reddit" && !queries.length && !sourceStatus.configured_source_count) {
+        return { key: source.key, label: source.label, ready: false, message: "no subreddit targets yet" };
+      }
+      if (source.key === "podcasts" && !queries.length && !sourceStatus.configured_source_count) {
+        return { key: source.key, label: source.label, ready: false, message: "no show or search targets yet" };
+      }
+      if (source.key === "youtube" && sourceStatus.quota_units_used && sourceStatus.quota_units_used >= 8000) {
+        return { key: source.key, label: source.label, ready: false, message: "quota is high today" };
+      }
+      if (source.key === "foreign_media" && !queries.length && !profile?.foreign_language_plan?.length) {
+        return { key: source.key, label: source.label, ready: false, message: "no native-language plan yet" };
+      }
+      return { key: source.key, label: source.label, ready: true, message: queries.length ? `${queries.length} planned query(s)` : "ready" };
+    });
 }
 
 function searchPlanItems(profile: TopicProfile | null): string[] {
@@ -4500,6 +4656,56 @@ function searchPlanItems(profile: TopicProfile | null): string[] {
     if (item.native_query?.trim()) items.push(`${item.name || item.code}: ${item.native_query.trim()}`);
   }
   return Array.from(new Set(items)).slice(0, 8);
+}
+
+type SearchPlanGroup = {
+  key: string;
+  label: string;
+  queries: string[];
+};
+
+function sourceSearchPlanGroups(profile: TopicProfile | null): SearchPlanGroup[] {
+  if (!profile) return [];
+  const groups: SearchPlanGroup[] = [];
+  const generalQueries = uniqueCleanList(profile.search_queries ?? []);
+  if (generalQueries.length) {
+    groups.push({ key: "general", label: "General", queries: generalQueries });
+  }
+
+  const sourceSelection = profile.source_selection ?? {};
+  const hasSourceSelection = Object.keys(sourceSelection).length > 0;
+  for (const source of sourceOptions) {
+    if (hasSourceSelection && !sourceSelection[source.key]) continue;
+    const queries = uniqueCleanList(profile.source_queries?.[source.key] ?? []);
+    groups.push({
+      key: source.key,
+      label: source.label,
+      queries: queries.length ? queries : [emptySourcePlanLabel(source.key)],
+    });
+  }
+
+  for (const item of profile.foreign_language_plan ?? []) {
+    const nativeQuery = item.native_query?.trim();
+    if (nativeQuery) {
+      groups.push({
+        key: `foreign-${item.code || item.name || nativeQuery}`,
+        label: item.name || item.code || "Foreign Media",
+        queries: [nativeQuery],
+      });
+    }
+  }
+  return groups;
+}
+
+function uniqueCleanList(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function emptySourcePlanLabel(source: SourceKey): string {
+  if (source === "markets") return "No ticker resolved yet";
+  if (source === "foreign_media") return "No native-language query set yet";
+  if (source === "gmail") return "Uses approved newsletter rules";
+  return "Uses general search terms";
 }
 
 function splitList(value: string): string[] {
@@ -4802,6 +5008,11 @@ function formatMetricMs(value: number | null | undefined): string {
 function formatMetricNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "n/a";
   return `${Math.round(value)}`;
+}
+
+function currentRouteModel(status: AdminStatus | null, routeName: string): string | null {
+  const route = status?.model?.routing?.routes?.[routeName];
+  return route?.effective_model ?? route?.model ?? status?.model?.routing?.defaults?.local ?? null;
 }
 
 function formatRate(value: number | null | undefined): string {

@@ -954,6 +954,69 @@ def test_scheduled_run_promotes_deduped_sources(monkeypatch, tmp_path) -> None:
     assert promoted_sources[0]["ref"] == "newsletter@localai.example"
 
 
+def test_final_source_mix_issues_explain_missing_requested_sources() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "topic_id": "topic-source-mix",
+            "statement": "Track local AI deployment",
+            "scope": "Track local AI deployment",
+            "source_selection": {"gmail": True, "reddit": True, "podcasts": True},
+        }
+    )
+    gmail_payload = NormalizedPayload(id="gmail-1", source_type="gmail", source_name="AI Newsletter", raw_text="Newsletter item")
+    reddit_payload = NormalizedPayload(id="reddit-1", source_type="reddit_thread", source_name="LocalLLaMA", raw_text="Thread item")
+    discovery = DiscoveryResult(
+        profile=profile,
+        candidates=(
+            Candidate(adapter="gmail", payload=gmail_payload, score=0.9, reason="Newsletter"),
+            Candidate(adapter="reddit", payload=reddit_payload, score=0.7, reason="Thread"),
+        ),
+        statuses=(
+            AdapterStatus(name="gmail", status="completed", candidate_count=1),
+            AdapterStatus(name="reddit", status="completed", candidate_count=1),
+            AdapterStatus(name="podcasts", status="completed", candidate_count=0),
+        ),
+    )
+    article_results = [
+        ArticleFetchResult(
+            payload=gmail_payload,
+            original_url="https://mail.example.com/item",
+            final_url="https://mail.example.com/item",
+            title="Newsletter item",
+            text="newsletter",
+            excerpt="newsletter",
+            domain="mail.example.com",
+            status="fetched",
+            tier="lead",
+        ),
+        ArticleFetchResult(
+            payload=reddit_payload,
+            original_url="https://reddit.com/r/LocalLLaMA/comments/1",
+            final_url="https://reddit.com/r/LocalLLaMA/comments/1",
+            title="Thread item",
+            text="thread",
+            excerpt="thread",
+            domain="reddit.com",
+            status="fetched",
+            tier="dropped",
+        ),
+    ]
+    progress: dict[str, Any] = {}
+
+    explore._add_final_source_mix_issues(
+        progress,
+        discovery,
+        article_results,
+        {"gmail": True, "reddit": True, "podcasts": True},
+    )
+
+    reasons = {issue["source_name"]: issue["reason"] for issue in progress["requested_source_issues"]}
+    assert "returned 1 candidate(s), but none survived" in reasons["Reddit"]
+    assert reasons["Podcast"] == "Podcast was selected but returned no usable candidates for this run."
+    assert "relying on Gmail/newsletter fallback" in reasons["Source mix"]
+    assert progress["built_with_issues"] is True
+
+
 def test_discovery_runner_dedupes_and_marks_opt_outs() -> None:
     profile = TopicProfile.from_dict(
         {
@@ -1763,6 +1826,83 @@ def test_refinement_agent_does_not_repeat_same_strategy_question(monkeypatch, tm
     assert assistant_questions[0] == repeated_question
     assert assistant_questions[-1] != repeated_question
     assert len(set(assistant_questions)) == len(assistant_questions)
+
+
+def test_strategy_refinement_endpoint_uses_ai_patch(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    monkeypatch.setattr(refinement, "_run_refinement_agent", lambda **_kwargs: None)
+    monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)
+
+    class _StrategyRefinementModelClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def complete_json(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(kwargs)
+            return {
+                "profile_patch": {
+                    "source_queries": {
+                        "foreign_media": [
+                            "中国大模型 Kimi MiniMax DeepSeek 通义千问 最新进展",
+                            "月之暗面 MiniMax DeepSeek Qwen 性能评测",
+                        ],
+                        "podcasts": ["AI Daily local AI deployment"],
+                    },
+                    "foreign_language_plan": [
+                        {
+                            "code": "zh",
+                            "name": "Chinese",
+                            "native_query": "中国大模型 Kimi MiniMax DeepSeek 通义千问 最新进展",
+                            "native_entity_terms": ["Kimi", "MiniMax", "DeepSeek", "通义千问"],
+                            "reason": "The user asked to cover Chinese AI model competitors.",
+                        }
+                    ],
+                },
+                "reasoning_summary": "Expanded China model coverage and added AI Daily to podcasts.",
+            }
+
+    model_client = _StrategyRefinementModelClient()
+    monkeypatch.setattr(
+        "backend.app.services.refinement.ModelClient.from_settings",
+        lambda *_args, **_kwargs: model_client,
+    )
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Track local AI deployment and Chinese model competition",
+                "source_selection": {
+                    "web_search": True,
+                    "foreign_media": True,
+                    "podcasts": True,
+                },
+                "models": {"refinement": "strategy-model"},
+            },
+        )
+        session_id = started.json()["session_id"]
+        refined = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/strategy",
+            json={
+                "instruction": "Foreign media should cover Kimi and MiniMax too, and add The AI Daily to podcasts.",
+                "models": {"refinement": "strategy-model"},
+            },
+        )
+
+    assert refined.status_code == 200
+    body = refined.json()
+    foreign_queries = body["profile"]["source_queries"]["foreign_media"]
+    podcast_queries = body["profile"]["source_queries"]["podcasts"]
+    assert any("MiniMax" in query for query in foreign_queries)
+    assert any("Kimi" in query for query in foreign_queries)
+    assert any("AI Daily" in query for query in podcast_queries)
+    diagnostics = body["profile"]["refinement_diagnostics"]
+    assert diagnostics["readiness_reason"] == "strategy_refined"
+    assert diagnostics["model_profile_patch"]["source_queries"]["foreign_media"][0].startswith("中国大模型")
+    assert model_client.calls
+    assert "natural-language instruction" in str(model_client.calls[0]["system"])
+    assert "Kimi and MiniMax" in str(model_client.calls[0]["prompt"])
 
 
 def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None:

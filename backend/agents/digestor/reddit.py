@@ -35,9 +35,10 @@ async def fetch_reddit_threads(
     digest_interest: str,
     lookback_hours: int,
     max_threads: int = MAX_REDDIT_THREADS,
+    sources_override: list[RedditSource] | None = None,
 ) -> list[NormalizedPayload]:
     """Fetch Reddit threads from Source Scout-approved communities."""
-    sources = _sources_for_digest(digest_id)
+    sources = sources_override if sources_override is not None else _sources_for_digest(digest_id)
     if not sources:
         return []
 

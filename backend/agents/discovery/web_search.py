@@ -208,21 +208,43 @@ def _clean_query(value: str, *, max_length: int = 380) -> str:
     return clipped or cleaned[:max_length].strip()
 
 
-def _provider_from_config() -> WebSearchBackend:
+def _providers_from_config() -> list[WebSearchBackend]:
     settings = get_settings()
     preferred = str(settings.web_search_provider or "auto").strip().lower()
+    providers: list[WebSearchBackend] = []
+    seen: set[str] = set()
+
+    def add(provider: WebSearchBackend) -> None:
+        if provider.name in seen:
+            return
+        providers.append(provider)
+        seen.add(provider.name)
+
     if preferred in {"", "auto", "tavily", "tavily_search", "tavily-search"}:
         key = str(settings.web_search_tavily_api_key or _read_secret(settings, "tavily", "api_key") or "").strip()
         if key:
-            return TavilyBackend(api_key=key)
+            add(TavilyBackend(api_key=key))
     if preferred in {"", "auto", "brave", "brave_search", "brave-search"}:
         key = str(settings.web_search_brave_api_key or _read_secret(settings, "brave", "api_key") or "").strip()
         if key:
-            return BraveBackend(api_key=key)
+            add(BraveBackend(api_key=key))
     if preferred in {"", "auto", "serpapi", "serp_api", "serp-api"}:
         key = str(settings.web_search_serpapi_api_key or _read_secret(settings, "serpapi", "api_key") or "").strip()
         if key:
-            return SerpAPIBackend(api_key=key)
+            add(SerpAPIBackend(api_key=key))
+    if preferred not in {"", "auto"}:
+        # A named primary provider should still have configured backups. This is
+        # especially useful for transient Tavily failures such as HTTP 432.
+        if "brave" not in seen:
+            key = str(settings.web_search_brave_api_key or _read_secret(settings, "brave", "api_key") or "").strip()
+            if key:
+                add(BraveBackend(api_key=key))
+        if "serpapi" not in seen:
+            key = str(settings.web_search_serpapi_api_key or _read_secret(settings, "serpapi", "api_key") or "").strip()
+            if key:
+                add(SerpAPIBackend(api_key=key))
+    if providers:
+        return providers
     if preferred not in {"auto", ""}:
         raise AdapterUnavailable(f"Web-search provider '{preferred}' is not configured.")
     raise AdapterUnavailable("Web-search provider is not configured yet.")
@@ -304,5 +326,12 @@ def lookback_to_days(lookback_hours: int | None) -> int | None:
 
 
 async def search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None) -> list[SearchHit]:
-    backend = _provider_from_config()
-    return await backend.search(query=query, limit=limit, language=language, days=days)
+    providers = _providers_from_config()
+    errors: list[str] = []
+    for backend in providers:
+        try:
+            return await backend.search(query=query, limit=limit, language=language, days=days)
+        except Exception as exc:
+            errors.append(f"{backend.name}: {exc}")
+            continue
+    raise AdapterUnavailable("Web search failed across configured providers: " + "; ".join(errors))

@@ -112,6 +112,11 @@ class RefinementMessage(BaseModel):
     just_go_now: bool = False
 
 
+class StrategyRefinementMessage(BaseModel):
+    instruction: str = Field(min_length=1, max_length=4000)
+    models: dict[str, Any] = Field(default_factory=dict)
+
+
 class TopicProfileSchedule(BaseModel):
     schedule: ScheduleValue | None = None
     time_of_day: str | None = Field(default=None, max_length=8)
@@ -188,6 +193,17 @@ def start_refinement(payload: RefinementStart) -> dict[str, Any]:
 @router.post("/explore/refinement-sessions/{session_id}/messages")
 def answer_refinement(session_id: str, payload: RefinementMessage) -> dict[str, Any]:
     session = refinement.advance_session(session_id, payload.model_dump())
+    if session is None:
+        raise HTTPException(status_code=404, detail="Refinement session not found")
+    return session
+
+
+@router.post("/explore/refinement-sessions/{session_id}/strategy")
+def refine_search_strategy(session_id: str, payload: StrategyRefinementMessage) -> dict[str, Any]:
+    try:
+        session = refinement.refine_strategy(session_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if session is None:
         raise HTTPException(status_code=404, detail="Refinement session not found")
     return session

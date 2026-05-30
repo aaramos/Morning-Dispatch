@@ -518,11 +518,23 @@ def _ensure_explore_tables(connection: sqlite3.Connection) -> None:
           created_at  TEXT NOT NULL
         ) STRICT;
 
+        CREATE TABLE IF NOT EXISTS exploration_feedback (
+          id              TEXT PRIMARY KEY,
+          exploration_id  TEXT NOT NULL REFERENCES explorations(exploration_id),
+          topic_id        TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          url             TEXT NOT NULL,
+          source_name     TEXT,
+          signal          TEXT NOT NULL CHECK(signal IN ('up','down')),
+          created_at      TEXT NOT NULL
+        ) STRICT;
+
         CREATE INDEX IF NOT EXISTS idx_topic_profiles_updated_at ON topic_profiles(updated_at);
         CREATE INDEX IF NOT EXISTS idx_refinement_sessions_updated_at ON refinement_sessions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_explorations_topic_id ON explorations(topic_id);
         CREATE INDEX IF NOT EXISTS idx_explorations_status ON explorations(status);
         CREATE INDEX IF NOT EXISTS idx_promoted_sources_topic_id ON promoted_sources(topic_id);
+        CREATE INDEX IF NOT EXISTS idx_exploration_feedback_topic_id ON exploration_feedback(topic_id);
+        CREATE INDEX IF NOT EXISTS idx_exploration_feedback_exploration_id ON exploration_feedback(exploration_id);
         """
     )
     existing_columns = {
@@ -541,6 +553,21 @@ def _ensure_explore_tables(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_explorations_status ON explorations(status)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_explorations_deleted_at ON explorations(deleted_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_explorations_delete_after ON explorations(delete_after)")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exploration_feedback (
+          id              TEXT PRIMARY KEY,
+          exploration_id  TEXT NOT NULL REFERENCES explorations(exploration_id),
+          topic_id        TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          url             TEXT NOT NULL,
+          source_name     TEXT,
+          signal          TEXT NOT NULL CHECK(signal IN ('up','down')),
+          created_at      TEXT NOT NULL
+        ) STRICT
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_exploration_feedback_topic_id ON exploration_feedback(topic_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_exploration_feedback_exploration_id ON exploration_feedback(exploration_id)")
 
 
 def _ensure_exploration_status_allows_queued(connection: sqlite3.Connection) -> None:
@@ -6035,10 +6062,19 @@ def apply_feedback_to_candidates(digest_id: str, article_results: list[ArticleFe
             """,
             (digest_id,),
         ).fetchall()
+        exploration_rows = connection.execute(
+            """
+            SELECT url AS canonical_url, url AS original_url, source_name AS domain, signal, COUNT(*) AS signal_count
+            FROM exploration_feedback
+            WHERE topic_id = ?
+            GROUP BY url, source_name, signal
+            """,
+            (digest_id,),
+        ).fetchall()
 
     exact_signals: dict[str, int] = {}
     domain_signals: dict[str, int] = {}
-    for row in rows:
+    for row in [*rows, *exploration_rows]:
         value = int(row["signal_count"] or 0)
         delta = value if row["signal"] == "up" else -value
         for url in (row["canonical_url"], row["original_url"]):
@@ -6075,7 +6111,39 @@ def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] |
             (issue_id,),
         ).fetchone()
         if issue is None:
-            return None
+            exploration = connection.execute(
+                "SELECT exploration_id, topic_id FROM explorations WHERE exploration_id = ?",
+                (issue_id,),
+            ).fetchone()
+            if exploration is None:
+                return None
+            feedback_id = new_id()
+            source_name = _domain(url)
+            connection.execute(
+                """
+                INSERT INTO exploration_feedback (id, exploration_id, topic_id, url, source_name, signal, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    feedback_id,
+                    exploration["exploration_id"],
+                    exploration["topic_id"],
+                    url,
+                    source_name,
+                    signal,
+                    now,
+                ),
+            )
+            if source_name:
+                _update_source_weight(connection, str(exploration["topic_id"]), source_name, signal, now)
+            return {
+                "id": feedback_id,
+                "issue_id": issue_id,
+                "signal": signal,
+                "url": url,
+                "source_name": source_name,
+                "created_at": now,
+            }
 
         rows = connection.execute(
             """
