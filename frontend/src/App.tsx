@@ -362,6 +362,7 @@ type ConfirmationDraft = {
   exclusions: string;
   content_limits: ContentLimitsDraft;
   sourceScopeTouched?: boolean;
+  recency_scope_confirmed?: boolean;
 };
 
 type ContentLimitsDraft = {
@@ -987,6 +988,10 @@ function DispatchApp() {
 
   async function buildBrief() {
     if (!canBuild) return;
+    if (draft.recency_weighting !== "all_available" && !draft.recency_scope_confirmed) {
+      setMessage("Please confirm the recency window before building this brief.");
+      return;
+    }
     const blocked = firstBlockedSelectedSource(sourceSelection, sourceStatus);
     if (blocked) {
       setEnableSource(blocked);
@@ -2018,6 +2023,9 @@ function ConfirmationPanel(props: {
   const contentLimitErrors = validateContentLimits(props.draft.content_limits, props.sources);
   const searchPlanGroups = sourceSearchPlanGroups(props.profile);
   const readinessItems = sourceReadinessItems(props.sources, props.sourceStatus, props.profile);
+  const recencyWindowSummary = sourceScopeConfirmation(props.draft.recency_weighting, props.draft.lookback_hours);
+  const needsRecencyConfirmation =
+    props.draft.recency_weighting !== "all_available" && !props.draft.recency_scope_confirmed;
 
   function updateContentLimits(next: ContentLimitsDraft) {
     props.onDraftChange({ ...props.draft, content_limits: next });
@@ -2064,6 +2072,7 @@ function ConfirmationPanel(props: {
               ...props.draft,
               recency_weighting: event.target.value as ConfirmationDraft["recency_weighting"],
               lookback_hours: lookbackHoursFromSourceScope(event.target.value as SourceScope),
+              recency_scope_confirmed: false,
               sourceScopeTouched: true,
             })}
           >
@@ -2074,6 +2083,19 @@ function ConfirmationPanel(props: {
           </select>
           <small>{sourceScopeConfirmation(props.draft.recency_weighting, props.draft.lookback_hours)}</small>
         </label>
+        {props.draft.recency_weighting !== "all_available" ? (
+          <label className="recency-confirmation">
+            <input
+              type="checkbox"
+              checked={Boolean(props.draft.recency_scope_confirmed)}
+              onChange={(event) => props.onDraftChange({
+                ...props.draft,
+                recency_scope_confirmed: event.target.checked,
+              })}
+            />
+            <span>I confirm this recency window: {recencyWindowSummary}</span>
+          </label>
+        ) : null}
         <NumberStepper
           label="Recency window (days)"
           value={Math.max(1, Math.round(props.draft.lookback_hours / 24))}
@@ -2082,6 +2104,7 @@ function ConfirmationPanel(props: {
           onChange={(days) => props.onDraftChange({
             ...props.draft,
             lookback_hours: clampContentLimit(days, 1, 365) * 24,
+            recency_scope_confirmed: false,
             sourceScopeTouched: true,
           })}
         />
@@ -2173,7 +2196,13 @@ function ConfirmationPanel(props: {
         ) : null}
       </div>
       <div className="confirmation-actions">
-        <button type="button" className="primary-action build-brief-action" onClick={props.onBuild} disabled={props.busy || contentLimitErrors.length > 0}>
+        <button
+          type="button"
+          className="primary-action build-brief-action"
+          onClick={props.onBuild}
+          disabled={props.busy || contentLimitErrors.length > 0 || needsRecencyConfirmation}
+          title={needsRecencyConfirmation ? `Please confirm the recency window before building.` : undefined}
+        >
           Build brief
         </button>
       </div>
@@ -4685,6 +4714,7 @@ function emptyDraft(defaults = defaultContentLimits): ConfirmationDraft {
     lookback_hours: defaultBriefControls.lookback_hours,
     exclusions: "",
     content_limits: defaults,
+    recency_scope_confirmed: false,
     sourceScopeTouched: false,
   };
 }
@@ -4697,6 +4727,7 @@ function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits
     lookback_hours: lookbackHoursForBuild(profile, undefined, defaultBriefControls.lookback_hours),
     exclusions: (profile.exclusions ?? []).join(", "),
     content_limits: contentLimitsFromProfile(profile, defaults),
+    recency_scope_confirmed: false,
     sourceScopeTouched: false,
   };
 }

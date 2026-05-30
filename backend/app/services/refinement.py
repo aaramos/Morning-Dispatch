@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+from datetime import UTC, datetime
 from typing import Any
 
 from backend.agents.discovery.language_support import trusted_language_options
@@ -950,6 +951,7 @@ def _build_refinement_agent_prompt(
     turn_count: int,
     just_go_now: bool,
 ) -> str:
+    current_utc = datetime.now(UTC).strftime("%Y-%m-%d")
     profile_snapshot = {
         "statement": str(profile.get("statement") or ""),
         "scope": str(profile.get("scope") or ""),
@@ -963,6 +965,7 @@ def _build_refinement_agent_prompt(
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
         "exclusions": _string_list(profile.get("exclusions")),
         "source_selection": _source_selection_dict(profile.get("source_selection")),
+        "current_date_utc": current_utc,
         "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
         "gmail_rules": _normalize_gmail_rules(profile.get("gmail_rules")),
     }
@@ -1021,6 +1024,7 @@ def _build_refinement_agent_prompt(
                 "If this is an existing profile being revisited, ask how to sharpen the search plan "
                 "or what would make the rebuilt brief more useful before marking ready."
             ) if profile.get("_revisit_existing") and messages == [] and turn_count == 0 else "",
+            "current_date_hint": f"Today is {current_utc} (UTC). Use this date when judging freshness windows.",
         },
         ensure_ascii=False,
     )
@@ -2025,7 +2029,7 @@ def _queries_from_statement(text: str) -> list[str]:
     if theme_words:
         theme_chunk = " ".join(dict.fromkeys(w.lower() for w in theme_words[:4]))
         lead = " ".join(dict.fromkeys(names[:2])) if names else ""
-        parts.append(f"{lead} {theme_chunk} 2025".strip())
+        parts.append((f"{lead} {theme_chunk}" if lead else theme_chunk).strip())
 
     # 3. First short phrase before the first sentence-ending punctuation.
     first_phrase = re.split(r"[.!?;]", text)[0].strip()

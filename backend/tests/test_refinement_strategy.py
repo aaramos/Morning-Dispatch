@@ -8,6 +8,8 @@ diagnostics trail explains why the strategy was produced.
 
 from __future__ import annotations
 
+import json
+import re
 from backend.app.services import refinement
 
 
@@ -173,3 +175,27 @@ def test_just_go_now_readiness_reason():
     )
     assert ready is True
     assert patched["refinement_diagnostics"]["readiness_reason"] == "just_go_now"
+
+
+def test_refinement_prompt_includes_current_date_hint():
+    profile = refinement._coerce_profile(_profile())
+    payload = json.loads(
+        refinement._build_refinement_agent_prompt(
+            profile=profile,
+            messages=[],
+            turn_count=0,
+            just_go_now=False,
+        )
+    )
+
+    current_profile = payload["current_profile"]
+    assert re.search(r"20\d{2}-\d{2}-\d{2}", str(current_profile.get("current_date_utc", "")))
+    assert "Today is" in payload["current_date_hint"]
+    assert "Use this date when judging freshness windows." in payload["current_date_hint"]
+    assert payload["current_date_hint"]
+
+
+def test_queries_from_statement_no_hardcoded_year_suffix():
+    queries = refinement._queries_from_statement("optimizing AI inference chips and memory architecture")
+    assert "2025" not in " ".join(queries)
+    assert len(queries) > 0
