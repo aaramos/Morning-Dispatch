@@ -1330,7 +1330,7 @@ def _source_window_rejection_reason(profile: TopicProfile, result: ArticleFetchR
         item_key = _undated_item_key(result)
         if database.has_served_undated_item(profile.topic_id, item_key):
             return "Undated item was already shown once and is hidden from future editions."
-        return ""
+        return "Date is missing for this strict source, so it is excluded under the bounded window."
     return ""
 
 

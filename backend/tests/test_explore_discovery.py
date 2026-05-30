@@ -152,7 +152,7 @@ def test_refinement_seeds_year_lookback_from_interest_text() -> None:
     assert profile["lookback_hours"] == 8760
 
 
-def test_source_window_filter_allows_undated_web_results_once(monkeypatch, tmp_path) -> None:
+def test_source_window_filter_allows_undated_web_results(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
     profile = TopicProfile.from_dict(
@@ -176,6 +176,7 @@ def test_source_window_filter_allows_undated_web_results_once(monkeypatch, tmp_p
         title="Undated Hynix market note",
         url="https://example.com/news/hynix-market-note",
         summary="No publish date is available on this search result.",
+        source_type="web_search",
     )
 
     kept, issues = explore._apply_source_window_filter(
@@ -186,29 +187,25 @@ def test_source_window_filter_allows_undated_web_results_once(monkeypatch, tmp_p
 
     assert kept[0] == fresh
     assert kept[1].title == undated.title
-    assert kept[1].metadata["served_once"] is True
+    assert kept[1].metadata == {}
     assert len(issues) == 1
     assert "outside the requested source window" in issues[0]["reason"]
 
-    database.record_served_undated_items(
-        profile.topic_id,
-        explore._served_undated_items_from_results(kept),
-    )
     kept_again, issues_again = explore._apply_source_window_filter(
         profile,
         [undated],
         lookback_hours=72,
     )
-    assert kept_again == []
-    assert "already shown once" in issues_again[0]["reason"]
+    assert kept_again == [undated]
+    assert issues_again == []
 
 
-def test_source_window_filter_marks_undated_strict_types_as_served_once(monkeypatch, tmp_path) -> None:
-    """Undated gmail_link articles are kept on first appearance but tagged served_once.
+def test_source_window_filter_rejects_undated_strict_types_under_bounded_window(monkeypatch, tmp_path) -> None:
+    """Strict source types without dates are rejected when lookback is bounded.
 
     With recency_weighting="breaking" and lookback_hours=24, the filter runs and undated
     strict-type articles (gmail_link, foreign_web, reddit_thread, podcast_episode) are
-    allowed through exactly once, tagged with served_once=True metadata.
+    rejected so stale or unknown-dated content does not leak into time-bound briefs.
     """
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
@@ -227,10 +224,10 @@ def test_source_window_filter_marks_undated_strict_types_as_served_once(monkeypa
 
     kept, issues = explore._apply_source_window_filter(profile, [undated], lookback_hours=24)
 
-    assert len(kept) == 1
-    assert kept[0].title == "Undated local AI story"
-    assert kept[0].metadata.get("served_once") is True
-    assert issues == []
+    assert kept == []
+    assert len(issues) == 1
+    assert issues[0]["source_name"] == "Undated local AI story"
+    assert issues[0]["reason"].startswith("Date is missing for this strict source")
 
 
 def test_reddit_adapter_uses_web_fallback_when_mcp_fails(monkeypatch) -> None:
@@ -855,6 +852,7 @@ def test_scheduled_run_promotes_kept_sources(monkeypatch, tmp_path) -> None:
         source_name="localai",
         raw_text="Thread signal.",
         metadata={"subreddit": "localAI"},
+        published_at=(datetime.now(UTC) - timedelta(hours=1)).isoformat(timespec="seconds"),
     )
     podcast_payload = NormalizedPayload(
         id="podcast-1",
@@ -862,6 +860,7 @@ def test_scheduled_run_promotes_kept_sources(monkeypatch, tmp_path) -> None:
         source_name="Practical AI Podcast",
         raw_text="Episode notes.",
         metadata={"podcast_title": "Practical AI Podcast", "feed_url": "https://podcast.example.com/feed"},
+        published_at=(datetime.now(UTC) - timedelta(hours=1)).isoformat(timespec="seconds"),
     )
     web_payload = NormalizedPayload(
         id="search-1",

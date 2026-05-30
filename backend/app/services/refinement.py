@@ -544,6 +544,7 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
         for source, enabled in _source_selection_dict(profile.get("source_selection")).items()
         if enabled
     ]
+    current_utc = datetime.now(UTC).strftime("%Y-%m-%d")
     return json.dumps(
         {
             "task": "Revise the current search strategy using the user's instruction.",
@@ -563,7 +564,11 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
                 "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
                 "exclusions": _string_list(profile.get("exclusions")),
             },
+            "current_date_utc": current_utc,
             "constraints": [
+                "Use the provided current date when interpreting natural-language time windows. "
+                f"Today is {current_utc} (UTC). "
+                "Honor the existing lookback window and avoid introducing stale-year artifacts.",
                 "Only add source_queries for selected sources unless the instruction explicitly names a source type to add.",
                 "Do not remove existing useful queries unless the instruction asks to narrow or exclude them.",
                 "Specific named sources may be added to requested_sources.",
