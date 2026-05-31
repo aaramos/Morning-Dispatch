@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from backend.agents.discovery.language_support import trusted_language_options
@@ -27,6 +27,7 @@ GMAIL_RULES_FIELD = "gmail_rules"
 GMAIL_SENDER_SELECTION_FIELD = "gmail_sender_selection"
 PENDING_STRATEGY_FIELD = "strategy_refinement"
 PENDING_STRATEGY_PROFILE_KEY = "pending_strategy_refinement"
+STRATEGY_REVIEW_PROFILE_KEY = "strategy_review"
 FIELD_ORDER = ("scope", "related_interests", "depth", "recency_weighting", "requested_sources", "exclusions")
 FIELD_HINT_TEXT_SOURCE = ("statement", "scope", "keywords", "subtopics")
 DEPTH_PRACTITIONER_TOKENS = (
@@ -273,11 +274,14 @@ Do not claim the change has already been applied.
 
 Return strict JSON only:
 {
+  "requires_changes": true,
+  "findings": ["specific issue or correction"],
   "profile_patch": {
     "scope": "optional refined scope",
     "subtopics": ["new facet"],
     "keywords": ["new term"],
     "search_queries": ["general query"],
+    "replace_search_queries": false,
     "source_queries": {
       "web_search": ["query"],
       "foreign_media": ["native-language query"],
@@ -287,6 +291,7 @@ Return strict JSON only:
       "collections": ["local document query"],
       "markets": ["TICKER"]
     },
+    "replace_source_queries": false,
     "foreign_language_plan": [
       {
         "code": "zh",
@@ -304,7 +309,8 @@ Return strict JSON only:
   "reasoning_summary": "one concise sentence describing the proposed change",
   "assistant_response": "plain-language response explaining what you propose and why"
 }
-Only include fields that should change.
+Only include fields that should change. If you are reviewing a strategy and no
+changes are needed, set requires_changes false and return an empty profile_patch.
 """.strip()
 
 
@@ -502,36 +508,18 @@ def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
     model_patch = agent_update.get("profile_patch") if isinstance(agent_update, dict) else None
     if not isinstance(model_patch, dict) or not model_patch:
         raise ValueError("AI strategy refinement did not return a usable proposal; no changes were applied.")
-    proposed_profile = _merge_agent_profile_patch(proposal_base, model_patch, user_text=instruction)
-    reasoning_summary = str((agent_update or {}).get("reasoning_summary") or "").strip() if isinstance(agent_update, dict) else ""
-    if reasoning_summary:
-        proposed_profile["reasoning_summary"] = reasoning_summary
-    proposed_profile = _fill_defaults(proposed_profile)
-    pre_critique = _diagnostics_query_snapshot(proposed_profile)
-    proposed_profile = _critique_search_plan(proposed_profile)
-    proposed_profile["refinement_diagnostics"] = _enrich_diagnostics(
-        proposed_profile,
-        model_profile_patch=model_patch,
-        pre_critique=pre_critique,
+    pending = _build_pending_strategy_refinement(
+        proposal_base,
+        instruction=instruction,
+        agent_update=agent_update,
         readiness_reason="strategy_refinement_proposed",
+        review_mode=None,
     )
-    assistant_response = str(agent_update.get("assistant_response") or reasoning_summary or "").strip()
-    if not assistant_response:
-        assistant_response = _strategy_proposal_summary(model_patch)
-    pending = {
-        "instruction": instruction,
-        "assistant_response": assistant_response,
-        "reasoning_summary": reasoning_summary,
-        "profile_patch": _trim_for_diagnostics(model_patch),
-        "proposed_profile": proposed_profile,
-        "strategy_preview": _strategy_preview(proposed_profile),
-        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
-    }
     profile[PENDING_STRATEGY_PROFILE_KEY] = pending
     messages = [
         *_messages(session),
         {"role": "user", "content": instruction},
-        {"role": "assistant", "content": assistant_response},
+        {"role": "assistant", "content": str(pending.get("assistant_response") or "")},
     ]
     updated = database.update_refinement_session(
         session_id,
@@ -543,6 +531,137 @@ def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         topic_id=session.get("topic_id"),
     )
     return _session_response(updated) if updated else None
+
+
+def review_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    session = database.get_refinement_session(session_id)
+    if session is None:
+        return None
+    profile = dict(session["profile"])
+    if _pending_strategy_refinement(profile):
+        return _session_response(session)
+    review_profile = _profile_for_strategy_review(
+        profile,
+        payload.get("profile"),
+        models=payload.get("models"),
+    )
+    instruction = _pre_build_strategy_review_instruction(review_profile)
+    agent_update = _run_strategy_refinement_agent(
+        profile=review_profile,
+        instruction=instruction,
+        task="Review the current search strategy immediately before the brief build.",
+    )
+    messages = _messages(session)
+    reviewed_at = datetime.now(UTC).isoformat(timespec="seconds")
+    if not isinstance(agent_update, dict):
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "unavailable",
+            "assistant_response": "AI strategy review was unavailable, so no strategy changes were proposed.",
+            "findings": [],
+            "reviewed_at": reviewed_at,
+        }
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=messages,
+            pending_field=session.get("pending_field"),
+            turn_count=int(session.get("turn_count") or 0),
+            status=session.get("status") or "finalized",
+            topic_id=session.get("topic_id"),
+        )
+        return _session_response(updated) if updated else None
+
+    model_patch = agent_update.get("profile_patch")
+    requires_changes = bool(agent_update.get("requires_changes")) or (isinstance(model_patch, dict) and bool(model_patch))
+    if not requires_changes or not isinstance(model_patch, dict) or not model_patch:
+        assistant_response = str(agent_update.get("assistant_response") or "").strip()
+        if not assistant_response:
+            assistant_response = "AI reviewed the strategy against the current date, source mix, and recency window; no changes are needed."
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "passed",
+            "assistant_response": assistant_response,
+            "findings": _string_list(agent_update.get("findings"), limit=8),
+            "reviewed_at": reviewed_at,
+        }
+        messages.append({"role": "assistant", "content": assistant_response})
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=messages,
+            pending_field=None,
+            turn_count=int(session.get("turn_count") or 0),
+            status=session.get("status") or "finalized",
+            topic_id=session.get("topic_id"),
+        )
+        return _session_response(updated) if updated else None
+
+    pending = _build_pending_strategy_refinement(
+        review_profile,
+        instruction=instruction,
+        agent_update=agent_update,
+        readiness_reason="pre_build_strategy_review_proposed",
+        review_mode="pre_build_review",
+    )
+    profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+        "status": "proposed",
+        "assistant_response": pending["assistant_response"],
+        "findings": pending.get("findings", []),
+        "reviewed_at": reviewed_at,
+    }
+    profile[PENDING_STRATEGY_PROFILE_KEY] = pending
+    messages.append({"role": "assistant", "content": pending["assistant_response"]})
+    updated = database.update_refinement_session(
+        session_id,
+        profile=profile,
+        messages=messages,
+        pending_field=PENDING_STRATEGY_FIELD,
+        turn_count=int(session.get("turn_count") or 0),
+        status=session.get("status") or "finalized",
+        topic_id=session.get("topic_id"),
+    )
+    return _session_response(updated) if updated else None
+
+
+def _build_pending_strategy_refinement(
+    profile: dict[str, Any],
+    *,
+    instruction: str,
+    agent_update: dict[str, Any],
+    readiness_reason: str,
+    review_mode: str | None,
+) -> dict[str, Any]:
+    model_patch = agent_update.get("profile_patch") if isinstance(agent_update, dict) else None
+    if not isinstance(model_patch, dict):
+        model_patch = {}
+    proposed_profile = _merge_agent_profile_patch(profile, model_patch, user_text=instruction)
+    reasoning_summary = str((agent_update or {}).get("reasoning_summary") or "").strip()
+    if reasoning_summary:
+        proposed_profile["reasoning_summary"] = reasoning_summary
+    proposed_profile = _fill_defaults(proposed_profile)
+    pre_critique = _diagnostics_query_snapshot(proposed_profile)
+    proposed_profile = _critique_search_plan(proposed_profile)
+    proposed_profile["refinement_diagnostics"] = _enrich_diagnostics(
+        proposed_profile,
+        model_profile_patch=model_patch,
+        pre_critique=pre_critique,
+        readiness_reason=readiness_reason,
+    )
+    assistant_response = str(agent_update.get("assistant_response") or reasoning_summary or "").strip()
+    if not assistant_response:
+        assistant_response = _strategy_proposal_summary(model_patch)
+    pending: dict[str, Any] = {
+        "instruction": instruction,
+        "assistant_response": assistant_response,
+        "reasoning_summary": reasoning_summary,
+        "profile_patch": _trim_for_diagnostics(model_patch),
+        "proposed_profile": proposed_profile,
+        "strategy_preview": _strategy_preview(proposed_profile),
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "findings": _string_list(agent_update.get("findings"), limit=8),
+    }
+    if review_mode:
+        pending["review_mode"] = review_mode
+    return pending
 
 
 def _pending_strategy_refinement(profile: dict[str, Any]) -> dict[str, Any]:
@@ -602,11 +721,73 @@ def confirm_strategy_refinement(session_id: str, payload: dict[str, Any]) -> dic
     return _session_response(updated) if updated else None
 
 
-def _run_strategy_refinement_agent(*, profile: dict[str, Any], instruction: str) -> dict[str, Any] | None:
+def _profile_for_strategy_review(base_profile: dict[str, Any], payload_profile: Any, *, models: Any) -> dict[str, Any]:
+    merged = dict(base_profile)
+    if isinstance(payload_profile, dict):
+        for key in (
+            "topic_id",
+            "statement",
+            "scope",
+            "subtopics",
+            "keywords",
+            "search_queries",
+            "source_queries",
+            "foreign_language_plan",
+            "requested_sources",
+            "depth",
+            "recency_weighting",
+            "lookback_hours",
+            "exclusions",
+            "source_selection",
+            "gmail_rules",
+            "schedule",
+            "schedule_config",
+            "delivery_config",
+        ):
+            if key in payload_profile:
+                merged[key] = payload_profile.get(key)
+    return _apply_models(_coerce_profile(merged), models)
+
+
+def _pre_build_strategy_review_instruction(profile: dict[str, Any]) -> str:
+    current = datetime.now(UTC)
+    lookback_hours = _coerce_lookback_hours(profile.get("lookback_hours"))
+    if lookback_hours:
+        cutoff = (current - timedelta(hours=lookback_hours)).strftime("%Y-%m-%d")
+        recency_text = f"The confirmed source window is the last {lookback_hours} hours, with an approximate cutoff of {cutoff} UTC."
+    else:
+        recency_text = "The confirmed source window is all available history."
+    selected_sources = [
+        _SOURCE_DISPLAY.get(source, source)
+        for source, enabled in _source_selection_dict(profile.get("source_selection")).items()
+        if enabled
+    ]
+    return (
+        "Pre-build review: inspect the strategy before the user builds the brief. "
+        f"Today is {current.strftime('%Y-%m-%d')} UTC. {recency_text} "
+        f"Selected sources: {', '.join(selected_sources) or 'none'}. "
+        "Check whether any general or per-source query contradicts the confirmed recency window, "
+        "especially explicit stale years or phrases that would pull results outside the window. "
+        "Check source fit: markets must use ticker symbols, foreign media must use native-language queries, "
+        "podcasts should use show/episode/topic phrasing likely to find playable audio, YouTube should use video/channel/topic phrasing, "
+        "and web search should use current/fresh wording. "
+        "If corrections are needed, return a proposal with profile_patch only; use replace_search_queries or replace_source_queries "
+        "when stale or conflicting query lists should be replaced rather than appended. "
+        "If the strategy is already consistent with the user's intent, current date, selected sources, and recency window, "
+        "return requires_changes false and an empty profile_patch."
+    )
+
+
+def _run_strategy_refinement_agent(
+    *,
+    profile: dict[str, Any],
+    instruction: str,
+    task: str = "Revise the current search strategy using the user's instruction.",
+) -> dict[str, Any] | None:
     client = _refinement_model_client(profile)
     if client is None:
         return None
-    prompt = _build_strategy_refinement_prompt(profile=profile, instruction=instruction)
+    prompt = _build_strategy_refinement_prompt(profile=profile, instruction=instruction, task=task)
     try:
         parsed = _run_sync_complete_json(
             client.complete_json(
@@ -621,7 +802,7 @@ def _run_strategy_refinement_agent(*, profile: dict[str, Any], instruction: str)
     return parsed if isinstance(parsed, dict) else None
 
 
-def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: str) -> str:
+def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: str, task: str) -> str:
     selected_sources = [
         source
         for source, enabled in _source_selection_dict(profile.get("source_selection")).items()
@@ -630,7 +811,7 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
     current_utc = datetime.now(UTC).strftime("%Y-%m-%d")
     return json.dumps(
         {
-            "task": "Revise the current search strategy using the user's instruction.",
+            "task": task,
             "instruction": instruction,
             "current_profile": {
                 "statement": str(profile.get("statement") or ""),
@@ -1132,7 +1313,10 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
     for key in ("subtopics", "search_queries", "exclusions"):
         if key not in patch:
             continue
-        updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
+        if key == "search_queries" and bool(patch.get("replace_search_queries")):
+            updated[key] = _string_list(patch.get(key), limit=20)
+        else:
+            updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
     if "keywords" in patch:
         keywords = _string_list(patch.get("keywords"), limit=16)
         if keywords:
@@ -1150,7 +1334,10 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
         updated["lookback_hours"] = lookback_hours
 
     if "source_queries" in patch:
-        updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), patch.get("source_queries"))
+        if bool(patch.get("replace_source_queries")):
+            updated["source_queries"] = _clean_source_queries(patch.get("source_queries"))
+        else:
+            updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), patch.get("source_queries"))
     if "foreign_language_plan" in patch:
         updated["foreign_language_plan"] = _merge_foreign_language_plan(
             updated.get("foreign_language_plan"),
@@ -2416,6 +2603,9 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "refinement_diagnostics": dict(profile.get("refinement_diagnostics"))
         if isinstance(profile.get("refinement_diagnostics"), dict)
         else {},
+        "strategy_review": dict(profile.get(STRATEGY_REVIEW_PROFILE_KEY))
+        if isinstance(profile.get(STRATEGY_REVIEW_PROFILE_KEY), dict)
+        else {},
         "related_interests_answered": bool(profile.get("related_interests_answered")),
         "requested_sources_answered": bool(profile.get("requested_sources_answered")),
         "depth_answered": bool(profile.get("depth_answered")),
@@ -2657,6 +2847,9 @@ def _session_response(session: dict[str, Any]) -> dict[str, Any]:
         else {},
         "strategy_preview": _strategy_preview(profile),
         "pending_strategy_refinement": _pending_strategy_refinement(profile) or None,
+        "strategy_review": dict(profile.get(STRATEGY_REVIEW_PROFILE_KEY))
+        if isinstance(profile.get(STRATEGY_REVIEW_PROFILE_KEY), dict)
+        else None,
     }
     if session.get("topic_id"):
         response["topic_profile"] = database.get_topic_profile(str(session["topic_id"]))

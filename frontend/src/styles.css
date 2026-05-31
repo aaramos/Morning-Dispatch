@@ -698,6 +698,12 @@ label {
   color: #5f5125;
 }
 
+.strategy-findings {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: #5f5125;
+}
+
 .strategy-proposal-actions {
   display: flex;
   flex-wrap: wrap;

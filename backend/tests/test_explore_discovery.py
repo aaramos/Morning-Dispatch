@@ -2005,6 +2005,162 @@ def test_strategy_refinement_endpoint_uses_ai_patch(monkeypatch, tmp_path) -> No
     assert "Kimi and MiniMax" in str(model_client.calls[0]["prompt"])
 
 
+def test_strategy_review_proposes_replacement_for_stale_year_queries(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)
+    session = database.create_refinement_session(
+        statement="Track local AI hardware signals from the last 90 days.",
+        profile={
+            "topic_id": "topic-stale-years",
+            "statement": "Track local AI hardware signals from the last 90 days.",
+            "scope": "Local AI hardware signals",
+            "search_queries": ["local AI hardware 2024 benchmarks", "Mac Studio AI inference 2025"],
+            "source_queries": {
+                "web_search": ["local AI hardware 2024 benchmarks"],
+                "youtube": ["Mac Studio AI inference 2025 video"],
+            },
+            "source_selection": {"web_search": True, "youtube": True},
+            "recency_weighting": "recent",
+            "lookback_hours": 2160,
+        },
+        messages=[],
+        pending_field=None,
+        status="finalized",
+    )
+
+    class _StrategyReviewModelClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def complete_json(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(kwargs)
+            return {
+                "requires_changes": True,
+                "findings": ["Queries include stale explicit years outside the last 90 days."],
+                "profile_patch": {
+                    "search_queries": ["local AI hardware current benchmarks", "Mac Studio AI inference recent tests"],
+                    "replace_search_queries": True,
+                    "source_queries": {
+                        "web_search": ["local AI hardware current benchmarks"],
+                        "youtube": ["Mac Studio AI inference recent video tests"],
+                    },
+                    "replace_source_queries": True,
+                },
+                "reasoning_summary": "Removed stale year-bound queries before build.",
+                "assistant_response": "I found stale year terms and propose replacing them with current-window searches before building.",
+            }
+
+    model_client = _StrategyReviewModelClient()
+    monkeypatch.setattr(
+        "backend.app.services.refinement.ModelClient.from_settings",
+        lambda *_args, **_kwargs: model_client,
+    )
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        reviewed = client.post(
+            f"/api/explore/refinement-sessions/{session['session_id']}/strategy/review",
+            json={
+                "profile": {
+                    "statement": "Track local AI hardware signals from the last 90 days.",
+                    "scope": "Local AI hardware signals",
+                    "search_queries": ["local AI hardware 2024 benchmarks", "Mac Studio AI inference 2025"],
+                    "source_queries": {
+                        "web_search": ["local AI hardware 2024 benchmarks"],
+                        "youtube": ["Mac Studio AI inference 2025 video"],
+                    },
+                    "source_selection": {"web_search": True, "youtube": True},
+                    "recency_weighting": "recent",
+                    "lookback_hours": 2160,
+                },
+                "models": {"refinement": "strategy-review-model"},
+            },
+        )
+        confirmed = client.post(
+            f"/api/explore/refinement-sessions/{session['session_id']}/strategy/confirm",
+            json={"apply": True},
+        )
+
+    assert reviewed.status_code == 200
+    body = reviewed.json()
+    assert body["pending_field"] == "strategy_refinement"
+    assert "2024" in " ".join(body["profile"]["search_queries"])
+    pending = body["pending_strategy_refinement"]
+    assert pending["review_mode"] == "pre_build_review"
+    assert pending["findings"] == ["Queries include stale explicit years outside the last 90 days"]
+    proposal = pending["proposed_profile"]
+    proposed_text = " ".join(
+        [
+            *proposal["search_queries"],
+            *proposal["source_queries"]["web_search"],
+            *proposal["source_queries"]["youtube"],
+        ]
+    )
+    assert "2024" not in proposed_text
+    assert "2025" not in proposed_text
+    assert confirmed.status_code == 200
+    confirmed_text = " ".join(confirmed.json()["profile"]["search_queries"])
+    assert "2024" not in confirmed_text
+    assert model_client.calls
+    assert "before the brief build" in str(model_client.calls[0]["prompt"])
+    assert "last 2160 hours" in str(model_client.calls[0]["prompt"])
+
+
+def test_strategy_review_passes_clean_strategy_without_pending_proposal(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    session = database.create_refinement_session(
+        statement="Track fresh AI infrastructure supply chain updates.",
+        profile={
+            "topic_id": "topic-clean-strategy",
+            "statement": "Track fresh AI infrastructure supply chain updates.",
+            "scope": "Fresh AI infrastructure supply chain updates",
+            "search_queries": ["AI infrastructure supply chain current updates"],
+            "source_queries": {
+                "web_search": ["AI infrastructure supply chain current updates"],
+                "youtube": ["AI infrastructure supply chain recent interview"],
+            },
+            "source_selection": {"web_search": True, "youtube": True},
+            "recency_weighting": "recent",
+            "lookback_hours": 168,
+        },
+        messages=[],
+        pending_field=None,
+        status="finalized",
+    )
+
+    class _PassingStrategyReviewModelClient:
+        async def complete_json(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "requires_changes": False,
+                "findings": [],
+                "profile_patch": {},
+                "reasoning_summary": "Strategy is current and source-shaped.",
+                "assistant_response": "I reviewed the strategy against the confirmed window and it is ready to build.",
+            }
+
+    monkeypatch.setattr(
+        "backend.app.services.refinement.ModelClient.from_settings",
+        lambda *_args, **_kwargs: _PassingStrategyReviewModelClient(),
+    )
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        reviewed = client.post(
+            f"/api/explore/refinement-sessions/{session['session_id']}/strategy/review",
+            json={
+                "profile": session["profile"],
+                "models": {"refinement": "strategy-review-model"},
+            },
+        )
+
+    assert reviewed.status_code == 200
+    body = reviewed.json()
+    assert body["pending_field"] is None
+    assert body["pending_strategy_refinement"] is None
+    assert body["strategy_review"]["status"] == "passed"
+    assert "ready to build" in body["strategy_review"]["assistant_response"]
+
+
 def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()

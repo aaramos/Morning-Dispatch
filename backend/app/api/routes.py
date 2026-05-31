@@ -117,6 +117,11 @@ class StrategyRefinementMessage(BaseModel):
     models: dict[str, Any] = Field(default_factory=dict)
 
 
+class StrategyReviewMessage(BaseModel):
+    profile: dict[str, Any] = Field(default_factory=dict)
+    models: dict[str, Any] = Field(default_factory=dict)
+
+
 class StrategyRefinementConfirm(BaseModel):
     apply: bool = True
 
@@ -214,6 +219,17 @@ def answer_refinement(session_id: str, payload: RefinementMessage) -> dict[str, 
 def refine_search_strategy(session_id: str, payload: StrategyRefinementMessage) -> dict[str, Any]:
     try:
         session = refinement.refine_strategy(session_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if session is None:
+        raise HTTPException(status_code=404, detail="Refinement session not found")
+    return session
+
+
+@router.post("/explore/refinement-sessions/{session_id}/strategy/review")
+def review_search_strategy(session_id: str, payload: StrategyReviewMessage) -> dict[str, Any]:
+    try:
+        session = refinement.review_strategy(session_id, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if session is None:

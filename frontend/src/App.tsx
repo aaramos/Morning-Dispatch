@@ -100,6 +100,15 @@ type PendingStrategyRefinement = {
   proposed_profile: TopicProfile;
   strategy_preview?: StrategyPreview;
   created_at?: string;
+  findings?: string[];
+  review_mode?: string;
+};
+
+type StrategyReview = {
+  status: "passed" | "proposed" | "unavailable" | string;
+  assistant_response?: string;
+  findings?: string[];
+  reviewed_at?: string;
 };
 
 type RefinementSession = {
@@ -114,6 +123,7 @@ type RefinementSession = {
   reasoning_summary?: string;
   strategy_preview?: StrategyPreview;
   pending_strategy_refinement?: PendingStrategyRefinement | null;
+  strategy_review?: StrategyReview | null;
 };
 
 type ConfirmedProfilePayload = {
@@ -1020,8 +1030,52 @@ function DispatchApp() {
     };
   }
 
+  async function reviewSearchStrategyBeforeBuild(profilePayload: ConfirmedProfilePayload): Promise<boolean> {
+    const currentSession = session ?? await api<RefinementSession>("/api/explore/refinement-sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        statement: profilePayload.statement,
+        topic_id: profilePayload.topic_id ?? topicProfile?.topic_id,
+        revisit: Boolean(profilePayload.topic_id ?? topicProfile?.topic_id),
+        source_selection: selectedEnabledSources,
+        models: {},
+      }),
+    });
+    const reviewed = await api<RefinementSession>(`/api/explore/refinement-sessions/${currentSession.session_id}/strategy/review`, {
+      method: "POST",
+      body: JSON.stringify({
+        profile: profilePayload,
+        models: {},
+      }),
+    });
+    profilePayload.refinement_session_id = reviewed.session_id;
+    setSession(reviewed);
+    const proposal = reviewed.pending_strategy_refinement?.proposed_profile;
+    if (proposal) {
+      setDraft(draftFromProfile(proposal, defaultControls.content_limits));
+      if (reviewed.topic_profile) setTopicProfile(reviewed.topic_profile);
+      setFlow("confirm");
+      setStrategyConfirmation(
+        reviewed.pending_strategy_refinement?.assistant_response
+          || "AI found strategy changes to review before building."
+      );
+      setMessage("Review the AI strategy proposal before building");
+      return false;
+    }
+    if (reviewed.strategy_review?.assistant_response) {
+      setStrategyConfirmation(reviewed.strategy_review.assistant_response);
+    }
+    if (reviewed.topic_profile) setTopicProfile(reviewed.topic_profile);
+    return true;
+  }
+
   async function buildBrief() {
     if (!canBuild) return;
+    if (session?.pending_strategy_refinement) {
+      setFlow("confirm");
+      setMessage("Apply or discard the proposed strategy update before building.");
+      return;
+    }
     if (draft.recency_weighting !== "all_available" && !draft.recency_scope_confirmed) {
       setMessage("Please confirm the recency window before building this brief.");
       return;
@@ -1031,16 +1085,21 @@ function DispatchApp() {
       setEnableSource(blocked);
       return;
     }
+    const profilePayload = {
+      ...confirmedProfilePayload(),
+      source_selection: selectedEnabledSources,
+    };
     setBusy(true);
-    setFlow("building");
-    setMessage("Building the brief...");
-    setBriefHtml("");
+    setMessage("AI is checking the search strategy...");
+    beginRefinementProgress("confirming", "Reviewing search strategy");
     let startedExploration: Exploration | null = null;
     try {
-      const profilePayload = {
-        ...confirmedProfilePayload(),
-        source_selection: selectedEnabledSources,
-      };
+      const strategyReady = await reviewSearchStrategyBeforeBuild(profilePayload);
+      endRefinementProgress();
+      if (!strategyReady) return;
+      setFlow("building");
+      setMessage("Building the brief...");
+      setBriefHtml("");
       const started = refinementTargetExplorationId
         ? await api<{ exploration: Exploration }>(`/api/explore/explorations/${refinementTargetExplorationId}/rebuild`, {
           method: "POST",
@@ -1075,6 +1134,7 @@ function DispatchApp() {
       setMessage(errorMessage(error, "Could not build brief"));
     } finally {
       setBusy(false);
+      endRefinementProgress();
     }
   }
 
@@ -2061,6 +2121,7 @@ function ConfirmationPanel(props: {
   const recencyWindowSummary = sourceScopeConfirmation(props.draft.recency_weighting, props.draft.lookback_hours);
   const needsRecencyConfirmation =
     props.draft.recency_weighting !== "all_available" && !props.draft.recency_scope_confirmed;
+  const buildBlockedByProposal = Boolean(props.pendingStrategy);
 
   function updateContentLimits(next: ContentLimitsDraft) {
     props.onDraftChange({ ...props.draft, content_limits: next });
@@ -2079,6 +2140,13 @@ function ConfirmationPanel(props: {
         <div className={`strategy-confirmation ${props.pendingStrategy ? "pending" : ""}`}>
           <strong>{props.pendingStrategy ? "AI proposed update" : "AI update"}</strong>
           <p>{props.strategyConfirmation}</p>
+          {props.pendingStrategy?.findings?.length ? (
+            <ul className="strategy-findings">
+              {props.pendingStrategy.findings.map((finding) => (
+                <li key={finding}>{finding}</li>
+              ))}
+            </ul>
+          ) : null}
           {props.pendingStrategy ? (
             <div className="strategy-proposal-actions">
               <button
@@ -2255,10 +2323,16 @@ function ConfirmationPanel(props: {
           type="button"
           className="primary-action build-brief-action"
           onClick={props.onBuild}
-          disabled={props.busy || contentLimitErrors.length > 0}
-          title={needsRecencyConfirmation ? `Please confirm the recency window before building.` : undefined}
+          disabled={props.busy || contentLimitErrors.length > 0 || buildBlockedByProposal}
+          title={
+            buildBlockedByProposal
+              ? "Apply or discard the proposed strategy update before building."
+              : needsRecencyConfirmation
+                ? "Please confirm the recency window before building."
+                : undefined
+          }
         >
-          {props.pendingStrategy ? "Build with proposed strategy" : "Build brief"}
+          {props.pendingStrategy ? "Review proposal first" : "Build brief"}
         </button>
       </div>
     </section>
