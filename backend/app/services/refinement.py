@@ -25,6 +25,8 @@ MAX_REFINEMENT_TURNS = 10
 AGENT_PENDING_FIELD = "refinement_agent"
 GMAIL_RULES_FIELD = "gmail_rules"
 GMAIL_SENDER_SELECTION_FIELD = "gmail_sender_selection"
+PENDING_STRATEGY_FIELD = "strategy_refinement"
+PENDING_STRATEGY_PROFILE_KEY = "pending_strategy_refinement"
 FIELD_ORDER = ("scope", "related_interests", "depth", "recency_weighting", "requested_sources", "exclusions")
 FIELD_HINT_TEXT_SOURCE = ("statement", "scope", "keywords", "subtopics")
 DEPTH_PRACTITIONER_TOKENS = (
@@ -258,12 +260,16 @@ STRATEGY_REFINEMENT_SYSTEM_PROMPT = """
 You revise an already-confirmed Morning Dispatch search strategy from a user's
 natural-language instruction.
 
-Apply the instruction directly to the retrieval plan. Preserve the user's
-original intent and selected sources unless the instruction explicitly changes
-them. Prefer concrete, executable queries over abstract themes. Use
-source-shaped phrasing: native-language terms for foreign media, subreddit or
-community phrasing for Reddit, show/channel/topic phrasing for podcasts and
-YouTube, and ticker symbols for markets.
+Return a proposal for the user to review before anything is applied. Preserve
+the user's original intent and selected sources unless the instruction
+explicitly changes them. Prefer concrete, executable queries over abstract
+themes. Use source-shaped phrasing: native-language terms for foreign media,
+subreddit or community phrasing for Reddit, show/channel/topic phrasing for
+podcasts and YouTube, and ticker symbols for markets.
+
+Your response should sound like a useful research collaborator: briefly say how
+you interpreted the feedback, then name the meaningful adjustments you propose.
+Do not claim the change has already been applied.
 
 Return strict JSON only:
 {
@@ -295,7 +301,8 @@ Return strict JSON only:
     "lookback_hours": 336,
     "exclusions": ["thing to avoid"]
   },
-  "reasoning_summary": "one concise sentence describing what changed"
+  "reasoning_summary": "one concise sentence describing the proposed change",
+  "assistant_response": "plain-language response explaining what you propose and why"
 }
 Only include fields that should change.
 """.strip()
@@ -483,30 +490,106 @@ def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         raise ValueError("Strategy refinement instruction is required")
     profile = dict(session["profile"])
     profile = _apply_models(profile, payload.get("models"))
-    deterministic_patch = _strategy_refinement_patch(profile, instruction)
-    agent_update = _run_strategy_refinement_agent(profile=profile, instruction=instruction)
-    profile = _merge_agent_profile_patch(profile, deterministic_patch, user_text=instruction)
+    current_pending = _pending_strategy_refinement(profile)
+    proposal_base = current_pending.get("proposed_profile") if current_pending else None
+    if isinstance(proposal_base, dict):
+        proposal_base = {**proposal_base, "models": profile.get("models")}
+    else:
+        proposal_base = profile
+    agent_update = _run_strategy_refinement_agent(profile=proposal_base, instruction=instruction)
+    if not isinstance(agent_update, dict):
+        raise ValueError("AI strategy refinement is unavailable; no changes were applied.")
     model_patch = agent_update.get("profile_patch") if isinstance(agent_update, dict) else None
-    if model_patch:
-        profile = _merge_agent_profile_patch(profile, model_patch, user_text=instruction)
+    if not isinstance(model_patch, dict) or not model_patch:
+        raise ValueError("AI strategy refinement did not return a usable proposal; no changes were applied.")
+    proposed_profile = _merge_agent_profile_patch(proposal_base, model_patch, user_text=instruction)
     reasoning_summary = str((agent_update or {}).get("reasoning_summary") or "").strip() if isinstance(agent_update, dict) else ""
     if reasoning_summary:
-        profile["reasoning_summary"] = reasoning_summary
-    profile = _fill_defaults(profile)
-    pre_critique = _diagnostics_query_snapshot(profile)
-    profile = _critique_search_plan(profile)
-    profile["refinement_diagnostics"] = _enrich_diagnostics(
-        profile,
-        model_profile_patch=model_patch or deterministic_patch,
+        proposed_profile["reasoning_summary"] = reasoning_summary
+    proposed_profile = _fill_defaults(proposed_profile)
+    pre_critique = _diagnostics_query_snapshot(proposed_profile)
+    proposed_profile = _critique_search_plan(proposed_profile)
+    proposed_profile["refinement_diagnostics"] = _enrich_diagnostics(
+        proposed_profile,
+        model_profile_patch=model_patch,
         pre_critique=pre_critique,
-        readiness_reason="strategy_refined",
+        readiness_reason="strategy_refinement_proposed",
     )
-    saved = explore.save_topic_profile(profile)
+    assistant_response = str(agent_update.get("assistant_response") or reasoning_summary or "").strip()
+    if not assistant_response:
+        assistant_response = _strategy_proposal_summary(model_patch)
+    pending = {
+        "instruction": instruction,
+        "assistant_response": assistant_response,
+        "reasoning_summary": reasoning_summary,
+        "profile_patch": _trim_for_diagnostics(model_patch),
+        "proposed_profile": proposed_profile,
+        "strategy_preview": _strategy_preview(proposed_profile),
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    profile[PENDING_STRATEGY_PROFILE_KEY] = pending
     messages = [
         *_messages(session),
         {"role": "user", "content": instruction},
-        {"role": "assistant", "content": reasoning_summary or "Search strategy updated."},
+        {"role": "assistant", "content": assistant_response},
     ]
+    updated = database.update_refinement_session(
+        session_id,
+        profile=profile,
+        messages=messages,
+        pending_field=PENDING_STRATEGY_FIELD,
+        turn_count=int(session.get("turn_count") or 0),
+        status=session.get("status") or "finalized",
+        topic_id=session.get("topic_id"),
+    )
+    return _session_response(updated) if updated else None
+
+
+def _pending_strategy_refinement(profile: dict[str, Any]) -> dict[str, Any]:
+    pending = profile.get(PENDING_STRATEGY_PROFILE_KEY)
+    return dict(pending) if isinstance(pending, dict) else {}
+
+
+def _strategy_proposal_summary(patch: dict[str, Any]) -> str:
+    changed: list[str] = []
+    if patch.get("search_queries"):
+        changed.append("general searches")
+    source_queries = patch.get("source_queries")
+    if isinstance(source_queries, dict):
+        changed.extend(format_source for source in source_queries.keys() if (format_source := _SOURCE_DISPLAY.get(str(source), str(source))))
+    if patch.get("lookback_hours") or patch.get("recency_weighting"):
+        changed.append("recency window")
+    if patch.get("exclusions"):
+        changed.append("exclusions")
+    if changed:
+        return f"I prepared a proposed update covering {', '.join(changed[:5])}. Review it before applying."
+    return "I prepared a proposed search strategy update. Review it before applying."
+
+
+def confirm_strategy_refinement(session_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    session = database.get_refinement_session(session_id)
+    if session is None:
+        return None
+    profile = dict(session["profile"])
+    pending = _pending_strategy_refinement(profile)
+    if not pending:
+        raise ValueError("There is no pending strategy refinement to confirm.")
+    apply_change = bool(payload.get("apply", True))
+    messages = _messages(session)
+    topic_id = session.get("topic_id")
+    if apply_change:
+        proposed = pending.get("proposed_profile")
+        if not isinstance(proposed, dict):
+            raise ValueError("Pending strategy refinement is invalid.")
+        profile = dict(proposed)
+        profile.pop(PENDING_STRATEGY_PROFILE_KEY, None)
+        profile = _fill_defaults(profile)
+        saved = explore.save_topic_profile(profile)
+        topic_id = str(saved["topic_id"])
+        messages.append({"role": "assistant", "content": "Applied the proposed search strategy changes."})
+    else:
+        profile.pop(PENDING_STRATEGY_PROFILE_KEY, None)
+        messages.append({"role": "assistant", "content": "Discarded the proposed search strategy changes."})
     updated = database.update_refinement_session(
         session_id,
         profile=profile,
@@ -514,7 +597,7 @@ def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         pending_field=None,
         turn_count=int(session.get("turn_count") or 0),
         status="finalized",
-        topic_id=str(saved["topic_id"]),
+        topic_id=topic_id,
     )
     return _session_response(updated) if updated else None
 
@@ -577,68 +660,6 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
         },
         ensure_ascii=False,
     )
-
-
-def _strategy_refinement_patch(profile: dict[str, Any], instruction: str) -> dict[str, Any]:
-    text = instruction.casefold()
-    patch: dict[str, Any] = {
-        "search_queries": _queries_from_statement(instruction)[:4],
-        "source_queries": {},
-    }
-    source_queries: dict[str, list[str]] = {}
-    if any(term in text for term in ("foreign", "china", "chinese", "qwen", "deepseek", "kimi", "minimax", "moonshot")):
-        source_queries["foreign_media"] = [
-            "中国大模型 最新进展 DeepSeek 通义千问 Kimi MiniMax",
-            "DeepSeek 通义千问 Kimi MiniMax 性能评测",
-            "月之暗面 Kimi MiniMax 智谱 百度 文心一言 豆包 混元",
-            "国产大模型 竞争 OpenAI Anthropic 最新消息",
-        ]
-        patch["foreign_language_plan"] = [
-            {
-                "code": "zh",
-                "name": "Chinese",
-                "native_query": "中国大模型 最新进展 DeepSeek 通义千问 Kimi MiniMax",
-                "native_entity_terms": ["DeepSeek", "通义千问", "Kimi", "MiniMax", "智谱", "文心一言", "豆包", "混元"],
-                "reason": "User asked to broaden Chinese AI lab coverage.",
-            }
-        ]
-    if any(term in text for term in ("podcast", "show", "audio", "interview", "ai daily", "latent space", "hard fork")):
-        source_queries["podcasts"] = _merge_string_lists(
-            profile.get("source_queries", {}).get("podcasts") if isinstance(profile.get("source_queries"), dict) else [],
-            _string_list(instruction, limit=8),
-            limit=10,
-        )
-    if any(term in text for term in ("youtube", "video", "channel")):
-        source_queries["youtube"] = _merge_string_lists(
-            profile.get("source_queries", {}).get("youtube") if isinstance(profile.get("source_queries"), dict) else [],
-            _string_list(instruction, limit=8),
-            limit=10,
-        )
-    if "reddit" in text or "subreddit" in text or "r/" in instruction:
-        source_queries["reddit"] = _merge_string_lists(
-            profile.get("source_queries", {}).get("reddit") if isinstance(profile.get("source_queries"), dict) else [],
-            _string_list(instruction, limit=8),
-            limit=10,
-        )
-    lookback = _coerce_lookback_hours_from_instruction(instruction)
-    if lookback:
-        patch["lookback_hours"] = lookback
-    patch["source_queries"] = source_queries
-    return patch
-
-
-def _coerce_lookback_hours_from_instruction(value: str) -> int | None:
-    lowered = value.lower()
-    match = re.search(r"\b(\d{1,3})\s*(hour|hours|day|days|week|weeks)\b", lowered)
-    if not match:
-        return None
-    amount = int(match.group(1))
-    unit = match.group(2)
-    if unit.startswith("hour"):
-        return _coerce_lookback_hours(amount)
-    if unit.startswith("day"):
-        return _coerce_lookback_hours(amount * 24)
-    return _coerce_lookback_hours(amount * 7 * 24)
 
 
 def _gmail_refinement_question(profile: dict[str, Any]) -> str | None:
@@ -2635,6 +2656,7 @@ def _session_response(session: dict[str, Any]) -> dict[str, Any]:
         if isinstance(profile.get("refinement_diagnostics"), dict)
         else {},
         "strategy_preview": _strategy_preview(profile),
+        "pending_strategy_refinement": _pending_strategy_refinement(profile) or None,
     }
     if session.get("topic_id"):
         response["topic_profile"] = database.get_topic_profile(str(session["topic_id"]))

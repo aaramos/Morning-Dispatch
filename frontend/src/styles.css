@@ -688,6 +688,23 @@ label {
   color: #2f4d42;
 }
 
+.strategy-confirmation.pending {
+  border-color: #cab36b;
+  background: #fbf7e8;
+  color: #433711;
+}
+
+.strategy-confirmation.pending p {
+  color: #5f5125;
+}
+
+.strategy-proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .preset-control-row {
   display: flex;
   flex-wrap: wrap;

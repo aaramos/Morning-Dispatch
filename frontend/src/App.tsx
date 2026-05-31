@@ -92,6 +92,16 @@ type StrategyPreview = {
   reasoning_summary: string;
 };
 
+type PendingStrategyRefinement = {
+  instruction: string;
+  assistant_response: string;
+  reasoning_summary?: string;
+  profile_patch?: Record<string, unknown>;
+  proposed_profile: TopicProfile;
+  strategy_preview?: StrategyPreview;
+  created_at?: string;
+};
+
 type RefinementSession = {
   session_id: string;
   statement: string;
@@ -103,6 +113,7 @@ type RefinementSession = {
   topic_profile?: TopicProfileResponse;
   reasoning_summary?: string;
   strategy_preview?: StrategyPreview;
+  pending_strategy_refinement?: PendingStrategyRefinement | null;
 };
 
 type ConfirmedProfilePayload = {
@@ -919,8 +930,8 @@ function DispatchApp() {
     const baseStatement = activeInterest || topicProfile?.statement || session?.statement || "";
     if (!baseStatement) return;
     setBusy(true);
-    setMessage("Updating search strategy...");
-    beginRefinementProgress("answering", "Updating search strategy");
+    setMessage("Asking AI to review your strategy feedback...");
+    beginRefinementProgress("answering", "Reviewing strategy feedback");
     try {
       const currentSession = session ?? await api<RefinementSession>("/api/explore/refinement-sessions", {
         method: "POST",
@@ -940,12 +951,12 @@ function DispatchApp() {
         }),
       });
       setSession(updated);
-      setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
+      const proposal = updated.pending_strategy_refinement?.proposed_profile;
+      if (proposal) setDraft(draftFromProfile(proposal, defaultControls.content_limits));
       if (updated.topic_profile) setTopicProfile(updated.topic_profile);
       setFlow("confirm");
-      const assistantNote = [...updated.messages].reverse().find((item) => item.role === "assistant")?.content;
-      setStrategyConfirmation(strategyUpdateConfirmation(assistantNote, updated.profile));
-      setMessage("Search strategy updated");
+      setStrategyConfirmation(updated.pending_strategy_refinement?.assistant_response || "AI prepared a proposed strategy update for review.");
+      setMessage("Review the proposed strategy update");
     } catch (error) {
       setMessage(errorMessage(error, "Could not update search strategy"));
     } finally {
@@ -954,8 +965,31 @@ function DispatchApp() {
     }
   }
 
+  async function confirmStrategyRefinement(apply: boolean) {
+    if (!session?.session_id) return;
+    setBusy(true);
+    setMessage(apply ? "Applying strategy update..." : "Discarding strategy update...");
+    beginRefinementProgress("confirming", apply ? "Applying strategy update" : "Discarding strategy update");
+    try {
+      const updated = await api<RefinementSession>(`/api/explore/refinement-sessions/${session.session_id}/strategy/confirm`, {
+        method: "POST",
+        body: JSON.stringify({ apply }),
+      });
+      setSession(updated);
+      setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
+      if (updated.topic_profile) setTopicProfile(updated.topic_profile);
+      setStrategyConfirmation(apply ? strategyUpdateConfirmation("Search strategy updated.", updated.profile) : "Discarded the proposed strategy update.");
+      setMessage(apply ? "Search strategy updated" : "Strategy proposal discarded");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not confirm search strategy update"));
+    } finally {
+      setBusy(false);
+      endRefinementProgress();
+    }
+  }
+
   function confirmedProfilePayload(): ConfirmedProfilePayload {
-    const baseProfile = session?.profile ?? topicProfile?.profile;
+    const baseProfile = session?.pending_strategy_refinement?.proposed_profile ?? session?.profile ?? topicProfile?.profile;
     const topicId = topicProfile?.topic_id ?? session?.topic_id ?? baseProfile?.topic_id;
     const interest = activeInterest || baseProfile?.statement || "";
     const lookbackHours = draft.recency_weighting === "all_available"
@@ -1133,11 +1167,6 @@ function DispatchApp() {
       await sleep(1800);
     }
     throw new Error("Brief build timed out while waiting for the finished brief");
-  }
-
-  async function loadBriefHtml(record: Exploration) {
-    const html = await fetchBriefHtml(record);
-    if (html) setBriefHtml(html);
   }
 
   async function fetchBriefHtml(record: Exploration): Promise<string | null> {
@@ -1603,6 +1632,7 @@ function DispatchApp() {
               draft={draft}
               profile={session?.profile ?? topicProfile?.profile ?? null}
               strategyPreview={session?.strategy_preview ?? null}
+              pendingStrategy={session?.pending_strategy_refinement ?? null}
               strategyConfirmation={strategyConfirmation}
               sources={sourceSelection}
               sourceStatus={sourceStatus}
@@ -1611,6 +1641,7 @@ function DispatchApp() {
               onDraftChange={setDraft}
               onSourceClick={updateSource}
               onStrategyRefine={(instruction) => void refineSearchStrategy(instruction)}
+              onStrategyConfirm={(apply) => void confirmStrategyRefinement(apply)}
               onBuild={() => void buildBrief()}
               youtubePresets={briefSettings?.youtube_presets ?? defaultBriefControls.youtube_presets}
             />
@@ -2002,6 +2033,7 @@ function ConfirmationPanel(props: {
   draft: ConfirmationDraft;
   profile: TopicProfile | null;
   strategyPreview: StrategyPreview | null;
+  pendingStrategy: PendingStrategyRefinement | null;
   strategyConfirmation: string;
   sources: Record<SourceKey, boolean>;
   sourceStatus: SourceStatusResponse | null;
@@ -2010,6 +2042,7 @@ function ConfirmationPanel(props: {
   onDraftChange: (draft: ConfirmationDraft) => void;
   onSourceClick: (source: SourceKey) => void;
   onStrategyRefine: (instruction: string) => void;
+  onStrategyConfirm: (apply: boolean) => void;
   onBuild: () => void;
   youtubePresets?: {
     max: number;
@@ -2020,9 +2053,11 @@ function ConfirmationPanel(props: {
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [strategyInstruction, setStrategyInstruction] = useState("");
+  const reviewProfile = props.pendingStrategy?.proposed_profile ?? props.profile;
+  const reviewPreview = props.pendingStrategy?.strategy_preview ?? props.strategyPreview;
   const contentLimitErrors = validateContentLimits(props.draft.content_limits, props.sources);
-  const searchPlanGroups = sourceSearchPlanGroups(props.profile);
-  const readinessItems = sourceReadinessItems(props.sources, props.sourceStatus, props.profile);
+  const searchPlanGroups = sourceSearchPlanGroups(reviewProfile);
+  const readinessItems = sourceReadinessItems(props.sources, props.sourceStatus, reviewProfile);
   const recencyWindowSummary = sourceScopeConfirmation(props.draft.recency_weighting, props.draft.lookback_hours);
   const needsRecencyConfirmation =
     props.draft.recency_weighting !== "all_available" && !props.draft.recency_scope_confirmed;
@@ -2039,11 +2074,31 @@ function ConfirmationPanel(props: {
           <h2>{props.draft.scope || props.profile?.statement || "Brief setup"}</h2>
         </div>
       </div>
-      {props.strategyPreview ? <StrategyReviewCard preview={props.strategyPreview} /> : null}
+      {reviewPreview ? <StrategyReviewCard preview={reviewPreview} /> : null}
       {props.strategyConfirmation ? (
-        <div className="strategy-confirmation">
-          <strong>AI update</strong>
+        <div className={`strategy-confirmation ${props.pendingStrategy ? "pending" : ""}`}>
+          <strong>{props.pendingStrategy ? "AI proposed update" : "AI update"}</strong>
           <p>{props.strategyConfirmation}</p>
+          {props.pendingStrategy ? (
+            <div className="strategy-proposal-actions">
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => props.onStrategyConfirm(true)}
+                disabled={props.busy}
+              >
+                Apply proposed strategy
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => props.onStrategyConfirm(false)}
+                disabled={props.busy}
+              >
+                Discard
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
       <div className="confirm-grid">
@@ -2124,19 +2179,19 @@ function ConfirmationPanel(props: {
           <span className={item.ready ? "ready" : "warning"} key={item.key}>{item.label}: {item.message}</span>
         ))}
       </div>
-      {props.profile?.requested_sources?.length ? (
+      {reviewProfile?.requested_sources?.length ? (
         <div className="requested-source-list">
           <strong>Requested sources</strong>
-          {props.profile.requested_sources.map((source) => (
+          {reviewProfile.requested_sources.map((source) => (
             <span key={`${source.adapter}-${source.ref}`}>{formatSourceLabel(source.adapter)}: {source.ref}</span>
           ))}
         </div>
       ) : null}
-      {props.profile?.gmail_rules?.include_senders?.length ? (
+      {reviewProfile?.gmail_rules?.include_senders?.length ? (
         <div className="requested-source-list">
           <strong>Gmail rules</strong>
-          <span>{props.profile.gmail_rules.intent || "Selected newsletters"}</span>
-          <span>{gmailLookbackLabel(props.profile.gmail_rules.lookback_hours)} · {props.profile.gmail_rules.include_senders.join(", ")}</span>
+          <span>{reviewProfile.gmail_rules.intent || "Selected newsletters"}</span>
+          <span>{gmailLookbackLabel(reviewProfile.gmail_rules.lookback_hours)} · {reviewProfile.gmail_rules.include_senders.join(", ")}</span>
         </div>
       ) : null}
       {searchPlanGroups.length ? (
@@ -2200,10 +2255,10 @@ function ConfirmationPanel(props: {
           type="button"
           className="primary-action build-brief-action"
           onClick={props.onBuild}
-          disabled={props.busy || contentLimitErrors.length > 0 || needsRecencyConfirmation}
+          disabled={props.busy || contentLimitErrors.length > 0}
           title={needsRecencyConfirmation ? `Please confirm the recency window before building.` : undefined}
         >
-          Build brief
+          {props.pendingStrategy ? "Build with proposed strategy" : "Build brief"}
         </button>
       </div>
     </section>

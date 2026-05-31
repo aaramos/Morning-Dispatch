@@ -1979,6 +1979,7 @@ def test_strategy_refinement_endpoint_uses_ai_patch(monkeypatch, tmp_path) -> No
                     ],
                 },
                 "reasoning_summary": "Expanded China model coverage and added AI Daily to podcasts.",
+                "assistant_response": "I would broaden foreign media to Kimi and MiniMax, and add AI Daily to the podcast searches.",
             }
 
     model_client = _StrategyRefinementModelClient()
@@ -2008,17 +2009,30 @@ def test_strategy_refinement_endpoint_uses_ai_patch(monkeypatch, tmp_path) -> No
                 "models": {"refinement": "strategy-model"},
             },
         )
+        confirmed = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/strategy/confirm",
+            json={"apply": True},
+        )
 
     assert refined.status_code == 200
     body = refined.json()
-    foreign_queries = body["profile"]["source_queries"]["foreign_media"]
-    podcast_queries = body["profile"]["source_queries"]["podcasts"]
+    assert body["pending_field"] == "strategy_refinement"
+    assert "foreign_media" not in body["profile"].get("source_queries", {})
+    assert body["pending_strategy_refinement"]["assistant_response"].startswith("I would broaden")
+    proposal = body["pending_strategy_refinement"]["proposed_profile"]
+    foreign_queries = proposal["source_queries"]["foreign_media"]
+    podcast_queries = proposal["source_queries"]["podcasts"]
     assert any("MiniMax" in query for query in foreign_queries)
     assert any("Kimi" in query for query in foreign_queries)
     assert any("AI Daily" in query for query in podcast_queries)
-    diagnostics = body["profile"]["refinement_diagnostics"]
-    assert diagnostics["readiness_reason"] == "strategy_refined"
+    diagnostics = proposal["refinement_diagnostics"]
+    assert diagnostics["readiness_reason"] == "strategy_refinement_proposed"
     assert diagnostics["model_profile_patch"]["source_queries"]["foreign_media"][0].startswith("中国大模型")
+    assert confirmed.status_code == 200
+    confirmed_body = confirmed.json()
+    assert confirmed_body["pending_field"] is None
+    assert confirmed_body["pending_strategy_refinement"] is None
+    assert any("MiniMax" in query for query in confirmed_body["profile"]["source_queries"]["foreign_media"])
     assert model_client.calls
     assert "natural-language instruction" in str(model_client.calls[0]["system"])
     assert "Kimi and MiniMax" in str(model_client.calls[0]["prompt"])
