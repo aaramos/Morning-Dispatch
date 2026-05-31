@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 
 type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets";
@@ -489,27 +489,27 @@ const defaultContentLimits: ContentLimitsDraft = {
     web_search: 25,
     foreign_media: 25,
     gmail: 25,
-    podcasts: 10,
-    youtube: 10,
+    podcasts: 25,
+    youtube: 25,
     collections: 25,
     markets: 25,
   },
   quality_floor: "standard",
 };
 const defaultBriefControls: BriefControlsDraft = {
-  lookback_hours: 168,
+  lookback_hours: 336,
   content_limits: defaultContentLimits,
   youtube_presets: {
-    max: 10,
-    large: 8,
-    medium: 5,
-    focused: 3,
+    max: 25,
+    large: 20,
+    medium: 15,
+    focused: 10,
   },
   podcast_presets: {
-    max: 10,
-    large: 7,
-    medium: 5,
-    focused: 3,
+    max: 25,
+    large: 20,
+    medium: 15,
+    focused: 10,
   },
 };
 const briefControlBounds = {
@@ -517,7 +517,7 @@ const briefControlBounds = {
   total_items: { min: 1, max: 250 },
   target_items: { min: 1, max: 250 },
   lead_items: { min: 0, max: 20 },
-  per_source: { min: 1, max: 100 },
+  per_source: { min: 1, max: 25 },
 };
 const defaultPipelineLimits: PipelineLimitsDraft = {
   article_fetches: 250,
@@ -741,9 +741,16 @@ function DispatchApp() {
   );
   const defaultControls = briefSettings?.defaults ?? defaultBriefControls;
   const activeInterest = (submittedInterest || statement).trim();
+  const buildInterest = (
+    activeInterest
+    || draft.scope
+    || session?.profile?.statement
+    || topicProfile?.statement
+    || ""
+  ).trim();
   const sourceLocked = flow === "building";
   const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
-  const canBuild = activeInterest.length > 0 && !busy;
+  const canBuild = buildInterest.length > 0 && !busy;
   const currentIssues = buildAttentionIssues(exploration);
   const backgroundBuild = useMemo(
     () => recentExplorations.find((item) => item.status === "queued" || item.status === "running") ?? null,
@@ -984,6 +991,7 @@ function DispatchApp() {
       setSession(updated);
       setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
       if (updated.topic_profile) setTopicProfile(updated.topic_profile);
+      if (!updated.pending_strategy_refinement) setFlow("confirm");
       setStrategyConfirmation(apply ? strategyUpdateConfirmation("Search strategy updated.", updated.profile) : "Discarded the proposed strategy update.");
       setMessage(apply ? "Search strategy updated" : "Strategy proposal discarded");
     } catch (error) {
@@ -994,22 +1002,22 @@ function DispatchApp() {
     }
   }
 
-  function confirmedProfilePayload(): ConfirmedProfilePayload {
+  function confirmedProfilePayload(draftOverride: ConfirmationDraft = draft): ConfirmedProfilePayload {
     const baseProfile = session?.pending_strategy_refinement?.proposed_profile ?? session?.profile ?? topicProfile?.profile;
     const topicId = topicProfile?.topic_id ?? session?.topic_id ?? baseProfile?.topic_id;
-    const interest = activeInterest || baseProfile?.statement || "";
-    const lookbackHours = draft.recency_weighting === "all_available"
+    const interest = buildInterest || baseProfile?.statement || "";
+    const lookbackHours = draftOverride.recency_weighting === "all_available"
       ? null
-      : lookbackHoursForConfirmedDraft(baseProfile, draft, defaultControls.lookback_hours);
+      : lookbackHoursForConfirmedDraft(baseProfile, draftOverride, defaultControls.lookback_hours);
     return {
       ...(topicId ? { topic_id: topicId } : {}),
       ...(session?.session_id ? { refinement_session_id: session.session_id } : {}),
       statement: interest,
-      scope: draft.scope.trim() || interest,
-      depth: draft.depth,
-      recency_weighting: draft.recency_weighting,
+      scope: draftOverride.scope.trim() || interest,
+      depth: draftOverride.depth,
+      recency_weighting: draftOverride.recency_weighting,
       ...(lookbackHours ? { lookback_hours: lookbackHours } : {}),
-      exclusions: splitList(draft.exclusions),
+      exclusions: splitList(draftOverride.exclusions),
       source_selection: selectedEnabledSources,
       requested_sources: baseProfile?.requested_sources ?? [],
       subtopics: baseProfile?.subtopics ?? [],
@@ -1021,8 +1029,8 @@ function DispatchApp() {
       schedule: baseProfile?.schedule ?? null,
       schedule_config: baseProfile?.schedule_config ?? {},
       delivery_config: baseProfile?.delivery_config ?? {},
-      candidate_limit: draft.content_limits.total_items,
-      content_limits: draft.content_limits,
+      candidate_limit: draftOverride.content_limits.total_items,
+      content_limits: draftOverride.content_limits,
     };
   }
 
@@ -1072,17 +1080,14 @@ function DispatchApp() {
       setMessage("Apply or discard the proposed strategy update before building.");
       return;
     }
-    if (draft.recency_weighting !== "all_available" && !draft.recency_scope_confirmed) {
-      setMessage("Please confirm the recency window before building this brief.");
-      return;
-    }
+    const buildDraft = draft;
     const blocked = firstBlockedSelectedSource(sourceSelection, sourceStatus);
     if (blocked) {
       setEnableSource(blocked);
       return;
     }
     const profilePayload = {
-      ...confirmedProfilePayload(),
+      ...confirmedProfilePayload(buildDraft),
       source_selection: selectedEnabledSources,
     };
     setBusy(true);
@@ -1816,7 +1821,7 @@ function DispatchApp() {
         <RefinementProgressOverlay
           progress={activeRefinementProgress}
           now={progressNow}
-          interest={submittedInterest || statement}
+          summary={progressIntentSummary(session?.profile ?? topicProfile?.profile ?? null, submittedInterest || statement)}
         />
       ) : null}
     </main>
@@ -1968,9 +1973,6 @@ function RefinementStatusIndicator(props: { progress: RefinementProgress | null;
         </div>
         <span>{formatElapsed(state.elapsedMs)}</span>
       </div>
-      <div className="progress-track" aria-label={`Refinement progress ${state.percent}%`}>
-        <span style={{ width: `${state.percent}%` }} />
-      </div>
       <div className="refinement-activity-row">
         <span className="activity-pulse" />
         <small>{state.activity}</small>
@@ -1979,13 +1981,13 @@ function RefinementStatusIndicator(props: { progress: RefinementProgress | null;
   );
 }
 
-function RefinementProgressOverlay(props: { progress: RefinementProgress; now: number; interest: string }) {
+function RefinementProgressOverlay(props: { progress: RefinementProgress; now: number; summary: string }) {
   return (
     <div className="refinement-progress-backdrop" role="status" aria-live="polite">
       <div className="refinement-progress-modal">
         <p className="section-kicker">Refinement running</p>
         <h2>Working on your brief plan</h2>
-        <p className="muted">{props.interest}</p>
+        <p className="muted">{props.summary}</p>
         <RefinementStatusIndicator progress={props.progress} now={props.now} />
       </div>
     </div>
@@ -2018,22 +2020,24 @@ function RefinementPlanPreview(props: { profile: TopicProfile | null }) {
 
 function StrategyReviewCard(props: { preview: StrategyPreview }) {
   const { preview } = props;
+  const looksAt = preview.looks_at.filter((label) => label.toLowerCase() !== "reddit");
+  const ignores = preview.ignores.filter((label) => label.toLowerCase() !== "reddit");
   return (
     <div className="strategy-review-card">
       {preview.reasoning_summary ? (
         <p className="strategy-review-summary">{preview.reasoning_summary}</p>
       ) : null}
       <div className="strategy-review-row">
-        {preview.looks_at.length ? (
+        {looksAt.length ? (
           <div className="strategy-review-block">
             <strong>Looks at</strong>
-            <span>{preview.looks_at.join(", ")}</span>
+            <span>{looksAt.join(", ")}</span>
           </div>
         ) : null}
-        {preview.ignores.length ? (
+        {ignores.length ? (
           <div className="strategy-review-block">
             <strong>Ignores</strong>
-            <span>{preview.ignores.join(", ")}</span>
+            <span>{ignores.join(", ")}</span>
           </div>
         ) : null}
         {preview.exclusions.length ? (
@@ -2109,14 +2113,12 @@ function ConfirmationPanel(props: {
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [strategyInstruction, setStrategyInstruction] = useState("");
+  const strategyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const reviewProfile = props.pendingStrategy?.proposed_profile ?? props.profile;
   const reviewPreview = props.pendingStrategy?.strategy_preview ?? props.strategyPreview;
   const contentLimitErrors = validateContentLimits(props.draft.content_limits, props.sources);
   const searchPlanGroups = sourceSearchPlanGroups(reviewProfile);
   const readinessItems = sourceReadinessItems(props.sources, props.sourceStatus, reviewProfile);
-  const recencyWindowSummary = sourceScopeConfirmation(props.draft.recency_weighting, props.draft.lookback_hours);
-  const needsRecencyConfirmation =
-    props.draft.recency_weighting !== "all_available" && !props.draft.recency_scope_confirmed;
   const buildBlockedByProposal = Boolean(props.pendingStrategy);
 
   function updateContentLimits(next: ContentLimitsDraft) {
@@ -2131,40 +2133,6 @@ function ConfirmationPanel(props: {
           <h2>{props.draft.scope || props.profile?.statement || "Brief setup"}</h2>
         </div>
       </div>
-      {reviewPreview ? <StrategyReviewCard preview={reviewPreview} /> : null}
-      {props.strategyConfirmation ? (
-        <div className={`strategy-confirmation ${props.pendingStrategy ? "pending" : ""}`}>
-          <strong>{props.pendingStrategy ? "AI proposed update" : "AI update"}</strong>
-          <p>{props.strategyConfirmation}</p>
-          {props.pendingStrategy?.findings?.length ? (
-            <ul className="strategy-findings">
-              {props.pendingStrategy.findings.map((finding) => (
-                <li key={finding}>{finding}</li>
-              ))}
-            </ul>
-          ) : null}
-          {props.pendingStrategy ? (
-            <div className="strategy-proposal-actions">
-              <button
-                type="button"
-                className="primary-action"
-                onClick={() => props.onStrategyConfirm(true)}
-                disabled={props.busy}
-              >
-                Apply proposed strategy
-              </button>
-              <button
-                type="button"
-                className="secondary-action"
-                onClick={() => props.onStrategyConfirm(false)}
-                disabled={props.busy}
-              >
-                Discard
-              </button>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
       <div className="confirm-grid">
         <label>
           Scope
@@ -2191,7 +2159,6 @@ function ConfirmationPanel(props: {
               ...props.draft,
               recency_weighting: event.target.value as ConfirmationDraft["recency_weighting"],
               lookback_hours: lookbackHoursFromSourceScope(event.target.value as SourceScope),
-              recency_scope_confirmed: false,
               sourceScopeTouched: true,
             })}
           >
@@ -2202,31 +2169,6 @@ function ConfirmationPanel(props: {
           </select>
           <small>{sourceScopeConfirmation(props.draft.recency_weighting, props.draft.lookback_hours)}</small>
         </label>
-        {props.draft.recency_weighting !== "all_available" ? (
-          <label className="recency-confirmation">
-            <input
-              type="checkbox"
-              checked={Boolean(props.draft.recency_scope_confirmed)}
-              onChange={(event) => props.onDraftChange({
-                ...props.draft,
-                recency_scope_confirmed: event.target.checked,
-              })}
-            />
-            <span>I confirm this recency window: {recencyWindowSummary}</span>
-          </label>
-        ) : null}
-        <NumberStepper
-          label="Recency window (days)"
-          value={Math.max(1, Math.round(props.draft.lookback_hours / 24))}
-          min={briefControlBounds.source_window_days.min}
-          max={briefControlBounds.source_window_days.max}
-          onChange={(days) => props.onDraftChange({
-            ...props.draft,
-            lookback_hours: clampContentLimit(days, 1, 365) * 24,
-            recency_scope_confirmed: false,
-            sourceScopeTouched: true,
-          })}
-        />
         <label>
           Exclusions
           <input
@@ -2274,9 +2216,52 @@ function ConfirmationPanel(props: {
         </div>
       ) : null}
       <div className="strategy-refine-box">
+        {reviewPreview ? <StrategyReviewCard preview={reviewPreview} /> : null}
+        {props.strategyConfirmation ? (
+          <div className={`strategy-confirmation ${props.pendingStrategy ? "pending" : ""}`}>
+            <strong>{props.pendingStrategy ? "AI proposed update" : "AI update"}</strong>
+            <p>{props.strategyConfirmation}</p>
+            {props.pendingStrategy?.findings?.length ? (
+              <ul className="strategy-findings">
+                {props.pendingStrategy.findings.map((finding) => (
+                  <li key={finding}>{finding}</li>
+                ))}
+              </ul>
+            ) : null}
+            {props.pendingStrategy ? (
+              <div className="strategy-proposal-actions">
+                <button
+                  type="button"
+                  className="primary-action"
+                  onClick={() => props.onStrategyConfirm(true)}
+                  disabled={props.busy}
+                >
+                  Apply proposed strategy
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => strategyTextareaRef.current?.focus()}
+                  disabled={props.busy}
+                >
+                  Keep refining
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => props.onStrategyConfirm(false)}
+                  disabled={props.busy}
+                >
+                  Discard
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <label>
           Refine search strategy
           <textarea
+            ref={strategyTextareaRef}
             value={strategyInstruction}
             onChange={(event) => setStrategyInstruction(event.target.value)}
             placeholder="Add missing sources, entities, recency, countries, channels, podcasts, or search terms..."
@@ -2286,10 +2271,14 @@ function ConfirmationPanel(props: {
           type="button"
           className="secondary-action"
           onClick={() => {
+            if (!strategyInstruction.trim()) {
+              strategyTextareaRef.current?.focus();
+              return;
+            }
             props.onStrategyRefine(strategyInstruction);
             setStrategyInstruction("");
           }}
-          disabled={props.busy || !strategyInstruction.trim()}
+          disabled={props.busy}
         >
           Update strategy
         </button>
@@ -2315,6 +2304,20 @@ function ConfirmationPanel(props: {
         ) : null}
       </div>
       <div className="confirmation-actions">
+        {props.draft.recency_weighting !== "all_available" ? (
+          <NumberStepper
+            label="Recency window (days)"
+            value={Math.max(1, Math.round(props.draft.lookback_hours / 24))}
+            min={briefControlBounds.source_window_days.min}
+            max={briefControlBounds.source_window_days.max}
+            compact
+            onChange={(days) => props.onDraftChange({
+              ...props.draft,
+              lookback_hours: clampContentLimit(days, 1, 365) * 24,
+              sourceScopeTouched: true,
+            })}
+          />
+        ) : null}
         <button
           type="button"
           className="primary-action build-brief-action"
@@ -2323,9 +2326,7 @@ function ConfirmationPanel(props: {
           title={
             buildBlockedByProposal
               ? "Apply or discard the proposed strategy update before building."
-              : needsRecencyConfirmation
-                ? "Please confirm the recency window before building."
-                : undefined
+              : undefined
           }
         >
           {props.pendingStrategy ? "Review proposal first" : "Build brief"}
@@ -2375,8 +2376,9 @@ function ContentLimitsPanel(props: {
   function applyPreset(scale: number) {
     const scaled = (value: number, min: number, max: number) => clampContentLimit(Math.round(value * scale), min, max);
     const nextPerSource: Partial<Record<SourceKey, number>> = {};
-    const presets = props.youtubePresets ?? { max: 10, large: 8, medium: 5, focused: 3 };
-    const podcastPresets = props.podcastPresets ?? { max: 10, large: 7, medium: 5, focused: 3 };
+    const presets = props.youtubePresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
+    const podcastPresets = props.podcastPresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
+    const systemMax = defaultContentLimits;
     
     for (const source of sourceOptions) {
       if (source.key === "youtube") {
@@ -2394,15 +2396,15 @@ function ContentLimitsPanel(props: {
         else if (scale === 0.4) podcastVal = podcastPresets.focused;
         nextPerSource[source.key] = podcastVal;
       } else {
-        const maxValue = defaults.per_source[source.key] ?? briefControlBounds.per_source.max;
+        const maxValue = systemMax.per_source[source.key] ?? briefControlBounds.per_source.max;
         nextPerSource[source.key] = scaled(maxValue, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
       }
     }
     props.onChange({
       ...props.limits,
-      total_items: scaled(defaults.total_items, briefControlBounds.total_items.min, briefControlBounds.total_items.max),
-      target_items: scaled(defaults.target_items, briefControlBounds.target_items.min, briefControlBounds.target_items.max),
-      lead_items: scaled(defaults.lead_items, briefControlBounds.lead_items.min, briefControlBounds.lead_items.max),
+      total_items: scaled(systemMax.total_items, briefControlBounds.total_items.min, briefControlBounds.total_items.max),
+      target_items: scaled(systemMax.target_items, briefControlBounds.target_items.min, briefControlBounds.target_items.max),
+      lead_items: scaled(systemMax.lead_items, briefControlBounds.lead_items.min, briefControlBounds.lead_items.max),
       per_source: nextPerSource,
     });
   }
@@ -2466,7 +2468,7 @@ function ContentLimitsPanel(props: {
         </div>
       ) : null}
       {props.showReset !== false ? (
-        <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(defaults)}>
+        <button type="button" className="ghost-action reset-limits-action" onClick={() => props.onChange(defaultContentLimits)}>
           {props.resetLabel ?? "Reset to defaults"}
         </button>
       ) : null}
@@ -2482,8 +2484,8 @@ function BriefControlsPanel(props: {
   onChange: (controls: BriefControlsDraft) => void;
 }) {
   const sourceWindowDays = Math.max(0, Math.round((Number(props.controls.lookback_hours) || 0) / 24));
-  const presets = props.controls.youtube_presets ?? { max: 10, large: 8, medium: 5, focused: 3 };
-  const podcastPresets = props.controls.podcast_presets ?? { max: 10, large: 7, medium: 5, focused: 3 };
+  const presets = props.controls.youtube_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
+  const podcastPresets = props.controls.podcast_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
 
   return (
     <div className="brief-controls-panel">
@@ -2507,13 +2509,13 @@ function BriefControlsPanel(props: {
       />
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>YouTube scale presets</strong>
-        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source video limits for YouTube for each profile scale (Max 10).</p>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source video limits for YouTube for each profile scale (Max 25).</p>
         <div className="content-limit-grid">
           <NumberStepper
             label="Max profile"
             value={presets.max}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, max: val }
@@ -2523,7 +2525,7 @@ function BriefControlsPanel(props: {
             label="Large profile"
             value={presets.large}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, large: val }
@@ -2533,7 +2535,7 @@ function BriefControlsPanel(props: {
             label="Medium profile"
             value={presets.medium}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, medium: val }
@@ -2543,7 +2545,7 @@ function BriefControlsPanel(props: {
             label="Focused profile"
             value={presets.focused}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, focused: val }
@@ -2553,13 +2555,13 @@ function BriefControlsPanel(props: {
       </div>
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>Podcast scale presets</strong>
-        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for podcast items for each profile scale (Max 10).</p>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for podcast items for each profile scale (Max 25).</p>
         <div className="content-limit-grid">
           <NumberStepper
             label="Max profile"
             value={podcastPresets.max}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, max: val }
@@ -2569,7 +2571,7 @@ function BriefControlsPanel(props: {
             label="Large profile"
             value={podcastPresets.large}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, large: val }
@@ -2579,7 +2581,7 @@ function BriefControlsPanel(props: {
             label="Medium profile"
             value={podcastPresets.medium}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, medium: val }
@@ -2589,7 +2591,7 @@ function BriefControlsPanel(props: {
             label="Focused profile"
             value={podcastPresets.focused}
             min={1}
-            max={10}
+            max={25}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, focused: val }
@@ -4952,7 +4954,7 @@ function sourceScopeFromProfile(profile: TopicProfile): SourceScope {
 
 function lookbackHoursFromSourceScope(sourceScope: SourceScope): number {
   if (sourceScope === "last_year" || sourceScope === "all_available") return 8760;
-  if (sourceScope === "recent") return 72;
+  if (sourceScope === "recent") return 336;
   return 24;
 }
 
@@ -5342,6 +5344,31 @@ function releaseStamp(status: AdminStatus | null): string {
   return "Release unknown";
 }
 
+function progressIntentSummary(profile: TopicProfile | null, fallback: string): string {
+  if (!profile) {
+    const cleaned = fallback.trim();
+    return cleaned ? truncateSentence(cleaned, 160) : "Reviewing your brief plan and source strategy.";
+  }
+  const scope = profile.scope || profile.statement || fallback || "Reviewing your brief plan";
+  const sources = Object.entries(profile.source_selection ?? {})
+    .filter(([, enabled]) => enabled)
+    .map(([source]) => formatSourceLabel(source))
+    .filter((source) => source !== "Collections")
+    .slice(0, 5);
+  const lookback = profile.lookback_hours
+    ? `over the last ${Math.max(1, Math.round(Number(profile.lookback_hours) / 24))} days`
+    : "";
+  const exclusions = profile.exclusions?.length ? ` while avoiding ${profile.exclusions.slice(0, 2).join(" and ")}` : "";
+  const sourceText = sources.length ? ` across ${sources.join(", ")}` : "";
+  return truncateSentence(`${scope}${sourceText}${lookback ? ` ${lookback}` : ""}${exclusions}.`, 160);
+}
+
+function truncateSentence(value: string, maxLength: number): string {
+  const cleaned = value.split(/\s+/).join(" ").trim();
+  if (cleaned.length <= maxLength) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
+
 function strategyUpdateConfirmation(note: string | undefined, profile: TopicProfile): string {
   const sourceQueries = profile.source_queries ?? {};
   const changedSources = Object.entries(sourceQueries)
@@ -5419,46 +5446,39 @@ function refinementProgressState(progress: RefinementProgress, now: number): Ref
   const seconds = elapsedMs / 1000;
   let stage = "Preparing request";
   let detail = "Packaging your interest, selected sources, and the current refinement state.";
-  let activity = "Model request is active.";
-  let percent = 14;
+  let activity = "Still working.";
+  const percent = 0;
 
   if (seconds >= 1.5) {
     stage = "Calling model";
-    detail = "Sending the refinement prompt to the configured model provider.";
-    percent = 30;
+    detail = "The model is reviewing your plan.";
   }
   if (seconds >= 4) {
-    stage = "Waiting for model";
-    detail = "The selected provider may be loading the model or allocating memory.";
-    activity = "Waiting for the model response.";
-    percent = 48;
+    stage = "Still working";
+    detail = "The model is reviewing your brief plan. This step can take a minute.";
+    activity = "Still working.";
   }
   if (seconds >= 9) {
-    stage = "Generating response";
-    detail = "Waiting for the model to return the refined profile and next question.";
-    activity = "Token-level progress is not exposed for this blocking call yet.";
-    percent = 68;
+    stage = "Still working";
+    detail = "The model is still working on the strategy update.";
+    activity = "Still working.";
   }
   if (seconds >= 20) {
-    stage = "Still waiting on local model";
-    detail = "The local model may still be warming up or generating the structured response.";
-    activity = "No server response yet; elapsed time is still updating.";
-    percent = 82;
+    stage = "Still working";
+    detail = "This is taking longer than usual, but the request is still running.";
+    activity = "Still working.";
   }
   if (seconds >= 75) {
     stage = "Taking longer than usual";
-    detail = "The local model is still inside the backend timeout window. You can keep waiting, retry, or refresh.";
-    percent = 90;
+    detail = "The request has not finished yet. You can keep waiting or retry.";
   }
   if (progress.phase === "answering" && seconds < 4) {
     stage = "Updating search strategy";
-    detail = "Applying your answer and deciding the next refinement question.";
-    percent = Math.max(percent, 34);
+    detail = "The model is reviewing your feedback.";
   }
   if (progress.phase === "confirming" && seconds < 4) {
-    stage = "Preparing confirmation";
-    detail = "Finalizing the profile so you can review it before building.";
-    percent = Math.max(percent, 38);
+    stage = "Reviewing strategy";
+    detail = "The model is checking the plan before the brief is built.";
   }
 
   return {

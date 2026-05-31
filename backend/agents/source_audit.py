@@ -411,8 +411,6 @@ def _heuristic_exclusion_reason(profile_record: dict[str, Any], result: ArticleF
         return "Excluded by deterministic fallback because tag/archive pages are not article coverage."
     if any(phrase in title_lower for phrase in MARKET_REPORT_PHRASES):
         return "Excluded by deterministic fallback because generic market-report pages are low-signal for a current news brief."
-    if source_type == "market_snapshot" and not _matches_requested_entity(text_lower, result):
-        return "Excluded by deterministic fallback because the market snapshot does not match the requested companies."
     if source_type == "foreign_web" and _looks_like_english_page_for_foreign_result(metadata, title, result.excerpt or ""):
         return "Excluded by deterministic fallback because the result is not native-language foreign coverage."
     return None
@@ -696,7 +694,7 @@ def _apply_audit_payload(
             "resolved_published_date": model_date or "",
         }}
 
-        if decision == "exclude" and confidence >= 0.5:
+        if decision == "exclude" and confidence >= 0.5 and result.payload.source_type != "market_snapshot":
             updated[index] = replace(result, tier="dropped", metadata=metadata)
             excluded_count += 1
             action = "drop_article"

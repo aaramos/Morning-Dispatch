@@ -162,15 +162,16 @@ class DiscoveryRunner:
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
 
         # Dedicated source ranking lanes (sorted against each other before competing with
-        # other sources for pipeline capacity). YouTube and podcast lanes are each capped
-        # to system ceilings for isolation.
+        # other sources for pipeline capacity). These sources should be judged within
+        # their own lanes rather than crowded out by high-volume web results.
         target_capacity = max(1, context.candidate_limit)
         profile_total_limit = _explicit_total_limit(profile)
         if profile_total_limit is not None:
             target_capacity = min(target_capacity, profile_total_limit)
         source_plan: tuple[tuple[str, int], ...] = (
-            ("youtube", _lane_limit(profile, "youtube", default=10, system_max=10)),
-            ("podcasts", _lane_limit(profile, "podcasts", default=10, system_max=10)),
+            ("markets", _lane_limit(profile, "markets", default=25, system_max=25)),
+            ("youtube", _lane_limit(profile, "youtube", default=25, system_max=25)),
+            ("podcasts", _lane_limit(profile, "podcasts", default=25, system_max=25)),
         )
 
         lane_candidates: list[Candidate] = []
@@ -297,8 +298,6 @@ def _apply_source_limits(profile: TopicProfile, candidates: list[Candidate], *, 
     kept_ids: set[int] = set()
     for candidate in ranked:
         limit = _source_limit(per_source.get(candidate.adapter))
-        if candidate.adapter == "youtube":
-            limit = min(limit or 10, 10)
         if limit is None:
             kept.append(candidate)
             kept_ids.add(id(candidate))
@@ -350,7 +349,7 @@ def _source_limit(value: Any) -> int | None:
         return None
     if limit < 1:
         return None
-    return min(limit, 100)
+    return min(limit, 25)
 
 
 def _apply_exclusions(profile: TopicProfile, candidates: list[Candidate]) -> tuple[list[Candidate], list[dict[str, Any]]]:

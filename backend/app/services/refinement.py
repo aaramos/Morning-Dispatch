@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -29,6 +30,7 @@ GMAIL_SENDER_SELECTION_FIELD = "gmail_sender_selection"
 PENDING_STRATEGY_FIELD = "strategy_refinement"
 PENDING_STRATEGY_PROFILE_KEY = "pending_strategy_refinement"
 STRATEGY_REVIEW_PROFILE_KEY = "strategy_review"
+STRATEGY_REVIEW_RESOLVED_STATUSES = {"passed", "applied", "discarded", "suppressed", "unavailable"}
 FIELD_ORDER = ("scope", "related_interests", "depth", "recency_weighting", "requested_sources", "exclusions")
 FIELD_HINT_TEXT_SOURCE = ("statement", "scope", "keywords", "subtopics")
 DEPTH_PRACTITIONER_TOKENS = (
@@ -294,6 +296,33 @@ def review_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         payload.get("profile"),
         models=payload.get("models"),
     )
+    current_fingerprint = _strategy_fingerprint(review_profile)
+    existing_review = profile.get(STRATEGY_REVIEW_PROFILE_KEY)
+    if (
+        isinstance(existing_review, dict)
+        and existing_review.get("fingerprint") == current_fingerprint
+        and str(existing_review.get("status") or "") in STRATEGY_REVIEW_RESOLVED_STATUSES
+    ):
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            **existing_review,
+            "status": str(existing_review.get("status") or "passed"),
+            "assistant_response": str(
+                existing_review.get("assistant_response")
+                or "Strategy was already reviewed for this version and is ready to build."
+            ),
+            "fingerprint": current_fingerprint,
+        }
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=_messages(session),
+            pending_field=None,
+            turn_count=int(session.get("turn_count") or 0),
+            status=session.get("status") or "finalized",
+            topic_id=session.get("topic_id"),
+        )
+        return _session_response(updated) if updated else None
+
     instruction = _pre_build_strategy_review_instruction(review_profile)
     agent_update = _run_strategy_refinement_agent(
         profile=review_profile,
@@ -308,6 +337,7 @@ def review_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
             "assistant_response": "AI strategy review was unavailable, so no strategy changes were proposed.",
             "findings": [],
             "reviewed_at": reviewed_at,
+            "fingerprint": current_fingerprint,
         }
         updated = database.update_refinement_session(
             session_id,
@@ -331,6 +361,7 @@ def review_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
             "assistant_response": assistant_response,
             "findings": _string_list(agent_update.get("findings"), limit=8),
             "reviewed_at": reviewed_at,
+            "fingerprint": current_fingerprint,
         }
         messages.append({"role": "assistant", "content": assistant_response})
         updated = database.update_refinement_session(
@@ -351,11 +382,36 @@ def review_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         readiness_reason="pre_build_strategy_review_proposed",
         review_mode="pre_build_review",
     )
+    proposed_fingerprint = str(pending.get("proposal_fingerprint") or "")
+    if not proposed_fingerprint or proposed_fingerprint == current_fingerprint or _proposal_was_resolved(profile, proposed_fingerprint):
+        assistant_response = "Strategy quality check is already resolved for this plan; building can continue."
+        profile.pop(PENDING_STRATEGY_PROFILE_KEY, None)
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "suppressed",
+            "assistant_response": assistant_response,
+            "findings": pending.get("findings", []),
+            "reviewed_at": reviewed_at,
+            "fingerprint": current_fingerprint,
+            "suppressed_proposal_fingerprint": proposed_fingerprint,
+        }
+        messages.append({"role": "assistant", "content": assistant_response})
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=messages,
+            pending_field=None,
+            turn_count=int(session.get("turn_count") or 0),
+            status=session.get("status") or "finalized",
+            topic_id=session.get("topic_id"),
+        )
+        return _session_response(updated) if updated else None
     profile[STRATEGY_REVIEW_PROFILE_KEY] = {
         "status": "proposed",
         "assistant_response": pending["assistant_response"],
         "findings": pending.get("findings", []),
         "reviewed_at": reviewed_at,
+        "fingerprint": current_fingerprint,
+        "proposal_fingerprint": proposed_fingerprint,
     }
     profile[PENDING_STRATEGY_PROFILE_KEY] = pending
     messages.append({"role": "assistant", "content": pending["assistant_response"]})
@@ -407,6 +463,8 @@ def _build_pending_strategy_refinement(
         "strategy_preview": _strategy_preview(proposed_profile),
         "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "findings": _string_list(agent_update.get("findings"), limit=8),
+        "base_fingerprint": _strategy_fingerprint(profile),
+        "proposal_fingerprint": _strategy_fingerprint(proposed_profile),
     }
     if review_mode:
         pending["review_mode"] = review_mode
@@ -445,6 +503,9 @@ def confirm_strategy_refinement(session_id: str, payload: dict[str, Any]) -> dic
     apply_change = bool(payload.get("apply", True))
     messages = _messages(session)
     topic_id = session.get("topic_id")
+    reviewed_at = datetime.now(UTC).isoformat(timespec="seconds")
+    base_fingerprint = str(pending.get("base_fingerprint") or _strategy_fingerprint(profile))
+    proposal_fingerprint = str(pending.get("proposal_fingerprint") or "")
     if apply_change:
         proposed = pending.get("proposed_profile")
         if not isinstance(proposed, dict):
@@ -452,11 +513,31 @@ def confirm_strategy_refinement(session_id: str, payload: dict[str, Any]) -> dic
         profile = dict(proposed)
         profile.pop(PENDING_STRATEGY_PROFILE_KEY, None)
         profile = _fill_defaults(profile)
+        proposal_fingerprint = _strategy_fingerprint(profile)
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "applied",
+            "assistant_response": "Applied the proposed search strategy changes.",
+            "findings": _string_list(pending.get("findings"), limit=8),
+            "reviewed_at": reviewed_at,
+            "fingerprint": proposal_fingerprint,
+            "base_fingerprint": base_fingerprint,
+            "proposal_fingerprint": proposal_fingerprint,
+        }
         saved = explore.save_topic_profile(profile)
         topic_id = str(saved["topic_id"])
         messages.append({"role": "assistant", "content": "Applied the proposed search strategy changes."})
     else:
         profile.pop(PENDING_STRATEGY_PROFILE_KEY, None)
+        current_fingerprint = _strategy_fingerprint(profile)
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "discarded",
+            "assistant_response": "Discarded the proposed search strategy changes.",
+            "findings": _string_list(pending.get("findings"), limit=8),
+            "reviewed_at": reviewed_at,
+            "fingerprint": current_fingerprint,
+            "base_fingerprint": base_fingerprint,
+            "proposal_fingerprint": proposal_fingerprint,
+        }
         messages.append({"role": "assistant", "content": "Discarded the proposed search strategy changes."})
     updated = database.update_refinement_session(
         session_id,
@@ -492,10 +573,56 @@ def _profile_for_strategy_review(base_profile: dict[str, Any], payload_profile: 
             "schedule",
             "schedule_config",
             "delivery_config",
+            "content_limits",
+            "pipeline_limits",
         ):
             if key in payload_profile:
                 merged[key] = payload_profile.get(key)
     return _apply_models(_coerce_profile(merged), models)
+
+
+def _proposal_was_resolved(profile: dict[str, Any], proposal_fingerprint: str) -> bool:
+    if not proposal_fingerprint:
+        return False
+    review = profile.get(STRATEGY_REVIEW_PROFILE_KEY)
+    if not isinstance(review, dict):
+        return False
+    if str(review.get("proposal_fingerprint") or "") != proposal_fingerprint:
+        return False
+    return str(review.get("status") or "") in {"applied", "discarded", "suppressed"}
+
+
+def _strategy_fingerprint(profile: dict[str, Any]) -> str:
+    comparable = {
+        "statement": str(profile.get("statement") or ""),
+        "scope": str(profile.get("scope") or ""),
+        "subtopics": _string_list(profile.get("subtopics"), limit=24),
+        "keywords": _string_list(profile.get("keywords"), limit=24),
+        "search_queries": _string_list(profile.get("search_queries"), limit=20),
+        "source_queries": _clean_source_queries(profile.get("source_queries")),
+        "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
+        "depth": str(profile.get("depth") or ""),
+        "recency_weighting": str(profile.get("recency_weighting") or ""),
+        "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
+        "exclusions": _string_list(profile.get("exclusions"), limit=24),
+        "source_selection": _source_selection_dict(profile.get("source_selection")),
+        "gmail_rules": _normalize_gmail_rules(profile.get("gmail_rules")),
+        "content_limits": _stable_jsonable(profile.get("content_limits")),
+        "pipeline_limits": _stable_jsonable(profile.get("pipeline_limits")),
+    }
+    encoded = json.dumps(comparable, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _stable_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _stable_jsonable(val) for key, val in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_stable_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def _pre_build_strategy_review_instruction(profile: dict[str, Any]) -> str:
@@ -2366,6 +2493,8 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "schedule": _coerce_schedule(profile.get("schedule")),
         "schedule_config": dict(profile.get("schedule_config") or {}) if isinstance(profile.get("schedule_config"), dict) else {},
         "delivery_config": dict(profile.get("delivery_config") or {}) if isinstance(profile.get("delivery_config"), dict) else {},
+        "content_limits": _stable_jsonable(profile.get("content_limits")) if isinstance(profile.get("content_limits"), dict) else {},
+        "pipeline_limits": _stable_jsonable(profile.get("pipeline_limits")) if isinstance(profile.get("pipeline_limits"), dict) else {},
     }
 
 

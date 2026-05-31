@@ -606,8 +606,8 @@ def test_source_audit_fallback_uses_company_fit_for_market_snapshots(monkeypatch
     )
 
     assert summary["status"] == "fallback"
-    assert updated[0].tier == "dropped"
-    assert "market snapshot does not match" in summary["issues"][0]["reason"]
+    assert updated[0].tier == "main"
+    assert not summary["issues"]
 
 
 def test_digest_runner_uses_langgraph_orchestration():

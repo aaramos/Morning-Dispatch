@@ -9,7 +9,6 @@ _SOURCE_LABELS = {
     "gmail": "approved Gmail newsletters",
     "markets": "market data",
     "podcasts": "podcasts",
-    "reddit": "Reddit",
     "web_search": "web search",
     "youtube": "YouTube",
 }
@@ -38,7 +37,7 @@ def summarize_search_strategy(
 
 
 def selected_source_labels(source_selection: dict[str, bool]) -> list[str]:
-    return [source_label(name) for name, enabled in source_selection.items() if enabled]
+    return [source_label(name) for name, enabled in source_selection.items() if enabled and name in _SOURCE_LABELS]
 
 
 def _strategy_topic(statement: str, *, keywords: list[str] | tuple[str, ...]) -> str:

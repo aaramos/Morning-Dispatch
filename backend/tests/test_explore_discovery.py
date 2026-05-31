@@ -760,11 +760,11 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         assert updated.json()["profile"]["content_limits"] == {
             "lead_items": 2,
                 "per_source": {
-                    "collections": 15,
-                    "foreign_media": 15,
-                    "gmail": 15,
-                    "markets": 15,
-                    "podcasts": 10,
+                    "collections": 25,
+                    "foreign_media": 25,
+                    "gmail": 25,
+                    "markets": 25,
+                    "podcasts": 25,
                     "web_search": 5,
                     "youtube": 2,
                 },
@@ -1018,16 +1018,15 @@ def test_scheduled_run_promotes_kept_sources(monkeypatch, tmp_path) -> None:
     assert "web search" in strategy["summary"]
 
     promoted_sources = database.list_promoted_sources(topic["topic_id"])
-    assert len(promoted_sources) == 3
+    assert len(promoted_sources) == 2
     promoted_keys = {
         (source["adapter"], source["ref"], source["has_feed"], source["feed_url"]) for source in promoted_sources
     }
     assert ("gmail", "newsletter@localai.example", False, None) in promoted_keys
-    assert ("reddit", "r/localAI", False, None) in promoted_keys
     assert ("podcasts", "Practical AI Podcast", True, "https://podcast.example.com/feed") in promoted_keys
 
     topic_profile_after = database.get_topic_profile(topic["topic_id"]) or {}
-    assert len(topic_profile_after["profile"].get("promoted_sources", [])) == 3
+    assert len(topic_profile_after["profile"].get("promoted_sources", [])) == 2
 
 
 def test_scheduled_run_promotes_deduped_sources(monkeypatch, tmp_path) -> None:
@@ -1217,7 +1216,7 @@ def test_discovery_runner_dedupes_and_marks_opt_outs() -> None:
     assert result.candidates[0].score == 0.7
     statuses = {status.name: status.status for status in result.statuses}
     assert statuses["gmail"] == "completed"
-    assert statuses["reddit"] == "skipped"
+    assert "reddit" not in statuses
 
 
 def test_discovery_runner_applies_per_source_content_limits() -> None:
@@ -1651,7 +1650,7 @@ def test_explore_api_creates_topic_profile(monkeypatch, tmp_path) -> None:
     assert response.status_code == 201
     body = response.json()
     assert body["statement"] == "Explore local AI infrastructure"
-    assert body["profile"]["source_selection"]["reddit"] is False
+    assert "reddit" not in body["profile"]["source_selection"]
     assert discovery.status_code == 202
     discovery_body = discovery.json()
     assert discovery_body["exploration"]["status"] == "complete"
@@ -2162,6 +2161,14 @@ def test_strategy_review_proposes_replacement_for_stale_year_queries(monkeypatch
             f"/api/explore/refinement-sessions/{session['session_id']}/strategy/confirm",
             json={"apply": True},
         )
+        call_count_after_confirm = len(model_client.calls)
+        repeated_review = client.post(
+            f"/api/explore/refinement-sessions/{session['session_id']}/strategy/review",
+            json={
+                "profile": confirmed.json()["profile"],
+                "models": {"refinement": "strategy-review-model"},
+            },
+        )
 
     assert reviewed.status_code == 200
     body = reviewed.json()
@@ -2183,6 +2190,12 @@ def test_strategy_review_proposes_replacement_for_stale_year_queries(monkeypatch
     assert confirmed.status_code == 200
     confirmed_text = " ".join(confirmed.json()["profile"]["search_queries"])
     assert "2024" not in confirmed_text
+    assert confirmed.json()["pending_strategy_refinement"] is None
+    assert confirmed.json()["strategy_review"]["status"] == "applied"
+    assert repeated_review.status_code == 200
+    assert repeated_review.json()["pending_strategy_refinement"] is None
+    assert repeated_review.json()["strategy_review"]["status"] == "applied"
+    assert len(model_client.calls) == call_count_after_confirm
     assert model_client.calls
     assert "before the brief build" in str(model_client.calls[0]["prompt"])
     assert "last 2160 hours" in str(model_client.calls[0]["prompt"])

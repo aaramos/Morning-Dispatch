@@ -13,6 +13,7 @@ Depth = Literal["practitioner", "informed-generalist"]
 RecencyWeighting = Literal["breaking", "recent", "last_year", "all_available"]
 ScheduleValue = Literal["hourly", "daily", "weekdays", "weekly", "monthly"]
 VALID_SCHEDULES: set[str] = {"hourly", "daily", "weekdays", "weekly", "monthly"}
+VALID_SOURCE_ADAPTERS: set[str] = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"}
 
 DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
     "gmail": True,
@@ -277,10 +278,9 @@ def _source_queries(value: Any) -> dict[str, tuple[str, ...]]:
     if not isinstance(value, dict):
         return {}
     queries: dict[str, tuple[str, ...]] = {}
-    valid_adapters = {"gmail", "reddit", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"}
     for raw_key, raw_queries in value.items():
         key = _clean_text(raw_key)
-        if key not in valid_adapters:
+        if key not in VALID_SOURCE_ADAPTERS:
             continue
         cleaned = tuple(_string_list(raw_queries)[:20])
         if cleaned:
@@ -312,8 +312,8 @@ def _content_limits(value: Any) -> dict[str, Any]:
     if isinstance(raw_per_source, dict):
         for raw_key, raw_limit in raw_per_source.items():
             key = _clean_text(raw_key)
-            source_limit = _positive_int(raw_limit, maximum=100)
-            if key and source_limit is not None:
+            source_limit = _positive_int(raw_limit, maximum=25)
+            if key in VALID_SOURCE_ADAPTERS and source_limit is not None:
                 per_source[key] = source_limit
     if per_source:
         limits["per_source"] = per_source
@@ -336,9 +336,8 @@ def _source_selection(value: Any) -> dict[str, bool]:
     if isinstance(value, dict):
         for key, enabled in value.items():
             clean_key = _clean_text(key)
-            if clean_key:
+            if clean_key in DEFAULT_SOURCE_SELECTION:
                 selection[clean_key] = bool(enabled)
-    selection["reddit"] = False
     return selection
 
 

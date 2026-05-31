@@ -20,40 +20,40 @@ MAX_CANDIDATE_BUDGET = 250
 MAX_LEAD_ITEMS = 20
 MAX_LOOKBACK_HOURS = 8760
 MAX_LOOKBACK_DAYS = MAX_LOOKBACK_HOURS // 24
-MAX_PER_SOURCE_LIMIT = 100
+MAX_PER_SOURCE_LIMIT = 25
 MAX_TARGET_ITEMS = 250
 MODEL_REFINEMENT_LIMIT = 150
 MAX_ARTICLE_FETCH_CONCURRENCY = 20
 
 DEFAULT_YOUTUBE_PRESETS: dict[str, int] = {
-    "max": 10,
-    "large": 8,
-    "medium": 5,
-    "focused": 3,
+    "max": 25,
+    "large": 20,
+    "medium": 15,
+    "focused": 10,
 }
 
 DEFAULT_PODCAST_PRESETS: dict[str, int] = {
-    "max": 10,
-    "large": 7,
-    "medium": 5,
-    "focused": 3,
+    "max": 25,
+    "large": 20,
+    "medium": 15,
+    "focused": 10,
 }
 
 DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
-    "lookback_hours": 168,
+    "lookback_hours": 336,
     "content_limits": {
-        "total_items": 150,
+        "total_items": 250,
         "target_items": 25,
         "lead_items": 5,
         "quality_floor": "standard",
         "per_source": {
-            "web_search": 15,
-            "foreign_media": 15,
-            "gmail": 15,
-            "podcasts": 10,
-            "youtube": 10,
-            "collections": 15,
-            "markets": 15,
+            "web_search": 25,
+            "foreign_media": 25,
+            "gmail": 25,
+            "podcasts": 25,
+            "youtube": 25,
+            "collections": 25,
+            "markets": 25,
         },
     },
 }
@@ -88,8 +88,8 @@ def brief_settings_status(settings: Settings) -> dict[str, Any]:
         "defaults": load_brief_defaults(settings),
         "pipeline_limits": load_pipeline_limits(settings),
         "system_limits": system_limits(settings),
-        "youtube_presets": payload.get("youtube_presets", DEFAULT_YOUTUBE_PRESETS),
-        "podcast_presets": payload.get("podcast_presets", DEFAULT_PODCAST_PRESETS),
+        "youtube_presets": normalize_youtube_presets(payload.get("youtube_presets")),
+        "podcast_presets": normalize_podcast_presets(payload.get("podcast_presets")),
     }
 
 
@@ -97,8 +97,8 @@ def load_brief_defaults(settings: Settings) -> dict[str, Any]:
     payload = _read_settings_file(settings)
     defaults = payload.get("brief_defaults") if isinstance(payload, dict) else None
     normalized = normalize_brief_controls(defaults)
-    normalized["youtube_presets"] = payload.get("youtube_presets", DEFAULT_YOUTUBE_PRESETS)
-    normalized["podcast_presets"] = payload.get("podcast_presets", DEFAULT_PODCAST_PRESETS)
+    normalized["youtube_presets"] = normalize_youtube_presets(payload.get("youtube_presets"))
+    normalized["podcast_presets"] = normalize_podcast_presets(payload.get("podcast_presets"))
     return normalized
 
 
@@ -116,20 +116,20 @@ def save_brief_defaults(settings: Settings, defaults: dict[str, Any]) -> dict[st
 def normalize_youtube_presets(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
     return {
-        "max": _bounded_int(raw.get("max"), 1, 10) or 10,
-        "large": _bounded_int(raw.get("large"), 1, 10) or 8,
-        "medium": _bounded_int(raw.get("medium"), 1, 10) or 5,
-        "focused": _bounded_int(raw.get("focused"), 1, 10) or 3,
+        "max": _bounded_int(raw.get("max"), 1, 25) or 25,
+        "large": _bounded_int(raw.get("large"), 1, 25) or 20,
+        "medium": _bounded_int(raw.get("medium"), 1, 25) or 15,
+        "focused": _bounded_int(raw.get("focused"), 1, 25) or 10,
     }
 
 
 def normalize_podcast_presets(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
     return {
-        "max": _bounded_int(raw.get("max"), 1, 10) or 10,
-        "large": _bounded_int(raw.get("large"), 1, 10) or 7,
-        "medium": _bounded_int(raw.get("medium"), 1, 10) or 5,
-        "focused": _bounded_int(raw.get("focused"), 1, 10) or 3,
+        "max": _bounded_int(raw.get("max"), 1, 25) or 25,
+        "large": _bounded_int(raw.get("large"), 1, 25) or 20,
+        "medium": _bounded_int(raw.get("medium"), 1, 25) or 15,
+        "focused": _bounded_int(raw.get("focused"), 1, 25) or 10,
     }
 
 
@@ -256,8 +256,6 @@ def _per_source_limits(value: Any) -> dict[str, int]:
     limits: dict[str, int] = {}
     for key, fallback_value in fallback.items():
         val = _bounded_int(raw.get(key), 1, MAX_PER_SOURCE_LIMIT) or int(fallback_value)
-        if key in {"youtube", "podcasts"}:
-            val = min(val, 10)
         limits[key] = val
     return limits
 

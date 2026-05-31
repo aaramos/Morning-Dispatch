@@ -235,7 +235,7 @@ def _apply_critic_payload(
 
         if action in AUTO_REPAIR_ACTIONS and index is not None and 0 <= index < len(updated):
             result = updated[index]
-            if action == "drop_article" and finding_type in DROP_FINDING_TYPES:
+            if action == "drop_article" and finding_type in DROP_FINDING_TYPES and result.payload.source_type != "market_snapshot":
                 updated[index] = replace(result, tier="dropped")
                 applied_action = "drop_article"
             elif action == "demote_article" and finding_type in DEMOTE_FINDING_TYPES | DROP_FINDING_TYPES:

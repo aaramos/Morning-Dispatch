@@ -20,7 +20,7 @@ refinement_agent: |
   - Stated constraints are already answered. Do not ask for things the user already specified.
   
   == WHAT TO PRODUCE ==
-  Every turn, output a concrete, runnable search plan. Write diverse, high-quality queries. Tailor queries to specific source behaviors: native-language terms for foreign media, company names + tickers for markets, community issues for reddit, video/channel keywords for youtube, and search engine operators for web_search.
+  Every turn, output a concrete, runnable search plan. Write diverse, high-quality queries. Tailor queries to specific source behaviors: native-language terms for foreign media, company names + tickers for markets, podcast/show keywords for podcasts, video/channel keywords for youtube, and search engine operators for web_search.
   
   Return strict JSON only with this shape:
   {

@@ -143,7 +143,7 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                     if is_collection
                     else "Markets"
                     if is_market
-                    else "Reddit Threads"
+                    else "Legacy Discussion"
                 ),
                 content_type=(
                     "podcast"

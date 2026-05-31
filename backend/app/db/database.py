@@ -3195,7 +3195,7 @@ def _source_label(result: ArticleFetchResult) -> str:
     if source_type == "podcast_episode":
         return "Podcast"
     if source_type == "reddit_thread":
-        return "Reddit"
+        return "Legacy Discussion"
     if source_type == "collection_chunk":
         return "Collection"
     if source_type == "market_snapshot":
@@ -4602,7 +4602,7 @@ def _editor_note_for_payload(payload: NormalizedPayload) -> str:
 def _editor_note_for_result(result: ArticleFetchResult) -> str:
     if result.payload.source_type == "reddit_thread":
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
-        return f"Reddit thread selected from {result.payload.source_name} by Source Scout.{score}"
+        return f"Legacy discussion selected from {result.payload.source_name}.{score}"
     if result.payload.source_type == "podcast_episode":
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         source = str((result.payload.metadata or {}).get("transcript_source") or "show notes").replace("_", " ")

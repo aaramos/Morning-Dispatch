@@ -802,7 +802,6 @@ def _adapter_from_payload_type(source_type: str) -> str:
     return {
         "gmail": "gmail",
         "gmail_link": "gmail",
-        "reddit_thread": "reddit",
         "podcast_episode": "podcasts",
         "youtube_video": "youtube",
         "foreign_web": "foreign_media",
@@ -908,8 +907,6 @@ def _infer_payload_adapter(payload: Any) -> str | None:
         return "collections"
     if source_type == "market_snapshot":
         return "markets"
-    if source_type == "reddit_thread":
-        return "reddit"
     if source_type in {"gmail", "gmail_link"}:
         if metadata.get("search_query") or metadata.get("search_provider"):
             return "web_search"
@@ -935,14 +932,6 @@ def _extract_promoted_source(*, adapter: str | None, payload: Any) -> dict[str, 
         ref = str(metadata.get("sender_email") or source_name).strip()
         if not ref:
             return None
-        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
-
-    if normalized_adapter == "reddit":
-        ref = str(metadata.get("subreddit") or source_name).strip()
-        if not ref:
-            return None
-        if source_name and not ref.lower().startswith("r/"):
-            ref = f"r/{ref}"
         return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
 
     if normalized_adapter == "podcasts":

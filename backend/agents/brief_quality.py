@@ -24,6 +24,9 @@ def apply_brief_quality_checks(
     seen_titles: set[str] = set()
 
     for result in results:
+        if result.payload.source_type == "market_snapshot":
+            cleaned_results.append(result)
+            continue
         url = result.final_url or result.original_url
         target = url or result.title
         if not result.fetched and _low_value_unresolved_link(result):

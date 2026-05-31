@@ -37,11 +37,6 @@ class Settings:
     podcastindex_api_key: str | None = None
     podcastindex_api_secret: str | None = None
     podcast_transcribe_command: str | None = None
-    reddit_client_id: str | None = None
-    reddit_client_secret: str | None = None
-    reddit_username: str | None = None
-    reddit_password: str | None = None
-    reddit_user_agent: str | None = None
     model_base_url: str | None = None
     model_api_key: str | None = None
     ollama_api_key: str | None = None
@@ -264,21 +259,6 @@ def get_settings() -> Settings:
     podcastindex_api_secret = os.environ.get("MORNING_DISPATCH_PODCASTINDEX_API_SECRET") or _secret_text(
         secrets_dir / "podcastindex" / "api_secret"
     )
-    reddit_client_id = os.environ.get("MORNING_DISPATCH_REDDIT_CLIENT_ID") or _secret_text(
-        secrets_dir / "reddit" / "client_id"
-    )
-    reddit_client_secret = os.environ.get("MORNING_DISPATCH_REDDIT_CLIENT_SECRET") or _secret_text(
-        secrets_dir / "reddit" / "client_secret"
-    )
-    reddit_username = os.environ.get("MORNING_DISPATCH_REDDIT_USERNAME") or _secret_text(
-        secrets_dir / "reddit" / "username"
-    )
-    reddit_password = os.environ.get("MORNING_DISPATCH_REDDIT_PASSWORD") or _secret_text(
-        secrets_dir / "reddit" / "password"
-    )
-    reddit_user_agent = os.environ.get("MORNING_DISPATCH_REDDIT_USER_AGENT") or _secret_text(
-        secrets_dir / "reddit" / "user_agent"
-    )
     web_search_provider = (os.environ.get("MORNING_DISPATCH_WEB_SEARCH_PROVIDER") or "auto").strip().lower()
     shared_search_env_path = _shared_search_env_path()
     web_search_tavily_api_key = (
@@ -339,11 +319,6 @@ def get_settings() -> Settings:
         podcastindex_api_key=podcastindex_api_key,
         podcastindex_api_secret=podcastindex_api_secret,
         podcast_transcribe_command=os.environ.get("MORNING_DISPATCH_PODCAST_TRANSCRIBE_COMMAND"),
-        reddit_client_id=reddit_client_id,
-        reddit_client_secret=reddit_client_secret,
-        reddit_username=reddit_username,
-        reddit_password=reddit_password,
-        reddit_user_agent=reddit_user_agent,
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
         ollama_api_key=ollama_api_key,
@@ -397,7 +372,6 @@ def ensure_runtime_dirs(settings: Settings) -> None:
         settings.data_dir / "podcast-transcripts",
         settings.secrets_dir,
         settings.secrets_dir / "gmail",
-        settings.secrets_dir / "reddit",
         settings.secrets_dir / "podcastindex",
         settings.secrets_dir / "tavily",
         settings.secrets_dir / "brave",

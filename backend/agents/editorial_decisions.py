@@ -231,7 +231,7 @@ def _apply_editorial_payload(
         section = _safe_section(raw.get("section"))
         action = "none"
 
-        if decision == "exclude" and confidence >= 0.55:
+        if decision == "exclude" and confidence >= 0.55 and result.payload.source_type != "market_snapshot":
             updated[index] = replace(result, tier="dropped")
             action = "drop"
         elif decision == "demote":

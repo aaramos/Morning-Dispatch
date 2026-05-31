@@ -355,8 +355,8 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
     settings = get_settings()
     
     status = brief_settings_status(settings)
-    assert status["youtube_presets"] == {"max": 10, "large": 8, "medium": 5, "focused": 3}
-    assert status["podcast_presets"] == {"max": 10, "large": 7, "medium": 5, "focused": 3}
+    assert status["youtube_presets"] == {"max": 25, "large": 20, "medium": 15, "focused": 10}
+    assert status["podcast_presets"] == {"max": 25, "large": 20, "medium": 15, "focused": 10}
     
     # Save modified defaults
     modified_defaults = {
