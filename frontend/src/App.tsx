@@ -1924,6 +1924,7 @@ type GmailCandidateLine = {
   sender: string;
   count: string;
   subject: string;
+  rationale?: string;
 };
 
 function ChatMessageContent(props: { content: string }) {
@@ -1940,6 +1941,7 @@ function ChatMessageContent(props: { content: string }) {
                 <span>{candidate.sender}</span>
               </div>
               <small>{candidate.count} found · Latest: {candidate.subject}</small>
+              {candidate.rationale ? <small>{candidate.rationale}</small> : null}
             </li>
           ))}
         </ol>
@@ -1957,7 +1959,9 @@ function parseGmailCandidateMessage(content: string): { intro: string; candidate
   const candidates: GmailCandidateLine[] = [];
   let promptStart = lines.length;
   for (let index = firstCandidateIndex; index < lines.length; index += 1) {
-    const match = lines[index].match(/^(\d+)\.\s+(.+?)\s+<([^>]+)>\s+\((\d+)\s+found;\s+latest subject:\s+(.+)\)$/i);
+    const match = lines[index].match(
+      /^(\d+)\.\s+(.+?)\s+<([^>]+)>\s+\((\d+)\s+found;\s+latest subject:\s+(.+?)\)(?:\s+[—-]\s+(.+))?$/i,
+    );
     if (!match) {
       promptStart = index;
       break;
@@ -1968,6 +1972,7 @@ function parseGmailCandidateMessage(content: string): { intro: string; candidate
       sender: match[3],
       count: match[4],
       subject: match[5],
+      rationale: match[6],
     });
   }
   if (!candidates.length || !lines[0].includes("found newsletter candidates")) return null;

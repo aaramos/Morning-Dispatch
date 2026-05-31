@@ -583,6 +583,11 @@ a {
   line-height: 1.35;
 }
 
+.gmail-candidate-list small + small {
+  margin-top: 3px;
+  color: #474741;
+}
+
 .refinement-input {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
