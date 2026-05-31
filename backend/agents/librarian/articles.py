@@ -106,7 +106,7 @@ async def fetch_articles_for_payloads(
 def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[ArticleFetchResult]:
     results: list[ArticleFetchResult] = []
     for payload in payloads:
-        if payload.source_type not in {"reddit_thread", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot"} or not payload.original_url:
+        if payload.source_type not in {"reddit_thread", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot", "sec_filing", "fred_series"} or not payload.original_url:
             continue
         canonical_url = canonicalize_url(payload.original_url)
         title = _payload_title(payload) or payload.source_name or "Direct source"
@@ -115,6 +115,8 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
         is_youtube = payload.source_type == "youtube_video"
         is_collection = payload.source_type == "collection_chunk"
         is_market = payload.source_type == "market_snapshot"
+        is_sec = payload.source_type == "sec_filing"
+        is_fred = payload.source_type == "fred_series"
         results.append(
             ArticleFetchResult(
                 payload=payload,
@@ -132,7 +134,7 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                     or (payload.metadata or {}).get("youtube_quality_score")
                     or (payload.metadata or {}).get("collection_quality_score")
                     or (payload.metadata or {}).get("market_quality_score")
-                    or 0.65
+                    or (0.85 if is_sec else 0.88 if is_fred else 0.65)
                 ),
                 section=(
                     "Podcast Signals"
@@ -143,6 +145,10 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                     if is_collection
                     else "Markets"
                     if is_market
+                    else "SEC Filings"
+                    if is_sec
+                    else "Macro Indicators"
+                    if is_fred
                     else "Legacy Discussion"
                 ),
                 content_type=(
@@ -154,6 +160,10 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                     if is_collection
                     else "market"
                     if is_market
+                    else "sec_filing"
+                    if is_sec
+                    else "fred_series"
+                    if is_fred
                     else "reddit_thread"
                 ),
                 metadata=_direct_result_metadata(payload),

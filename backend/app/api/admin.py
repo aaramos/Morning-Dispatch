@@ -111,6 +111,10 @@ class PodcastCredentialsPayload(BaseModel):
     api_secret: str = Field(min_length=1, max_length=1000)
 
 
+class FredCredentialsPayload(BaseModel):
+    api_key: str = Field(min_length=1, max_length=1000)
+
+
 class GmailSenderPayload(BaseModel):
     sender: str = Field(min_length=3, max_length=254)
     sender_name: str | None = Field(default=None, max_length=120)
@@ -519,6 +523,17 @@ def save_podcast_credentials(payload: PodcastCredentialsPayload) -> dict[str, An
     refreshed_settings = _settings()
     digests = [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()]
     return _podcast_status(refreshed_settings, digests)
+
+
+@router.post("/fred/credentials")
+def save_fred_credentials(payload: FredCredentialsPayload) -> dict[str, Any]:
+    api_key = payload.api_key.strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="FRED API key is required")
+    settings = _settings()
+    _write_secret_text(settings.secrets_dir / "fred" / "api_key", api_key)
+    refreshed_settings = _settings()
+    return secret_health.status(refreshed_settings)
 
 
 @router.post("/digests/{digest_id}/podcast-sources")

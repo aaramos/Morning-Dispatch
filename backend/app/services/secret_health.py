@@ -43,6 +43,12 @@ def status(settings: Settings) -> dict[str, Any]:
             configured=bool(settings.youtube_api_key),
         ),
         _secret_item(
+            "fred_key",
+            "FRED API key",
+            settings.secrets_dir / "fred" / "api_key",
+            configured=bool(settings.fred_api_key),
+        ),
+        _secret_item(
             "brave_key",
             "Brave Search key",
             settings.secrets_dir / "brave" / "api_key",

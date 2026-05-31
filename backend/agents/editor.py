@@ -74,6 +74,12 @@ def _prepare_result(
         section = "Community Signals"
     elif result.payload.source_type == "podcast_episode":
         section = "Podcast Signals"
+    elif result.payload.source_type == "market_snapshot":
+        section = "Markets"
+    elif result.payload.source_type == "sec_filing":
+        section = "SEC Filings"
+    elif result.payload.source_type == "fred_series":
+        section = "Macro Indicators"
     else:
         section = _section_for(result.title, source_text, keywords, interest_tokens)
     relevance = _relevance_score(result, interest_tokens, keywords, recency_weighting)
@@ -91,6 +97,13 @@ def _prepare_result(
         and not topic_signal
     ):
         tier = "dropped"
+    elif result.payload.source_type in {"market_snapshot", "sec_filing", "fred_series"}:
+        if (result.payload.metadata or {}).get("explicit_ticker") is True:
+            tier = "main"
+        elif relevance >= 0.15:
+            tier = "main"
+        else:
+            tier = "dropped"
     elif result.payload.source_type == "reddit_thread":
         if relevance >= max(0.28, threshold - 0.18) and result.link_score >= 0.30:
             tier = "main"

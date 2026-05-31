@@ -20,7 +20,7 @@ MAX_CANDIDATE_BUDGET = 250
 MAX_LEAD_ITEMS = 20
 MAX_LOOKBACK_HOURS = 8760
 MAX_LOOKBACK_DAYS = MAX_LOOKBACK_HOURS // 24
-MAX_PER_SOURCE_LIMIT = 25
+MAX_PER_SOURCE_LIMIT = 50
 MAX_TARGET_ITEMS = 250
 MODEL_REFINEMENT_LIMIT = 150
 MAX_ARTICLE_FETCH_CONCURRENCY = 20
@@ -53,7 +53,7 @@ DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
             "podcasts": 25,
             "youtube": 25,
             "collections": 25,
-            "markets": 25,
+            "markets": 50,
         },
     },
 }

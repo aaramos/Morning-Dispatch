@@ -36,6 +36,7 @@ class Settings:
     environment: str = "development"
     podcastindex_api_key: str | None = None
     podcastindex_api_secret: str | None = None
+    fred_api_key: str | None = None
     podcast_transcribe_command: str | None = None
     model_base_url: str | None = None
     model_api_key: str | None = None
@@ -259,6 +260,9 @@ def get_settings() -> Settings:
     podcastindex_api_secret = os.environ.get("MORNING_DISPATCH_PODCASTINDEX_API_SECRET") or _secret_text(
         secrets_dir / "podcastindex" / "api_secret"
     )
+    fred_api_key = os.environ.get("MORNING_DISPATCH_FRED_API_KEY") or _secret_text(
+        secrets_dir / "fred" / "api_key"
+    )
     web_search_provider = (os.environ.get("MORNING_DISPATCH_WEB_SEARCH_PROVIDER") or "auto").strip().lower()
     shared_search_env_path = _shared_search_env_path()
     web_search_tavily_api_key = (
@@ -318,6 +322,7 @@ def get_settings() -> Settings:
         environment=os.environ.get("MORNING_DISPATCH_ENV", "development"),
         podcastindex_api_key=podcastindex_api_key,
         podcastindex_api_secret=podcastindex_api_secret,
+        fred_api_key=fred_api_key,
         podcast_transcribe_command=os.environ.get("MORNING_DISPATCH_PODCAST_TRANSCRIBE_COMMAND"),
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
@@ -377,6 +382,7 @@ def ensure_runtime_dirs(settings: Settings) -> None:
         settings.secrets_dir / "brave",
         settings.secrets_dir / "serpapi",
         settings.secrets_dir / "youtube",
+        settings.secrets_dir / "fred",
         settings.secrets_dir / "ollama",
     ):
         directory.mkdir(parents=True, exist_ok=True)

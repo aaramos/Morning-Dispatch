@@ -492,7 +492,7 @@ const defaultContentLimits: ContentLimitsDraft = {
     podcasts: 25,
     youtube: 25,
     collections: 25,
-    markets: 25,
+    markets: 50,
   },
   quality_floor: "standard",
 };
@@ -517,7 +517,7 @@ const briefControlBounds = {
   total_items: { min: 1, max: 250 },
   target_items: { min: 1, max: 250 },
   lead_items: { min: 0, max: 20 },
-  per_source: { min: 1, max: 25 },
+  per_source: { min: 1, max: 50 },
 };
 const defaultPipelineLimits: PipelineLimitsDraft = {
   article_fetches: 250,
@@ -681,6 +681,7 @@ function DispatchApp() {
   const [podcastKey, setPodcastKey] = useState("");
   const [podcastSecret, setPodcastSecret] = useState("");
   const [youtubeKey, setYoutubeKey] = useState("");
+  const [fredKey, setFredKey] = useState("");
   const [exploration, setExploration] = useState<Exploration | null>(null);
   const [briefHtml, setBriefHtml] = useState("");
   const [recentExplorations, setRecentExplorations] = useState<Exploration[]>([]);
@@ -1528,6 +1529,24 @@ function DispatchApp() {
     }
   }
 
+  async function saveFredCredentials() {
+    if (!fredKey.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/fred/credentials", {
+        method: "POST",
+        body: JSON.stringify({ api_key: fredKey.trim() }),
+      });
+      setFredKey("");
+      await refreshSourcesAndSelect("markets");
+      setMessage("FRED connected");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not connect FRED"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function setupCollectionsSource() {
     setBusy(true);
     try {
@@ -1800,6 +1819,7 @@ function DispatchApp() {
           podcastKey={podcastKey}
           podcastSecret={podcastSecret}
           youtubeKey={youtubeKey}
+          fredKey={fredKey}
           busy={busy}
           onClose={() => setEnableSource(null)}
           onWebKeyChange={setWebKey}
@@ -1808,11 +1828,13 @@ function DispatchApp() {
           onPodcastKeyChange={setPodcastKey}
           onPodcastSecretChange={setPodcastSecret}
           onYoutubeKeyChange={setYoutubeKey}
+          onFredKeyChange={setFredKey}
           onSaveWeb={() => void saveWebKey()}
           onSaveGmailSecret={() => void saveGmailClientSecret()}
           onConnectGmail={() => void connectGmail()}
           onSavePodcast={() => void savePodcastCredentials()}
           onSaveYoutube={() => void saveYoutubeCredentials()}
+          onSaveFred={() => void saveFredCredentials()}
           onSetupCollections={() => void setupCollectionsSource()}
           onRetry={() => void refreshSourcesAndSelect(enableSource)}
         />
@@ -3014,6 +3036,7 @@ function EnableSourceModal(props: {
   podcastKey: string;
   podcastSecret: string;
   youtubeKey: string;
+  fredKey: string;
   busy: boolean;
   onClose: () => void;
   onWebKeyChange: (value: string) => void;
@@ -3022,11 +3045,13 @@ function EnableSourceModal(props: {
   onPodcastKeyChange: (value: string) => void;
   onPodcastSecretChange: (value: string) => void;
   onYoutubeKeyChange: (value: string) => void;
+  onFredKeyChange: (value: string) => void;
   onSaveWeb: () => void;
   onSaveGmailSecret: () => void;
   onConnectGmail: () => void;
   onSavePodcast: () => void;
   onSaveYoutube: () => void;
+  onSaveFred: () => void;
   onSetupCollections: () => void;
   onRetry: () => void;
 }) {
@@ -3111,8 +3136,22 @@ function EnableSourceModal(props: {
         ) : null}
         {props.source === "markets" ? (
           <div className="enable-stack">
-            <p>Markets uses free public-market data. No API key is required for Simple mode.</p>
-            <button type="button" onClick={props.onRetry} disabled={props.busy}>Retry Markets</button>
+            <p>Markets uses free public-market data. For rich macroeconomic indicators (yield curve, interest rates, inflation, etc.), you can optionally provide a free FRED API key.</p>
+            <label style={{ display: "flex", flexDirection: "column", gap: "6px", width: "100%", boxSizing: "border-box" }}>
+              FRED API Key (optional)
+              <input
+                type="password"
+                value={props.fredKey}
+                onChange={(event) => props.onFredKeyChange(event.target.value)}
+                placeholder="Paste FRED API key"
+              />
+            </label>
+            <button type="button" onClick={props.onSaveFred} disabled={props.busy || !props.fredKey.trim()}>
+              Save FRED Key
+            </button>
+            <div style={{ marginTop: "12px", borderTop: "1px solid var(--line)", paddingTop: "12px", display: "flex", justifyContent: "flex-end" }}>
+              <button type="button" onClick={props.onRetry} disabled={props.busy}>Retry Markets</button>
+            </div>
           </div>
         ) : null}
       </section>

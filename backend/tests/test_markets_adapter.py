@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+import json
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -105,6 +106,7 @@ def test_fetch_market_snapshot_maps_yfinance_payload(monkeypatch, tmp_path) -> N
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setattr(markets, "markets_available", lambda: True)
     monkeypatch.setattr(markets, "_yfinance_module", lambda: FakeYFinance)
+    monkeypatch.setattr(markets, "fetch_google_news_rss", lambda ticker, name: [])
 
     snapshots = asyncio.run(
         markets.fetch_market_snapshots(
@@ -215,3 +217,163 @@ def test_source_status_includes_markets(monkeypatch, tmp_path) -> None:
     assert status.status_code == 200
     assert status.json()["sources"]["markets"]["label"] == "Markets"
     assert status.json()["sources"]["markets"]["mode"] == "simple"
+
+
+def test_fred_credentials_saved_outside_git(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        resp = client.post("/api/admin/fred/credentials", json={"api_key": "fake_fred_key_123"})
+        assert resp.status_code == 200
+
+        secrets_dir = tmp_path / "runtime" / "secrets"
+        key_file = secrets_dir / "fred" / "api_key"
+        assert key_file.exists()
+        assert key_file.read_text(encoding="utf-8").strip() == "fake_fred_key_123"
+
+
+def test_yfinance_enriched_snapshot_parsing(monkeypatch, tmp_path) -> None:
+    class FakeCalendar:
+        def __init__(self):
+            pass
+        @property
+        def calendar(self):
+            from datetime import datetime
+            return {"Earnings Date": [datetime(2026, 6, 15)]}
+
+    class FakeTicker(FakeCalendar):
+        info = {
+            "shortName": "NVIDIA Corporation",
+            "currentPrice": 900.0,
+            "marketCap": 2_200_000_000_000,
+            "currency": "USD",
+            "recommendationKey": "buy",
+            "sector": "Technology",
+            "industry": "Semiconductors",
+            "trailingPE": 35.5,
+            "forwardPE": 28.2,
+            "pegRatio": 1.25,
+            "priceToBook": 15.0,
+            "enterpriseToEbitda": 25.0,
+            "debtToEquity": 10.5,
+            "profitMargins": 0.40,
+            "operatingMargins": 0.45,
+            "beta": 1.75,
+            "shortPercentOfFloat": 0.02,
+            "targetMeanPrice": 1100.0,
+        }
+        news = []
+        def history(self, *_args: object, **_kwargs: object) -> dict[str, list[float]]:
+            return {"Close": [900.0, 900.0]}
+
+    class FakeYFinance:
+        @staticmethod
+        def Ticker(_ticker: str) -> FakeTicker:
+            return FakeTicker()
+
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(markets, "markets_available", lambda: True)
+    monkeypatch.setattr(markets, "_yfinance_module", lambda: FakeYFinance)
+    monkeypatch.setattr(markets, "fetch_google_news_rss", lambda ticker, name: [])
+
+    snapshots = asyncio.run(
+        markets.fetch_market_snapshots(
+            [MarketCompany(ticker="NVDA", company_name="NVIDIA", tier="core", rationale="AI GPUs", explicit=True)]
+        )
+    )
+
+    assert len(snapshots) == 1
+    snap = snapshots[0]
+    assert snap.pe_trailing == 35.5
+    assert snap.pe_forward == 28.2
+    assert snap.peg_ratio == 1.25
+    assert snap.price_to_book == 15.0
+    assert snap.ev_ebitda == 25.0
+    assert snap.debt_to_equity == 10.5
+    assert snap.profit_margin == 0.40
+    assert snap.operating_margin == 0.45
+    assert snap.beta == 1.75
+    assert snap.short_percent_of_float == 0.02
+    assert snap.target_mean_price == 1100.0
+    assert snap.implied_upside_pct == 22.22
+    assert snap.next_earnings_date == "2026-06-15"
+    assert snap.explicit_ticker is True
+
+
+def test_sec_filings_parsing(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(markets, "_fetch_cik_map", lambda: {"NVDA": "0001045810"})
+
+    class FakeResponse:
+        def __init__(self, data: bytes):
+            self.data = data
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001045810-26-000050"],
+                "filingDate": ["2026-05-20"],
+                "reportDate": ["2026-04-30"],
+                "acceptanceDateTime": ["2026-05-20T16:00:00Z"],
+                "act": ["34"],
+                "form": ["10-Q"],
+                "fileNumber": ["001-33963"],
+                "filmNumber": ["26543210"],
+                "items": [""],
+                "size": [123456],
+                "isXBRL": [1],
+                "isInlineXBRL": [1],
+                "primaryDocument": ["nvda-20260430.htm"],
+                "primaryDocDescription": ["Form 10-Q Quarterly Report"],
+            }
+        }
+    }
+
+    def fake_urlopen(req, **kwargs):
+        return FakeResponse(json.dumps(mock_submissions).encode("utf-8"))
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    filings = markets.fetch_sec_filings("NVDA", "NVIDIA")
+    assert len(filings) == 1
+    assert filings[0]["form"] == "10-Q"
+    assert filings[0]["filing_date"] == "2026-05-20"
+    assert filings[0]["url"] == "https://www.sec.gov/Archives/edgar/data/0001045810/000104581026000050/nvda-20260430.htm"
+
+
+def test_fred_series_parsing(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    class FakeResponse:
+        def __init__(self, data: bytes):
+            self.data = data
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_observations = {
+        "observations": [
+            {"date": "2026-05-01", "value": "5.33"},
+            {"date": "2026-04-01", "value": "5.33"},
+        ]
+    }
+
+    def fake_urlopen(req, **kwargs):
+        return FakeResponse(json.dumps(mock_observations).encode("utf-8"))
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    fred_data = markets.fetch_fred_macro_data("fake_api_key")
+    assert len(fred_data) == 4
+    assert fred_data[0]["current_value"] == 5.33
+    assert fred_data[0]["current_date"] == "2026-05-01"

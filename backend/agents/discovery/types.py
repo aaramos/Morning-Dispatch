@@ -312,7 +312,7 @@ def _content_limits(value: Any) -> dict[str, Any]:
     if isinstance(raw_per_source, dict):
         for raw_key, raw_limit in raw_per_source.items():
             key = _clean_text(raw_key)
-            source_limit = _positive_int(raw_limit, maximum=25)
+            source_limit = _positive_int(raw_limit, maximum=50)
             if key in VALID_SOURCE_ADAPTERS and source_limit is not None:
                 per_source[key] = source_limit
     if per_source:

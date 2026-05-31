@@ -169,7 +169,7 @@ class DiscoveryRunner:
         if profile_total_limit is not None:
             target_capacity = min(target_capacity, profile_total_limit)
         source_plan: tuple[tuple[str, int], ...] = (
-            ("markets", _lane_limit(profile, "markets", default=25, system_max=25)),
+            ("markets", _lane_limit(profile, "markets", default=50, system_max=50)),
             ("youtube", _lane_limit(profile, "youtube", default=25, system_max=25)),
             ("podcasts", _lane_limit(profile, "podcasts", default=25, system_max=25)),
         )
@@ -184,13 +184,32 @@ class DiscoveryRunner:
             lane_capacity = max(0, target_capacity - len(lane_candidates))
             if lane_capacity <= 0:
                 break
-            lane_cap_for_source = min(source_limit, lane_capacity)
-            lane_candidates.extend(
-                _dedupe_candidates(
-                    sorted(raw_candidates, key=lambda c: c.score, reverse=True),
+
+            if source == "markets":
+                explicit_candidates = [c for c in raw_candidates if (c.payload.metadata or {}).get("explicit_ticker") is True]
+                regular_candidates = [c for c in raw_candidates if (c.payload.metadata or {}).get("explicit_ticker") is not True]
+
+                deduped_explicit = _dedupe_candidates(
+                    sorted(explicit_candidates, key=lambda c: c.score, reverse=True),
+                    limit=len(explicit_candidates),
+                )
+
+                lane_cap_for_source = min(source_limit, lane_capacity)
+                deduped_regular = _dedupe_candidates(
+                    sorted(regular_candidates, key=lambda c: c.score, reverse=True),
                     limit=lane_cap_for_source,
                 )
-            )
+
+                lane_candidates.extend(deduped_explicit)
+                lane_candidates.extend(deduped_regular)
+            else:
+                lane_cap_for_source = min(source_limit, lane_capacity)
+                lane_candidates.extend(
+                    _dedupe_candidates(
+                        sorted(raw_candidates, key=lambda c: c.score, reverse=True),
+                        limit=lane_cap_for_source,
+                    )
+                )
 
         other_candidates = [candidate for candidate in candidates if candidate.adapter not in lane_adapters]
 

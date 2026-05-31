@@ -20,7 +20,13 @@ from backend.agents.discovery.types import (
 from backend.app.db import database
 from backend.app.core.config import get_settings
 from backend.agents.discovery.collections_source import search_collections, sync_collections
-from backend.agents.discovery.markets import MarketSnapshot, fetch_market_snapshots, select_market_companies
+from backend.agents.discovery.markets import (
+    MarketSnapshot,
+    fetch_market_snapshots,
+    select_market_companies,
+    fetch_sec_filings,
+    fetch_fred_macro_data,
+)
 from backend.agents.discovery.web_search import lookback_to_days, search_web
 from backend.agents.discovery.youtube import fetch_youtube_transcript, search_youtube
 
@@ -257,10 +263,35 @@ class MarketsSourceAdapter:
             max_core=settings.markets_max_core_companies,
             max_related=settings.markets_max_related_companies,
         )
-        if not companies:
-            return []
-        snapshots = await fetch_market_snapshots(companies)
-        return [_market_candidate(snapshot) for snapshot in snapshots[: max(1, min(context.candidate_limit, 20))]]
+        candidates = []
+
+        # 1. Market Snapshots
+        if companies:
+            snapshots = await fetch_market_snapshots(companies)
+            for snapshot in snapshots:
+                candidate = _market_candidate(snapshot)
+                if snapshot.explicit_ticker:
+                    candidate.payload.metadata["explicit_ticker"] = True
+                candidates.append(candidate)
+
+            # 2. SEC Filings
+            sec_tasks = [
+                asyncio.to_thread(fetch_sec_filings, company.ticker, company.company_name)
+                for company in companies
+            ]
+            sec_results = await asyncio.gather(*sec_tasks, return_exceptions=True)
+            for res in sec_results:
+                if isinstance(res, list):
+                    for filing in res:
+                        candidates.append(_sec_filing_candidate(filing))
+
+        # 3. FRED Macro Data
+        if settings.fred_api_key:
+            fred_data = await asyncio.to_thread(fetch_fred_macro_data, settings.fred_api_key)
+            for series in fred_data:
+                candidates.append(_fred_series_candidate(series))
+
+        return candidates[:context.candidate_limit]
 
     async def fetch(self, candidate: Candidate) -> Any:
         return candidate.payload
@@ -498,6 +529,65 @@ def _market_candidate(snapshot: MarketSnapshot) -> Candidate:
         ),
         score=score,
         reason=f"{snapshot.tier.title()} public-market signal.",
+    )
+
+
+def _sec_filing_candidate(filing: dict[str, Any]) -> Candidate:
+    title = f"SEC Filing: {filing['company_name']} ({filing['ticker']}) - {filing['form_label']}"
+    raw_text = (
+        f"SEC corporate filing for {filing['company_name']} ({filing['ticker']}). "
+        f"Form: {filing['form']}. Filing Date: {filing['filing_date']}. "
+        f"Description: {filing['description']}."
+    )
+    return Candidate(
+        adapter="markets",
+        payload=NormalizedPayload(
+            source_type="sec_filing",
+            source_name=title,
+            raw_text=raw_text,
+            original_url=filing["url"],
+            published_at=filing["filing_date"],
+            metadata={
+                "ticker": filing["ticker"],
+                "company_name": filing["company_name"],
+                "form": filing["form"],
+                "filing_date": filing["filing_date"],
+                "description": filing["description"],
+                "title": title,
+            }
+        ),
+        score=0.85,
+        reason="Corporate SEC filing event.",
+    )
+
+
+def _fred_series_candidate(series: dict[str, Any]) -> Candidate:
+    title = f"Macro Indicator: {series['label']} ({series['series_id']})"
+    raw_text = (
+        f"Macroeconomic indicator {series['label']} ({series['series_id']}). "
+        f"Latest Value: {series['current_value']} as of {series['current_date']}. "
+        f"1-period change: {series['change_1period']:+.4f}."
+    )
+    return Candidate(
+        adapter="markets",
+        payload=NormalizedPayload(
+            source_type="fred_series",
+            source_name=title,
+            raw_text=raw_text,
+            original_url=series["url"],
+            published_at=series["current_date"],
+            metadata={
+                "series_id": series["series_id"],
+                "label": series["label"],
+                "current_value": series["current_value"],
+                "current_date": series["current_date"],
+                "change_1period": series["change_1period"],
+                "history": list(series["history"]),
+                "title": title,
+            }
+        ),
+        score=0.88,
+        reason="FRED macroeconomic indicator snapshot.",
     )
 
 
