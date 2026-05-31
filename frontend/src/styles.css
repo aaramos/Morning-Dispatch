@@ -1215,6 +1215,29 @@ label {
   font-weight: 600;
 }
 
+.gmail-allowlist-group-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #d8d7cf;
+  border-radius: 10px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.gmail-allowlist-group-toggle:hover {
+  border-color: #b9b7ad;
+  background: #f8f7f2;
+}
+
 .gmail-allowlist-empty {
   margin: 0;
 }
