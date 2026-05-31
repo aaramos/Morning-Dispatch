@@ -1116,6 +1116,133 @@ label {
   width: min(280px, 100%);
 }
 
+.strategy-modal {
+  position: relative;
+  width: min(860px, 100%);
+  max-height: min(820px, calc(100vh - 48px));
+  overflow: auto;
+  display: grid;
+  grid-template-rows: auto minmax(180px, 1fr) auto;
+  gap: 16px;
+  padding: 28px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(23, 23, 23, 0.24);
+}
+
+.strategy-modal-header {
+  display: grid;
+  gap: 6px;
+  padding-right: 72px;
+}
+
+.strategy-modal-header h2 {
+  margin: 0;
+  font-size: clamp(1.35rem, 2vw, 1.9rem);
+  line-height: 1.1;
+}
+
+.strategy-modal-header p {
+  margin: 0;
+  color: #5f5f59;
+  line-height: 1.45;
+}
+
+.strategy-modal-thread {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-height: 220px;
+  max-height: 340px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid #deddd6;
+  border-radius: 8px;
+  background: #f7f7f4;
+}
+
+.strategy-chat-turn {
+  width: min(680px, 88%);
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.strategy-chat-turn.user {
+  justify-self: end;
+  background: #fff4dc;
+}
+
+.strategy-chat-turn b {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #5f5f59;
+}
+
+.strategy-chat-turn p {
+  margin: 0;
+  line-height: 1.42;
+  overflow-wrap: anywhere;
+}
+
+.strategy-modal-proposal {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #cab36b;
+  border-radius: 8px;
+  background: #fbf7e8;
+  color: #433711;
+}
+
+.strategy-modal-proposal p {
+  margin: 0;
+  color: #5f5125;
+  line-height: 1.42;
+}
+
+.strategy-modal-proposal ul {
+  margin: 0;
+  padding-left: 20px;
+  color: #5f5125;
+}
+
+.strategy-modal-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.strategy-modal-preview span {
+  padding: 5px 9px;
+  border: 1px solid rgba(67, 55, 17, 0.2);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.6);
+  font-size: 0.85rem;
+}
+
+.strategy-modal-composer {
+  display: grid;
+  gap: 12px;
+}
+
+.strategy-modal-composer label {
+  display: grid;
+  gap: 8px;
+}
+
+.strategy-modal-composer textarea {
+  width: 100%;
+  min-height: 104px;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
 .strategy-review-card {
   margin-top: 18px;
   padding: 16px 18px;

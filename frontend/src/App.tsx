@@ -2143,8 +2143,7 @@ function ConfirmationPanel(props: {
   };
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [strategyInstruction, setStrategyInstruction] = useState("");
-  const strategyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [strategyModalOpen, setStrategyModalOpen] = useState(false);
   const reviewProfile = props.pendingStrategy?.proposed_profile ?? props.profile;
   const reviewPreview = props.pendingStrategy?.strategy_preview ?? props.strategyPreview;
   const contentLimitErrors = validateContentLimits(props.draft.content_limits, props.sources);
@@ -2252,78 +2251,32 @@ function ConfirmationPanel(props: {
           <div className={`strategy-confirmation ${props.pendingStrategy ? "pending" : ""}`}>
             <strong>{props.pendingStrategy ? "AI proposed update" : "AI update"}</strong>
             <p>{props.strategyConfirmation}</p>
-            {props.pendingStrategy?.conversation?.length ? (
-              <div className="strategy-conversation">
-                {props.pendingStrategy.conversation.slice(-4).map((turn, index) => (
-                  <div className={`strategy-turn ${turn.role === "user" ? "user" : "assistant"}`} key={`${turn.role}-${index}-${turn.content.slice(0, 20)}`}>
-                    <b>{turn.role === "user" ? "You" : "AI"}</b>
-                    <span>{turn.content}</span>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-            {props.pendingStrategy?.findings?.length ? (
-              <ul className="strategy-findings">
-                {props.pendingStrategy.findings.map((finding) => (
-                  <li key={finding}>{finding}</li>
-                ))}
-              </ul>
-            ) : null}
-            {props.pendingStrategy ? (
-              <div className="strategy-proposal-actions">
-                <button
-                  type="button"
-                  className="primary-action"
-                  onClick={() => props.onStrategyConfirm(true)}
-                  disabled={props.busy}
-                >
-                  Apply proposed strategy
-                </button>
-                <button
-                  type="button"
-                  className="secondary-action"
-                  onClick={() => strategyTextareaRef.current?.focus()}
-                  disabled={props.busy}
-                >
-                  Keep refining
-                </button>
-                <button
-                  type="button"
-                  className="secondary-action"
-                  onClick={() => props.onStrategyConfirm(false)}
-                  disabled={props.busy}
-                >
-                  Discard
-                </button>
-              </div>
-            ) : null}
           </div>
         ) : null}
-        <label>
-          {props.pendingStrategy ? "Keep refining this proposal" : "Refine search strategy"}
-          <textarea
-            ref={strategyTextareaRef}
-            value={strategyInstruction}
-            onChange={(event) => setStrategyInstruction(event.target.value)}
-            placeholder={props.pendingStrategy ? "Add your next comment about this proposed update..." : "Add missing sources, entities, recency, countries, channels, podcasts, or search terms..."}
-          />
-        </label>
         <button
           type="button"
           className="secondary-action"
-          onClick={() => {
-            if (!strategyInstruction.trim()) {
-              strategyTextareaRef.current?.focus();
-              return;
-            }
-            props.onStrategyRefine(strategyInstruction);
-            setStrategyInstruction("");
-          }}
+          onClick={() => setStrategyModalOpen(true)}
           disabled={props.busy}
         >
-          Update strategy
+          {props.pendingStrategy ? "Open refinement session" : "Refine search strategy"}
         </button>
       </div>
+      {strategyModalOpen ? (
+        <StrategyRefinementModal
+          profile={reviewProfile}
+          preview={reviewPreview}
+          pendingStrategy={props.pendingStrategy}
+          strategyConfirmation={props.strategyConfirmation}
+          busy={props.busy}
+          onClose={() => setStrategyModalOpen(false)}
+          onSubmit={props.onStrategyRefine}
+          onConfirm={(apply) => {
+            props.onStrategyConfirm(apply);
+            if (!apply) setStrategyModalOpen(false);
+          }}
+        />
+      ) : null}
       <div className="advanced-settings-shell">
         <DisclosureButton
           expanded={advancedOpen}
@@ -2375,6 +2328,147 @@ function ConfirmationPanel(props: {
       </div>
     </section>
   );
+}
+
+function StrategyRefinementModal(props: {
+  profile: TopicProfile | null;
+  preview: StrategyPreview | null;
+  pendingStrategy: PendingStrategyRefinement | null;
+  strategyConfirmation: string;
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (instruction: string) => void;
+  onConfirm: (apply: boolean) => void;
+}) {
+  const [instruction, setInstruction] = useState("");
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const turns = strategyConversationTurns(props.pendingStrategy, props.strategyConfirmation);
+  const proposalSummary = props.pendingStrategy?.assistant_response || props.strategyConfirmation;
+  const findings = props.pendingStrategy?.findings ?? [];
+  const intentSummary = strategyIntentSummary(props.profile, props.preview);
+
+  function submit() {
+    const clean = instruction.trim();
+    if (!clean || props.busy) {
+      inputRef.current?.focus();
+      return;
+    }
+    props.onSubmit(clean);
+    setInstruction("");
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="strategy-modal" role="dialog" aria-modal="true" aria-labelledby="strategy-modal-title">
+        <button type="button" className="modal-close" onClick={props.onClose} aria-label="Close refinement session">
+          Close
+        </button>
+        <div className="strategy-modal-header">
+          <p className="section-kicker">AI refinement session</p>
+          <h2 id="strategy-modal-title">Refine search strategy</h2>
+          <p>{intentSummary}</p>
+        </div>
+
+        <div className="strategy-modal-thread" aria-live="polite">
+          {turns.length ? (
+            turns.map((turn, index) => (
+              <div className={`strategy-chat-turn ${turn.role === "user" ? "user" : "assistant"}`} key={`${turn.role}-${index}-${turn.content.slice(0, 24)}`}>
+                <b>{turn.role === "user" ? "You" : "AI"}</b>
+                <p>{turn.content}</p>
+              </div>
+            ))
+          ) : (
+            <div className="strategy-chat-turn assistant">
+              <b>AI</b>
+              <p>Tell me what is missing, too broad, too narrow, stale, or misweighted. I’ll translate your feedback into proposed search-strategy changes for review.</p>
+            </div>
+          )}
+        </div>
+
+        {props.pendingStrategy ? (
+          <div className="strategy-modal-proposal">
+            <strong>Proposed changes</strong>
+            {proposalSummary ? <p>{proposalSummary}</p> : null}
+            {findings.length ? (
+              <ul>
+                {findings.map((finding) => (
+                  <li key={finding}>{finding}</li>
+                ))}
+              </ul>
+            ) : null}
+            {props.pendingStrategy.strategy_preview ? (
+              <div className="strategy-modal-preview">
+                <span>{sourceSearchPlanGroups(props.pendingStrategy.proposed_profile).length} source plan group(s)</span>
+                <span>{props.pendingStrategy.strategy_preview.search_queries.length} general search(es)</span>
+                <span>{props.pendingStrategy.strategy_preview.lookback_hours ? gmailLookbackLabel(props.pendingStrategy.strategy_preview.lookback_hours) : "Open-ended recency"}</span>
+              </div>
+            ) : null}
+            <div className="strategy-proposal-actions">
+              <button type="button" className="primary-action" onClick={() => props.onConfirm(true)} disabled={props.busy}>
+                Apply proposed strategy
+              </button>
+              <button type="button" className="secondary-action" onClick={() => inputRef.current?.focus()} disabled={props.busy}>
+                Keep refining
+              </button>
+              <button type="button" className="secondary-action" onClick={() => props.onConfirm(false)} disabled={props.busy}>
+                Discard
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="strategy-modal-composer">
+          <label>
+            Continue the conversation
+            <textarea
+              ref={inputRef}
+              value={instruction}
+              onChange={(event) => setInstruction(event.target.value)}
+              placeholder="Add a natural-language refinement, e.g. include frontier labs as demand signals but keep markets ticker-only..."
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  submit();
+                }
+              }}
+            />
+          </label>
+          <div className="modal-actions">
+            <button type="button" className="secondary-action" onClick={props.onClose} disabled={props.busy}>
+              Done
+            </button>
+            <button type="button" className="primary-action" onClick={submit} disabled={props.busy || !instruction.trim()}>
+              Send to AI
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function strategyConversationTurns(
+  pendingStrategy: PendingStrategyRefinement | null,
+  strategyConfirmation: string,
+): Array<{ role: string; content: string }> {
+  const turns = (pendingStrategy?.conversation ?? [])
+    .filter((turn) => turn && typeof turn.content === "string" && turn.content.trim())
+    .map((turn) => ({ role: turn.role === "user" ? "user" : "assistant", content: turn.content.trim() }));
+  if (turns.length) return turns;
+  const confirmation = strategyConfirmation.trim();
+  return confirmation ? [{ role: "assistant", content: confirmation }] : [];
+}
+
+function strategyIntentSummary(profile: TopicProfile | null, preview: StrategyPreview | null): string {
+  const scope = profile?.scope || preview?.scope || profile?.statement || preview?.statement || "Current brief strategy";
+  const sourceLabels = Object.entries(profile?.source_selection ?? {})
+    .filter(([, enabled]) => enabled)
+    .map(([source]) => formatSourceLabel(source))
+    .filter((source) => source !== "Collections")
+    .slice(0, 5);
+  const lookback = profile?.lookback_hours ? ` over ${gmailLookbackLabel(profile.lookback_hours).toLowerCase()}` : "";
+  const sources = sourceLabels.length ? ` across ${sourceLabels.join(", ")}` : "";
+  return truncateSentence(`${scope}${sources}${lookback}.`, 220);
 }
 
 function ContentLimitsPanel(props: {
