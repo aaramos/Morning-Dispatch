@@ -4214,6 +4214,8 @@ function AdminApp() {
                     ]}
                     onAction={(sender, action) => void updateGmailAllowlistSender(sender, action)}
                     emptyLabel="No approved senders yet."
+                    collapsible
+                    defaultCollapsed
                   />
                   <GmailAllowlistGroup
                     title="Pending approval"
