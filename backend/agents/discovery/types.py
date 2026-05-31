@@ -7,7 +7,7 @@ from typing import Any, Literal, Protocol
 
 from backend.agents.digestor.base import NormalizedPayload
 
-AdapterName = Literal["gmail", "reddit", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"]
+AdapterName = Literal["gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"]
 AdapterStatusValue = Literal["pending", "running", "completed", "timed_out", "failed", "skipped"]
 Depth = Literal["practitioner", "informed-generalist"]
 RecencyWeighting = Literal["breaking", "recent", "last_year", "all_available"]
@@ -16,7 +16,6 @@ VALID_SCHEDULES: set[str] = {"hourly", "daily", "weekdays", "weekly", "monthly"}
 
 DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
     "gmail": True,
-    "reddit": False,
     "podcasts": True,
     "web_search": True,
     "foreign_media": False,
@@ -27,7 +26,6 @@ DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
 
 DEFAULT_EXPLORE_SOURCE_SELECTION: dict[str, bool] = {
     "gmail": False,
-    "reddit": False,
     "podcasts": False,
     "web_search": True,
     "foreign_media": False,

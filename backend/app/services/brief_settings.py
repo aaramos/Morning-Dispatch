@@ -5,7 +5,6 @@ from typing import Any
 
 from backend.agents.critic import MAX_CRITIC_ARTICLES, MAX_NEWSLETTER_RECORDS
 from backend.agents.digestor.podcast import MAX_DISCOVERED_FEEDS, MAX_PODCAST_EPISODES
-from backend.agents.digestor.reddit import MAX_ACTIVE_SOURCES, MAX_REDDIT_THREADS, POSTS_PER_ACTIVE_SOURCE
 from backend.agents.discovery.foreign_media import MAX_FOREIGN_LANGUAGES
 from backend.agents.librarian.articles import (
     MAX_ARTICLE_FETCHES,
@@ -51,7 +50,6 @@ DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
             "web_search": 15,
             "foreign_media": 15,
             "gmail": 15,
-            "reddit": 15,
             "podcasts": 10,
             "youtube": 10,
             "collections": 15,
@@ -208,7 +206,6 @@ def system_limits(settings: Settings) -> list[dict[str, Any]]:
             "group": "Source discovery caps",
             "items": [
                 {"label": "Web results per query", "value": "4-20", "note": "Search provider requests are capped per query."},
-                {"label": "Reddit threads", "value": str(MAX_REDDIT_THREADS), "note": f"Up to {MAX_ACTIVE_SOURCES} active communities, {POSTS_PER_ACTIVE_SOURCE} posts each."},
                 {"label": "Podcast episodes", "value": str(MAX_PODCAST_EPISODES), "note": f"Podcast discovery can add up to {MAX_DISCOVERED_FEEDS} feeds."},
                 {"label": "YouTube results", "value": str(settings.youtube_max_results), "note": "Runtime setting, capped by the system at 50."},
                 {"label": "Collections results", "value": str(settings.collections_max_results), "note": f"File first-slice limit: {settings.collections_max_file_bytes:,} bytes."},

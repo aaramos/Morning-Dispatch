@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 
 from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes
-from backend.agents.digestor.reddit import RedditSource, fetch_reddit_threads
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.text_utils import STOPWORDS
 from backend.agents.discovery.types import (
@@ -56,48 +55,7 @@ class GmailSourceAdapter:
         return candidate.payload
 
 
-class RedditSourceAdapter:
-    name = "reddit"
-    cost_profile = CostProfile(label="medium", timeout_seconds=25.0)
-    good_for = ("community_signal", "sentiment", "emerging_workflows")
 
-    async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
-        source_digest_id = _digest_id_with_reddit_sources()
-        planned_sources = _reddit_sources_from_plan(profile)
-        if source_digest_id is None and not planned_sources:
-            return []
-        try:
-            payloads = await fetch_reddit_threads(
-                digest_id=source_digest_id or context.exploration_id,
-                digest_interest=profile.query_for_source(self.name),
-                lookback_hours=context.lookback_hours or 24 * 365,
-                sources_override=planned_sources or None,
-            )
-        except Exception as exc:
-            fallback = await _reddit_web_fallback_candidates(profile, context, planned_sources, error=str(exc))
-            if fallback:
-                return fallback
-            raise
-        if not payloads:
-            fallback = await _reddit_web_fallback_candidates(profile, context, planned_sources)
-            if fallback:
-                return fallback
-            planned = ", ".join(f"r/{source.subreddit}" for source in planned_sources[:6])
-            if planned:
-                raise AdapterUnavailable(f"Reddit searched {planned} but no usable threads entered the candidate pool.")
-            raise AdapterUnavailable("Reddit was selected but no usable threads entered the candidate pool.")
-        return [
-            Candidate(
-                adapter=self.name,
-                payload=payload,
-                score=_payload_score(payload.metadata),
-                reason="Reddit community signal.",
-            )
-            for payload in payloads
-        ]
-
-    async def fetch(self, candidate: Candidate) -> Any:
-        return candidate.payload
 
 
 class PodcastSourceAdapter:
@@ -312,12 +270,7 @@ def _approved_gmail_senders() -> list[str]:
     return database.approved_gmail_senders()
 
 
-def _digest_id_with_reddit_sources() -> str | None:
-    for digest in database.list_digests(include_archived=False):
-        digest_id = str(digest.get("id") or "")
-        if digest_id and database.list_reddit_sources(digest_id, include_retired=False):
-            return digest_id
-    return None
+
 
 
 def _approved_podcast_sources() -> list[dict[str, Any]]:
@@ -347,31 +300,7 @@ def _source_plan_refs(profile: TopicProfile, adapter: str) -> list[str]:
     return refs
 
 
-def _reddit_sources_from_plan(profile: TopicProfile) -> list[RedditSource]:
-    sources: list[RedditSource] = []
-    seen: set[str] = set()
-    for ref in _source_plan_refs(profile, "reddit"):
-        subreddit = _subreddit_from_ref(ref)
-        if not subreddit:
-            continue
-        key = subreddit.lower()
-        if key in seen:
-            continue
-        sources.append(RedditSource(subreddit=subreddit, state="search_only", score=0.62, category="strategy_plan"))
-        seen.add(key)
-        if len(sources) >= 20:
-            break
-    return sources
 
-
-def _subreddit_from_ref(value: str) -> str:
-    match = re.search(r"(?:^|\s)r/([A-Za-z0-9_]{2,40})\b", value)
-    if match:
-        return match.group(1)
-    stripped = value.strip().strip("/")
-    if re.fullmatch(r"[A-Za-z0-9_]{2,40}", stripped):
-        return stripped
-    return ""
 
 
 def _sources(digest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -410,67 +339,7 @@ def _payload_score(metadata: dict[str, Any] | None) -> float:
     return 0.5
 
 
-async def _reddit_web_fallback_candidates(
-    profile: TopicProfile,
-    context: SourceAdapterContext,
-    planned_sources: list[RedditSource],
-    *,
-    error: str | None = None,
-) -> list[Candidate]:
-    refs = _source_plan_refs(profile, "reddit") or [profile.query_for_source("reddit")]
-    days = lookback_to_days(context.lookback_hours)
-    queries: list[tuple[str, str]] = []
-    for ref in refs[:6]:
-        subreddit = _subreddit_from_ref(ref)
-        clean_ref = re.sub(r"(?:^|\s)r/[A-Za-z0-9_]{2,40}\b", " ", ref).strip() or profile.statement
-        if subreddit:
-            queries.append((f"site:reddit.com/r/{subreddit} {clean_ref}", subreddit))
-        else:
-            queries.append((f"site:reddit.com/r/ {ref} reddit discussion", "reddit"))
-    if not queries and planned_sources:
-        queries = [(f"site:reddit.com/r/{source.subreddit} {profile.statement}", source.subreddit) for source in planned_sources[:6]]
-    results = await asyncio.gather(
-        *(search_web(query, limit=6, days=days) for query, _subreddit in queries),
-        return_exceptions=True,
-    )
-    candidates: dict[str, Candidate] = {}
-    for (query, planned_subreddit), result in zip(queries, results, strict=True):
-        if isinstance(result, BaseException):
-            continue
-        for hit in result:
-            if not _is_reddit_thread_url(hit.url):
-                continue
-            key = _dedupe_url_key(hit.url)
-            subreddit = _subreddit_from_url(hit.url) or planned_subreddit
-            score = max(0.46, min(0.82, _search_score(hit.score) * 0.9))
-            payload = NormalizedPayload(
-                source_type="reddit_thread",
-                source_name=f"r/{subreddit}" if subreddit and subreddit != "reddit" else "Reddit",
-                raw_text="\n\n".join(part for part in (hit.title, hit.snippet, hit.url) if part),
-                original_url=hit.url,
-                published_at=hit.published_at,
-                metadata={
-                    "thread_quality_score": score,
-                    "title": hit.title,
-                    "subreddit": subreddit,
-                    "search_query": query,
-                    "search_provider": hit.provider,
-                    "fallback_source": "web_search",
-                    "fallback_reason": error,
-                },
-            )
-            candidate = Candidate(
-                adapter="reddit",
-                payload=payload,
-                score=score,
-                reason=f"Reddit thread discovered via {hit.provider} fallback.",
-            )
-            existing = candidates.get(key)
-            if existing is None or candidate.score > existing.score:
-                candidates[key] = candidate
-    return sorted(candidates.values(), key=lambda candidate: candidate.score, reverse=True)[
-        : max(1, min(context.candidate_limit, 20))
-    ]
+
 
 
 def _podcast_discovery_refs(profile: TopicProfile) -> list[str]:
@@ -501,15 +370,7 @@ def _search_score(value: float) -> float:
     return round(max(0.0, min(score, 0.98)), 3)
 
 
-def _is_reddit_thread_url(url: str) -> bool:
-    parsed = urlparse(str(url or ""))
-    host = parsed.netloc.lower()
-    return host.endswith("reddit.com") and "/r/" in parsed.path.lower()
 
-
-def _subreddit_from_url(url: str) -> str:
-    match = re.search(r"/r/([^/\s]+)/", urlparse(str(url or "")).path, re.IGNORECASE)
-    return match.group(1) if match else ""
 
 
 async def _youtube_candidates(videos: tuple[Any, ...]) -> list[Candidate]:

@@ -53,12 +53,10 @@ _GOOD_FOR_SIGNAL_MAP: dict[str, tuple[str, ...]] = {
     ),
     "community_signal": (
         "community",
-        "reddit",
         "forum",
         "discussion",
         "social",
         "group",
-        "discussion",
         "pulse",
     ),
     "sentiment": (
@@ -393,7 +391,6 @@ def _matched_exclusion_terms(candidate: Candidate, exclusions: set[str]) -> set[
         candidate.payload.original_url or "",
         str(candidate.payload.metadata.get("source", "")),
         str(candidate.payload.metadata.get("sender_email", "")),
-        str(candidate.payload.metadata.get("subreddit", "")),
         str(candidate.payload.metadata.get("podcast_title", "")),
     ]
     for key, value in candidate.payload.metadata.items():
@@ -552,7 +549,7 @@ def _candidate_has_judgeable_topic_text(candidate: Candidate) -> bool:
         fields.extend(_flatten_metadata_value(key))
         fields.extend(_flatten_metadata_value(value))
     tokens = keyword_set(" ".join(str(value) for value in fields if value))
-    generic = {"candidate", "gmail", "item", "newsletter", "reddit", "signal", "source", "web"}
+    generic = {"candidate", "gmail", "item", "newsletter", "signal", "source", "web"}
     return len({token for token in tokens if token not in generic}) >= 3
 
 
@@ -562,7 +559,6 @@ def _candidate_key(candidate: Candidate) -> str:
         return "url:" + _canonical_url(payload.original_url)
     native_id = (
         payload.metadata.get("gmail_message_id")
-        or payload.metadata.get("reddit_thread_id")
         or payload.metadata.get("podcast_episode_id")
         or payload.id
     )

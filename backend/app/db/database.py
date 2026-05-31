@@ -753,23 +753,7 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return result
 
 
-def _reddit_source_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    record = dict(row)
-    try:
-        metadata = json.loads(record.get("metadata") or "{}")
-    except json.JSONDecodeError:
-        metadata = {}
-    record["metadata"] = metadata if isinstance(metadata, dict) else {}
-    return record
 
-
-def _normalize_subreddit_name(value: str) -> str:
-    name = value.strip()
-    if name.startswith("/r/"):
-        name = name[3:]
-    if name.startswith("r/"):
-        name = name[2:]
-    return re.sub(r"[^A-Za-z0-9_]", "", name)[:80]
 
 
 def list_profiles() -> list[dict[str, Any]]:
@@ -1751,281 +1735,7 @@ def _podcast_source_key(source: dict[str, Any]) -> str:
     return "feed:" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
 
 
-def seed_reddit_sources(digest_id: str, seed_sources: list[dict[str, Any]]) -> int:
-    now = utc_now()
-    affected = 0
-    with connect() as connection:
-        for source in seed_sources:
-            subreddit = _normalize_subreddit_name(str(source.get("subreddit") or ""))
-            if not subreddit:
-                continue
-            result = connection.execute(
-                """
-                INSERT INTO reddit_sources (
-                  id, digest_id, subreddit, state, category, score, reason,
-                  metadata, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(digest_id, subreddit) DO UPDATE SET
-                  category = CASE
-                    WHEN reddit_sources.category IS NULL
-                      OR reddit_sources.category = ''
-                      OR reddit_sources.category = 'Discovered'
-                    THEN excluded.category
-                    ELSE reddit_sources.category
-                  END,
-                  reason = CASE
-                    WHEN reddit_sources.category IS NULL
-                      OR reddit_sources.category = ''
-                      OR reddit_sources.category = 'Discovered'
-                    THEN excluded.reason
-                    ELSE reddit_sources.reason
-                  END,
-                  metadata = CASE
-                    WHEN reddit_sources.category IS NULL
-                      OR reddit_sources.category = ''
-                      OR reddit_sources.category = 'Discovered'
-                    THEN excluded.metadata
-                    ELSE reddit_sources.metadata
-                  END,
-                  updated_at = excluded.updated_at
-                """,
-                (
-                    new_id(),
-                    digest_id,
-                    subreddit,
-                    str(source.get("state") or "candidate"),
-                    source.get("category"),
-                    float(source.get("score") or 0),
-                    source.get("reason"),
-                    json.dumps({key: value for key, value in source.items() if key not in {"subreddit", "state", "category", "score", "reason"}}),
-                    now,
-                    now,
-                ),
-            )
-            affected += int(result.rowcount > 0)
-    return affected
 
-
-def retire_reddit_sources_by_name(digest_id: str, subreddits: list[str], *, reason: str) -> int:
-    names = [_normalize_subreddit_name(name) for name in subreddits]
-    names = [name for name in names if name]
-    if not names:
-        return 0
-
-    now = utc_now()
-    updated = 0
-    with connect() as connection:
-        for name in names:
-            result = connection.execute(
-                """
-                UPDATE reddit_sources
-                SET state = 'retired',
-                    reason = ?,
-                    updated_at = ?
-                WHERE digest_id = ?
-                  AND lower(subreddit) = lower(?)
-                """,
-                (reason, now, digest_id, name),
-            )
-            updated += result.rowcount
-    return updated
-
-
-def list_reddit_sources(digest_id: str | None = None, *, include_retired: bool = False) -> list[dict[str, Any]]:
-    where = []
-    params: list[Any] = []
-    if digest_id:
-        where.append("digest_id = ?")
-        params.append(digest_id)
-    if not include_retired:
-        where.append("state != 'retired'")
-    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
-    with connect() as connection:
-        rows = connection.execute(
-            f"""
-            SELECT *
-            FROM reddit_sources
-            {where_clause}
-            ORDER BY
-              CASE state
-                WHEN 'active' THEN 1
-                WHEN 'search_only' THEN 2
-                WHEN 'candidate' THEN 3
-                ELSE 4
-              END,
-              score DESC,
-              subreddit COLLATE NOCASE
-            """,
-            params,
-        ).fetchall()
-    return [_reddit_source_row_to_dict(row) for row in rows]
-
-
-def save_source_scout_review(
-    *,
-    digest_id: str,
-    review: Any,
-    status: str = "completed",
-    error_detail: str | None = None,
-) -> dict[str, Any]:
-    now = utc_now()
-    scout_run_id = new_id()
-    with connect() as connection:
-        for update in review.updates:
-            connection.execute(
-                """
-                INSERT INTO reddit_sources (
-                  id, digest_id, subreddit, state, category, score, reason,
-                  last_reviewed_at, last_seen_post_at, consecutive_stale_runs,
-                  metadata, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(digest_id, subreddit) DO UPDATE SET
-                  state = excluded.state,
-                  category = excluded.category,
-                  score = excluded.score,
-                  reason = excluded.reason,
-                  last_reviewed_at = excluded.last_reviewed_at,
-                  last_seen_post_at = COALESCE(excluded.last_seen_post_at, reddit_sources.last_seen_post_at),
-                  consecutive_stale_runs = excluded.consecutive_stale_runs,
-                  metadata = excluded.metadata,
-                  updated_at = excluded.updated_at
-                """,
-                (
-                    new_id(),
-                    digest_id,
-                    _normalize_subreddit_name(str(update.subreddit)),
-                    update.state,
-                    update.category,
-                    float(update.score),
-                    update.reason,
-                    now,
-                    update.last_seen_post_at,
-                    int(update.consecutive_stale_runs),
-                    json.dumps(update.metadata),
-                    now,
-                    now,
-                ),
-            )
-        connection.execute(
-            """
-            INSERT INTO source_scout_runs (
-              id, digest_id, run_at, status, sampled_count, active_count,
-              candidate_count, retired_count, summary, error_detail
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                scout_run_id,
-                digest_id,
-                now,
-                status,
-                int(review.sampled_count),
-                int(review.active_count),
-                int(review.candidate_count),
-                int(review.retired_count),
-                review.summary,
-                error_detail,
-            ),
-        )
-        for decision in review.decisions:
-            connection.execute(
-                """
-                INSERT INTO source_scout_decisions (
-                  id, scout_run_id, digest_id, agent, subreddit, decision,
-                  action, confidence, reason, metadata, created_at
-                )
-                VALUES (?, ?, ?, 'source_scout', ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_id(),
-                    scout_run_id,
-                    digest_id,
-                    _normalize_subreddit_name(str(decision.subreddit)),
-                    decision.decision,
-                    decision.action,
-                    float(decision.confidence),
-                    decision.reason,
-                    json.dumps(decision.metadata),
-                    now,
-                ),
-            )
-    run = get_source_scout_run(scout_run_id)
-    if run is None:
-        raise RuntimeError("Source Scout run was not created")
-    return run
-
-
-def get_source_scout_run(run_id: str) -> dict[str, Any] | None:
-    with connect() as connection:
-        row = connection.execute(
-            "SELECT * FROM source_scout_runs WHERE id = ?",
-            (run_id,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def source_scout_summary(digest_id: str | None = None) -> dict[str, Any]:
-    where = "WHERE digest_id = ?" if digest_id else ""
-    params: tuple[Any, ...] = (digest_id,) if digest_id else ()
-    with connect() as connection:
-        source_rows = connection.execute(
-            f"""
-            SELECT state, COUNT(*) AS count
-            FROM reddit_sources
-            {where}
-            GROUP BY state
-            """,
-            params,
-        ).fetchall()
-        latest = connection.execute(
-            f"""
-            SELECT *
-            FROM source_scout_runs
-            {where}
-            ORDER BY run_at DESC
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-    state_counts = {str(row["state"]): int(row["count"]) for row in source_rows}
-    return {
-        "source_count": sum(state_counts.values()),
-        "active_count": state_counts.get("active", 0),
-        "search_only_count": state_counts.get("search_only", 0),
-        "candidate_count": state_counts.get("candidate", 0),
-        "retired_count": state_counts.get("retired", 0),
-        "latest_run": dict(latest) if latest else None,
-    }
-
-
-def list_source_scout_decisions(*, digest_id: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
-    where = "WHERE digest_id = ?" if digest_id else ""
-    params: list[Any] = [digest_id] if digest_id else []
-    params.append(max(1, min(limit, 100)))
-    with connect() as connection:
-        rows = connection.execute(
-            f"""
-            SELECT id, scout_run_id, digest_id, agent, subreddit, decision,
-                   action, confidence, reason, metadata, created_at
-            FROM source_scout_decisions
-            {where}
-            ORDER BY created_at DESC, confidence DESC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
-    decisions = []
-    for row in rows:
-        record = dict(row)
-        try:
-            metadata = json.loads(record.get("metadata") or "{}")
-        except json.JSONDecodeError:
-            metadata = {}
-        record["metadata"] = metadata if isinstance(metadata, dict) else {}
-        decisions.append(record)
-    return decisions
 
 
 def _gmail_sender_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -3221,9 +2931,8 @@ def _digest_item_row_to_fetch_result(row: sqlite3.Row) -> ArticleFetchResult:
     thread_id = row["thread_id"]
     status = str(row["fetch_status"] or "fetched")
     metadata = {
-        "article_id": str(row["article_id"]),
         "gmail_message_id": row["message_id"],
-        "reddit_thread_id": thread_id if source_type == "reddit_thread" else None,
+        "reddit_thread_id": None,
         "podcast_episode_id": thread_id if source_type == "podcast_episode" else None,
         "sender_email": row["sender_email"],
         "link_text": row["link_text"],
@@ -3331,7 +3040,7 @@ def _insert_discovery(
             payload.source_name,
             metadata.get("sender_email") or metadata.get("sender"),
             metadata.get("gmail_message_id"),
-            metadata.get("reddit_thread_id") or metadata.get("podcast_episode_id") or metadata.get("thread_id"),
+            metadata.get("podcast_episode_id") or metadata.get("thread_id"),
             payload.published_at,
             _title_for_payload(payload),
             _summary_for_payload(payload),
@@ -3400,7 +3109,7 @@ def _insert_discovery_for_result(
             result.payload.source_name,
             metadata.get("sender_email") or metadata.get("sender"),
             metadata.get("gmail_message_id"),
-            metadata.get("reddit_thread_id") or metadata.get("podcast_episode_id") or metadata.get("thread_id"),
+            metadata.get("podcast_episode_id") or metadata.get("thread_id"),
             result.payload.published_at,
             metadata.get("link_text") or result.title,
             _discovery_snippet_for_result(result),

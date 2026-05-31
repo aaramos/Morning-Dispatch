@@ -44,7 +44,7 @@ _BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
 _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 150
-_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "reddit_thread", "podcast_episode"}
+_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode"}
 _DATE_METADATA_KEYS = (
     "published_at",
     "published",
@@ -172,11 +172,6 @@ async def source_status() -> dict[str, Any]:
             gmail_reason = "Upload a Gmail OAuth client in Admin Sources, then connect Gmail."
         else:
             gmail_reason = "Finish the Gmail connection in Admin Sources."
-    reddit_enabled = False
-    reddit_source_count = sum(
-        len(database.list_reddit_sources(str(digest.get("id") or ""), include_retired=False))
-        for digest in database.list_digests(include_archived=False)
-    )
     podcast_sources = _all_configured_podcast_sources()
     podcast_enabled = bool(
         settings.podcastindex_api_key
@@ -222,15 +217,7 @@ async def source_status() -> dict[str, Any]:
                 "setup_required": not gmail_enabled,
                 "reason": gmail_reason,
             },
-            "reddit": {
-                "label": "Reddit",
-                "enabled": reddit_enabled,
-                "setup_required": False,
-                "reason": "Reddit is disabled because Reddit no longer supports the API path this connector used.",
-                "configured_source_count": reddit_source_count,
-                "authenticated": False,
-                "auth_mode": "disabled",
-            },
+
             "podcasts": {
                 "label": "Podcast",
                 "enabled": podcast_enabled,
@@ -315,117 +302,11 @@ def save_youtube_credentials(*, api_key: str) -> dict[str, Any]:
     }
 
 
-def save_reddit_credentials(
-    *,
-    client_id: str,
-    client_secret: str,
-    username: str | None = None,
-    password: str | None = None,
-    user_agent: str | None = None,
-) -> dict[str, Any]:
-    settings = get_settings()
-    reddit_dir = settings.secrets_dir / "reddit"
-    _write_secret_text(reddit_dir / "client_id", client_id)
-    _write_secret_text(reddit_dir / "client_secret", client_secret)
-    if username and username.strip():
-        _write_secret_text(reddit_dir / "username", username)
-    if password and password.strip():
-        _write_secret_text(reddit_dir / "password", password)
-    if user_agent and user_agent.strip():
-        _write_secret_text(reddit_dir / "user_agent", user_agent)
-    _sync_reddit_mcp_env(settings)
-    return {
-        "configured": True,
-        "authenticated": True,
-        "mode": "authenticated",
-        "restart_required": True,
-    }
-
-
 def setup_collections() -> dict[str, Any]:
     settings = get_settings()
     if settings.collections_root is None:
         raise ValueError("Collections root is not configured")
     return setup_collections_root(settings.collections_root)
-
-
-def reddit_credentials_status(settings: Any | None = None) -> dict[str, Any]:
-    settings = settings or get_settings()
-    return {
-        "configured": bool(settings.reddit_client_id and settings.reddit_client_secret),
-        "authenticated": bool(settings.reddit_client_id and settings.reddit_client_secret),
-        "user_configured": bool(settings.reddit_username and settings.reddit_password),
-        "user_agent_configured": bool(settings.reddit_user_agent),
-        "mode": "authenticated" if settings.reddit_client_id and settings.reddit_client_secret else "anonymous",
-        "client_id_path": str(settings.secrets_dir / "reddit" / "client_id"),
-        "client_secret_path": str(settings.secrets_dir / "reddit" / "client_secret"),
-        "mcp_restart_required": True,
-    }
-
-
-def _write_secret_text(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        path.parent.chmod(0o700)
-    except OSError:
-        logger.warning("Could not tighten permissions on %s", path.parent)
-    path.write_text(value.strip() + "\n", encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        logger.warning("Could not tighten permissions on %s", path)
-
-
-def _sync_reddit_mcp_env(settings: Any) -> None:
-    env = {
-        "REDDIT_CLIENT_ID": settings.reddit_client_id or _secret_text(settings.secrets_dir / "reddit" / "client_id"),
-        "REDDIT_CLIENT_SECRET": settings.reddit_client_secret or _secret_text(settings.secrets_dir / "reddit" / "client_secret"),
-        "REDDIT_USERNAME": settings.reddit_username or _secret_text(settings.secrets_dir / "reddit" / "username"),
-        "REDDIT_PASSWORD": settings.reddit_password or _secret_text(settings.secrets_dir / "reddit" / "password"),
-        "REDDIT_USER_AGENT": settings.reddit_user_agent or _secret_text(settings.secrets_dir / "reddit" / "user_agent"),
-        "REDDIT_AUTH_MODE": "authenticated",
-    }
-    clean_env = {key: value for key, value in env.items() if value}
-    _update_mcp_json(
-        Path.home() / ".lmstudio" / "mcp.json",
-        ["mcpServers", "reddit"],
-        clean_env,
-    )
-    _update_mcp_json(
-        Path.home() / ".lmstudio" / "extensions" / "plugins" / "mcp" / "reddit" / "mcp-bridge-config.json",
-        [],
-        clean_env,
-    )
-
-
-def _secret_text(path: Path) -> str | None:
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return value or None
-
-
-def _update_mcp_json(path: Path, key_path: list[str], env: dict[str, str]) -> None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict):
-        return
-    target: Any = payload
-    for key in key_path:
-        if not isinstance(target, dict):
-            return
-        target = target.get(key)
-    if not isinstance(target, dict):
-        return
-    target["command"] = "/opt/homebrew/bin/node"
-    target["command"] = "/Users/macstudio/Apps/mcp-reddit/.venv/bin/mcp-reddit"
-    target["args"] = []
-    existing_env = target.get("env") if isinstance(target.get("env"), dict) else {}
-    target["env"] = {**existing_env, **env}
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def cleanup_expired_exploration_briefs(retention_days: int = 90) -> int:
@@ -687,6 +568,16 @@ async def _run_exploration(
             concurrency=pipeline_limits["article_fetch_concurrency"],
         )
         stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
+        fetched_articles, date_review_summary = await _adjudicate_dates_before_source_window_filter(
+            profile,
+            fetched_articles,
+            lookback_hours=lookback_hours,
+            inference_run_id=exploration_id,
+            max_candidates=pipeline_limits["source_audit_candidates"],
+        )
+        if date_review_summary:
+            progress["source_date_review"] = date_review_summary
+            _persist_progress(exploration_id, progress)
         fetched_articles, source_window_issues = _apply_source_window_filter(
             profile,
             fetched_articles,
@@ -1287,6 +1178,84 @@ async def _run_digest_core(
     return article_results
 
 
+async def _adjudicate_dates_before_source_window_filter(
+    profile: TopicProfile,
+    article_results: list[ArticleFetchResult],
+    *,
+    lookback_hours: int | None,
+    inference_run_id: str,
+    max_candidates: int | None,
+) -> tuple[list[ArticleFetchResult], dict[str, Any]]:
+    if lookback_hours is None:
+        return article_results, {}
+    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+    at_risk_indexes = _source_window_date_adjudication_indexes(profile, article_results, cutoff)
+    if not at_risk_indexes:
+        return article_results, {
+            "status": "skipped",
+            "candidate_count": 0,
+            "message": "No articles needed AI date review before source-window filtering.",
+        }
+
+    limit = max(1, min(int(max_candidates or len(at_risk_indexes)), len(at_risk_indexes)))
+    selected_indexes = at_risk_indexes[:limit]
+    selected_results = [article_results[index] for index in selected_indexes]
+    settings = get_settings()
+    audit_client = model_routing.client_for_agent(
+        "source_audit",
+        settings=settings,
+        items=selected_results,
+        model_override=profile.models.get("brief"),
+    ).client
+    reviewed_results, _decisions, audit_summary = await apply_source_audit(
+        profile,
+        selected_results,
+        lookback_hours=lookback_hours,
+        model_client=audit_client,
+        inference_run_id=inference_run_id,
+        max_candidates=limit,
+    )
+    updated = list(article_results)
+    resolved_count = 0
+    for original_index, reviewed in zip(selected_indexes, reviewed_results, strict=False):
+        if _article_published_at(reviewed) is not None and _article_published_at(article_results[original_index]) is None:
+            resolved_count += 1
+        updated[original_index] = reviewed
+
+    status = str(audit_summary.get("status") or "completed")
+    return updated, {
+        "status": status,
+        "candidate_count": len(selected_indexes),
+        "at_risk_count": len(at_risk_indexes),
+        "resolved_count": resolved_count,
+        "excluded_count": int(audit_summary.get("excluded_count") or 0),
+        "message": (
+            "AI reviewed ambiguous dates before source-window filtering."
+            if status not in {"failed", "fallback"}
+            else "AI date review could not fully complete before source-window filtering."
+        ),
+        "summary": str(audit_summary.get("summary") or "").strip(),
+        "issues": list(audit_summary.get("issues") or []),
+    }
+
+
+def _source_window_date_adjudication_indexes(
+    profile: TopicProfile,
+    article_results: list[ArticleFetchResult],
+    cutoff: datetime,
+) -> list[int]:
+    indexes: list[int] = []
+    for index, result in enumerate(article_results):
+        if result.tier == "dropped" or not result.fetched:
+            continue
+        if _article_published_at(result) is not None:
+            continue
+        reason = _source_window_rejection_reason(profile, result, cutoff)
+        if reason:
+            indexes.append(index)
+    return indexes
+
+
 def _apply_source_window_filter(
     profile: TopicProfile,
     article_results: list[ArticleFetchResult],
@@ -1763,8 +1732,7 @@ def _build_source_issues(
             reason = status.message
         elif source == "markets":
             reason = "Markets price data returned no usable ticker items."
-        elif source == "reddit":
-            reason = "Reddit was selected but returned no usable threads. Check subreddit targets or broaden the query."
+
         elif source == "podcasts":
             reason = "Podcasts were selected but returned no usable episodes. Check show targets or broaden the query."
         elif source == "youtube":
@@ -1881,8 +1849,7 @@ def _adapter_label(adapter: str) -> str:
         "web_search": "Web Search",
         "foreign_media": "Foreign Media",
         "gmail": "Gmail",
-        "reddit": "Reddit",
-        "podcasts": "Podcast",
+        "podcasts": "Podcasts",
         "youtube": "YouTube",
         "collections": "Collections",
         "markets": "Markets",
@@ -1973,3 +1940,196 @@ def _merged_source_selection(
     source_selection: dict[str, bool] | None,
 ) -> dict[str, bool]:
     return {**profile.source_selection, **(source_selection or {})}
+
+
+async def re_enrich_deterministic_articles(exploration_id: str) -> dict[str, Any] | None:
+    import sqlite3
+    exploration = database.get_exploration(exploration_id)
+    if exploration is None or exploration.get("deleted_at"):
+        return None
+
+    # Load topic profile
+    topic_id = str(exploration["topic_id"])
+    topic = database.get_topic_profile(topic_id)
+    if topic is None:
+        return None
+    profile = TopicProfile.from_dict(topic["profile"])
+
+    # Load HTML brief
+    html = read_brief_html(exploration_id)
+    if html is None:
+        return None
+
+    # Extract all article URLs from the brief HTML
+    urls = set(re.findall(r'href="(https?://[^"#\s]+)"', html))
+    if not urls:
+        return {"status": "success", "message": "No article URLs found in brief"}
+
+    # Query articles from DB
+    article_results = []
+    settings = get_settings()
+
+    # Get model client
+    from backend.agents.librarian.enrichment import enrich_article_with_model
+    temp_payload = NormalizedPayload(
+        source_type="web_search",
+        source_name="Web",
+        original_url="http://example.com",
+    )
+    temp_result = ArticleFetchResult(
+        payload=temp_payload,
+        original_url="http://example.com",
+        final_url="http://example.com",
+        canonical_url="http://example.com",
+        title="Temp",
+        text="",
+        excerpt="",
+        domain="example.com",
+        status="fetched",
+        keywords=(),
+    )
+    brief_model = profile.models.get("brief")
+    librarian_resolution = model_routing.client_for_agent(
+        "librarian",
+        settings=settings,
+        items=[temp_result],
+        model_override=brief_model,
+    )
+    librarian_client = librarian_resolution.client
+    model_name = _model_client_name(librarian_client, settings.librarian_model)
+
+    re_enriched_count = 0
+
+    with database.connect() as connection:
+        connection.row_factory = sqlite3.Row
+        for url in urls:
+            row = connection.execute(
+                "SELECT * FROM articles WHERE canonical_url = ? OR original_url = ?",
+                (url, url)
+            ).fetchone()
+            if not row:
+                continue
+
+            # Hydrate ArticleFetchResult
+            metadata = {}
+            if row["metadata"]:
+                try:
+                    metadata = json.loads(row["metadata"])
+                except Exception:
+                    pass
+            metadata["article_id"] = row["id"]
+
+            payload = NormalizedPayload(
+                source_type=row["content_type"] or "web_search",
+                source_name=row["publisher"] or "Web",
+                original_url=row["original_url"] or row["canonical_url"],
+                published_at=row["published_at"],
+                metadata=metadata,
+            )
+            result = ArticleFetchResult(
+                payload=payload,
+                original_url=row["original_url"] or row["canonical_url"],
+                final_url=row["canonical_url"],
+                canonical_url=row["canonical_url"],
+                title=row["title"],
+                text=row["cleaned_text"] or "",
+                excerpt=row["summary"] or "",
+                domain=row["domain"],
+                status=row["fetch_status"] or "fetched",
+                keywords=tuple(json.loads(row["keywords"]) if row["keywords"] else []),
+                content_type=row["content_type"] or "article",
+            )
+
+            # Check if this article has a model cache entry
+            cache_row = connection.execute(
+                "SELECT * FROM model_enrichment_cache WHERE canonical_url = ? AND model_name = ?",
+                (result.canonical_url, model_name)
+            ).fetchone()
+
+            # If no cache entry exists, it means it fell back to deterministic summarization
+            # Rerun model enrichment
+            if not cache_row and librarian_client is not None and result.text:
+                try:
+                    enriched = await enrich_article_with_model(result, model_client=librarian_client)
+                    if enriched.enrichment_source in {"model", "model_fallback"}:
+                        # Update article summary/keywords in DB
+                        connection.execute(
+                            """
+                            UPDATE articles
+                            SET summary = ?, keywords = ?, content_type = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                enriched.editor_summary or enriched.excerpt,
+                                json.dumps(list(enriched.keywords)),
+                                enriched.content_type,
+                                database.utc_now(),
+                                row["id"]
+                            )
+                        )
+                        # Cache the model enrichment
+                        database.cache_model_enrichments(
+                            [enriched],
+                            model_name=model_name
+                        )
+                        result = enriched
+                        re_enriched_count += 1
+                except Exception as exc:
+                    logger.warning("Failed to re-enrich %s: %s", url, exc)
+
+            article_results.append(result)
+
+    # Re-render HTML brief if any articles were enriched
+    if re_enriched_count > 0:
+        payloads = [result.payload for result in article_results]
+        lookback_hours = _resolve_lookback_hours(profile, exploration.get("source_selection").get("lookback_hours") if (exploration.get("source_selection") and isinstance(exploration.get("source_selection"), dict)) else None)
+        configured_source_count = len(exploration.get("source_selection") or {})
+        # Generate stats and render
+        snapshot = database.ingested_snapshot(payloads, configured_source_count, article_results)
+        newsletter_source_notes = _newsletter_source_notes_for_brief(payloads, article_results)
+
+        # Build stats (use a dummy start time or exploration started_at)
+        try:
+            started_dt = datetime.fromisoformat(exploration["started_at"])
+            duration = (datetime.now(UTC) - started_dt).total_seconds()
+        except Exception:
+            duration = 10.0
+
+        digest_stats = database.build_digest_stats(
+            configured_source_count=configured_source_count,
+            newsletter_count=len(newsletter_source_notes),
+            link_count=sum(1 for payload in payloads if payload.source_type == "gmail_link"),
+            podcast_episode_count=sum(1 for payload in payloads if payload.source_type == "podcast_episode"),
+            article_results=article_results,
+            duration_seconds=duration,
+            inference_run_id=exploration_id,
+            stage_seconds={"re_enrich": 1.0},
+        )
+        if exploration.get("source_selection"):
+            digest_stats["search_strategy"] = _brief_search_strategy(profile, exploration.get("source_selection"), lookback_hours)
+
+        html = database.render_ingested_issue(
+            title=_brief_title(profile),
+            snapshot=snapshot,
+            payloads=payloads,
+            article_results=article_results,
+            lookback_hours=lookback_hours,
+            generated_at=database.utc_now(),
+            issue_id=exploration_id,
+            digest_stats=digest_stats,
+            newsletter_payloads=newsletter_source_notes,
+        )
+        _write_exploration_brief(exploration_id, html)
+
+        # Update progress snapshot / stats in DB
+        progress = dict(exploration["progress"] or {})
+        progress["brief"] = {
+            "title": _brief_title(profile),
+            "html_path": f"/api/explore/explorations/{exploration_id}/brief/html",
+            "snapshot": snapshot,
+            "stats": digest_stats,
+            "candidate_count": len(payloads),
+        }
+        database.update_exploration_progress(exploration_id, progress=progress)
+
+    return database.get_exploration(exploration_id)

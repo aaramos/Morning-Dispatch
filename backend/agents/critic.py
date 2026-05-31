@@ -13,6 +13,7 @@ from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import ModelClient, ModelClientError
 from backend.agents.model.metrics import record_model_response_metric
 from backend.app.core.config import get_settings
+from backend.app.core.prompt_loader import load_prompt
 
 MAX_CRITIC_ARTICLES = 50
 MAX_NEWSLETTER_RECORDS = 20
@@ -73,7 +74,7 @@ async def apply_critic_repairs(
     try:
         if hasattr(client, "complete_json_with_metrics"):
             response, payload = await client.complete_json_with_metrics(
-                system=CRITIC_SYSTEM_PROMPT,
+                system=load_prompt("critic"),
                 prompt=prompt,
                 max_tokens=1400,
                 on_token=reasoning_callback,
@@ -84,12 +85,12 @@ async def apply_critic_repairs(
                 mode="critic",
                 model_client=client,
                 response=response,
-                system_prompt=CRITIC_SYSTEM_PROMPT,
+                system_prompt=load_prompt("critic"),
                 prompt=prompt,
             )
         else:
             payload = await client.complete_json(
-                system=CRITIC_SYSTEM_PROMPT,
+                system=load_prompt("critic"),
                 prompt=prompt,
                 max_tokens=1400,
                 on_token=reasoning_callback,
@@ -315,9 +316,3 @@ def _client_model_name(client: Any, fallback: str | None) -> str | None:
     config = getattr(client, "config", None)
     model = getattr(config, "model", None)
     return str(model) if model else fallback
-
-
-CRITIC_SYSTEM_PROMPT = """You are the Morning Dispatch Critic Agent.
-Review a draft personal intelligence brief for quality issues.
-Return compact valid JSON. Recommend only safe repairs from the allowed list.
-Do not invent facts, add sources, or request broad research."""

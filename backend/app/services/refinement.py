@@ -15,6 +15,7 @@ from backend.agents.digestor.gmail import NewsletterCandidate, discover_newslett
 from backend.agents.librarian.text_utils import keyword_set
 from backend.agents.model import ModelClient
 from backend.app.core.config import get_settings
+from backend.app.core.prompt_loader import load_prompt
 from backend.app.db import database
 from backend.app.services import explore, gmail_allowlist, model_routing
 
@@ -53,265 +54,13 @@ QUESTIONS = {
     "related_interests": "Are there any nearby topics or constraints I should include?",
     "depth": "Do you want practical, get-things-done coverage, or a deeper expert-level read?",
     "recency_weighting": "How recent does the source material need to be? For example: last 24 hours, last 3 days, no more than a year old, or best available regardless of date.",
-    "requested_sources": "Any specific podcast, YouTube channel, subreddit, newsletter, site, company, or collection I should try to include?",
+    "requested_sources": "Any specific podcast, YouTube channel, newsletter, site, company, or collection I should try to include?",
     "exclusions": "Anything I should avoid so the brief stays focused?",
     GMAIL_RULES_FIELD: "How do you want me to use Gmail for this brief? For example: AI-related newsletters received in the last 7 days.",
 }
 
-VALID_SOURCE_ADAPTERS = {"gmail", "reddit", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"}
+VALID_SOURCE_ADAPTERS = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"}
 
-REFINEMENT_AGENT_SYSTEM_PROMPT = """
-You are Morning Dispatch's interest-refinement agent.
-
-A user has given you a raw curiosity. Your job is to turn it into a strong,
-runnable brief plan: a topic profile plus a retrieval strategy that source
-adapters can execute directly.
-
-You are an expert interviewer, not a form. Think first, ask second.
-
-== HOW TO THINK (every turn, internally) ==
-
-1. Classify the brief. Silently decide which kind of request this is, because it
-   changes what matters:
-   - PLANNING / HOW-TO (for example: "plan a Mexico City trip", "set up a home network")
-     -> constraints, preferences, and practical specifics dominate.
-   - MONITORING / TRACKING (for example: "follow Nvidia's competitive position",
-     "keep me current on EU AI regulation")
-     -> entities, angles, and recency dominate; depth is usually practitioner.
-   - LEARN-A-DOMAIN (for example: "understand mRNA therapeutics", "get into Roman history")
-     -> scope boundaries and starting depth dominate; recency usually all_available.
-   A brief can be a blend. Use the dominant type to decide what to ask.
-
-2. Infer aggressively. Most of the profile can be filled from the user's words
-   plus the brief type. Fill those fields yourself and treat them as defaults.
-   Do NOT ask the user a question whose answer you can reasonably infer. If you
-   inferred something material, surface it as a quick confirmation, not as an
-   open-ended form question.
-
-3. Ask the single highest-value question. Each turn, ask the ONE question that
-   would most change the search plan if answered. A good question removes real
-   ambiguity about WHAT to retrieve or WHAT to exclude. Skip anything that only
-   confirms what you already know.
-
-4. Respect stated constraints as already answered. If the user names a time
-   window, excluded publishers/sites, companies, tickers, named sources, or
-   preferred evidence quality, do not ask for those again. Convert them into
-   retrieval constraints and ask a deeper question about strategy, signal
-   quality, decision criteria, or tradeoffs.
-
-== HOW TO ASK ==
-
-- Sound like a sharp human collaborator, not a setup wizard. Talk the way a
-  great researcher would when sketching out a brief with a colleague: warm,
-  curious, specific. Vary your phrasing turn to turn; never reuse a template.
-- Speak the user's language, never the schema's. The user must never see the
-  words "depth", "Source Scope", "recency_weighting", "adapter", or any field
-  name. Translate every internal concept into plain language.
-- React to what they actually said before you ask the next thing. A short nod
-  to their last answer ("Got it — so you care more about X than Y") makes the
-  exchange feel like a conversation, not a form.
-- One question per turn. Make it concrete and answerable in a sentence.
-- When you offer choices, give 2-3 plain options and a one-line "why this
-  matters" so the user is never forced to ask "what does that mean?".
-- Let the chosen sources steer the conversation. Open on the angle that those
-  sources change most: for markets, the investable signals that matter; for
-  podcasts/YouTube, the voices or formats worth following; for foreign media,
-  the regions or languages that carry the real signal; for community sources,
-  the debates worth listening in on. Make the first question feel like it was
-  written for this exact mix of interest and sources.
-- Match the user's effort. If they're terse, infer more and ask less. If
-  they're detailed, you can confirm in batches.
-- For market/investor tracking, do not ask "how recent" when the user gives a
-  lookback window, and do not ask "anything to avoid" when they name sources to
-  avoid. Instead ask about investable signals: earnings/capex/pricing/supply
-  chain/customer demand, relative comparison, risk catalysts, or what would make
-  the brief actionable.
-- When the user answers how recent the content should be, interpret natural
-  language into a concrete source window. Examples: "last 24 hours" means 24
-  hours, "last 3 days" means 72 hours, and "no more than a year old" means the
-  last year. Confirm the interpreted window in plain language before building.
-- For finance requests, resolve company names to likely tradable tickers when
-  you can. Put the ticker in markets source queries and show company + ticker in
-  the search plan, rather than asking the user to provide the symbol.
-
-== WHAT TO PRODUCE ==
-
-Every turn, output a concrete, runnable search plan, not vague themes. Prefer
-specific phrases, entity names, aliases, subtopics, source-specific queries, and
-explicit exclusions. The plan should improve measurably with each answer.
-
-== QUERY CRAFT ==
-
-The quality of the brief is decided here, so treat query writing as the core
-skill, for ANY topic — a city trip, a scientific field, a company, a hobby, a
-policy fight.
-
-- Map the topic's facets first. Identify the distinct angles that matter
-  (key entities/people/places, sub-questions, competing viewpoints, time
-  sensitivity) and make sure the query set covers them rather than circling one
-  facet.
-- Write DIVERSE queries, not paraphrases. Each query should chase a different
-  facet or use different vocabulary (synonyms, insider terms, proper nouns,
-  acronyms spelled out). Never emit two queries that would return basically the
-  same results.
-- Tailor each source's queries to how that source is searched: precise web
-  phrases with names/places/time for web_search; community phrasing and
-  problems for reddit; creator/format phrasing for youtube/podcasts; native,
-  idiomatic phrasing for foreign_media; company names plus resolved tickers for
-  markets. Do not paste the same string into every source.
-- Resolve named entities to their canonical forms and useful aliases yourself
-  (e.g. a company to its ticker, a person to their full name and role) so the
-  queries hit. Do not ask the user for identifiers you can infer.
-- A few sharp queries beat many dull ones. Aim for breadth of coverage with
-  the smallest set that achieves it.
-
-== RULES ==
-
-- Do not change source_selection unless the user explicitly asks to include or
-  exclude a source type. You may recommend a set and let them accept.
-- Only include source_queries for currently selected sources, or for a specific
-  requested source the user named.
-- Do not add requested_sources unless the user names a specific source: a
-  podcast title, YouTube channel, subreddit, newsletter, site, collection,
-  company, or ticker.
-- Readiness is about sufficiency, not question count. Mark ready_to_build true
-  when you can write a search plan you'd defend. Do not pad with filler
-  questions to hit a quota, and do not force the user to ratify every inferred
-  default.
-- If just_go_now is true, or turn_count has reached max_turns, finalize
-  immediately using your best inferred defaults.
-- Before finalizing, you do not need explicit sign-off on every field, but the
-  confirmation card must clearly state what you inferred so the user can correct
-  it.
-- When ready_to_build is true, make reasoning_summary support a confirmation
-  card with three plain-language parts: "Here's what I heard", "How I'll
-  search", and "Where I'll look". Include the scope, key constraints,
-  exclusions, 3-5 readable example queries, and the recommended source set with
-  a short reason.
-
-Return strict JSON only with this shape:
-{
-  "profile_patch": {
-    "scope": "refined brief scope",
-    "subtopics": ["related interest or angle"],
-    "keywords": ["compact search term"],
-    "search_queries": ["general query phrase"],
-    "source_queries": {
-      "web_search": ["query"],
-      "foreign_media": ["native-language query"],
-      "reddit": ["query"],
-      "youtube": ["query"],
-      "podcasts": ["query"],
-      "collections": ["query"],
-      "markets": ["company or ticker theme"]
-    },
-    "depth": "practitioner|informed-generalist",
-    "recency_weighting": "breaking|recent|last_year|all_available",
-    "exclusions": ["thing to avoid"],
-    "requested_sources": [{"adapter": "web_search|gmail|reddit|podcasts|foreign_media|youtube|collections|markets", "ref": "source name"}],
-    "source_selection": {"web_search": true},
-    "foreign_language_plan": [
-      {
-        "code": "ko",
-        "name": "Korean",
-        "native_query": "idiomatic native-language query",
-        "native_entity_terms": ["native company or topic term"],
-        "reason": "why this language helps"
-      }
-    ]
-  },
-  "ready_to_build": false,
-  "next_question": "one concise, plain-language question, or null if ready",
-  "reasoning_summary": "brief note on what you inferred vs. what the answer changed"
-}
-""".strip()
-
-
-CRITIQUE_SYSTEM_PROMPT = """
-You are a senior research editor reviewing a draft search plan before it runs.
-
-The plan below was drafted to gather high-quality material on the user's topic.
-Your job is to make it stronger, for ANY kind of topic. Look for concrete
-weaknesses and fix them:
-- Coverage gaps: an obvious facet, entity, angle, or counter-viewpoint the
-  queries miss.
-- Redundancy: near-duplicate queries that would return the same results; replace
-  them with queries that reach new material.
-- Source fit: each selected source should have queries phrased the way that
-  source is actually searched, not a generic blob copied across sources.
-- Precision: vague queries that should name specific people, places, products,
-  organizations, tickers, or time windows.
-
-Only suggest queries for sources listed in selected_sources. Keep the user's
-intent; do not invent constraints they did not express. Prefer a small, sharp,
-diverse set over a long dull one.
-
-Return strict JSON only:
-{
-  "search_queries": ["improved general query phrases"],
-  "source_queries": {"web_search": ["query"], "reddit": ["query"]},
-  "subtopics": ["facet the plan should also cover"],
-  "notes": "one line on what you strengthened"
-}
-Return only sources you are improving; omit keys you are not changing.
-""".strip()
-
-
-STRATEGY_REFINEMENT_SYSTEM_PROMPT = """
-You revise an already-confirmed Morning Dispatch search strategy from a user's
-natural-language instruction.
-
-Return a proposal for the user to review before anything is applied. Preserve
-the user's original intent and selected sources unless the instruction
-explicitly changes them. Prefer concrete, executable queries over abstract
-themes. Use source-shaped phrasing: native-language terms for foreign media,
-subreddit or community phrasing for Reddit, show/channel/topic phrasing for
-podcasts and YouTube, and ticker symbols for markets.
-
-Your response should sound like a useful research collaborator: briefly say how
-you interpreted the feedback, then name the meaningful adjustments you propose.
-Do not claim the change has already been applied.
-
-Return strict JSON only:
-{
-  "requires_changes": true,
-  "findings": ["specific issue or correction"],
-  "profile_patch": {
-    "scope": "optional refined scope",
-    "subtopics": ["new facet"],
-    "keywords": ["new term"],
-    "search_queries": ["general query"],
-    "replace_search_queries": false,
-    "source_queries": {
-      "web_search": ["query"],
-      "foreign_media": ["native-language query"],
-      "reddit": ["r/Subreddit topic phrase"],
-      "youtube": ["video/channel query"],
-      "podcasts": ["show or episode topic"],
-      "collections": ["local document query"],
-      "markets": ["TICKER"]
-    },
-    "replace_source_queries": false,
-    "foreign_language_plan": [
-      {
-        "code": "zh",
-        "name": "Chinese",
-        "native_query": "idiomatic native-language query",
-        "native_entity_terms": ["native entity"],
-        "reason": "why this language helps"
-      }
-    ],
-    "requested_sources": [{"adapter": "reddit|podcasts|youtube|web_search|foreign_media|gmail|collections|markets", "ref": "specific source named by the user"}],
-    "recency_weighting": "breaking|recent|last_year|all_available",
-    "lookback_hours": 336,
-    "exclusions": ["thing to avoid"]
-  },
-  "reasoning_summary": "one concise sentence describing the proposed change",
-  "assistant_response": "plain-language response explaining what you propose and why"
-}
-Only include fields that should change. If you are reviewing a strategy and no
-changes are needed, set requires_changes false and return an empty profile_patch.
-""".strip()
 
 
 def start_session(payload: dict[str, Any]) -> dict[str, Any]:
@@ -791,7 +540,7 @@ def _run_strategy_refinement_agent(
     try:
         parsed = _run_sync_complete_json(
             client.complete_json(
-                system=STRATEGY_REFINEMENT_SYSTEM_PROMPT,
+                system=load_prompt("strategy_refinement"),
                 prompt=prompt,
                 max_tokens=1600,
             )
@@ -1051,7 +800,7 @@ def _run_refinement_agent(
     try:
         parsed = _run_sync_complete_json(
             client.complete_json(
-                system=REFINEMENT_AGENT_SYSTEM_PROMPT,
+                system=load_prompt("refinement_agent"),
                 prompt=prompt,
                 max_tokens=2000,
             )
@@ -1105,7 +854,7 @@ def _critique_search_plan(profile: dict[str, Any]) -> dict[str, Any]:
     try:
         parsed = _run_sync_complete_json(
             client.complete_json(
-                system=CRITIQUE_SYSTEM_PROMPT,
+                system=load_prompt("critique_agent"),
                 prompt=prompt,
                 max_tokens=1200,
             )
@@ -1196,7 +945,6 @@ def _build_refinement_agent_prompt(
                     "When selected, propose any non-English language the topic warrants and write idiomatic native-language queries. "
                     "Use this for public foreign media only."
                 ),
-                "reddit": "Use community phrasing, local names, problems, recommendations, and comparison language.",
                 "youtube": "Use creator/video search phrases for walkthroughs, explainers, interviews, or demos.",
                 "podcasts": "Use show/interview/topic phrases for deeper context.",
                 "collections": "Use terms likely to appear in local documents.",
@@ -2069,8 +1817,6 @@ def _source_specific_fallback(
     if source == "foreign_media":
         return list(foreign_fallback)
     base = phrase_queries[:3]
-    if source == "reddit":
-        return [f"{query} discussion" for query in base]
     if source == "youtube":
         return [f"{query} explained" for query in base]
     if source == "podcasts":
@@ -2319,7 +2065,6 @@ _QUESTION_VARIANTS: dict[str, tuple[str, ...]] = {
 }
 
 _SOURCE_PROMPT_LABELS: dict[str, str] = {
-    "reddit": "subreddits or communities",
     "podcasts": "shows or hosts",
     "youtube": "channels or creators",
     "markets": "companies or tickers",
@@ -2774,7 +2519,6 @@ _SOURCE_DISPLAY: dict[str, str] = {
     "web_search": "Web search",
     "foreign_media": "Foreign media",
     "gmail": "Gmail newsletters",
-    "reddit": "Reddit",
     "podcasts": "Podcasts",
     "youtube": "YouTube",
     "collections": "Your collections",
@@ -2900,7 +2644,6 @@ def _extract_requested_sources(text: str) -> list[dict[str, str]]:
         ("podcasts", r"\bpodcast[:\s]+([^.;,\n]+)"),
         ("gmail", r"\binclude\s+(?:the\s+)?newsletter[:\s]+([^.;,\n]+)"),
         ("gmail", r"\bnewsletter[:\s]+([^.;,\n]+)"),
-        ("reddit", r"\binclude\s+(?:the\s+)?(?:subreddit|reddit)[:\s]+(?:r/)?([A-Za-z0-9_][A-Za-z0-9_ -]{1,80})"),
         ("youtube", r"\binclude\s+(?:the\s+)?(?:youtube\s+)?(?:channel|creator|show)[:\s]+([^.;,\n]+)"),
         ("youtube", r"\byoutube\s+(?:channel|creator|show)[:\s]+([^.;,\n]+)"),
         ("collections", r"\binclude\s+(?:the\s+)?collection[:\s]+([^.;,\n]+)"),
@@ -2914,11 +2657,6 @@ def _extract_requested_sources(text: str) -> list[dict[str, str]]:
     for adapter, pattern in patterns:
         for match in re.finditer(pattern, clean, flags=re.IGNORECASE):
             ref = match.group(1).strip(" .\"'")
-            if adapter == "reddit":
-                ref = ref.replace(" ", "")
-                if ref.lower().startswith("r/"):
-                    ref = ref[2:]
-                ref = f"r/{ref}"
             if not ref:
                 continue
             key = (adapter, ref.lower())
@@ -2960,7 +2698,6 @@ def _generic_requested_ref(adapter: str, ref: str) -> bool:
         "foreign_media",
         "foreignmedia",
         "foreign",
-        "reddit",
         "youtube",
         "podcast",
         "podcasts",

@@ -148,12 +148,7 @@ class ApiKeyPayload(BaseModel):
     api_key: str = Field(min_length=1, max_length=1000)
 
 
-class RedditCredentialsPayload(BaseModel):
-    client_id: str = Field(min_length=1, max_length=1000)
-    client_secret: str = Field(min_length=1, max_length=1000)
-    username: str | None = Field(default=None, max_length=120)
-    password: str | None = Field(default=None, max_length=1000)
-    user_agent: str | None = Field(default=None, max_length=300)
+
 
 
 @router.get("/health")
@@ -525,6 +520,17 @@ async def foreign_article_translation_view(exploration_id: str, payload: Foreign
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/explore/explorations/{exploration_id}/re-enrich")
+async def re_enrich_exploration(exploration_id: str) -> dict[str, Any]:
+    try:
+        updated = await explore.re_enrich_deterministic_articles(exploration_id)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Exploration not found")
+        return {"status": "success", "exploration": updated}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/admin/explorations/{exploration_id}/issues")
 def admin_exploration_issues(exploration_id: str) -> dict[str, Any]:
     exploration = database.get_exploration(exploration_id)
@@ -548,15 +554,7 @@ def save_youtube_credentials(payload: ApiKeyPayload) -> dict[str, Any]:
     return explore.save_youtube_credentials(api_key=payload.api_key)
 
 
-@router.post("/admin/reddit/credentials")
-def save_reddit_credentials(payload: RedditCredentialsPayload) -> dict[str, Any]:
-    return explore.save_reddit_credentials(
-        client_id=payload.client_id,
-        client_secret=payload.client_secret,
-        username=payload.username,
-        password=payload.password,
-        user_agent=payload.user_agent,
-    )
+
 
 
 @router.post("/admin/collections/setup")

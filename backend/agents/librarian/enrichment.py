@@ -14,6 +14,7 @@ from backend.agents.discovery.language_support import trusted_script_language_pa
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClient, ModelClientConfig, ModelClientError
 from backend.app.core.config import DEFAULT_LIBRARIAN_MODEL, get_settings
+from backend.app.core.prompt_loader import load_prompt
 from backend.app.db import database
 
 
@@ -112,13 +113,13 @@ async def enrich_article_with_model(
     try:
         if hasattr(model_client, "complete_json_with_metrics"):
             model_response, model_payload = await model_client.complete_json_with_metrics(
-                system=LIBRARIAN_SYSTEM_PROMPT,
+                system=load_prompt("librarian"),
                 prompt=prompt,
                 max_tokens=220,
             )
         else:
             model_payload = await model_client.complete_json(
-                system=LIBRARIAN_SYSTEM_PROMPT,
+                system=load_prompt("librarian"),
                 prompt=prompt,
                 max_tokens=220,
             )
@@ -189,13 +190,13 @@ async def _retry_with_fallback_model(
     try:
         if hasattr(fallback_client, "complete_json_with_metrics"):
             model_response, model_payload = await fallback_client.complete_json_with_metrics(
-                system=LIBRARIAN_SYSTEM_PROMPT,
+                system=load_prompt("librarian"),
                 prompt=prompt,
                 max_tokens=220,
             )
         else:
             model_payload = await fallback_client.complete_json(
-                system=LIBRARIAN_SYSTEM_PROMPT,
+                system=load_prompt("librarian"),
                 prompt=prompt,
                 max_tokens=220,
             )
@@ -956,7 +957,7 @@ def _record_model_metric(
             "ttft_ms": ttft_ms,
             "generation_ms": generation_ms,
             "total_ms": total_ms,
-            "prompt_tokens": prompt_tokens if prompt_tokens is not None else _estimate_tokens(LIBRARIAN_SYSTEM_PROMPT, prompt),
+            "prompt_tokens": prompt_tokens if prompt_tokens is not None else _estimate_tokens(load_prompt("librarian"), prompt),
             "completion_tokens": completion_tokens,
             "tokens_per_sec": tokens_per_sec,
             "classification_label": classification_label,
@@ -1088,14 +1089,7 @@ NOISY_FETCHED_TEXT_MARKERS = (
     "we're one of the fastest-growing ai newsletters",
 )
 
-LIBRARIAN_SYSTEM_PROMPT = """You are a content librarian for a personal newspaper.
-Return only valid JSON with these fields:
-- title: canonical clean title for the primary article
-- summary: 2-4 concise sentences about the content, not the source newsletter
-- keywords: array of 5-10 topical and entity tags
-- content_type: one of [article, opinion, tutorial, podcast, newsletter_fallback, discussion]
-- confidence_note: short note only if the source text is weak or partial
-No preamble, no markdown fences. Keep the whole response under 220 tokens."""
+# LIBRARIAN_SYSTEM_PROMPT is loaded dynamically via load_prompt("librarian")
 
 STOPWORDS = {
     "about",

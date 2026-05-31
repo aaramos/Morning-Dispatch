@@ -12,6 +12,7 @@ from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import ModelClient, ModelClientError
 from backend.agents.model.metrics import record_model_response_metric
 from backend.app.core.config import get_settings
+from backend.app.core.prompt_loader import load_prompt
 
 MAX_EDITORIAL_CANDIDATES = 150
 ALLOWED_SECTIONS = {
@@ -71,7 +72,7 @@ async def apply_editorial_decisions(
     try:
         if hasattr(client, "complete_json_with_metrics"):
             response, payload = await client.complete_json_with_metrics(
-                system=EDITORIAL_SYSTEM_PROMPT,
+                system=load_prompt("editorial"),
                 prompt=prompt,
                 max_tokens=1600,
                 on_token=reasoning_callback,
@@ -82,12 +83,12 @@ async def apply_editorial_decisions(
                 mode="editorial",
                 model_client=client,
                 response=response,
-                system_prompt=EDITORIAL_SYSTEM_PROMPT,
+                system_prompt=load_prompt("editorial"),
                 prompt=prompt,
             )
         else:
             payload = await client.complete_json(
-                system=EDITORIAL_SYSTEM_PROMPT,
+                system=load_prompt("editorial"),
                 prompt=prompt,
                 max_tokens=1600,
                 on_token=reasoning_callback,
@@ -328,9 +329,3 @@ def _client_model_name(client: Any, fallback: str | None) -> str | None:
     config = getattr(client, "config", None)
     model = getattr(config, "model", None)
     return str(model) if model else fallback
-
-
-EDITORIAL_SYSTEM_PROMPT = """You are the Morning Dispatch Editorial Decision Agent.
-Make concise, conservative editorial choices for a personal AI intelligence brief.
-You may include, exclude, demote, section, or choose exactly one lead story.
-Use only the supplied article records. Do not invent facts. Return valid JSON only."""

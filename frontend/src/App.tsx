@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 
-type SourceKey = "web_search" | "foreign_media" | "gmail" | "reddit" | "podcasts" | "youtube" | "collections" | "markets";
+type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets";
 type FlowState = "idle" | "refining" | "confirm" | "building" | "ready" | "schedule";
 type SortMode = "recent" | "name";
 type SchedulePreset = "daily" | "weekdays" | "weekly" | "monthly";
@@ -456,7 +456,6 @@ const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
   { key: "web_search", label: "Web", icon: "🌐" },
   { key: "foreign_media", label: "Foreign Media", icon: "🌍" },
   { key: "gmail", label: "Gmail", icon: "✉️" },
-  { key: "reddit", label: "Reddit", icon: "🟠" },
   { key: "podcasts", label: "Podcast", icon: "🎙️" },
   { key: "youtube", label: "YouTube", icon: "▶" },
   { key: "collections", label: "Collections", icon: "▣" },
@@ -467,7 +466,6 @@ const defaultSourceSelection: Record<SourceKey, boolean> = {
   web_search: true,
   foreign_media: false,
   gmail: false,
-  reddit: false,
   podcasts: false,
   youtube: false,
   collections: false,
@@ -477,7 +475,6 @@ const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   web_search: true,
   foreign_media: true,
   gmail: true,
-  reddit: false,
   podcasts: true,
   youtube: true,
   collections: true,
@@ -492,7 +489,6 @@ const defaultContentLimits: ContentLimitsDraft = {
     web_search: 25,
     foreign_media: 25,
     gmail: 25,
-    reddit: 25,
     podcasts: 10,
     youtube: 10,
     collections: 25,
@@ -3117,11 +3113,6 @@ function EnableSourceModal(props: {
             <button type="button" onClick={props.onRetry} disabled={props.busy}>Retry Markets</button>
           </div>
         ) : null}
-        {props.source === "reddit" ? (
-          <div className="enable-stack">
-            <p>Reddit is disabled because Reddit no longer supports the API path this connector used.</p>
-          </div>
-        ) : null}
       </section>
     </div>
   );
@@ -4996,9 +4987,6 @@ function sourceReadinessItems(
       if (!sourceStatus?.enabled) {
         return { key: source.key, label: source.label, ready: false, message: sourceStatus?.reason || "not configured" };
       }
-      if (source.key === "reddit" && !queries.length && !sourceStatus.configured_source_count) {
-        return { key: source.key, label: source.label, ready: false, message: "no subreddit targets yet" };
-      }
       if (source.key === "podcasts" && !queries.length && !sourceStatus.configured_source_count) {
         return { key: source.key, label: source.label, ready: false, message: "no show or search targets yet" };
       }
@@ -5092,7 +5080,6 @@ function enabledSourceSelection(selection: Record<SourceKey, boolean>, status: S
     web_search: Boolean(selection.web_search && status?.sources.web_search?.enabled),
     foreign_media: Boolean(selection.foreign_media && status?.sources.foreign_media?.enabled),
     gmail: Boolean(selection.gmail && status?.sources.gmail?.enabled),
-    reddit: Boolean(selection.reddit && status?.sources.reddit?.enabled),
     podcasts: Boolean(selection.podcasts && status?.sources.podcasts?.enabled),
     youtube: Boolean(selection.youtube && status?.sources.youtube?.enabled),
     collections: Boolean(selection.collections && status?.sources.collections?.enabled),
@@ -5199,7 +5186,6 @@ function formatSourceLabel(source: string): string {
   if (source === "web_search") return "Web";
   if (source === "foreign_media") return "Foreign Media";
   if (source === "gmail") return "Gmail";
-  if (source === "reddit") return "Reddit";
   if (source === "podcasts") return "Podcast";
   if (source === "youtube") return "YouTube";
   if (source === "collections") return "Collections";

@@ -14,6 +14,7 @@ from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import ModelClient, ModelClientError
 from backend.agents.model.metrics import record_model_error_metric, record_model_response_metric
 from backend.app.core.config import get_settings
+from backend.app.core.prompt_loader import load_prompt
 
 MAX_AUDIT_CANDIDATES = 28
 RETRY_AUDIT_CANDIDATES = 4
@@ -162,7 +163,7 @@ async def _complete_audit(
     try:
         if hasattr(client, "complete_json_with_metrics"):
             response, payload = await client.complete_json_with_metrics(
-                system=SOURCE_AUDIT_SYSTEM_PROMPT,
+                system=load_prompt("source_audit"),
                 prompt=prompt,
                 max_tokens=max_tokens,
             )
@@ -172,11 +173,11 @@ async def _complete_audit(
                 mode="source_audit",
                 model_client=client,
                 response=response,
-                system_prompt=SOURCE_AUDIT_SYSTEM_PROMPT,
+                system_prompt=load_prompt("source_audit"),
                 prompt=prompt,
             )
             return payload, _elapsed_ms(started_at)
-        payload = await client.complete_json(system=SOURCE_AUDIT_SYSTEM_PROMPT, prompt=prompt, max_tokens=max_tokens)
+        payload = await client.complete_json(system=load_prompt("source_audit"), prompt=prompt, max_tokens=max_tokens)
         return payload, _elapsed_ms(started_at)
     except ModelClientError as exc:
         _record_audit_error(
@@ -204,7 +205,7 @@ def _record_audit_error(
         article_id=article_id,
         mode="source_audit",
         model_client=client,
-        system_prompt=SOURCE_AUDIT_SYSTEM_PROMPT,
+        system_prompt=load_prompt("source_audit"),
         prompt=prompt,
         status=exc.status,
         error_detail=str(exc),
@@ -899,10 +900,3 @@ def _string_list(value: Any) -> list[str]:
 
 def _elapsed_ms(started_at: float) -> int:
     return max(0, round((perf_counter() - started_at) * 1000))
-
-
-SOURCE_AUDIT_SYSTEM_PROMPT = """You are Morning Dispatch's Source Audit Agent.
-Your job is to protect the user's retrieval constraints before Editorial ranks the brief.
-You are not a deterministic filter: use judgment about freshness, source originality, topic fit, and whether a source deserves to be ranked as current news.
-Be strict when the user gave strict time windows or source-quality preferences.
-Return strict JSON only."""

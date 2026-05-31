@@ -36,7 +36,6 @@ def test_fallback_does_not_copy_same_phrase_into_every_source():
     profile = _profile(
         source_selection={
             "web_search": True,
-            "reddit": True,
             "youtube": True,
             "podcasts": True,
         }
@@ -49,11 +48,9 @@ def test_fallback_does_not_copy_same_phrase_into_every_source():
         "Samsung HBM3E yield",
         "SK Hynix HBM capacity",
     ]
-    # Community/video/audio lanes are differentiated from web and from each other.
-    assert sq["reddit"] != sq["web_search"]
+    # Video/audio lanes are differentiated from web and from each other.
     assert sq["youtube"] != sq["web_search"]
     assert sq["podcasts"] != sq["web_search"]
-    assert all(q.endswith("discussion") for q in sq["reddit"])
     assert all(q.endswith("explained") for q in sq["youtube"])
     assert any(q.endswith("podcast") for q in sq["podcasts"])
     assert any(q.endswith("interview") for q in sq["podcasts"])
@@ -104,9 +101,9 @@ def test_foreign_media_fallback_is_native_only():
 
 
 def test_disabled_sources_get_no_queries():
-    profile = _profile(source_selection={"web_search": True, "reddit": False})
+    profile = _profile(source_selection={"web_search": True, "youtube": False})
     result = refinement._fill_defaults(profile)
-    assert "reddit" not in result["source_queries"]
+    assert "youtube" not in result["source_queries"]
 
 
 def test_diagnostics_present_and_survive_coercion():
@@ -119,7 +116,7 @@ def test_diagnostics_present_and_survive_coercion():
         "selected": True,
         "query_count": 3,
     }
-    assert diagnostics["source_availability"]["reddit"] == {
+    assert diagnostics["source_availability"]["podcasts"] == {
         "selected": False,
         "query_count": 0,
     }

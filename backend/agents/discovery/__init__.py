@@ -3,7 +3,6 @@ from backend.agents.discovery.adapters import (
     GmailSourceAdapter,
     MarketsSourceAdapter,
     PodcastSourceAdapter,
-    RedditSourceAdapter,
     WebSearchSourceAdapter,
     YouTubeSourceAdapter,
 )
@@ -30,7 +29,6 @@ __all__ = [
     "GmailSourceAdapter",
     "MarketsSourceAdapter",
     "PodcastSourceAdapter",
-    "RedditSourceAdapter",
     "SourceAdapterContext",
     "SourceRegistry",
     "TopicProfile",

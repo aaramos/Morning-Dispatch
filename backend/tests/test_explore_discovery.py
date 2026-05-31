@@ -230,41 +230,125 @@ def test_source_window_filter_rejects_undated_strict_types_under_bounded_window(
     assert issues[0]["reason"].startswith("Date is missing for this strict source")
 
 
-def test_reddit_adapter_uses_web_fallback_when_mcp_fails(monkeypatch) -> None:
+def test_pre_window_date_adjudication_rescues_fresh_strict_item(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
     profile = TopicProfile.from_dict(
         {
-            "statement": "Track LocalLLaMA Apple Silicon local LLM threads",
-            "source_selection": {"reddit": True},
-            "source_queries": {"reddit": ["r/LocalLLaMA Apple Silicon MLX"]},
+            "topic_id": "topic-date-rescue",
+            "statement": "Track local AI tooling news from the last 7 days.",
+            "scope": "Local AI tooling",
+            "recency_weighting": "recent",
         }
     )
-    context = SourceAdapterContext(exploration_id="run-1", lookback_hours=336, candidate_limit=5)
+    undated = article_for_window(
+        title="Undated local AI story",
+        url="https://example.com/news/local-ai-story",
+        summary="Fresh local AI tooling news with an explicit dateline.",
+        source_type="gmail_link",
+    )
+    fresh_date = (datetime.now(UTC) - timedelta(days=1)).date().isoformat()
 
-    async def fake_fetch_reddit_threads(**_kwargs):
-        raise RuntimeError("Reddit API returned HTTP 403")
+    class _DateReviewModelClient:
+        async def complete_json(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "decisions": [
+                    {
+                        "index": 0,
+                        "decision": "include",
+                        "confidence": 0.9,
+                        "constraint_failures": [],
+                        "resolved_published_date": fresh_date,
+                        "reason": "The supplied text contains an explicit fresh dateline.",
+                    }
+                ],
+                "summary": "Resolved a missing date from supplied article evidence.",
+            }
 
-    async def fake_search_web(query: str, **_kwargs):
-        assert "site:reddit.com/r/LocalLLaMA" in query
-        return [
-            SearchHit(
-                title="MLX benchmark thread",
-                url="https://www.reddit.com/r/LocalLLaMA/comments/abc123/mlx_benchmark/",
-                snippet="Local builders compare MLX and llama.cpp.",
-                score=0.75,
-                provider="brave",
-            )
-        ]
+    monkeypatch.setattr(
+        explore.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: type("Resolution", (), {"client": _DateReviewModelClient()})(),
+    )
 
-    monkeypatch.setattr(adapters, "fetch_reddit_threads", fake_fetch_reddit_threads)
-    monkeypatch.setattr(adapters, "search_web", fake_search_web)
-    monkeypatch.setattr(adapters.database, "list_digests", lambda **_kwargs: [])
+    reviewed, summary = asyncio.run(
+        explore._adjudicate_dates_before_source_window_filter(
+            profile,
+            [undated],
+            lookback_hours=24 * 7,
+            inference_run_id="date-rescue-run",
+            max_candidates=10,
+        )
+    )
+    kept, issues = explore._apply_source_window_filter(profile, reviewed, lookback_hours=24 * 7)
 
-    candidates = asyncio.run(adapters.RedditSourceAdapter().query(profile, context))
+    assert summary["resolved_count"] == 1
+    assert reviewed[0].payload.published_at == fresh_date
+    assert reviewed[0].metadata["date_source"] == "model"
+    assert kept == reviewed
+    assert issues == []
 
-    assert len(candidates) == 1
-    assert candidates[0].payload.source_type == "reddit_thread"
-    assert candidates[0].payload.metadata["fallback_source"] == "web_search"
-    assert candidates[0].payload.metadata["subreddit"] == "LocalLLaMA"
+
+def test_pre_window_date_adjudication_still_rejects_stale_model_date(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    profile = TopicProfile.from_dict(
+        {
+            "topic_id": "topic-date-stale",
+            "statement": "Track local AI tooling news from the last 7 days.",
+            "scope": "Local AI tooling",
+            "recency_weighting": "recent",
+        }
+    )
+    undated = article_for_window(
+        title="Undated local AI story",
+        url="https://example.com/news/local-ai-story",
+        summary="Older local AI tooling news with an explicit dateline.",
+        source_type="gmail_link",
+    )
+    stale_date = (datetime.now(UTC) - timedelta(days=45)).date().isoformat()
+
+    class _DateReviewModelClient:
+        async def complete_json(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "decisions": [
+                    {
+                        "index": 0,
+                        "decision": "include",
+                        "confidence": 0.9,
+                        "constraint_failures": [],
+                        "resolved_published_date": stale_date,
+                        "reason": "The supplied text contains an explicit stale dateline.",
+                    }
+                ],
+                "summary": "Resolved a missing date from supplied article evidence.",
+            }
+
+    monkeypatch.setattr(
+        explore.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: type("Resolution", (), {"client": _DateReviewModelClient()})(),
+    )
+
+    reviewed, summary = asyncio.run(
+        explore._adjudicate_dates_before_source_window_filter(
+            profile,
+            [undated],
+            lookback_hours=24 * 7,
+            inference_run_id="date-stale-run",
+            max_candidates=10,
+        )
+    )
+    kept, issues = explore._apply_source_window_filter(profile, reviewed, lookback_hours=24 * 7)
+
+    assert summary["resolved_count"] == 1
+    assert reviewed[0].payload.published_at == stale_date
+    assert kept == []
+    assert len(issues) == 1
+    assert issues[0]["reason"].startswith("Published outside the requested source window")
+
+
+
 
 
 def test_podcast_adapter_rejects_web_fallback_when_directory_is_empty(monkeypatch) -> None:
@@ -644,7 +728,7 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
             json={
                 "statement": "Explore local AI workflows",
                 "scope": "Local AI operations and tooling",
-                "source_selection": {"web_search": True, "reddit": True},
+                "source_selection": {"web_search": True, "youtube": True},
             },
         )
         topic_id = created.json()["topic_id"]
@@ -656,7 +740,7 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                     "total_items": 9,
                     "target_items": 6,
                     "lead_items": 2,
-                "per_source": {"web_search": 5, "reddit": 2},
+                "per_source": {"web_search": 5, "youtube": 2},
                 "quality_floor": "strong",
             },
             "lookback_hours": 168,
@@ -681,9 +765,8 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                     "gmail": 15,
                     "markets": 15,
                     "podcasts": 10,
-                    "reddit": 2,
                     "web_search": 5,
-                    "youtube": 10,
+                    "youtube": 2,
                 },
             "quality_floor": "strong",
             "target_items": 6,
@@ -1045,20 +1128,20 @@ def test_final_source_mix_issues_explain_missing_requested_sources() -> None:
             "topic_id": "topic-source-mix",
             "statement": "Track local AI deployment",
             "scope": "Track local AI deployment",
-            "source_selection": {"gmail": True, "reddit": True, "podcasts": True},
+            "source_selection": {"gmail": True, "youtube": True, "podcasts": True},
         }
     )
     gmail_payload = NormalizedPayload(id="gmail-1", source_type="gmail", source_name="AI Newsletter", raw_text="Newsletter item")
-    reddit_payload = NormalizedPayload(id="reddit-1", source_type="reddit_thread", source_name="LocalLLaMA", raw_text="Thread item")
+    youtube_payload = NormalizedPayload(id="youtube-1", source_type="youtube_video", source_name="Tech Channel", raw_text="Video item")
     discovery = DiscoveryResult(
         profile=profile,
         candidates=(
             Candidate(adapter="gmail", payload=gmail_payload, score=0.9, reason="Newsletter"),
-            Candidate(adapter="reddit", payload=reddit_payload, score=0.7, reason="Thread"),
+            Candidate(adapter="youtube", payload=youtube_payload, score=0.7, reason="Video"),
         ),
         statuses=(
             AdapterStatus(name="gmail", status="completed", candidate_count=1),
-            AdapterStatus(name="reddit", status="completed", candidate_count=1),
+            AdapterStatus(name="youtube", status="completed", candidate_count=1),
             AdapterStatus(name="podcasts", status="completed", candidate_count=0),
         ),
     )
@@ -1075,13 +1158,13 @@ def test_final_source_mix_issues_explain_missing_requested_sources() -> None:
             tier="lead",
         ),
         ArticleFetchResult(
-            payload=reddit_payload,
-            original_url="https://reddit.com/r/LocalLLaMA/comments/1",
-            final_url="https://reddit.com/r/LocalLLaMA/comments/1",
-            title="Thread item",
-            text="thread",
-            excerpt="thread",
-            domain="reddit.com",
+            payload=youtube_payload,
+            original_url="https://youtube.com/watch?v=1",
+            final_url="https://youtube.com/watch?v=1",
+            title="Video item",
+            text="video",
+            excerpt="video",
+            domain="youtube.com",
             status="fetched",
             tier="dropped",
         ),
@@ -1092,12 +1175,12 @@ def test_final_source_mix_issues_explain_missing_requested_sources() -> None:
         progress,
         discovery,
         article_results,
-        {"gmail": True, "reddit": True, "podcasts": True},
+        {"gmail": True, "youtube": True, "podcasts": True},
     )
 
     reasons = {issue["source_name"]: issue["reason"] for issue in progress["requested_source_issues"]}
-    assert "returned 1 candidate(s), but none survived" in reasons["Reddit"]
-    assert reasons["Podcast"] == "Podcast was selected but returned no usable candidates for this run."
+    assert "returned 1 candidate(s), but none survived" in reasons["YouTube"]
+    assert reasons["Podcasts"] == "Podcasts was selected but returned no usable candidates for this run."
     assert "relying on Gmail/newsletter fallback" in reasons["Source mix"]
     assert progress["built_with_issues"] is True
 
@@ -1727,7 +1810,6 @@ def test_refinement_session_default_sources_are_web_only(monkeypatch, tmp_path) 
     assert started.status_code == 201
     assert started.json()["profile"]["source_selection"] == {
         "gmail": False,
-        "reddit": False,
             "podcasts": False,
             "web_search": True,
             "foreign_media": False,

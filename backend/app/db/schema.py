@@ -332,49 +332,7 @@ CREATE TABLE IF NOT EXISTS source_weights (
   PRIMARY KEY (digest_id, source_name)
 );
 
-CREATE TABLE IF NOT EXISTS reddit_sources (
-  id                    TEXT PRIMARY KEY,
-  digest_id             TEXT NOT NULL REFERENCES digests(id),
-  subreddit             TEXT NOT NULL,
-  state                 TEXT NOT NULL CHECK(state IN ('active','search_only','candidate','retired')),
-  category              TEXT,
-  score                 REAL NOT NULL DEFAULT 0,
-  reason                TEXT,
-  last_reviewed_at      TEXT,
-  last_seen_post_at     TEXT,
-  consecutive_stale_runs INTEGER NOT NULL DEFAULT 0,
-  metadata              TEXT NOT NULL DEFAULT '{}',
-  created_at            TEXT NOT NULL,
-  updated_at            TEXT NOT NULL,
-  UNIQUE(digest_id, subreddit)
-) STRICT;
 
-CREATE TABLE IF NOT EXISTS source_scout_runs (
-  id               TEXT PRIMARY KEY,
-  digest_id        TEXT NOT NULL REFERENCES digests(id),
-  run_at           TEXT NOT NULL,
-  status           TEXT NOT NULL CHECK(status IN ('completed','partial','failed')),
-  sampled_count    INTEGER NOT NULL DEFAULT 0,
-  active_count     INTEGER NOT NULL DEFAULT 0,
-  candidate_count  INTEGER NOT NULL DEFAULT 0,
-  retired_count    INTEGER NOT NULL DEFAULT 0,
-  summary          TEXT,
-  error_detail     TEXT
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS source_scout_decisions (
-  id               TEXT PRIMARY KEY,
-  scout_run_id     TEXT NOT NULL REFERENCES source_scout_runs(id),
-  digest_id        TEXT NOT NULL REFERENCES digests(id),
-  agent            TEXT NOT NULL DEFAULT 'source_scout',
-  subreddit        TEXT NOT NULL,
-  decision         TEXT NOT NULL,
-  action           TEXT NOT NULL DEFAULT 'none',
-  confidence       REAL,
-  reason           TEXT,
-  metadata         TEXT NOT NULL DEFAULT '{}',
-  created_at       TEXT NOT NULL
-) STRICT;
 
 CREATE TABLE IF NOT EXISTS gmail_senders (
   id           TEXT PRIMARY KEY,
@@ -425,10 +383,7 @@ CREATE INDEX IF NOT EXISTS idx_podcast_metrics_status ON podcast_metrics(status)
 CREATE INDEX IF NOT EXISTS idx_discoveries_article_id ON article_discoveries(article_id);
 CREATE INDEX IF NOT EXISTS idx_model_enrichment_cache_url ON model_enrichment_cache(canonical_url);
 CREATE INDEX IF NOT EXISTS idx_model_enrichment_cache_model ON model_enrichment_cache(model_name);
-CREATE INDEX IF NOT EXISTS idx_reddit_sources_digest_id ON reddit_sources(digest_id);
-CREATE INDEX IF NOT EXISTS idx_reddit_sources_state ON reddit_sources(state);
-CREATE INDEX IF NOT EXISTS idx_source_scout_runs_digest_id ON source_scout_runs(digest_id);
-CREATE INDEX IF NOT EXISTS idx_source_scout_decisions_digest_id ON source_scout_decisions(digest_id);
+
 CREATE INDEX IF NOT EXISTS idx_served_undated_items_topic ON served_undated_items(topic_id);
 CREATE INDEX IF NOT EXISTS idx_gmail_senders_state ON gmail_senders(state);
 """

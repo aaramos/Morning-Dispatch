@@ -64,7 +64,7 @@ def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
                     "target_items": 18,
                     "lead_items": 4,
                     "quality_floor": "strong",
-                    "per_source": {"web_search": 30, "reddit": 20},
+                    "per_source": {"web_search": 30, "youtube": 8},
                 },
             },
         )
@@ -85,7 +85,7 @@ def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
     assert defaults["content_limits"]["lead_items"] == 4
     assert defaults["content_limits"]["quality_floor"] == "strong"
     assert defaults["content_limits"]["per_source"]["web_search"] == 30
-    assert defaults["content_limits"]["per_source"]["reddit"] == 20
+    assert defaults["content_limits"]["per_source"]["youtube"] == 8
     payload = json.loads((runtime / "data" / "brief-settings.json").read_text(encoding="utf-8"))
     assert payload["brief_defaults"]["content_limits"]["total_items"] == 80
 

@@ -29,7 +29,6 @@ from backend.app.services import (
     model_routing,
     scheduler,
     secret_health,
-    source_scout,
     verification,
 )
 
@@ -194,7 +193,6 @@ async def admin_status(request: Request) -> dict[str, Any]:
     inference_metrics = database.inference_metrics_summary()
     podcast_metrics = database.podcast_metrics_summary()
     agent_decisions = database.agent_decisions_summary()
-    source_scout = database.source_scout_summary()
     fetch_failures = database.fetch_failure_breakdown(limit=5)
     brief_review = database.brief_review(limit=8)
     digest_stats = database.latest_digest_stats()
@@ -223,7 +221,6 @@ async def admin_status(request: Request) -> dict[str, Any]:
             scheduler_status=scheduler_status,
             digests=digests,
             inference_metrics=inference_metrics,
-            source_scout=source_scout,
             delivery=delivery_status,
             secret_status=secret_status,
         ),
@@ -253,7 +250,6 @@ async def admin_status(request: Request) -> dict[str, Any]:
         "inference_metrics": inference_metrics,
         "podcast_metrics": podcast_metrics,
         "agent_decisions": agent_decisions,
-        "source_scout": source_scout,
         "fetch_failures": fetch_failures,
         "brief_review": brief_review,
         "digest_stats": digest_stats,
@@ -306,7 +302,6 @@ def _admin_health(
     scheduler_status: dict[str, Any],
     digests: list[dict[str, Any]],
     inference_metrics: dict[str, Any],
-    source_scout: dict[str, Any],
     delivery: dict[str, Any],
     secret_status: dict[str, Any],
 ) -> dict[str, Any]:
@@ -321,7 +316,6 @@ def _admin_health(
         add("Gmail", "warning", "Gmail needs a reconnect to grant the required permissions.")
     else:
         add("Gmail", "ok", "Connected and ready to read newsletters.")
-    add("Reddit", "ok", "Disabled. Reddit no longer supports the API path this connector used.")
 
     model_catalog = model.get("catalog") if isinstance(model.get("catalog"), dict) else {}
     model_ready = bool(model.get("enabled") and model.get("api_key_configured") and model_catalog.get("available"))
@@ -370,8 +364,6 @@ def _admin_health(
         )
     else:
         add("Model capacity", "ok", "No recent model-capacity errors recorded.")
-
-    add("Source Scout", "ok", "Disabled with Reddit.")
 
     email_status = delivery.get("email") if isinstance(delivery.get("email"), dict) else {}
     if email_status.get("enabled") and email_status.get("gmail_send_ready"):
@@ -576,13 +568,7 @@ def send_latest_digest_email(digest_id: str) -> dict[str, Any]:
     return result
 
 
-@router.get("/source-scout")
-def list_source_scout() -> dict[str, Any]:
-    return {
-        "summary": database.source_scout_summary(),
-        "sources": database.list_reddit_sources(include_retired=True),
-        "decisions": database.list_source_scout_decisions(limit=60),
-    }
+
 
 
 @router.get("/gmail/allowlist")
@@ -622,12 +608,7 @@ def remove_gmail_allowlist_sender(sender: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/digests/{digest_id}/source-scout")
-async def run_source_scout(digest_id: str, live_sample: bool = True) -> dict[str, Any]:
-    result = await source_scout.run_source_scout(digest_id, live_sample=live_sample)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Digest not found")
-    return result
+
 
 
 @router.post("/model/jobs")

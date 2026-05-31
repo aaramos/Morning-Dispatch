@@ -11,7 +11,6 @@ from backend.agents.agentic import AgentDecision
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes, mark_podcast_payloads_seen
-from backend.agents.digestor.reddit import fetch_reddit_threads
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
@@ -51,7 +50,6 @@ class DigestGraphState(TypedDict, total=False):
     sender_allowlist: list[str]
     lookback_hours: int
     gmail_payloads: Annotated[list[NormalizedPayload], add]
-    reddit_payloads: Annotated[list[NormalizedPayload], add]
     podcast_payloads: Annotated[list[NormalizedPayload], add]
     payloads: list[NormalizedPayload]
     podcast_decisions: Annotated[list[AgentDecision], add]
@@ -133,21 +131,18 @@ def _digest_graph() -> Any:
 
 
 async def _ingest_sources(state: DigestGraphState) -> DigestGraphState:
-    gmail_result, reddit_result, podcast_result = await asyncio.gather(
+    gmail_result, podcast_result = await asyncio.gather(
         _ingest_gmail(state),
-        _ingest_reddit(state),
         _ingest_podcast(state),
     )
     gmail_payloads = gmail_result.get("gmail_payloads", [])
-    reddit_payloads = reddit_result.get("reddit_payloads", [])
     podcast_payloads = podcast_result.get("podcast_payloads", [])
-    payloads = [*gmail_payloads, *reddit_payloads, *podcast_payloads]
+    payloads = [*gmail_payloads, *podcast_payloads]
 
     stage_seconds = dict(state.get("stage_seconds", {}))
     stage_started = _mark_stage(stage_seconds, "ingestion", state["stage_started"])
     return {
         "gmail_payloads": gmail_payloads,
-        "reddit_payloads": reddit_payloads,
         "podcast_payloads": podcast_payloads,
         "podcast_decisions": podcast_result.get("podcast_decisions", []),
         "payloads": payloads,
@@ -167,16 +162,6 @@ async def _ingest_gmail(state: DigestGraphState) -> DigestGraphState:
         db_path=str(database.database_path()),
     )
     return {"gmail_payloads": payloads}
-
-
-async def _ingest_reddit(state: DigestGraphState) -> DigestGraphState:
-    digest = state["digest"]
-    payloads = await fetch_reddit_threads(
-        digest_id=state["digest_id"],
-        digest_interest=str(digest.get("interest") or ""),
-        lookback_hours=state["lookback_hours"],
-    )
-    return {"reddit_payloads": payloads}
 
 
 async def _ingest_podcast(state: DigestGraphState) -> DigestGraphState:
@@ -342,7 +327,6 @@ async def _publish_run(state: DigestGraphState) -> DigestGraphState:
     sender_allowlist = gmail_sender_allowlist(digest.get("sources", []))
     configured_source_count = (
         len(sender_allowlist)
-        + len(database.list_reddit_sources(state["digest_id"], include_retired=False))
         + len(podcast_sources(digest.get("sources", [])))
     )
 
