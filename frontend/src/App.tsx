@@ -3285,6 +3285,7 @@ function AdminApp() {
   const [adminPodcastKey, setAdminPodcastKey] = useState("");
   const [adminPodcastSecret, setAdminPodcastSecret] = useState("");
   const [youtubeKey, setYoutubeKey] = useState("");
+  const [adminFredKey, setAdminFredKey] = useState("");
   const [adminEmailRecipients, setAdminEmailRecipients] = useState<Record<string, string>>({});
   const [selectedLocalModel, setSelectedLocalModel] = useState("");
   const [selectedCloudModel, setSelectedCloudModel] = useState("");
@@ -3559,6 +3560,24 @@ function AdminApp() {
       setMessage("YouTube saved");
     } catch (error) {
       setMessage(errorMessage(error, "Could not save YouTube"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveAdminFred() {
+    if (!adminFredKey.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/admin/fred/credentials", {
+        method: "POST",
+        body: JSON.stringify({ api_key: adminFredKey.trim() }),
+      });
+      setAdminFredKey("");
+      await loadAdmin();
+      setMessage("FRED saved");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save FRED"));
     } finally {
       setBusy(false);
     }
@@ -4228,7 +4247,22 @@ function AdminApp() {
 
                 <section className="source-setup-card">
                   <h2>Markets</h2>
-                  <p>Simple mode. No API key required.</p>
+                  <p>
+                    Price and filing data works without a key. Add a free FRED API key here to enable macro indicators
+                    such as rates, inflation, unemployment, and the yield curve.
+                  </p>
+                  <label>
+                    FRED API key
+                    <input
+                      type="password"
+                      value={adminFredKey}
+                      onChange={(event) => setAdminFredKey(event.target.value)}
+                      placeholder="Paste FRED API key"
+                    />
+                  </label>
+                  <button type="button" onClick={() => void saveAdminFred()} disabled={busy || !adminFredKey.trim()}>
+                    Save FRED
+                  </button>
                 </section>
               </div>
             ) : null}
