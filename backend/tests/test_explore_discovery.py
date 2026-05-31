@@ -267,7 +267,7 @@ def test_reddit_adapter_uses_web_fallback_when_mcp_fails(monkeypatch) -> None:
     assert candidates[0].payload.metadata["subreddit"] == "LocalLLaMA"
 
 
-def test_podcast_adapter_uses_web_fallback_when_directory_is_empty(monkeypatch) -> None:
+def test_podcast_adapter_rejects_web_fallback_when_directory_is_empty(monkeypatch) -> None:
     profile = TopicProfile.from_dict(
         {
             "statement": "Track local LLM podcast discussions",
@@ -280,27 +280,11 @@ def test_podcast_adapter_uses_web_fallback_when_directory_is_empty(monkeypatch) 
     async def fake_fetch_podcast_episodes(**_kwargs):
         return [], []
 
-    async def fake_search_web(_query: str, **_kwargs):
-        return [
-            SearchHit(
-                title="Local LLMs on Apple Silicon - Example Podcast",
-                url="https://podcasts.apple.com/us/podcast/local-llms-on-apple-silicon/id123",
-                snippet="A technical podcast episode about MLX and local inference.",
-                score=0.72,
-                provider="brave",
-            )
-        ]
-
     monkeypatch.setattr(adapters, "fetch_podcast_episodes", fake_fetch_podcast_episodes)
-    monkeypatch.setattr(adapters, "search_web", fake_search_web)
     monkeypatch.setattr(adapters.database, "list_digests", lambda **_kwargs: [])
 
-    candidates = asyncio.run(adapters.PodcastSourceAdapter().query(profile, context))
-
-    assert len(candidates) == 1
-    assert candidates[0].payload.source_type == "podcast_episode"
-    assert candidates[0].payload.metadata["fallback_source"] == "web_search"
-    assert candidates[0].payload.metadata["transcript_source"] == "web_search_snippet"
+    with pytest.raises(adapters.AdapterUnavailable, match="playable audio"):
+        asyncio.run(adapters.PodcastSourceAdapter().query(profile, context))
 
 
 def test_podcast_adapter_discovers_from_profile_when_podcast_plan_is_empty(monkeypatch) -> None:
@@ -314,37 +298,20 @@ def test_podcast_adapter_discovers_from_profile_when_podcast_plan_is_empty(monke
     )
     context = SourceAdapterContext(exploration_id="run-1", lookback_hours=336, candidate_limit=5)
     seen_sources: list[list[dict[str, object]]] = []
-    seen_queries: list[str] = []
 
     async def fake_fetch_podcast_episodes(**kwargs):
         seen_sources.append(list(kwargs["sources"]))
         return [], []
 
-    async def fake_search_web(query: str, **_kwargs):
-        seen_queries.append(query)
-        return [
-            SearchHit(
-                title="MLX and local inference - Example Podcast",
-                url="https://podcasts.apple.com/us/podcast/mlx-and-local-inference/id456",
-                snippet="A podcast episode about Apple Silicon, MLX, and local LLM deployment.",
-                score=0.74,
-                provider="brave",
-            )
-        ]
-
     monkeypatch.setattr(adapters, "fetch_podcast_episodes", fake_fetch_podcast_episodes)
-    monkeypatch.setattr(adapters, "search_web", fake_search_web)
     monkeypatch.setattr(adapters.database, "list_digests", lambda **_kwargs: [])
 
-    candidates = asyncio.run(adapters.PodcastSourceAdapter().query(profile, context))
+    with pytest.raises(adapters.AdapterUnavailable, match="playable audio"):
+        asyncio.run(adapters.PodcastSourceAdapter().query(profile, context))
 
     assert seen_sources
     assert seen_sources[0][0]["type"] == "podcast_search"
     assert "Apple Silicon MLX" in str(seen_sources[0][0]["query"])
-    assert seen_queries
-    assert len(candidates) == 1
-    assert candidates[0].payload.source_type == "podcast_episode"
-    assert candidates[0].payload.metadata["fallback_source"] == "web_search"
 
 
 class _TestStreamingModelClient:

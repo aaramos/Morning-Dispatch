@@ -3927,21 +3927,21 @@ def _render_media_card(result: ArticleFetchResult, *, issue_id: str | None = Non
     modal_html = ""
     cta_copy = "Open"
     if result.payload.source_type == "podcast_episode":
-        modal_id = _podcast_modal_id(result)
-        url = f"#{modal_id}"
-        podcast_url = str(
-            result.payload.metadata.get("episode_url")
-            or result.payload.metadata.get("apple_podcasts_url")
-            or _result_url(result)
-            or ""
-        ).strip()
-        title_attributes = f' data-podcast-modal-target="{escape(modal_id, quote=True)}"'
-        if podcast_url:
-            title_attributes += f' data-podcast-url="{escape(_safe_web_url(podcast_url) or podcast_url, quote=True)}"'
-        title_class = ' class="podcast-modal-link"'
-        title_target = ""
-        modal_html = _render_podcast_modal(result, modal_id)
-        cta_copy = "Listen"
+        podcast_url = _podcast_external_url(result)
+        audio_url = _podcast_audio_url(result)
+        if audio_url:
+            modal_id = _podcast_modal_id(result)
+            url = f"#{modal_id}"
+            title_attributes = f' data-podcast-modal-target="{escape(modal_id, quote=True)}"'
+            if podcast_url:
+                title_attributes += f' data-podcast-url="{escape(podcast_url, quote=True)}"'
+            title_class = ' class="podcast-modal-link"'
+            title_target = ""
+            modal_html = _render_podcast_modal(result, modal_id)
+            cta_copy = "Listen"
+        else:
+            url = podcast_url or _result_url(result)
+            cta_copy = "Open podcast"
     elif result.payload.source_type == "youtube_video":
         modal_id = _youtube_modal_id(result)
         url = f"#{modal_id}"
@@ -4244,7 +4244,7 @@ def _render_article_card(
     summary = _clean_newsletter_text(result.editor_summary or result.excerpt)
     title = _clean_newsletter_text(result.title) or result.title
     feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
-    podcast_modal_id = _podcast_modal_id(result) if result.payload.source_type == "podcast_episode" else ""
+    podcast_modal_id = _podcast_modal_id(result) if result.payload.source_type == "podcast_episode" and _podcast_audio_url(result) else ""
     youtube_modal_id = _youtube_modal_id(result) if result.payload.source_type == "youtube_video" else ""
     title_attributes = ""
     title_class = ""
@@ -4282,12 +4282,26 @@ def _podcast_modal_id(result: ArticleFetchResult) -> str:
     return f"podcast-{hashlib.sha1(raw_key.encode('utf-8')).hexdigest()[:12]}"
 
 
+def _podcast_audio_url(result: ArticleFetchResult) -> str:
+    return _safe_web_url((result.payload.metadata or {}).get("audio_url")) or ""
+
+
+def _podcast_external_url(result: ArticleFetchResult) -> str:
+    metadata = result.payload.metadata or {}
+    return (
+        _safe_web_url(metadata.get("episode_url"))
+        or _safe_web_url(metadata.get("apple_podcasts_url"))
+        or _safe_web_url(_result_url(result))
+        or ""
+    )
+
+
 def _render_podcast_modal(result: ArticleFetchResult, modal_id: str) -> str:
     metadata = result.payload.metadata or {}
     show_name = str(metadata.get("podcast_title") or result.payload.source_name or "Podcast")
     episode_title = _clean_newsletter_text(str(metadata.get("title") or result.title or "Podcast episode"))
     image_url = _safe_web_url(metadata.get("image_url"))
-    audio_url = _safe_web_url(metadata.get("audio_url"))
+    audio_url = _podcast_audio_url(result)
     apple_url = _safe_web_url(metadata.get("apple_podcasts_url"))
     episode_url = _safe_web_url(metadata.get("episode_url"))
     transcript_source = str(metadata.get("transcript_source") or "show_notes")
@@ -4315,11 +4329,7 @@ def _render_podcast_modal(result: ArticleFetchResult, modal_id: str) -> str:
         if image_url
         else f'<div class="podcast-art fallback" aria-hidden="true">{escape(_podcast_initials(show_name))}</div>'
     )
-    player_html = (
-        f'<audio class="podcast-player" data-podcast-player controls preload="none" src="{escape(audio_url, quote=True)}"></audio>'
-        if audio_url
-        else '<p class="meta">Audio is not available for this episode.</p>'
-    )
+    player_html = f'<audio class="podcast-player" data-podcast-player controls preload="none" src="{escape(audio_url, quote=True)}"></audio>'
     action_links = []
     if apple_url:
         action_links.append(f'<a href="{escape(apple_url, quote=True)}" target="_blank" rel="noreferrer">Apple Podcasts</a>')

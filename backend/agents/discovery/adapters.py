@@ -126,14 +126,13 @@ class PodcastSourceAdapter:
             include_seen=True,
         )
         if not payloads:
-            fallback = await _podcast_web_fallback_candidates(profile, context)
-            if fallback:
-                return fallback
             lanes = _source_plan_refs(profile, "podcasts")[:4]
             lane_text = ", ".join(lanes)
             if lane_text:
-                raise AdapterUnavailable(f"Podcast discovery searched {lane_text} but found no usable recent episodes.")
-            raise AdapterUnavailable("Podcast discovery found no usable recent episodes.")
+                raise AdapterUnavailable(
+                    f"Podcast discovery searched {lane_text} but found no usable recent episodes with playable audio."
+                )
+            raise AdapterUnavailable("Podcast discovery found no usable recent episodes with playable audio.")
         return [
             Candidate(
                 adapter=self.name,
@@ -474,53 +473,6 @@ async def _reddit_web_fallback_candidates(
     ]
 
 
-async def _podcast_web_fallback_candidates(profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
-    refs = _podcast_discovery_refs(profile)
-    days = lookback_to_days(context.lookback_hours)
-    queries = [f"{ref} podcast episode interview AI" for ref in refs[:6] if ref]
-    results = await asyncio.gather(
-        *(search_web(query, limit=6, days=days) for query in queries),
-        return_exceptions=True,
-    )
-    candidates: dict[str, Candidate] = {}
-    for query, result in zip(queries, results, strict=True):
-        if isinstance(result, BaseException):
-            continue
-        for hit in result:
-            if not _is_podcast_url(hit.url, hit.title):
-                continue
-            key = _dedupe_url_key(hit.url)
-            score = max(0.42, min(0.78, _search_score(hit.score) * 0.85))
-            payload = NormalizedPayload(
-                source_type="podcast_episode",
-                source_name=_podcast_source_name(hit.title, hit.url),
-                raw_text="\n\n".join(part for part in (hit.title, hit.snippet, hit.url) if part),
-                original_url=hit.url,
-                published_at=hit.published_at,
-                metadata={
-                    "episode_quality_score": score,
-                    "title": hit.title,
-                    "podcast_title": _podcast_source_name(hit.title, hit.url),
-                    "search_query": query,
-                    "search_provider": hit.provider,
-                    "transcript_source": "web_search_snippet",
-                    "fallback_source": "web_search",
-                },
-            )
-            candidate = Candidate(
-                adapter="podcasts",
-                payload=payload,
-                score=score,
-                reason=f"Podcast episode discovered via {hit.provider} fallback.",
-            )
-            existing = candidates.get(key)
-            if existing is None or candidate.score > existing.score:
-                candidates[key] = candidate
-    return sorted(candidates.values(), key=lambda candidate: candidate.score, reverse=True)[
-        : max(1, min(context.candidate_limit, 20))
-    ]
-
-
 def _podcast_discovery_refs(profile: TopicProfile) -> list[str]:
     refs = list(_source_plan_refs(profile, "podcasts"))
     if not refs:
@@ -558,38 +510,6 @@ def _is_reddit_thread_url(url: str) -> bool:
 def _subreddit_from_url(url: str) -> str:
     match = re.search(r"/r/([^/\s]+)/", urlparse(str(url or "")).path, re.IGNORECASE)
     return match.group(1) if match else ""
-
-
-def _is_podcast_url(url: str, title: str = "") -> bool:
-    parsed = urlparse(str(url or ""))
-    host = parsed.netloc.lower()
-    podcast_hosts = (
-        "podcasts.apple.com",
-        "open.spotify.com",
-        "podcasts.google.com",
-        "podcastaddict.com",
-        "podbay.fm",
-        "podtail.com",
-        "listennotes.com",
-        "overcast.fm",
-        "castbox.fm",
-        "podbean.com",
-        "simplecast.com",
-        "transistor.fm",
-        "captivate.fm",
-    )
-    if any(host.endswith(podcast_host) for podcast_host in podcast_hosts):
-        return True
-    text = f"{host} {title}".lower()
-    return "podcast" in text and any(word in text for word in ("episode", "interview", "show", "listen"))
-
-
-def _podcast_source_name(title: str, url: str) -> str:
-    cleaned = str(title or "").split("|", 1)[0].split(" - ", 1)[0].strip()
-    if cleaned:
-        return cleaned[:120]
-    host = urlparse(str(url or "")).netloc
-    return host or "Podcast"
 
 
 async def _youtube_candidates(videos: tuple[Any, ...]) -> list[Candidate]:

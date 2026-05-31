@@ -462,6 +462,53 @@ def test_podcast_media_card_modal_summary_transcript_and_controls() -> None:
     assert "data-podcast-url" in html
 
 
+def test_podcast_without_audio_links_out_without_modal() -> None:
+    payload = NormalizedPayload(
+        source_type="podcast_episode",
+        source_name="AI Insight Podcast",
+        raw_text="Show notes about local model orchestration.",
+        original_url="https://podcasts.apple.com/podcast/ep-1",
+        published_at="2026-05-21T12:00:00Z",
+        metadata={
+            "podcast_title": "AI Insight Podcast",
+            "title": "Local model orchestration roundup",
+            "podcast_episode_id": "ep-102",
+            "apple_podcasts_url": "https://podcasts.apple.com/podcast/ep-1",
+            "transcript_source": "show_notes",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://podcasts.apple.com/podcast/ep-1",
+        final_url="https://podcasts.apple.com/podcast/ep-1",
+        canonical_url="https://podcasts.apple.com/podcast/ep-1",
+        title="Local model orchestration roundup",
+        text=payload.raw_text,
+        excerpt="Show notes about local model orchestration.",
+        domain="podcasts.apple.com",
+        status="fetched",
+        link_score=0.72,
+        section="Podcasts",
+        content_type="podcast",
+        editor_summary="A show-notes summary without playable audio.",
+    )
+
+    html = database.render_ingested_issue(
+        "Podcast Brief",
+        "Podcast without audio test",
+        [payload],
+        [result],
+        lookback_hours=48,
+    )
+
+    assert 'href="https://podcasts.apple.com/podcast/ep-1"' in html
+    assert "Open podcast" in html
+    assert '<div class="podcast-modal"' not in html
+    assert 'data-podcast-modal-target="' not in html
+    assert '<audio class="podcast-player"' not in html
+    assert "Audio is not available" not in html
+
+
 def test_podcast_email_html_link_transformation() -> None:
     from backend.app.services.email_delivery import _email_html
 
