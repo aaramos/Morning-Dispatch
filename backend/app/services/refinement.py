@@ -253,7 +253,9 @@ def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         proposal_base = {**proposal_base, "models": profile.get("models")}
     else:
         proposal_base = profile
-    agent_update = _run_strategy_refinement_agent(profile=proposal_base, instruction=instruction)
+    prior_context = _pending_strategy_context(current_pending)
+    effective_instruction = f"{prior_context}\n\nUser follow-up: {instruction}" if prior_context else instruction
+    agent_update = _run_strategy_refinement_agent(profile=proposal_base, instruction=effective_instruction)
     if not isinstance(agent_update, dict):
         raise ValueError("AI strategy refinement is unavailable; no changes were applied.")
     model_patch = agent_update.get("profile_patch") if isinstance(agent_update, dict) else None
@@ -261,11 +263,16 @@ def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
         raise ValueError("AI strategy refinement did not return a usable proposal; no changes were applied.")
     pending = _build_pending_strategy_refinement(
         proposal_base,
-        instruction=instruction,
+        instruction=effective_instruction,
         agent_update=agent_update,
         readiness_reason="strategy_refinement_proposed",
         review_mode=None,
     )
+    pending["conversation"] = [
+        *[item for item in current_pending.get("conversation", []) if isinstance(item, dict)],
+        {"role": "user", "content": instruction},
+        {"role": "assistant", "content": str(pending.get("assistant_response") or "")},
+    ]
     profile[PENDING_STRATEGY_PROFILE_KEY] = pending
     messages = [
         *_messages(session),
@@ -476,6 +483,24 @@ def _pending_strategy_refinement(profile: dict[str, Any]) -> dict[str, Any]:
     return dict(pending) if isinstance(pending, dict) else {}
 
 
+def _pending_strategy_context(pending: dict[str, Any]) -> str:
+    if not pending:
+        return ""
+    pieces: list[str] = []
+    assistant_response = str(pending.get("assistant_response") or "").strip()
+    if assistant_response:
+        pieces.append(f"Existing proposed update: {assistant_response}")
+    findings = _string_list(pending.get("findings"), limit=6)
+    if findings:
+        pieces.append("Existing findings: " + "; ".join(findings))
+    prior_instruction = str(pending.get("instruction") or "").strip()
+    if prior_instruction:
+        pieces.append(f"Previous instruction/context: {prior_instruction}")
+    if pieces:
+        pieces.append("Revise the existing proposal rather than starting a separate proposal.")
+    return "\n".join(pieces)
+
+
 def _strategy_proposal_summary(patch: dict[str, Any]) -> str:
     changed: list[str] = []
     if patch.get("search_queries"):
@@ -512,6 +537,7 @@ def confirm_strategy_refinement(session_id: str, payload: dict[str, Any]) -> dic
             raise ValueError("Pending strategy refinement is invalid.")
         profile = dict(proposed)
         profile.pop(PENDING_STRATEGY_PROFILE_KEY, None)
+        profile.pop(STRATEGY_REVIEW_PROFILE_KEY, None)
         profile = _fill_defaults(profile)
         proposal_fingerprint = _strategy_fingerprint(profile)
         profile[STRATEGY_REVIEW_PROFILE_KEY] = {
@@ -745,12 +771,19 @@ def _advance_gmail_refinement(
     if pending_field == GMAIL_RULES_FIELD and answer.strip():
         updated = dict(profile)
         rules = _gmail_rules_from_answer(answer, updated)
-        candidates = _discover_gmail_candidates(rules)
-        rules["candidates"] = [candidate.to_dict() for candidate in candidates]
+        candidates = _discover_gmail_candidates(rules, updated)
+        notes = rules.pop("_ai_candidate_notes", {})
+        rules["candidates"] = [
+            {
+                **candidate.to_dict(),
+                **({"ai_rationale": notes.get(candidate.sender.lower())} if notes.get(candidate.sender.lower()) else {}),
+            }
+            for candidate in candidates
+        ]
         if candidates:
             gmail_allowlist.record_candidates(rules["candidates"], source="refinement")
         updated["gmail_rules"] = rules
-        updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), {"gmail": [rules["intent"]]})
+        updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), {"gmail": [rules["gmail_search_query"]]})
         updated["lookback_hours"] = rules["lookback_hours"]
         updated["recency_weighting"] = _recency_from_lookback_hours(int(rules["lookback_hours"]))
         updated["source_scope_answered"] = True
@@ -1340,6 +1373,14 @@ def _normalize_gmail_rules(value: Any) -> dict[str, Any]:
     intent = " ".join(str(value.get("intent") or value.get("query") or "").split()).strip()
     if intent:
         rules["intent"] = intent[:240]
+    gmail_search_query = " ".join(str(value.get("gmail_search_query") or "").split()).strip()
+    if gmail_search_query:
+        rules["gmail_search_query"] = gmail_search_query[:240]
+    selection_criteria = " ".join(str(value.get("selection_criteria") or "").split()).strip()
+    if selection_criteria:
+        rules["selection_criteria"] = selection_criteria[:300]
+    if value.get("ai_managed") is not None:
+        rules["ai_managed"] = bool(value.get("ai_managed"))
     lookback_hours = _coerce_lookback_hours(value.get("lookback_hours"))
     if lookback_hours:
         rules["lookback_hours"] = lookback_hours
@@ -1366,6 +1407,7 @@ def _normalize_gmail_rules(value: Any) -> dict[str, Any]:
                     "subject": str(candidate.get("subject") or "").strip()[:240],
                     "message_count": message_count,
                     "latest_at": str(candidate.get("latest_at") or "").strip() or None,
+                    "ai_rationale": str(candidate.get("ai_rationale") or "").strip()[:240],
                 }
             )
             if len(cleaned_candidates) >= 12:
@@ -1391,39 +1433,187 @@ def _email_list(value: Any) -> list[str]:
     return emails
 
 
+def _ai_gmail_discovery_plan(intent: str, *, lookback_hours: int, profile: dict[str, Any]) -> dict[str, Any]:
+    client = _refinement_model_client(profile)
+    if client is None or not intent.strip():
+        return {}
+    prompt = json.dumps(
+        {
+            "task": "Craft the Gmail search query and screening criteria for newsletter sender discovery.",
+            "user_request": intent,
+            "brief_intent": {
+                "statement": str(profile.get("statement") or ""),
+                "scope": str(profile.get("scope") or ""),
+                "keywords": _string_list(profile.get("keywords"), limit=12),
+                "subtopics": _string_list(profile.get("subtopics"), limit=12),
+                "exclusions": _string_list(profile.get("exclusions"), limit=12),
+            },
+            "lookback_hours": lookback_hours,
+            "constraints": [
+                "Return strict JSON only.",
+                "gmail_search_query should be a compact natural-language topic phrase, not Gmail operators.",
+                "selection_criteria should say what would make a sender relevant.",
+                "Reject consumer, ticketing, automotive, sports, shopping, and unrelated hobby senders unless the user explicitly asked for them.",
+            ],
+            "schema": {
+                "gmail_search_query": "string",
+                "selection_criteria": "string",
+            },
+        },
+        ensure_ascii=False,
+    )
+    try:
+        parsed = _run_sync_complete_json(
+            client.complete_json(
+                system=load_prompt("refinement_agent"),
+                prompt=prompt,
+                max_tokens=700,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to run Gmail discovery planning agent")
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        "gmail_search_query": str(parsed.get("gmail_search_query") or "").strip(),
+        "selection_criteria": str(parsed.get("selection_criteria") or "").strip(),
+    }
+
+
+def _ai_rank_gmail_candidates(rules: dict[str, Any], candidates: list[NewsletterCandidate], profile: dict[str, Any]) -> list[NewsletterCandidate]:
+    if not candidates:
+        return []
+    client = _refinement_model_client(profile)
+    if client is None:
+        return candidates[:8]
+    candidate_payload = [candidate.to_dict() for candidate in candidates[:16]]
+    prompt = json.dumps(
+        {
+            "task": "Rank Gmail newsletter sender candidates for the user's requested brief.",
+            "gmail_search_query": rules.get("gmail_search_query") or rules.get("intent"),
+            "selection_criteria": rules.get("selection_criteria"),
+            "candidates": candidate_payload,
+            "constraints": [
+                "Return strict JSON only.",
+                "Only recommend senders likely to satisfy the brief intent.",
+                "Exclude clearly unrelated consumer commerce, ticketing, automotive, sports, or hobby senders.",
+            ],
+            "schema": {
+                "selected": [
+                    {
+                        "sender": "email address from candidates",
+                        "score": "0.0 to 1.0",
+                        "rationale": "short reason",
+                    }
+                ],
+                "rejected": [
+                    {
+                        "sender": "email address from candidates",
+                        "reason": "short reason",
+                    }
+                ],
+            },
+        },
+        ensure_ascii=False,
+    )
+    try:
+        parsed = _run_sync_complete_json(
+            client.complete_json(
+                system=load_prompt("refinement_agent"),
+                prompt=prompt,
+                max_tokens=1000,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to run Gmail candidate screening agent")
+        return candidates[:8]
+    selected = parsed.get("selected") if isinstance(parsed, dict) else None
+    if not isinstance(selected, list):
+        return candidates[:8]
+    by_sender = {candidate.sender.lower(): candidate for candidate in candidates}
+    ranked: list[tuple[float, NewsletterCandidate, str]] = []
+    for item in selected:
+        if not isinstance(item, dict):
+            continue
+        sender = str(item.get("sender") or "").strip().lower()
+        candidate = by_sender.get(sender)
+        if candidate is None:
+            continue
+        try:
+            score = float(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        if score < 0.45:
+            continue
+        ranked.append((score, candidate, str(item.get("rationale") or "").strip()))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    rules["_ai_candidate_notes"] = {
+        candidate.sender.lower(): rationale
+        for _score, candidate, rationale in ranked
+        if rationale
+    }
+    return [candidate for _score, candidate, _rationale in ranked] or candidates[:8]
+
+
 def _gmail_rules_from_answer(answer: str, profile: dict[str, Any]) -> dict[str, Any]:
     intent = " ".join(answer.split()).strip()
     lookback_hours = _extract_lookback_hours(answer) or _coerce_lookback_hours(profile.get("lookback_hours")) or 168
+    ai_plan = _ai_gmail_discovery_plan(intent, lookback_hours=lookback_hours, profile=profile)
+    query_text = str(ai_plan.get("gmail_search_query") or intent).strip() or intent
     return {
         "intent": intent,
+        "gmail_search_query": query_text,
+        "selection_criteria": str(ai_plan.get("selection_criteria") or "").strip(),
+        "ai_managed": bool(ai_plan),
         "lookback_hours": lookback_hours,
     }
 
 
-def _discover_gmail_candidates(rules: dict[str, Any]) -> list[NewsletterCandidate]:
-    intent = str(rules.get("intent") or "").strip()
+def _discover_gmail_candidates(rules: dict[str, Any], profile: dict[str, Any]) -> list[NewsletterCandidate]:
+    intent = str(rules.get("gmail_search_query") or rules.get("intent") or "").strip()
     lookback_hours = int(rules.get("lookback_hours") or 168)
     try:
-        return _run_sync_list(
+        candidates = _run_sync_list(
             discover_newsletter_candidates(
                 query_text=intent,
                 lookback_hours=lookback_hours,
-                limit=8,
+                limit=16,
             )
         )
+        ranked = _ai_rank_gmail_candidates(rules, candidates, profile)
+        return ranked[:8] if ranked else candidates[:8]
     except Exception:
         logger.exception("Failed to discover Gmail newsletter candidates")
         return []
 
 
 def _gmail_candidate_question(candidates: list[NewsletterCandidate], rules: dict[str, Any]) -> str:
+    ai_notes = {
+        str(item.get("sender") or "").lower(): str(item.get("ai_rationale") or "").strip()
+        for item in rules.get("candidates", [])
+        if isinstance(item, dict)
+    }
     sender_lines = [
-        f"{index}. {candidate.sender_name or candidate.sender} <{candidate.sender}> ({candidate.message_count} found; latest subject: {candidate.subject})"
+        (
+            f"{index}. {candidate.sender_name or candidate.sender} <{candidate.sender}> "
+            f"({candidate.message_count} found; latest subject: {candidate.subject})"
+            + (f" — {ai_notes.get(candidate.sender.lower())}" if ai_notes.get(candidate.sender.lower()) else "")
+        )
         for index, candidate in enumerate(candidates[:8], start=1)
     ]
     lookback = _lookback_label(int(rules.get("lookback_hours") or 168))
+    criteria = str(rules.get("selection_criteria") or "").strip()
+    search_phrase = str(rules.get("gmail_search_query") or rules.get("intent") or "").strip()
+    intro = (
+        f"I asked the AI to craft the Gmail search and screen candidate senders. "
+        f"It searched Gmail for {search_phrase} across {lookback}"
+    )
+    if criteria:
+        intro += f", prioritizing {criteria}"
     return (
-        f"I searched Gmail for {rules.get('intent')} across {lookback} and found newsletter candidates:\n"
+        intro
+        + " and found newsletter candidates:\n"
         + "\n".join(sender_lines)
         + "\nWhich should I approve to the Gmail allowlist? Only approved senders are ever read. "
         "Reply with numbers, sender names, 'all', or 'none'."

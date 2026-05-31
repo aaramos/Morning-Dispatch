@@ -384,3 +384,13 @@ def test_select_article_payloads_unwraps_redirect_links():
     selected = articles.select_article_payloads(payloads)
 
     assert selected[0].original_url == "https://example.com/articles/useful-ai"
+
+
+def test_score_link_candidate_newsletter_redirect():
+    # A standard tracking link that would normally get scored very poorly (e.g. 0.12 or less)
+    # should get scored at least 0.55 if it's on a known redirect / tracking domain.
+    score_normal = articles.score_link_candidate("https://clicks.substack.com/f/a/some-tracking-hash", "generic text")
+    assert score_normal >= 0.55
+
+    score_custom = articles.score_link_candidate("https://link.mail.beehiiv.com/ss/c/another-hash", "another generic text")
+    assert score_custom >= 0.55

@@ -718,6 +718,31 @@ label {
   margin-top: 8px;
 }
 
+.strategy-conversation {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.strategy-turn {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid rgba(67, 55, 17, 0.18);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.54);
+}
+
+.strategy-turn b {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.strategy-turn span {
+  overflow-wrap: anywhere;
+}
+
 .strategy-proposal-actions button {
   flex: 1 1 180px;
   white-space: normal;
@@ -1565,6 +1590,43 @@ label {
   font-weight: 650;
 }
 
+.filter-matrix {
+  display: grid;
+  gap: 0;
+  margin-top: 12px;
+  border: 1px solid #deddd6;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.filter-matrix-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 0.7fr) minmax(160px, 1.2fr) minmax(220px, 2fr);
+  gap: 12px;
+  padding: 9px 10px;
+  border-top: 1px solid #deddd6;
+  background: #ffffff;
+  color: #5d5950;
+  font-weight: 650;
+}
+
+.filter-matrix-row:first-child {
+  border-top: 0;
+}
+
+.filter-matrix-row.header {
+  background: #f0eee7;
+  color: #4d4d49;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.filter-matrix-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .ready-footer {
   display: flex;
   align-items: center;
@@ -2043,6 +2105,11 @@ label {
 
   .strategy-refine-box {
     grid-template-columns: 1fr;
+  }
+
+  .filter-matrix-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 
   .active-digest-link {

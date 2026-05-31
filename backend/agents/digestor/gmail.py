@@ -163,21 +163,40 @@ async def fetch_newsletters(
 
                     plain_text = extract_plain_text(payload)
                     if plain_text and message_id not in seen_message_ids:
-                        body_payload = NormalizedPayload(
-                            source_type="gmail",
-                            source_name=sender,
-                            raw_text=plain_text,
-                            original_url=None,
-                            published_at=published_at,
-                            metadata={
-                                "gmail_message_id": message_id,
-                                "sender_email": sender,
-                                "subject": subject,
-                            },
-                        )
-                        if pii_filter(body_payload):
-                            collected.append(body_payload)
-                            seen_message_ids.add(message_id)
+                        sections = split_plain_text_by_headers(payload, plain_text)
+                        if len(sections) > 1:
+                            for idx, (title, section_text) in enumerate(sections):
+                                body_payload = NormalizedPayload(
+                                    source_type="gmail",
+                                    source_name=sender,
+                                    raw_text=section_text,
+                                    original_url=f"https://mail.google.com/mail/u/0/#inbox/{message_id}#section-{idx}",
+                                    published_at=published_at,
+                                    metadata={
+                                        "gmail_message_id": message_id,
+                                        "sender_email": sender,
+                                        "subject": f"{subject}: {title}",
+                                        "section_title": title,
+                                    },
+                                )
+                                if pii_filter(body_payload):
+                                    collected.append(body_payload)
+                        else:
+                            body_payload = NormalizedPayload(
+                                source_type="gmail",
+                                source_name=sender,
+                                raw_text=plain_text,
+                                original_url=f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
+                                published_at=published_at,
+                                metadata={
+                                    "gmail_message_id": message_id,
+                                    "sender_email": sender,
+                                    "subject": subject,
+                                },
+                            )
+                            if pii_filter(body_payload):
+                                collected.append(body_payload)
+                        seen_message_ids.add(message_id)
 
                     for link in extract_link_items_from_html(payload):
                         if link.url in seen_urls:
@@ -211,6 +230,67 @@ async def fetch_newsletters(
         return []
 
     return collected
+
+
+def split_plain_text_by_headers(payload: dict[str, Any], plain_text: str) -> list[tuple[str, str]]:
+    html_parts = []
+    if "htmlBody" in payload:
+        html_parts.append(payload["htmlBody"])
+    else:
+        for part in _walk_mime_parts(payload):
+            if part.get("mimeType") == "text/html":
+                decoded = _decode_body_data(part)
+                if decoded:
+                    html_parts.append(decoded)
+    if not html_parts:
+        return []
+
+    soup = BeautifulSoup("\n\n".join(html_parts), "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "form", "iframe"]):
+        tag.decompose()
+
+    # Find h1, h2, h3 tags
+    headers = soup.find_all(["h1", "h2", "h3"])
+    header_texts = []
+    for h in headers:
+        text = _clean_text(h.get_text(" ", strip=True))
+        if text and 4 < len(text) < 120 and text.lower() not in {
+            "subscribe", "share", "read online", "view in browser", "introduction", "table of contents", "sponsor"
+        }:
+            if text not in header_texts:
+                header_texts.append(text)
+
+    if len(header_texts) < 2:
+        return []
+
+    # Find position of these headers in the plain text
+    matches = []
+    for header in header_texts:
+        pattern = re.compile(re.escape(header), re.IGNORECASE)
+        match = pattern.search(plain_text)
+        if match:
+            matches.append((match.start(), header))
+
+    # Sort matches by index
+    matches.sort(key=lambda x: x[0])
+
+    if len(matches) < 2:
+        return []
+
+    sections = []
+    # Intro section
+    intro_text = plain_text[:matches[0][0]].strip()
+    if len(intro_text) >= 450:
+        sections.append(("Introduction", intro_text))
+
+    for i in range(len(matches)):
+        start_idx, header = matches[i]
+        end_idx = matches[i+1][0] if i + 1 < len(matches) else len(plain_text)
+        section_text = plain_text[start_idx:end_idx].strip()
+        if len(section_text) >= 450:
+            sections.append((header, section_text))
+
+    return sections
 
 
 def get_gmail_service() -> Any:

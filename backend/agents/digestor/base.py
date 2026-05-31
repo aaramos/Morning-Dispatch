@@ -29,7 +29,6 @@ PII_KEYWORDS = [
     "social security",
     "account number",
     "routing number",
-    "invoice",
     "credit card",
     "bank account",
     "tax id",

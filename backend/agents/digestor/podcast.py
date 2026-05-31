@@ -419,8 +419,10 @@ def _podcast_discovery_lanes(queries: list[str], digest_interest: str) -> list[s
         for lane in (
             clean,
             f"{clean} podcast",
-            f"{clean} interview",
+            f"{clean} podcast episode",
+            f"{clean} expert interview",
             f"{clean} audio show",
+            f"{clean} show notes",
         ):
             key = lane.casefold()
             if key not in {existing.casefold() for existing in lanes}:

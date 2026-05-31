@@ -102,6 +102,7 @@ type PendingStrategyRefinement = {
   created_at?: string;
   findings?: string[];
   review_mode?: string;
+  conversation?: Array<{ role: string; content: string }>;
 };
 
 type StrategyReview = {
@@ -153,6 +154,9 @@ type ConfirmedProfilePayload = {
 type ExplorationIssue = {
   source_name: string;
   reason: string;
+  source?: string;
+  item?: string;
+  item_url?: string;
 };
 
 type Exploration = {
@@ -2243,6 +2247,16 @@ function ConfirmationPanel(props: {
           <div className={`strategy-confirmation ${props.pendingStrategy ? "pending" : ""}`}>
             <strong>{props.pendingStrategy ? "AI proposed update" : "AI update"}</strong>
             <p>{props.strategyConfirmation}</p>
+            {props.pendingStrategy?.conversation?.length ? (
+              <div className="strategy-conversation">
+                {props.pendingStrategy.conversation.slice(-4).map((turn, index) => (
+                  <div className={`strategy-turn ${turn.role === "user" ? "user" : "assistant"}`} key={`${turn.role}-${index}-${turn.content.slice(0, 20)}`}>
+                    <b>{turn.role === "user" ? "You" : "AI"}</b>
+                    <span>{turn.content}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             {props.pendingStrategy?.findings?.length ? (
               <ul className="strategy-findings">
                 {props.pendingStrategy.findings.map((finding) => (
@@ -2281,12 +2295,12 @@ function ConfirmationPanel(props: {
           </div>
         ) : null}
         <label>
-          Refine search strategy
+          {props.pendingStrategy ? "Keep refining this proposal" : "Refine search strategy"}
           <textarea
             ref={strategyTextareaRef}
             value={strategyInstruction}
             onChange={(event) => setStrategyInstruction(event.target.value)}
-            placeholder="Add missing sources, entities, recency, countries, channels, podcasts, or search terms..."
+            placeholder={props.pendingStrategy ? "Add your next comment about this proposed update..." : "Add missing sources, entities, recency, countries, channels, podcasts, or search terms..."}
           />
         </label>
         <button
@@ -2815,9 +2829,26 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
       {filterNotes.length ? (
         <details className="filter-note">
           <summary>{filterNotes.length} item(s) filtered out</summary>
-          {filterNotes.slice(0, 20).map((issue) => (
-            <p key={`${issue.source_name}-${issue.reason}`}>{issue.source_name}: {issue.reason}</p>
-          ))}
+          <div className="filter-matrix" role="table" aria-label="Filtered source items">
+            <div className="filter-matrix-row header" role="row">
+              <strong>Source</strong>
+              <strong>Item</strong>
+              <strong>Reject reason</strong>
+            </div>
+            {filterNotes.slice(0, 40).map((issue) => (
+              <div className="filter-matrix-row" role="row" key={`${issue.source_name}-${issue.item ?? ""}-${issue.reason}`}>
+                <span>{issue.source || sourceFromIssueName(issue.source_name)}</span>
+                <span>
+                  {issue.item_url ? (
+                    <a href={issue.item_url} target="_blank" rel="noreferrer">{issue.item || issue.source_name}</a>
+                  ) : (
+                    issue.item || issue.source_name
+                  )}
+                </span>
+                <span>{issue.reason}</span>
+              </div>
+            ))}
+          </div>
         </details>
       ) : null}
       {pipeline.length ? <p className="muted">{formatPipeline(pipeline)}</p> : null}
@@ -5337,6 +5368,16 @@ function filterDecisionNotes(exploration: Exploration): ExplorationIssue[] {
     ...(exploration.progress.source_filter_notes ?? []),
     ...(exploration.progress.source_audit_issues ?? []).filter((issue) => !isActionableIssue(issue)),
   ];
+}
+
+function sourceFromIssueName(sourceName: string): string {
+  const lowered = sourceName.toLowerCase();
+  if (lowered.includes("gmail") || lowered.includes("@")) return "Gmail";
+  if (lowered.includes("podcast")) return "Podcast";
+  if (lowered.includes("youtube")) return "YouTube";
+  if (lowered.includes("market") || /^[A-Z0-9.=-]{1,12}$/.test(sourceName.trim())) return "Markets";
+  if (/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(sourceName)) return "Foreign Media";
+  return "Web";
 }
 
 function isActionableIssue(issue: ExplorationIssue): boolean {

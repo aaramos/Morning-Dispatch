@@ -761,6 +761,7 @@ def _add_final_source_mix_issues(
             if adapter:
                 included_counts[adapter] = included_counts.get(adapter, 0) + 1
     candidate_counts = {status.name: status.candidate_count for status in discovery.statuses}
+    statuses = {status.name: status for status in discovery.statuses}
     selected_non_gmail = {
         source
         for source, enabled in source_selection.items()
@@ -778,6 +779,8 @@ def _add_final_source_mix_issues(
                 f"{_adapter_label(source)} returned {candidate_count} candidate(s), "
                 "but none survived fetch, audit, ranking, and review into the final brief."
             )
+        elif statuses.get(source) and statuses[source].message:
+            reason = str(statuses[source].message)
         else:
             reason = f"{_adapter_label(source)} was selected but returned no usable candidates for this run."
         issue = {"source_name": _adapter_label(source), "reason": reason}
@@ -1262,6 +1265,9 @@ def _apply_source_window_filter(
             issues.append(
                 {
                     "source_name": _source_window_issue_name(result),
+                    "source": _source_label_for_result(result),
+                    "item": _source_window_issue_name(result),
+                    "item_url": str(result.final_url or result.original_url or result.payload.original_url or "").strip(),
                     "reason": reason,
                 }
             )
@@ -1290,6 +1296,21 @@ def _source_window_rejection_reason(profile: TopicProfile, result: ArticleFetchR
             return "Undated item was already shown once and is hidden from future editions."
         return "Date is missing for this strict source, so it is excluded under the bounded window."
     return ""
+
+
+def _source_label_for_result(result: ArticleFetchResult) -> str:
+    source_type = str(result.payload.source_type or "")
+    if source_type == "gmail":
+        return "Gmail"
+    if source_type == "podcast_episode":
+        return "Podcast"
+    if source_type == "youtube_video":
+        return "YouTube"
+    if source_type == "market_snapshot":
+        return "Markets"
+    if source_type == "foreign_web":
+        return "Foreign Media"
+    return "Web"
 
 
 def _is_strict_undated_result(result: ArticleFetchResult) -> bool:
@@ -1865,10 +1886,31 @@ def _brief_search_strategy(
             keywords=list(profile.keywords),
         ),
         "queries": queries,
+        "strategy_axes": _strategy_axes(profile),
         "sources": selected_sources,
         "source_scope": scope,
         "exclusions": exclusions,
     }
+
+
+def _strategy_axes(profile: TopicProfile) -> list[str]:
+    combined = " ".join(
+        [
+            profile.scope or profile.statement,
+            *profile.keywords,
+            *profile.subtopics,
+            *profile.search_queries,
+            *[query for queries in profile.source_queries.values() for query in queries],
+        ]
+    ).lower()
+    axes: list[str] = []
+    if any(term in combined for term in ("frontier ai", "frontier lab", "openai", "anthropic", "model developer", "scaling law")):
+        axes.append("Frontier lab demand signals")
+    if any(term in combined for term in ("hbm", "dram", "nand", "memory")):
+        axes.append("Memory and storage supply chain")
+    if any(term in combined for term in ("capex", "capital expenditure", "spending")):
+        axes.append("AI infrastructure spending and CapEx")
+    return axes[:5]
 
 
 def _strategy_queries(profile: TopicProfile) -> list[str]:

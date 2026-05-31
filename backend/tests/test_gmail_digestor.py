@@ -293,3 +293,54 @@ def test_discover_newsletter_candidates_groups_by_sender(monkeypatch):
     assert candidates[0].message_count == 2
     assert "newer_than:7d" in service.fake_messages.queries[0]
     assert "maxResults" in service.fake_messages.list_kwargs[0]
+
+
+def test_invoice_is_not_filtered(monkeypatch, tmp_path):
+    db_path = init_db(tmp_path / "dispatch.sqlite3")
+    monkeypatch.setattr(
+        gmail,
+        "get_gmail_service",
+        lambda: FakeService({"msg-1": gmail_message("msg-1", plain_text="Let's talk about the invoice software startup in AI space.")}),
+    )
+
+    payloads = asyncio.run(gmail.fetch_newsletters("digest-1", ["news@example.com"], 24, db_path))
+
+    assert len(payloads) == 1
+    assert payloads[0].raw_text == "Let's talk about the invoice software startup in AI space."
+
+
+def test_newsletter_body_split_by_headers(monkeypatch, tmp_path):
+    db_path = init_db(tmp_path / "dispatch.sqlite3")
+
+    html = """
+    <h2>First Headline</h2>
+    <p>This is the first article text. It is quite substantial and tells an interesting story about AI models and agentic workflows. We need enough characters to exceed 450. To achieve this, we will write a very long sentence repeating keywords and adding details about artificial intelligence, model training, fine-tuning, large language models, agentic frameworks, the model context protocol, and client server integrations. More content is added to ensure we have a robust block of text that represents a full, deep newsletter article with enough length to meet the requirement.</p>
+    <h2>Second Headline</h2>
+    <p>This is the second article text. It is also substantial enough to exceed 450 characters. We write more sentences to ensure it passes the length check. OpenAI released something new and GPT models are improving. Agentic tools are widely discussed. In addition to that, we will expand this paragraph with generic details about newsletter parsing, web scraping, link resolution, and developer operations. Let's make sure it has sufficient size to be parsed as a standalone article candidate in our pipeline test.</p>
+    """
+
+    plain_text = (
+        "Introduction text. This intro is not long enough to be its own section.\n\n"
+        "First Headline\n"
+        "This is the first article text. It is quite substantial and tells an interesting story about AI models and agentic workflows. We need enough characters to exceed 450. To achieve this, we will write a very long sentence repeating keywords and adding details about artificial intelligence, model training, fine-tuning, large language models, agentic frameworks, the model context protocol, and client server integrations. More content is added to ensure we have a robust block of text that represents a full, deep newsletter article with enough length to meet the requirement.\n\n"
+        "Second Headline\n"
+        "This is the second article text. It is also substantial enough to exceed 450 characters. We write more sentences to ensure it passes the length check. OpenAI released something new and GPT models are improving. Agentic tools are widely discussed. In addition to that, we will expand this paragraph with generic details about newsletter parsing, web scraping, link resolution, and developer operations. Let's make sure it has sufficient size to be parsed as a standalone article candidate in our pipeline test."
+    )
+
+    monkeypatch.setattr(
+        gmail,
+        "get_gmail_service",
+        lambda: FakeService({"msg-1": gmail_message("msg-1", plain_text=plain_text, html=html)}),
+    )
+
+    payloads = asyncio.run(gmail.fetch_newsletters("digest-1", ["news@example.com"], 24, db_path))
+
+    gmail_payloads = [p for p in payloads if p.source_type == "gmail"]
+    # Should split into 2 sections since both are substantial, and the intro was too short (<450)
+    assert len(gmail_payloads) == 2
+    assert gmail_payloads[0].metadata["section_title"] == "First Headline"
+    assert "First Headline" in gmail_payloads[0].raw_text
+    assert "section-0" in gmail_payloads[0].original_url
+    assert gmail_payloads[1].metadata["section_title"] == "Second Headline"
+    assert "Second Headline" in gmail_payloads[1].raw_text
+    assert "section-1" in gmail_payloads[1].original_url

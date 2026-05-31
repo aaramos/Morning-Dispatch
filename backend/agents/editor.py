@@ -292,6 +292,7 @@ def _sort_key(result: ArticleFetchResult, recency_weighting: str = "recent") -> 
 
 
 AI_SECTION_MARKERS = (
+    ("Frontier Lab Demand Signals", ("frontier lab", "frontier ai", "scaling law", "model developer capex", "compute scaling")),
     ("Models & Labs", ("model", "gemini", "gpt", "claude", "openai", "anthropic", "llama", "qwen")),
     ("Agents & Developer Tools", ("agent", "codex", "mcp", "sdk", "api", "developer", "workflow", "automation")),
     ("AI Infrastructure", ("gpu", "compute", "nvidia", "capacity", "training", "inference", "mlx", "cluster")),

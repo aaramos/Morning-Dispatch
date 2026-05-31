@@ -426,6 +426,8 @@ def test_issue_renderer_surfaces_market_snapshot_sparklines():
 
     market = html.select_one(".market-snapshot")
     assert market is not None
+    assert html.select_one(".brief-sidebar .market-snapshot") is not None
+    assert html.select_one(".story-column .market-snapshot") is None
     assert "Ticker performance" in market.text
     assert "NVDA" in market.text
     assert "$900.00" in market.text

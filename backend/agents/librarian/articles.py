@@ -106,7 +106,7 @@ async def fetch_articles_for_payloads(
 def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[ArticleFetchResult]:
     results: list[ArticleFetchResult] = []
     for payload in payloads:
-        if payload.source_type not in {"reddit_thread", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot", "sec_filing", "fred_series"} or not payload.original_url:
+        if payload.source_type not in {"gmail", "reddit_thread", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot", "sec_filing", "fred_series"} or not payload.original_url:
             continue
         canonical_url = canonicalize_url(payload.original_url)
         title = _payload_title(payload) or payload.source_name or "Direct source"
@@ -117,6 +117,7 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
         is_market = payload.source_type == "market_snapshot"
         is_sec = payload.source_type == "sec_filing"
         is_fred = payload.source_type == "fred_series"
+        is_gmail = payload.source_type == "gmail"
         results.append(
             ArticleFetchResult(
                 payload=payload,
@@ -134,10 +135,12 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                     or (payload.metadata or {}).get("youtube_quality_score")
                     or (payload.metadata or {}).get("collection_quality_score")
                     or (payload.metadata or {}).get("market_quality_score")
-                    or (0.85 if is_sec else 0.88 if is_fred else 0.65)
+                    or (0.80 if is_gmail else 0.85 if is_sec else 0.88 if is_fred else 0.65)
                 ),
                 section=(
-                    "Podcast Signals"
+                    "Newsletter Content"
+                    if is_gmail
+                    else "Podcast Signals"
                     if is_podcast
                     else "YouTube Videos"
                     if is_youtube
@@ -152,7 +155,9 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                     else "Legacy Discussion"
                 ),
                 content_type=(
-                    "podcast"
+                    "newsletter"
+                    if is_gmail
+                    else "podcast"
                     if is_podcast
                     else "video"
                     if is_youtube
@@ -274,6 +279,9 @@ def score_link_candidate(url: str, link_text: str = "") -> float:
         score += 0.10
     if text in GENERIC_LINK_TEXT or len(text) <= 3:
         score -= 0.16
+
+    if domain in REDIRECT_DOMAINS or any(domain.endswith(suffix) for suffix in REDIRECT_DOMAIN_SUFFIXES):
+        score = max(score, 0.55)
 
     return max(0.0, min(score, 1.0))
 
@@ -967,3 +975,19 @@ TOPIC_HINTS = (
     "model",
     "openai",
 )
+
+
+REDIRECT_DOMAINS = {
+    "bit.ly",
+    "buff.ly",
+    "clicks.beehiv.com",
+    "clicks.substack.com",
+    "dest.link",
+    "lnkd.in",
+    "link.beehiiv.com",
+    "ow.ly",
+    "t.co",
+    "tinyurl.com",
+}
+
+REDIRECT_DOMAIN_SUFFIXES = (".beehiiv.com", ".substack.com")

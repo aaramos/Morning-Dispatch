@@ -2471,6 +2471,7 @@ def render_ingested_issue(
     )
     sidebar_html = _render_brief_sidebar(
         stats=effective_stats,
+        market_html=market_html,
         newsletter_html=newsletter_html,
         newsletter_count=len(newsletter_items),
         article_count=len(story_articles),
@@ -2585,21 +2586,21 @@ def render_ingested_issue(
     .story-copy {{ display: grid; gap: 9px; }}
     .story-title {{ font-family: var(--display); font-size: clamp(1.42rem, 2.5vw, 2.05rem); line-height: 1.02; font-weight: 800; }}
     .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-summary p, .podcast-transcript p {{ font-size: .98rem; line-height: 1.58; margin: 0; color: #4a4138; }}
-    .market-snapshot {{ border-top: 1px solid var(--ink); border-bottom: 1px solid var(--line); padding: 20px 0 8px; }}
-    .market-snapshot h2 {{ font-size: clamp(1.8rem, 3vw, 2.65rem); margin-bottom: 14px; }}
-    .market-grid {{ display: grid; gap: 10px; }}
-    .market-card {{ display: grid; grid-template-columns: minmax(118px, 160px) minmax(0, 1fr); gap: 14px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }}
+    .market-snapshot {{ background: var(--sidebar); border: 1px solid var(--line); padding: 16px; box-shadow: var(--shadow); }}
+    .market-snapshot h2 {{ font-size: 1.55rem; margin-bottom: 12px; }}
+    .market-grid {{ display: grid; gap: 0; }}
+    .market-card {{ display: grid; grid-template-columns: minmax(64px, .55fr) minmax(0, 1fr); gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid rgba(34, 29, 24, .18); }}
     .market-symbol {{ display: grid; gap: 3px; }}
-    .market-symbol strong {{ font: 900 1.35rem/1 var(--mono); color: var(--ink); }}
-    .market-symbol span {{ color: var(--muted); font: 700 .72rem/1.25 var(--mono); text-transform: uppercase; letter-spacing: .04em; }}
-    .market-performance {{ display: grid; gap: 8px; min-width: 0; }}
-    .market-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
-    .market-price {{ font: 900 1.05rem/1 var(--body); }}
-    .market-change {{ font: 800 .82rem/1 var(--mono); }}
+    .market-symbol strong {{ font: 900 1.05rem/1 var(--mono); color: var(--ink); }}
+    .market-symbol span {{ color: var(--muted); font: 700 .58rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: .04em; }}
+    .market-performance {{ display: grid; gap: 5px; min-width: 0; }}
+    .market-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }}
+    .market-price {{ font: 900 .92rem/1 var(--body); }}
+    .market-change {{ font: 800 .68rem/1 var(--mono); }}
     .market-change.up {{ color: #17633a; }}
     .market-change.down {{ color: #9f2820; }}
     .market-change.flat {{ color: var(--muted); }}
-    .sparkline {{ width: 100%; height: 46px; display: block; overflow: visible; }}
+    .sparkline {{ width: 100%; height: 30px; display: block; overflow: visible; }}
     .sparkline path {{ fill: none; stroke: var(--accent); stroke-width: 2.25; stroke-linecap: round; stroke-linejoin: round; }}
     .sparkline .baseline {{ stroke: rgba(34, 29, 24, .18); stroke-width: 1; }}
     .story-thumb {{ aspect-ratio: 1; border-radius: 2px; }}
@@ -2695,7 +2696,6 @@ def render_ingested_issue(
     {empty_state}
     <div class="brief-body">
       <div class="story-column">
-        {market_html}
         {image_strip_html}
         {lead_html}
         <section class="ranked-section" aria-labelledby="ranked-heading">
@@ -3742,6 +3742,7 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
 def _render_brief_sidebar(
     *,
     stats: dict[str, Any],
+    market_html: str,
     newsletter_html: str,
     newsletter_count: int,
     article_count: int,
@@ -3799,6 +3800,7 @@ def _render_brief_sidebar(
     model_usage_html = _render_sidebar_note("AI used", _model_usage_text(stats))
     return f"""
       <aside class="brief-sidebar" aria-label="Brief sources and process">
+        {market_html}
         <section class="side-panel provenance">
           <div class="section-kicker">Sources & process</div>
           <h2>About this brief</h2>
@@ -3829,6 +3831,9 @@ def _search_strategy_text(stats: dict[str, Any]) -> str:
     strategy = stats.get("search_strategy") if isinstance(stats.get("search_strategy"), dict) else {}
     summary = str(strategy.get("summary") or "").strip()
     if summary:
+        axes = _string_values(strategy.get("strategy_axes") if isinstance(strategy, dict) else None, limit=5)
+        if axes:
+            return summary.rstrip(".") + ". Strategy axes: " + "; ".join(axes) + "."
         return summary
     queries = _string_values(strategy.get("queries") if isinstance(strategy, dict) else None, limit=2)
     source_names = _string_values(strategy.get("sources") if isinstance(strategy, dict) else None, limit=5)

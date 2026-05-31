@@ -283,23 +283,44 @@ def _payloads_from_remote_message(
     payloads: list[NormalizedPayload] = []
 
     if plain_text and message_id not in seen_message_ids:
-        body_payload = NormalizedPayload(
-            source_type="gmail",
-            source_name=sender_email,
-            raw_text=plain_text,
-            original_url=None,
-            published_at=published_at,
-            metadata={
-                "gmail_message_id": message_id,
-                "gmail_thread_id": thread_id,
-                "sender_email": sender_email,
-                "subject": subject,
-                "gmail_mcp": "google_hosted",
-            },
-        )
-        if pii_filter(body_payload):
-            payloads.append(body_payload)
-            seen_message_ids.add(message_id)
+        sections = gmail_direct.split_plain_text_by_headers(message, plain_text)
+        if len(sections) > 1:
+            for idx, (title, section_text) in enumerate(sections):
+                body_payload = NormalizedPayload(
+                    source_type="gmail",
+                    source_name=sender_email,
+                    raw_text=section_text,
+                    original_url=f"https://mail.google.com/mail/u/0/#inbox/{message_id}#section-{idx}",
+                    published_at=published_at,
+                    metadata={
+                        "gmail_message_id": message_id,
+                        "gmail_thread_id": thread_id,
+                        "sender_email": sender_email,
+                        "subject": f"{subject}: {title}",
+                        "section_title": title,
+                        "gmail_mcp": "google_hosted",
+                    },
+                )
+                if pii_filter(body_payload):
+                    payloads.append(body_payload)
+        else:
+            body_payload = NormalizedPayload(
+                source_type="gmail",
+                source_name=sender_email,
+                raw_text=plain_text,
+                original_url=f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
+                published_at=published_at,
+                metadata={
+                    "gmail_message_id": message_id,
+                    "gmail_thread_id": thread_id,
+                    "sender_email": sender_email,
+                    "subject": subject,
+                    "gmail_mcp": "google_hosted",
+                },
+            )
+            if pii_filter(body_payload):
+                payloads.append(body_payload)
+        seen_message_ids.add(message_id)
 
     for link in _remote_html_links(html_body):
         if link.url in seen_urls:

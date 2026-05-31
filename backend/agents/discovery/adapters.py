@@ -79,7 +79,7 @@ class PodcastSourceAdapter:
                 "aggregator": "podcastindex",
                 "transcription": "auto",
             })
-        payloads, _decisions = await fetch_podcast_episodes(
+        payloads, decisions = await fetch_podcast_episodes(
             digest_id=context.exploration_id,
             digest_interest=profile.query_for_source(self.name),
             sources=sources,
@@ -92,11 +92,16 @@ class PodcastSourceAdapter:
         if not payloads:
             lanes = _source_plan_refs(profile, "podcasts")[:4]
             lane_text = ", ".join(lanes)
+            diagnostic = _podcast_diagnostic_summary(decisions)
             if lane_text:
                 raise AdapterUnavailable(
                     f"Podcast discovery searched {lane_text} but found no usable recent episodes with playable audio."
+                    + (f" {diagnostic}" if diagnostic else "")
                 )
-            raise AdapterUnavailable("Podcast discovery found no usable recent episodes with playable audio.")
+            raise AdapterUnavailable(
+                "Podcast discovery found no usable recent episodes with playable audio."
+                + (f" {diagnostic}" if diagnostic else "")
+            )
         return [
             Candidate(
                 adapter=self.name,
@@ -317,6 +322,25 @@ def _approved_podcast_sources() -> list[dict[str, Any]]:
             records.append(dict(source))
             seen.add(key)
     return records
+
+
+def _podcast_diagnostic_summary(decisions: list[Any]) -> str:
+    if not decisions:
+        return ""
+    counts: dict[str, int] = {}
+    for decision in decisions:
+        key = str(getattr(decision, "decision", "") or "checked")
+        counts[key] = counts.get(key, 0) + 1
+    parts: list[str] = []
+    if counts.get("watch"):
+        parts.append(f"{counts['watch']} feed(s) discovered")
+    if counts.get("feed_error"):
+        parts.append(f"{counts['feed_error']} feed error(s)")
+    if counts.get("skip"):
+        parts.append(f"{counts['skip']} low-fit episode(s)")
+    if counts.get("already_seen"):
+        parts.append(f"{counts['already_seen']} previously shown episode(s)")
+    return "Diagnostics: " + ", ".join(parts) + "." if parts else ""
 
 
 def _source_plan_refs(profile: TopicProfile, adapter: str) -> list[str]:
