@@ -413,6 +413,12 @@ type BriefControlsDraft = {
     medium: number;
     focused: number;
   };
+  gmail_presets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 };
 
 type SystemLimitGroup = {
@@ -441,6 +447,12 @@ type BriefSettingsResponse = {
     focused: number;
   };
   podcast_presets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
+  gmail_presets?: {
     max: number;
     large: number;
     medium: number;
@@ -510,6 +522,12 @@ const defaultBriefControls: BriefControlsDraft = {
     focused: 10,
   },
   podcast_presets: {
+    max: 25,
+    large: 20,
+    medium: 15,
+    focused: 10,
+  },
+  gmail_presets: {
     max: 25,
     large: 20,
     medium: 15,
@@ -1728,6 +1746,8 @@ function DispatchApp() {
               onStrategyConfirm={(apply) => void confirmStrategyRefinement(apply)}
               onBuild={() => void buildBrief()}
               youtubePresets={briefSettings?.youtube_presets ?? defaultBriefControls.youtube_presets}
+              podcastPresets={briefSettings?.podcast_presets ?? defaultBriefControls.podcast_presets}
+              gmailPresets={briefSettings?.gmail_presets ?? defaultBriefControls.gmail_presets}
             />
           ) : null}
 
@@ -2141,6 +2161,18 @@ function ConfirmationPanel(props: {
     medium: number;
     focused: number;
   };
+  podcastPresets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
+  gmailPresets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [strategyModalOpen, setStrategyModalOpen] = useState(false);
@@ -2292,6 +2324,8 @@ function ConfirmationPanel(props: {
               resetLabel="Use system defaults"
               onChange={updateContentLimits}
               youtubePresets={props.youtubePresets}
+              podcastPresets={props.podcastPresets}
+              gmailPresets={props.gmailPresets}
             />
             <SettingsErrorList errors={contentLimitErrors} />
           </>
@@ -2490,6 +2524,12 @@ function ContentLimitsPanel(props: {
     medium: number;
     focused: number;
   };
+  gmailPresets?: {
+    max: number;
+    large: number;
+    medium: number;
+    focused: number;
+  };
 }) {
   const selectedSources = sourceOptions.filter((source) => props.sourceSelection[source.key]);
   const defaults = props.defaults ?? defaultContentLimits;
@@ -2513,6 +2553,7 @@ function ContentLimitsPanel(props: {
     const nextPerSource: Partial<Record<SourceKey, number>> = {};
     const presets = props.youtubePresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
     const podcastPresets = props.podcastPresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
+    const gmailPresets = props.gmailPresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
     const systemMax = defaultContentLimits;
     
     for (const source of sourceOptions) {
@@ -2530,6 +2571,13 @@ function ContentLimitsPanel(props: {
         else if (scale === 0.6) podcastVal = podcastPresets.medium;
         else if (scale === 0.4) podcastVal = podcastPresets.focused;
         nextPerSource[source.key] = podcastVal;
+      } else if (source.key === "gmail") {
+        let gmailVal = gmailPresets.medium;
+        if (scale === 1.0) gmailVal = gmailPresets.max;
+        else if (scale === 0.8) gmailVal = gmailPresets.large;
+        else if (scale === 0.6) gmailVal = gmailPresets.medium;
+        else if (scale === 0.4) gmailVal = gmailPresets.focused;
+        nextPerSource[source.key] = gmailVal;
       } else {
         const maxValue = systemMax.per_source[source.key] ?? briefControlBounds.per_source.max;
         nextPerSource[source.key] = scaled(maxValue, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
@@ -2621,6 +2669,7 @@ function BriefControlsPanel(props: {
   const sourceWindowDays = Math.max(0, Math.round((Number(props.controls.lookback_hours) || 0) / 24));
   const presets = props.controls.youtube_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
   const podcastPresets = props.controls.podcast_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
+  const gmailPresets = props.controls.gmail_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
 
   return (
     <div className="brief-controls-panel">
@@ -2641,6 +2690,7 @@ function BriefControlsPanel(props: {
         onChange={(content_limits) => props.onChange({ ...props.controls, content_limits })}
         youtubePresets={props.controls.youtube_presets}
         podcastPresets={props.controls.podcast_presets}
+        gmailPresets={props.controls.gmail_presets}
       />
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>YouTube scale presets</strong>
@@ -2730,6 +2780,52 @@ function BriefControlsPanel(props: {
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, focused: val }
+            })}
+          />
+        </div>
+      </div>
+      <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
+        <strong>Gmail scale presets</strong>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for Gmail items for each profile scale (Max 25).</p>
+        <div className="content-limit-grid">
+          <NumberStepper
+            label="Max profile"
+            value={gmailPresets.max}
+            min={1}
+            max={25}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              gmail_presets: { ...gmailPresets, max: val }
+            })}
+          />
+          <NumberStepper
+            label="Large profile"
+            value={gmailPresets.large}
+            min={1}
+            max={25}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              gmail_presets: { ...gmailPresets, large: val }
+            })}
+          />
+          <NumberStepper
+            label="Medium profile"
+            value={gmailPresets.medium}
+            min={1}
+            max={25}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              gmail_presets: { ...gmailPresets, medium: val }
+            })}
+          />
+          <NumberStepper
+            label="Focused profile"
+            value={gmailPresets.focused}
+            min={1}
+            max={25}
+            onChange={(val) => props.onChange({
+              ...props.controls,
+              gmail_presets: { ...gmailPresets, focused: val }
             })}
           />
         </div>

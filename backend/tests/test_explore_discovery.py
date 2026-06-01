@@ -1263,6 +1263,43 @@ def test_discovery_runner_applies_per_source_content_limits() -> None:
     ]
 
 
+def test_discovery_runner_reserves_each_dedicated_lane_before_global_backfill() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "AI infrastructure investment signals",
+            "scope": "Find source-specific signals",
+            "source_selection": {"markets": True, "youtube": True, "podcasts": True, "gmail": True, "web_search": True},
+            "content_limits": {
+                "total_items": 2,
+                "per_source": {"markets": 2, "youtube": 2, "podcasts": 2, "gmail": 1, "web_search": 1},
+            },
+        }
+    )
+    registry = SourceRegistry(
+        [
+            FakeAdapter("markets", [candidate("markets", "https://example.com/market-1", 0.99), candidate("markets", "https://example.com/market-2", 0.98)]),
+            FakeAdapter("youtube", [candidate("youtube", "https://example.com/video-1", 0.97), candidate("youtube", "https://example.com/video-2", 0.96)]),
+            FakeAdapter("podcasts", [candidate("podcasts", "https://example.com/podcast-1", 0.95), candidate("podcasts", "https://example.com/podcast-2", 0.94)]),
+            FakeAdapter("gmail", [candidate("gmail", "https://example.com/mail-1", 0.93)]),
+            FakeAdapter("web_search", [candidate("web_search", "https://example.com/web-1", 0.92)]),
+        ]
+    )
+
+    result = asyncio.run(
+        DiscoveryRunner(registry).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="explore-lanes", candidate_limit=2),
+        )
+    )
+
+    adapters = [candidate.adapter for candidate in result.candidates]
+    assert adapters.count("markets") == 2
+    assert adapters.count("youtube") == 2
+    assert adapters.count("podcasts") == 2
+    assert adapters.count("gmail") == 1
+    assert "web_search" not in adapters
+
+
 def test_discovery_runner_backfills_unused_source_limit_capacity() -> None:
     profile = TopicProfile.from_dict(
         {
@@ -1465,6 +1502,38 @@ def test_discovery_runner_drops_cross_topic_source_bleed_when_no_topic_matches()
 
     assert result.candidates == ()
     assert any(entry["candidate_id"] == "ai" and "low_topic_overlap" in entry["excluded_by"] for entry in result.exclusions)
+
+
+def test_discovery_runner_keeps_promoted_source_through_topic_gate() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Mexico City travel in August 2026",
+            "scope": "CDMX food museums bike rides and neighborhood walks",
+            "source_selection": {"gmail": True},
+            "promoted_sources": [{"adapter": "gmail", "ref": "AI newsletter", "has_feed": False, "feed_url": None}],
+        }
+    )
+    ai = Candidate(
+        adapter="gmail",
+        payload=NormalizedPayload(
+            source_type="gmail",
+            source_name="AI newsletter",
+            raw_text="Long-running coding agents, model infrastructure, and autonomous workflow launches.",
+            original_url="https://example.com/ai",
+            id="ai",
+        ),
+        score=0.95,
+    )
+
+    result = asyncio.run(
+        DiscoveryRunner(SourceRegistry([FakeAdapter("gmail", [ai])])).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="explore-promoted-source", candidate_limit=10),
+        )
+    )
+
+    assert [candidate.payload.id for candidate in result.candidates] == ["ai"]
+    assert result.exclusions == ()
 
 
 def test_explore_progress_includes_exclusion_reasons(monkeypatch, tmp_path) -> None:

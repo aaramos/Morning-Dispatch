@@ -172,6 +172,7 @@ class DiscoveryRunner:
             ("markets", _lane_limit(profile, "markets", default=50, system_max=50)),
             ("youtube", _lane_limit(profile, "youtube", default=25, system_max=25)),
             ("podcasts", _lane_limit(profile, "podcasts", default=25, system_max=25)),
+            ("gmail", _lane_limit(profile, "gmail", default=25, system_max=25)),
         )
 
         lane_candidates: list[Candidate] = []
@@ -181,9 +182,6 @@ class DiscoveryRunner:
                 continue
             raw_candidates = [candidate for candidate in candidates if candidate.adapter == source]
             lane_adapters.add(source)
-            lane_capacity = max(0, target_capacity - len(lane_candidates))
-            if lane_capacity <= 0:
-                break
 
             if source == "markets":
                 explicit_candidates = [c for c in raw_candidates if (c.payload.metadata or {}).get("explicit_ticker") is True]
@@ -194,20 +192,18 @@ class DiscoveryRunner:
                     limit=len(explicit_candidates),
                 )
 
-                lane_cap_for_source = min(source_limit, lane_capacity)
                 deduped_regular = _dedupe_candidates(
                     sorted(regular_candidates, key=lambda c: c.score, reverse=True),
-                    limit=lane_cap_for_source,
+                    limit=source_limit,
                 )
 
                 lane_candidates.extend(deduped_explicit)
                 lane_candidates.extend(deduped_regular)
             else:
-                lane_cap_for_source = min(source_limit, lane_capacity)
                 lane_candidates.extend(
                     _dedupe_candidates(
                         sorted(raw_candidates, key=lambda c: c.score, reverse=True),
-                        limit=lane_cap_for_source,
+                        limit=source_limit,
                     )
                 )
 
@@ -450,6 +446,33 @@ def _flatten_metadata_value(value: object) -> list[str]:
     return [str(value)]
 
 
+def _is_candidate_from_requested_source(candidate: Candidate, profile: TopicProfile) -> bool:
+    explicit_sources = list(getattr(profile, "requested_sources", None) or [])
+    explicit_sources.extend(getattr(profile, "promoted_sources", None) or [])
+    for source in explicit_sources:
+        if not isinstance(source, dict):
+            continue
+        adapter = str(source.get("adapter") or "").strip().lower()
+        if adapter != candidate.adapter.lower():
+            continue
+        ref = str(source.get("ref") or source.get("source_name") or "").strip().lower()
+        if not ref:
+            continue
+
+        cand_name = str(candidate.payload.source_name or "").strip().lower()
+        cand_email = str(candidate.payload.metadata.get("sender_email") or "").strip().lower()
+        cand_podcast = str(candidate.payload.metadata.get("podcast_title") or "").strip().lower()
+
+        if ref in (cand_name, cand_email, cand_podcast):
+            return True
+
+        cand_url = str(candidate.payload.original_url or "").strip().lower()
+        if ref in cand_url:
+            return True
+
+    return False
+
+
 def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate]) -> tuple[list[Candidate], list[dict[str, Any]]]:
     topic_tokens = _topic_tokens(profile)
     if len(topic_tokens) < 2:
@@ -461,6 +484,9 @@ def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate]) -
     dropped: list[dict[str, Any]] = []
     for candidate in candidates:
         if not _candidate_has_judgeable_topic_text(candidate):
+            kept.append(candidate)
+            continue
+        if _is_candidate_from_requested_source(candidate, profile):
             kept.append(candidate)
             continue
         if _candidate_matches_topic(candidate, topic_tokens):

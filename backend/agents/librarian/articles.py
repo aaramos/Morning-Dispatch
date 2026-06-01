@@ -520,8 +520,6 @@ _DATE_META_SELECTORS = (
     ("meta[name='date']", "content"),
     ("meta[name='cxenseparse:recs:publishtime']", "content"),
     ("meta[property='pagefind:date']", "content"),
-    ("meta[property='article:modified_time']", "content"),
-    ("meta[property='og:updated_time']", "content"),
 )
 _JSONLD_DATE_KEYS = ("datePublished", "dateCreated", "uploadDate", "dateModified")
 # Visible publish-date bylines, in priority order. Many sites expose the date
@@ -851,6 +849,7 @@ NON_ARTICLE_EXTENSIONS = (
 BLOCKED_DOMAINS = {
     "apply.careers.microsoft.com",
     "calendar.google.com",
+    "danelfin.com",
     "facebook.com",
     "forms.gle",
     "instagram.com",

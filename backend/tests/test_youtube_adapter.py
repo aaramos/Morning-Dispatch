@@ -357,6 +357,7 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
     status = brief_settings_status(settings)
     assert status["youtube_presets"] == {"max": 25, "large": 20, "medium": 15, "focused": 10}
     assert status["podcast_presets"] == {"max": 25, "large": 20, "medium": 15, "focused": 10}
+    assert status["gmail_presets"] == {"max": 25, "large": 20, "medium": 15, "focused": 10}
     
     # Save modified defaults
     modified_defaults = {
@@ -370,14 +371,17 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
         },
         "youtube_presets": {"max": 10, "large": 9, "medium": 6, "focused": 4},
         "podcast_presets": {"max": 10, "large": 7, "medium": 4, "focused": 2},
+        "gmail_presets": {"max": 12, "large": 10, "medium": 8, "focused": 6},
     }
     
     updated_status = save_brief_defaults(settings, modified_defaults)
     assert updated_status["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
     assert updated_status["podcast_presets"] == {"max": 10, "large": 7, "medium": 4, "focused": 2}
+    assert updated_status["gmail_presets"] == {"max": 12, "large": 10, "medium": 8, "focused": 6}
     # Verify the YouTube preset limit is correctly saved
     assert updated_status["defaults"]["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
     assert updated_status["defaults"]["podcast_presets"] == {"max": 10, "large": 7, "medium": 4, "focused": 2}
+    assert updated_status["defaults"]["gmail_presets"] == {"max": 12, "large": 10, "medium": 8, "focused": 6}
 
 
 def test_youtube_email_html_link_transformation() -> None:
@@ -650,11 +654,11 @@ def test_podcast_lane_isolation_from_web_candidates() -> None:
     podcast_results = [c for c in candidates if c.adapter == "podcasts"]
     web_results = [c for c in candidates if c.adapter == "web_search"]
 
-    assert len(candidates) == 4
-    assert len(podcast_results) == 4
+    assert len(candidates) == 10
+    assert len(podcast_results) == 10
     assert len(web_results) == 0
 
-    # podcast items should come from highest scoring podcast candidates
+    # podcast items should come from highest scoring podcast candidates up to the lane limit.
     assert "https://podcast.example.com/episode-11" in {c.payload.original_url for c in podcast_results}
     assert "https://podcast.example.com/episode-10" in {c.payload.original_url for c in podcast_results}
     assert "https://podcast.example.com/episode-0" not in {c.payload.original_url for c in podcast_results}

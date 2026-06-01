@@ -83,6 +83,7 @@ class BriefDefaultsPayload(BaseModel):
     content_limits: dict[str, Any] = Field(default_factory=dict)
     youtube_presets: dict[str, int] = Field(default_factory=dict)
     podcast_presets: dict[str, int] = Field(default_factory=dict)
+    gmail_presets: dict[str, int] = Field(default_factory=dict)
 
 
 class PipelineLimitsPayload(BaseModel):

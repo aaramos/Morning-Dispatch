@@ -39,6 +39,13 @@ DEFAULT_PODCAST_PRESETS: dict[str, int] = {
     "focused": 10,
 }
 
+DEFAULT_GMAIL_PRESETS: dict[str, int] = {
+    "max": 25,
+    "large": 20,
+    "medium": 15,
+    "focused": 10,
+}
+
 DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
     "lookback_hours": 336,
     "content_limits": {
@@ -90,6 +97,7 @@ def brief_settings_status(settings: Settings) -> dict[str, Any]:
         "system_limits": system_limits(settings),
         "youtube_presets": normalize_youtube_presets(payload.get("youtube_presets")),
         "podcast_presets": normalize_podcast_presets(payload.get("podcast_presets")),
+        "gmail_presets": normalize_gmail_presets(payload.get("gmail_presets")),
     }
 
 
@@ -99,6 +107,7 @@ def load_brief_defaults(settings: Settings) -> dict[str, Any]:
     normalized = normalize_brief_controls(defaults)
     normalized["youtube_presets"] = normalize_youtube_presets(payload.get("youtube_presets"))
     normalized["podcast_presets"] = normalize_podcast_presets(payload.get("podcast_presets"))
+    normalized["gmail_presets"] = normalize_gmail_presets(payload.get("gmail_presets"))
     return normalized
 
 
@@ -109,6 +118,8 @@ def save_brief_defaults(settings: Settings, defaults: dict[str, Any]) -> dict[st
         payload["youtube_presets"] = normalize_youtube_presets(defaults["youtube_presets"])
     if "podcast_presets" in defaults:
         payload["podcast_presets"] = normalize_podcast_presets(defaults["podcast_presets"])
+    if "gmail_presets" in defaults:
+        payload["gmail_presets"] = normalize_gmail_presets(defaults["gmail_presets"])
     _write_settings_file(settings, payload)
     return brief_settings_status(settings)
 
@@ -124,6 +135,16 @@ def normalize_youtube_presets(value: Any) -> dict[str, int]:
 
 
 def normalize_podcast_presets(value: Any) -> dict[str, int]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "max": _bounded_int(raw.get("max"), 1, 25) or 25,
+        "large": _bounded_int(raw.get("large"), 1, 25) or 20,
+        "medium": _bounded_int(raw.get("medium"), 1, 25) or 15,
+        "focused": _bounded_int(raw.get("focused"), 1, 25) or 10,
+    }
+
+
+def normalize_gmail_presets(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
     return {
         "max": _bounded_int(raw.get("max"), 1, 25) or 25,

@@ -6,6 +6,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from backend.agents.digestor import gmail
 from backend.app.db.schema import SCHEMA_SQL
 from backend.db.queries import get_watermark
@@ -98,6 +100,11 @@ def init_db(path: Path) -> str:
     with sqlite3.connect(path) as connection:
         connection.executescript(SCHEMA_SQL)
     return str(path)
+
+
+@pytest.fixture(autouse=True)
+def default_gmail_boundary(monkeypatch):
+    monkeypatch.setattr(gmail, "_after_timestamp", lambda *_args, **_kwargs: 0)
 
 
 def test_fetch_returns_empty_on_auth_failure(monkeypatch, tmp_path):

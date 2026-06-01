@@ -18,7 +18,7 @@ from backend.app.core.prompt_loader import load_prompt
 
 MAX_AUDIT_CANDIDATES = 28
 RETRY_AUDIT_CANDIDATES = 4
-URL_DATE_RE = re.compile(r"/(20\d{2})[/-](0[1-9]|1[0-2])(?:[/-]([0-3]\d))?")
+URL_DATE_RE = re.compile(r"/(20\d{2})[/-](0?[1-9]|1[0-2])(?:[/-](0?[1-9]|[12]\d|3[01]))?")
 SYNDICATED_AGGREGATOR_DOMAINS = {
     "finance.yahoo.com",
     "news.yahoo.com",
@@ -635,7 +635,12 @@ def _url_date_hint(url: str) -> str | None:
     if not match:
         return None
     year, month, day = match.groups()
-    return "-".join(part for part in (year, month, day) if part)
+    parts = [year]
+    if month:
+        parts.append(month.zfill(2))
+    if day:
+        parts.append(day.zfill(2))
+    return "-".join(parts)
 
 
 def _apply_audit_payload(

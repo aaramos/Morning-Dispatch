@@ -1278,12 +1278,21 @@ def _apply_source_window_filter(
 
 def _source_window_rejection_reason(profile: TopicProfile, result: ArticleFetchResult, cutoff: datetime) -> str:
     source_type = str(result.payload.source_type or "")
+
+    # Check URL date hint first. URL dates are highly specific and indicate the original path publication date.
+    # If the URL date hint is older than the cutoff, reject it even if metadata says it was updated recently.
+    for value in (result.final_url, result.original_url, result.payload.original_url):
+        url_date = _date_from_url(value)
+        if url_date is not None and url_date < cutoff:
+            return f"URL date hint places it outside the requested source window ({_format_window_cutoff(cutoff)} or newer required)."
+
     published = _article_published_at(result)
     if published is not None:
         if published < cutoff:
             return f"Published outside the requested source window ({_format_window_cutoff(cutoff)} or newer required)."
         return ""
 
+    # If no published date, check general text date hints (which may be less precise, e.g. body text dates)
     hinted_date = _article_text_or_url_date(result)
     if hinted_date is not None:
         if hinted_date < cutoff:

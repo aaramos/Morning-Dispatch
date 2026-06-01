@@ -154,6 +154,11 @@ async def fetch_newsletters(
                     payload = message.get("payload", {})
                     subject = header_value(payload, "Subject")
                     published_at = message_published_at(message)
+                    if published_at:
+                        msg_time = _timestamp_from_iso(published_at)
+                        if msg_time <= after_timestamp:
+                            continue
+
                     latest_at, latest_id = _newer_message_marker(
                         latest_at=latest_at,
                         latest_id=latest_id,
@@ -324,7 +329,10 @@ def _credentials_path() -> Path:
 
 
 def build_query(sender: str, after_timestamp: int) -> str:
-    return f"from:{sender} after:{after_timestamp}"
+    # Gmail API query expects date format YYYY/MM/DD for 'after:', Unix timestamp is unstable
+    dt = datetime.fromtimestamp(after_timestamp, tz=UTC)
+    date_str = dt.strftime("%Y/%m/%d")
+    return f"from:{sender} after:{date_str}"
 
 
 def build_discovery_query(*, query_text: str, lookback_hours: int) -> str:
