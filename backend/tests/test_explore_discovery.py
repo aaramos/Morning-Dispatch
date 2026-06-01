@@ -763,7 +763,7 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                     "collections": 25,
                     "foreign_media": 25,
                     "gmail": 25,
-                    "markets": 50,
+                    "markets": 25,
                     "podcasts": 25,
                     "web_search": 5,
                     "youtube": 2,
@@ -1255,11 +1255,13 @@ def test_discovery_runner_applies_per_source_content_limits() -> None:
         )
     )
 
-    assert [candidate.adapter for candidate in result.candidates] == ["gmail", "web_search", "web_search"]
+    assert [candidate.adapter for candidate in result.candidates] == ["gmail", "gmail", "web_search", "web_search", "web_search"]
     assert [candidate.payload.original_url for candidate in result.candidates] == [
         "https://example.com/mail-1",
+        "https://example.com/mail-2",
         "https://example.com/web-1",
         "https://example.com/web-2",
+        "https://example.com/web-3",
     ]
 
 

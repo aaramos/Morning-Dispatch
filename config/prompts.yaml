@@ -172,3 +172,31 @@ query_refinement: |
   }
   
   Do not include any markup, fences, or text other than the JSON object.
+
+candidate_screening: |
+  You are an expert content editor filtering search results for a newsletter.
+  Your task is to review a batch of candidate titles/descriptions and determine which ones are relevant to the user's topic profile, and which ones are ads, promotional garbage, or completely irrelevant.
+
+  Topic Statement:
+  {{statement}}
+
+  Exclusions:
+  {{exclusions}}
+
+  Here is the list of candidates to screen:
+  {{candidates_json}}
+
+  For each candidate, output a JSON object containing its ID and your decision: "keep" or "drop", plus a very short reason.
+
+  Format your response as a strict JSON object with this shape:
+  {
+    "decisions": [
+      {
+        "id": "item ID",
+        "decision": "keep|drop",
+        "reason": "very short reason"
+      }
+    ]
+  }
+
+  Do not include any markup, fences, or text other than the JSON object.

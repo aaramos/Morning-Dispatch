@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes
@@ -90,15 +93,19 @@ class PodcastSourceAdapter:
             include_seen=True,
         )
         if len(payloads) < 3:
-            from backend.agents.discovery.query_refiner import refine_queries_for_adapter
-            initial_queries = _podcast_discovery_refs(profile)
-            refined_queries = await refine_queries_for_adapter(
-                adapter_name=self.name,
-                profile=profile,
-                initial_results=payloads,
-                initial_queries=initial_queries,
-                lookback_hours=context.lookback_hours,
-            )
+            try:
+                from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+                initial_queries = _podcast_discovery_refs(profile)
+                refined_queries = await refine_queries_for_adapter(
+                    adapter_name=self.name,
+                    profile=profile,
+                    initial_results=payloads,
+                    initial_queries=initial_queries,
+                    lookback_hours=context.lookback_hours,
+                )
+            except Exception as exc:
+                logger.warning("Failed to refine queries for podcast adapter: %s", exc)
+                refined_queries = []
             if refined_queries:
                 refined_sources = []
                 for ref in refined_queries:
@@ -185,14 +192,18 @@ class WebSearchSourceAdapter:
                 if existing is None or _search_score(hit.score) > _search_score(existing[0].score):
                     hits_by_url[key] = (hit, query, query_index)
         if len(hits_by_url) < 3:
-            from backend.agents.discovery.query_refiner import refine_queries_for_adapter
-            refined_queries = await refine_queries_for_adapter(
-                adapter_name=self.name,
-                profile=profile,
-                initial_results=[item[0] for item in hits_by_url.values()],
-                initial_queries=queries,
-                lookback_hours=context.lookback_hours,
-            )
+            try:
+                from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+                refined_queries = await refine_queries_for_adapter(
+                    adapter_name=self.name,
+                    profile=profile,
+                    initial_results=[item[0] for item in hits_by_url.values()],
+                    initial_queries=queries,
+                    lookback_hours=context.lookback_hours,
+                )
+            except Exception as exc:
+                logger.warning("Failed to refine queries for web search adapter: %s", exc)
+                refined_queries = []
             if refined_queries:
                 refined_queries = refined_queries[:3]
                 refined_results = await asyncio.gather(
@@ -292,14 +303,18 @@ class YouTubeSourceAdapter:
 
         refined_video_ids: set[str] = set()
         if len(videos_by_id) < 3:
-            from backend.agents.discovery.query_refiner import refine_queries_for_adapter
-            refined_queries = await refine_queries_for_adapter(
-                adapter_name=self.name,
-                profile=profile,
-                initial_results=list(videos_by_id.values()),
-                initial_queries=queries,
-                lookback_hours=context.lookback_hours,
-            )
+            try:
+                from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+                refined_queries = await refine_queries_for_adapter(
+                    adapter_name=self.name,
+                    profile=profile,
+                    initial_results=list(videos_by_id.values()),
+                    initial_queries=queries,
+                    lookback_hours=context.lookback_hours,
+                )
+            except Exception as exc:
+                logger.warning("Failed to refine queries for YouTube adapter: %s", exc)
+                refined_queries = []
             if refined_queries:
                 refined_queries = refined_queries[:2]
                 refined_recency = profile.recency_weighting if context.lookback_hours is not None else "all_available"

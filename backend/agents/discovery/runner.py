@@ -161,6 +161,19 @@ class DiscoveryRunner:
         candidates, exclusions = _apply_exclusions(profile, all_raw_candidates)
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
 
+        from backend.agents.discovery.query_refiner import screen_candidates
+        candidates = await screen_candidates(profile, candidates)
+
+        # Boost scores of candidates from requested/promoted sources by 0.4 (capped at 1.0)
+        boosted_candidates = []
+        for candidate in candidates:
+            if _is_candidate_from_requested_source(candidate, profile):
+                new_score = min(1.0, candidate.score + 0.4)
+                boosted_candidates.append(replace(candidate, score=new_score))
+            else:
+                boosted_candidates.append(candidate)
+        candidates = boosted_candidates
+
         # Dedicated source ranking lanes (sorted against each other before competing with
         # other sources for pipeline capacity). These sources should be judged within
         # their own lanes rather than crowded out by high-volume web results.
@@ -169,10 +182,11 @@ class DiscoveryRunner:
         if profile_total_limit is not None:
             target_capacity = min(target_capacity, profile_total_limit)
         source_plan: tuple[tuple[str, int], ...] = (
-            ("markets", _lane_limit(profile, "markets", default=50, system_max=50)),
-            ("youtube", _lane_limit(profile, "youtube", default=25, system_max=25)),
-            ("podcasts", _lane_limit(profile, "podcasts", default=25, system_max=25)),
-            ("gmail", _lane_limit(profile, "gmail", default=25, system_max=25)),
+            ("markets", _lane_limit(profile, "markets", default=250, system_max=250)),
+            ("youtube", _lane_limit(profile, "youtube", default=250, system_max=250)),
+            ("podcasts", _lane_limit(profile, "podcasts", default=250, system_max=250)),
+            ("gmail", _lane_limit(profile, "gmail", default=250, system_max=250)),
+            ("foreign_media", _lane_limit(profile, "foreign_media", default=250, system_max=250)),
         )
 
         lane_candidates: list[Candidate] = []
@@ -364,7 +378,7 @@ def _source_limit(value: Any) -> int | None:
         return None
     if limit < 1:
         return None
-    return min(limit, 25)
+    return min(limit * 10, 250)
 
 
 def _apply_exclusions(profile: TopicProfile, candidates: list[Candidate]) -> tuple[list[Candidate], list[dict[str, Any]]]:

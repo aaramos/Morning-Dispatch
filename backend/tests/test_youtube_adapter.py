@@ -594,19 +594,19 @@ def test_youtube_capacity_protection_and_lane_sorting() -> None:
     )
     
     candidates = result.candidates
-    assert len(candidates) == 8
+    assert len(candidates) == 12
     
     yt_results = [c for c in candidates if c.adapter == "youtube"]
     web_results = [c for c in candidates if c.adapter == "web_search"]
     
-    assert len(yt_results) == 5
-    assert len(web_results) == 3
+    assert len(yt_results) == 12
+    assert len(web_results) == 0
     
     # Verify that the youtube candidates selected are the ones with highest scores
     yt_urls = {c.payload.original_url for c in yt_results}
     assert "https://youtube.com/watch?v=yt-11" in yt_urls
     assert "https://youtube.com/watch?v=yt-7" in yt_urls
-    assert "https://youtube.com/watch?v=yt-0" not in yt_urls
+    assert "https://youtube.com/watch?v=yt-0" in yt_urls
 
 
 def test_podcast_lane_isolation_from_web_candidates() -> None:
@@ -654,14 +654,14 @@ def test_podcast_lane_isolation_from_web_candidates() -> None:
     podcast_results = [c for c in candidates if c.adapter == "podcasts"]
     web_results = [c for c in candidates if c.adapter == "web_search"]
 
-    assert len(candidates) == 10
-    assert len(podcast_results) == 10
+    assert len(candidates) == 12
+    assert len(podcast_results) == 12
     assert len(web_results) == 0
 
     # podcast items should come from highest scoring podcast candidates up to the lane limit.
     assert "https://podcast.example.com/episode-11" in {c.payload.original_url for c in podcast_results}
     assert "https://podcast.example.com/episode-10" in {c.payload.original_url for c in podcast_results}
-    assert "https://podcast.example.com/episode-0" not in {c.payload.original_url for c in podcast_results}
+    assert "https://podcast.example.com/episode-0" in {c.payload.original_url for c in podcast_results}
 
 
 def test_youtube_adapter_triggers_query_refinement(monkeypatch, tmp_path) -> None:

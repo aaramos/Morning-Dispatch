@@ -810,6 +810,7 @@ def _adapter_from_payload_type(source_type: str) -> str:
         "foreign_web": "foreign_media",
         "market_snapshot": "markets",
         "collection_chunk": "collections",
+        "web_search": "web_search",
     }.get(source_type, "")
 
 
@@ -1167,7 +1168,32 @@ async def _run_digest_core(
 
     if librarian_client is not None:
         database.cache_model_enrichments(article_results, model_name=_model_client_name(librarian_client, settings.librarian_model))
+    article_results = _enforce_inclusion_limits(profile, article_results)
     return article_results
+
+
+def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchResult]) -> list[ArticleFetchResult]:
+    per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else {}
+    counts: dict[str, int] = {}
+    updated: list[ArticleFetchResult] = []
+    for r in results:
+        adapter = _adapter_from_payload_type(r.payload.source_type)
+        if not adapter:
+            adapter = r.payload.source_type or "web_search"
+
+        limit = per_source.get(adapter, 25) if isinstance(per_source, dict) else 25
+        limit = min(limit, 25)
+
+        if r.tier != "dropped":
+            current = counts.get(adapter, 0)
+            if current >= limit:
+                updated.append(replace(r, tier="dropped"))
+            else:
+                counts[adapter] = current + 1
+                updated.append(r)
+        else:
+            updated.append(r)
+    return updated
 
 
 async def _adjudicate_dates_before_source_window_filter(

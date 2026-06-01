@@ -714,7 +714,8 @@ def _score_episode(episode: PodcastEpisode, digest_interest: str) -> float:
     episode_tokens = keyword_set(f"{episode.title} {episode.description} {episode.show_name}")
     if not episode_tokens:
         return 0.0
-    overlap = len(episode_tokens & interest_tokens) / max(1, len(interest_tokens)) if interest_tokens else 0.35
+    denominator = min(10, len(interest_tokens)) if interest_tokens else 1
+    overlap = len(episode_tokens & interest_tokens) / max(1, denominator) if interest_tokens else 0.35
     title_overlap = len(keyword_set(episode.title) & interest_tokens) / max(1, len(keyword_set(episode.title)) or 1) if interest_tokens else 0.25
     recency = _recency_score(episode.published_at)
     duration_bonus = 0.08 if not episode.duration_seconds or episode.duration_seconds <= 3600 else -0.08
