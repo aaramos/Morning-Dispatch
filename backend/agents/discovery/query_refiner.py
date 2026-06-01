@@ -125,7 +125,7 @@ async def screen_candidates(
         logger.warning("Failed to obtain model client for candidate screening: %s", exc)
         return candidates
 
-    batch_size = 40
+    batch_size = 15
     batches = [to_screen[i : i + batch_size] for i in range(0, len(to_screen), batch_size)]
 
     async def screen_batch(batch: list[Any]) -> dict[str, str]:
@@ -162,7 +162,7 @@ async def screen_candidates(
             payload = await client.complete_json(
                 system=system_prompt,
                 prompt=json.dumps(cand_list, ensure_ascii=False),
-                max_tokens=1200,
+                max_tokens=2000,
             )
             decisions = payload.get("decisions", [])
             return {

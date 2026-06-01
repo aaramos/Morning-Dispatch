@@ -413,25 +413,20 @@ async def _discover_sources(sources: list[dict[str, Any]], digest_interest: str)
 def _podcast_discovery_lanes(queries: list[str], digest_interest: str) -> list[str]:
     lanes: list[str] = []
     for query in [*queries, _discovery_query(digest_interest)]:
-        clean = _clean_text(query)
+        from backend.agents.librarian.text_utils import tokens, STOPWORDS
+        seen = set()
+        cleaned_words = []
+        for token in tokens(query):
+            if token not in STOPWORDS and len(token) > 1 and token not in seen:
+                cleaned_words.append(token)
+                seen.add(token)
+        clean = " ".join(cleaned_words[:3])
         if not clean:
             continue
-        for lane in (
-            clean,
-            f"{clean} podcast",
-            f"{clean} podcast episode",
-            f"{clean} expert interview",
-            f"{clean} audio show",
-            f"{clean} show notes",
-        ):
+        for lane in (clean, f"{clean} podcast"):
             key = lane.casefold()
             if key not in {existing.casefold() for existing in lanes}:
                 lanes.append(lane[:180])
-        tokens = [token for token in keyword_set(clean) if len(token) > 2]
-        if len(tokens) >= 3:
-            compact = " ".join(tokens[:6])
-            if compact.casefold() not in {existing.casefold() for existing in lanes}:
-                lanes.append(compact[:180])
     return lanes[:MAX_DISCOVERY_LANES]
 
 

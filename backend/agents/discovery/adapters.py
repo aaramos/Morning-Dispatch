@@ -526,6 +526,10 @@ def _payload_score(metadata: dict[str, Any] | None) -> float:
 def _podcast_discovery_refs(profile: TopicProfile) -> list[str]:
     refs = list(_source_plan_refs(profile, "podcasts"))
     if not refs:
+        if profile.keywords:
+            for kw in profile.keywords[:4]:
+                if len(kw) > 2:
+                    refs.append(kw)
         refs.extend(_trim_query(query, limit=140) for query in profile.search_queries)
         if profile.keywords:
             refs.append(_trim_query(" ".join(profile.keywords[:8]), limit=140))

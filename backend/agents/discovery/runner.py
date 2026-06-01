@@ -202,12 +202,12 @@ class DiscoveryRunner:
                 regular_candidates = [c for c in raw_candidates if (c.payload.metadata or {}).get("explicit_ticker") is not True]
 
                 deduped_explicit = _dedupe_candidates(
-                    sorted(explicit_candidates, key=lambda c: c.score, reverse=True),
+                    sorted(explicit_candidates, key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True),
                     limit=len(explicit_candidates),
                 )
 
                 deduped_regular = _dedupe_candidates(
-                    sorted(regular_candidates, key=lambda c: c.score, reverse=True),
+                    sorted(regular_candidates, key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True),
                     limit=source_limit,
                 )
 
@@ -216,7 +216,7 @@ class DiscoveryRunner:
             else:
                 lane_candidates.extend(
                     _dedupe_candidates(
-                        sorted(raw_candidates, key=lambda c: c.score, reverse=True),
+                        sorted(raw_candidates, key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True),
                         limit=source_limit,
                     )
                 )
@@ -234,7 +234,7 @@ class DiscoveryRunner:
         deduped_other = _dedupe_candidates(other_candidates, limit=non_lane_capacity)
 
         # Combine reserved lane results with the backfilled candidate stream.
-        candidates = sorted(list(lane_candidates) + list(deduped_other), key=lambda c: c.score, reverse=True)
+        candidates = sorted(list(lane_candidates) + list(deduped_other), key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True)
 
         excluded_statuses = [
             AdapterStatus(name=name, status="skipped", message="Source was turned off for this exploration.")
@@ -614,6 +614,8 @@ def _candidate_has_judgeable_topic_text(candidate: Candidate) -> bool:
 def _candidate_key(candidate: Candidate) -> str:
     payload = candidate.payload
     if payload.original_url:
+        if "mail.google.com" in payload.original_url:
+            return "url:" + payload.original_url.strip().lower()
         return "url:" + _canonical_url(payload.original_url)
     native_id = (
         payload.metadata.get("gmail_message_id")

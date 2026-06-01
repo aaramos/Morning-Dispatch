@@ -757,7 +757,7 @@ def _add_final_source_mix_issues(
     included_counts: dict[str, int] = {}
     for result in article_results:
         if result.fetched and result.tier != "dropped":
-            adapter = payload_adapters.get(result.payload.id, _adapter_from_payload_type(result.payload.source_type))
+            adapter = payload_adapters.get(result.payload.id, _adapter_from_payload_type(result.payload.source_type, result.payload.metadata))
             if adapter:
                 included_counts[adapter] = included_counts.get(adapter, 0) + 1
     candidate_counts = {status.name: status.candidate_count for status in discovery.statuses}
@@ -801,10 +801,14 @@ def _add_final_source_mix_issues(
         progress["built_with_issues"] = True
 
 
-def _adapter_from_payload_type(source_type: str) -> str:
+def _adapter_from_payload_type(source_type: str, metadata: dict[str, Any] | None = None) -> str:
+    metadata = metadata or {}
+    if source_type == "gmail_link":
+        if metadata.get("search_query") or metadata.get("search_provider"):
+            return "web_search"
+        return "gmail"
     return {
         "gmail": "gmail",
-        "gmail_link": "gmail",
         "podcast_episode": "podcasts",
         "youtube_video": "youtube",
         "foreign_web": "foreign_media",
@@ -1177,7 +1181,7 @@ def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchR
     counts: dict[str, int] = {}
     updated: list[ArticleFetchResult] = []
     for r in results:
-        adapter = _adapter_from_payload_type(r.payload.source_type)
+        adapter = _adapter_from_payload_type(r.payload.source_type, r.payload.metadata)
         if not adapter:
             adapter = r.payload.source_type or "web_search"
 
@@ -1537,7 +1541,7 @@ def _newsletter_source_notes_for_brief(
     kept_gmail_links = [
         result.payload
         for result in article_results
-        if result.fetched and result.tier != "dropped" and result.payload.source_type == "gmail_link"
+        if result.fetched and result.tier != "dropped" and result.payload.source_type in {"gmail", "gmail_link"}
     ]
     if not kept_gmail_links:
         return []

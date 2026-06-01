@@ -139,6 +139,7 @@ class ForeignMediaSourceAdapter:
                             source_name=hit.title or hit.url,
                             raw_text=hit.snippet,
                             original_url=hit.url,
+                            published_at=hit.published_at,
                             metadata={
                                 "link_quality_score": score,
                                 "search_query": item["native_query"],
