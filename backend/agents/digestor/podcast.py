@@ -1014,26 +1014,15 @@ def _clean_text(value: str) -> str:
 
 
 def _discovery_query(digest_interest: str) -> str:
-    tokens = [
-        token
-        for token in keyword_set(digest_interest)
-        if token
-        in {
-            "agent",
-            "agentic",
-            "ai",
-            "artificial",
-            "coding",
-            "infrastructure",
-            "intelligence",
-            "llm",
-            "model",
-            "openai",
-            "product",
-            "workflow",
-        }
-    ]
-    return " ".join(tokens[:8]) or "artificial intelligence news"
+    from backend.agents.librarian.text_utils import tokens, STOPWORDS
+    seen = set()
+    cleaned = []
+    for token in tokens(digest_interest):
+        if token not in STOPWORDS and len(token) > 1 and token not in seen:
+            cleaned.append(token)
+            seen.add(token)
+    return " ".join(cleaned[:8]) or "podcast"
+
 
 
 def _decision(

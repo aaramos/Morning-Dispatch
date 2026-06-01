@@ -89,6 +89,47 @@ class PodcastSourceAdapter:
             seen_requires_published=True,
             include_seen=True,
         )
+        if len(payloads) < 3:
+            from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+            initial_queries = _podcast_discovery_refs(profile)
+            refined_queries = await refine_queries_for_adapter(
+                adapter_name=self.name,
+                profile=profile,
+                initial_results=payloads,
+                initial_queries=initial_queries,
+                lookback_hours=context.lookback_hours,
+            )
+            if refined_queries:
+                refined_sources = []
+                for ref in refined_queries:
+                    refined_sources.append({
+                        "type": "podcast_search",
+                        "title": ref,
+                        "query": ref,
+                        "aggregator": "podcastindex",
+                        "transcription": "auto",
+                    })
+                refined_payloads, refined_decisions = await fetch_podcast_episodes(
+                    digest_id=context.exploration_id,
+                    digest_interest=profile.query_for_source(self.name),
+                    sources=refined_sources,
+                    lookback_hours=context.lookback_hours,
+                    inference_run_id=context.exploration_id,
+                    mark_seen=False,
+                    seen_requires_published=True,
+                    include_seen=True,
+                )
+                seen_episode_ids = {p.metadata.get("episode_id") or p.original_url for p in payloads if p.metadata}
+                for rp in refined_payloads:
+                    rp_id = rp.metadata.get("episode_id") or rp.original_url if rp.metadata else rp.original_url
+                    if rp_id not in seen_episode_ids:
+                        if rp.metadata is None:
+                            rp.metadata = {}
+                        rp.metadata["is_refined_query"] = True
+                        payloads.append(rp)
+                        seen_episode_ids.add(rp_id)
+                decisions.extend(refined_decisions)
+
         if not payloads:
             lanes = _source_plan_refs(profile, "podcasts")[:4]
             lane_text = ", ".join(lanes)
@@ -143,6 +184,34 @@ class WebSearchSourceAdapter:
                 existing = hits_by_url.get(key)
                 if existing is None or _search_score(hit.score) > _search_score(existing[0].score):
                     hits_by_url[key] = (hit, query, query_index)
+        if len(hits_by_url) < 3:
+            from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+            refined_queries = await refine_queries_for_adapter(
+                adapter_name=self.name,
+                profile=profile,
+                initial_results=[item[0] for item in hits_by_url.values()],
+                initial_queries=queries,
+                lookback_hours=context.lookback_hours,
+            )
+            if refined_queries:
+                refined_queries = refined_queries[:3]
+                refined_results = await asyncio.gather(
+                    *(search_web(query, limit=per_query_limit, days=days) for query in refined_queries),
+                    return_exceptions=True,
+                )
+                for query_index, (query, result) in enumerate(zip(refined_queries, refined_results, strict=True)):
+                    if isinstance(result, BaseException):
+                        errors.append(result)
+                        continue
+                    for hit in result:
+                        if not hit.url:
+                            continue
+                        key = _dedupe_url_key(hit.url)
+                        existing = hits_by_url.get(key)
+                        overall_index = query_index + len(queries)
+                        if existing is None or _search_score(hit.score) > _search_score(existing[0].score):
+                            hits_by_url[key] = (hit, query, overall_index)
+
         if not hits_by_url and errors:
             raise errors[0]
         if not hits_by_url:
@@ -156,6 +225,16 @@ class WebSearchSourceAdapter:
         )
         for hit, query, query_index in ordered_hits[: max(1, context.candidate_limit)]:
             score = _web_query_boosted_score(hit.score, query_index)
+            is_refined = query_index >= len(queries)
+            metadata = {
+                "link_quality_score": score,
+                "search_query": query,
+                "search_query_rank": query_index + 1,
+                "search_provider": hit.provider,
+            }
+            if is_refined:
+                metadata["is_refined_query"] = True
+
             payloads.append(
                 Candidate(
                     adapter=self.name,
@@ -165,12 +244,7 @@ class WebSearchSourceAdapter:
                         raw_text=hit.snippet,
                         original_url=hit.url,
                         published_at=hit.published_at,
-                        metadata={
-                            "link_quality_score": score,
-                            "search_query": query,
-                            "search_query_rank": query_index + 1,
-                            "search_provider": hit.provider,
-                        },
+                        metadata=metadata,
                     ),
                     score=score,
                     reason=f"Web result from {hit.provider}.",
@@ -215,12 +289,49 @@ class YouTubeSourceAdapter:
                 continue
             for video in result.videos:
                 videos_by_id.setdefault(video.video_id, video)
+
+        refined_video_ids: set[str] = set()
+        if len(videos_by_id) < 3:
+            from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+            refined_queries = await refine_queries_for_adapter(
+                adapter_name=self.name,
+                profile=profile,
+                initial_results=list(videos_by_id.values()),
+                initial_queries=queries,
+                lookback_hours=context.lookback_hours,
+            )
+            if refined_queries:
+                refined_queries = refined_queries[:2]
+                refined_recency = profile.recency_weighting if context.lookback_hours is not None else "all_available"
+                refined_results = await asyncio.gather(
+                    *(
+                        search_youtube(
+                            api_key=settings.youtube_api_key,
+                            query=query,
+                            limit=per_query_limit,
+                            recency_weighting=refined_recency,
+                            duration_filter="any",
+                            lookback_hours=context.lookback_hours,
+                        )
+                        for query in refined_queries
+                    ),
+                    return_exceptions=True,
+                )
+                for result in refined_results:
+                    if isinstance(result, BaseException):
+                        errors.append(result)
+                        continue
+                    for video in result.videos:
+                        if video.video_id not in videos_by_id:
+                            videos_by_id[video.video_id] = video
+                            refined_video_ids.add(video.video_id)
+
         if not videos_by_id and errors:
             raise errors[0]
         if not videos_by_id:
             return []
         videos = tuple(videos_by_id.values())[: max(1, min(context.candidate_limit, settings.youtube_max_results))]
-        return await _youtube_candidates(videos)
+        return await _youtube_candidates(videos, refined_video_ids=refined_video_ids)
 
     async def fetch(self, candidate: Candidate) -> Any:
         return candidate.payload
@@ -428,63 +539,48 @@ def _search_score(value: float) -> float:
 
 
 
-async def _youtube_candidates(videos: tuple[Any, ...]) -> list[Candidate]:
+async def _youtube_candidates(videos: tuple[Any, ...], refined_video_ids: set[str] | None = None) -> list[Candidate]:
     semaphore = asyncio.Semaphore(4)
 
     async def build(video: Any) -> Candidate | None:
         async with semaphore:
             transcript = await fetch_youtube_transcript(video.video_id)
         url = f"https://www.youtube.com/watch?v={video.video_id}"
+        is_refined = refined_video_ids is not None and video.video_id in refined_video_ids
+        metadata = {
+            "youtube_quality_score": video.score,
+            "video_id": video.video_id,
+            "youtube_title": video.title,
+            "title": video.title,
+            "channel_name": video.channel_name,
+            "thumbnail_url": video.thumbnail_url,
+            "duration_seconds": video.duration_seconds,
+            "transcript_source": "unavailable" if transcript is None else transcript.source,
+            "description": video.description,
+            "youtube_url": url,
+        }
         if transcript is None:
-            return Candidate(
-                adapter="youtube",
-                payload=NormalizedPayload(
-                    source_type="youtube_video",
-                    source_name=video.channel_name,
-                    raw_text=video.description,
-                    original_url=url,
-                    published_at=video.published_at,
-                    metadata={
-                        "youtube_quality_score": video.score,
-                        "video_id": video.video_id,
-                        "youtube_title": video.title,
-                        "title": video.title,
-                        "channel_name": video.channel_name,
-                        "thumbnail_url": video.thumbnail_url,
-                        "duration_seconds": video.duration_seconds,
-                        "transcript_source": "unavailable",
-                        "content_basis": "youtube_metadata",
-                        "description": video.description,
-                        "youtube_url": url,
-                    },
-                ),
-                score=video.score,
-                reason="YouTube metadata signal.",
-            )
+            metadata["content_basis"] = "youtube_metadata"
+        else:
+            metadata["transcript_segments"] = list(transcript.segments)
+        if is_refined:
+            metadata["is_refined_query"] = True
+
+        raw_text = video.description if transcript is None else transcript.text
+        reason = "YouTube metadata signal." if transcript is None else "YouTube transcript signal."
+
         return Candidate(
             adapter="youtube",
             payload=NormalizedPayload(
                 source_type="youtube_video",
                 source_name=video.channel_name,
-                raw_text=transcript.text,
+                raw_text=raw_text,
                 original_url=url,
                 published_at=video.published_at,
-                metadata={
-                    "youtube_quality_score": video.score,
-                    "video_id": video.video_id,
-                    "youtube_title": video.title,
-                    "title": video.title,
-                    "channel_name": video.channel_name,
-                    "thumbnail_url": video.thumbnail_url,
-                    "duration_seconds": video.duration_seconds,
-                    "transcript_source": transcript.source,
-                    "transcript_segments": list(transcript.segments),
-                    "description": video.description,
-                    "youtube_url": url,
-                },
+                metadata=metadata,
             ),
             score=video.score,
-            reason="YouTube transcript signal.",
+            reason=reason,
         )
 
     candidates = await asyncio.gather(*(build(video) for video in videos))

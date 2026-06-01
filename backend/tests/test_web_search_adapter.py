@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 import pytest
 
 from backend.agents.discovery.adapters import WebSearchSourceAdapter
+from backend.agents.discovery import query_refiner
 from backend.agents.discovery.types import AdapterUnavailable, Candidate, SourceAdapterContext, TopicProfile
 from backend.agents.discovery import web_search
 
@@ -508,3 +511,87 @@ def test_search_web_trims_long_provider_queries(monkeypatch, tmp_path) -> None:
     asyncio.run(web_search.search_web("Mexico City travel " * 80, limit=3))
 
     assert len(captured["query"]) <= 380
+
+
+def test_web_search_adapter_triggers_query_refinement(monkeypatch, tmp_path) -> None:
+    searched_queries = []
+
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
+        searched_queries.append((query, days))
+        if "refined" in query:
+            return [
+                web_search.SearchHit(
+                    title="Refined Web Result",
+                    url="https://example.com/refined-web-story",
+                    snippet="Snippet of refined result.",
+                    score=0.85,
+                    provider="fake-refined",
+                )
+            ]
+        return []
+
+    async def fake_refine_queries_for_adapter(
+        adapter_name: str,
+        profile: TopicProfile,
+        initial_results: list,
+        initial_queries: list[str],
+        lookback_hours: int | None = None,
+    ) -> list[str]:
+        assert lookback_hours == 24
+        return ["refined web query"]
+
+    monkeypatch.setenv("MORNING_DISPATCH_TAVILY_API_KEY", "test-key")
+    monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "auto")
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr("backend.agents.discovery.adapters.search_web", fake_search_web)
+    monkeypatch.setattr("backend.agents.discovery.query_refiner.refine_queries_for_adapter", fake_refine_queries_for_adapter)
+
+    adapter = WebSearchSourceAdapter()
+    candidates = asyncio.run(
+        adapter.query(
+            TopicProfile.from_dict({"statement": "AI", "scope": "AI"}),
+            SourceAdapterContext(exploration_id="explore-1", candidate_limit=10, lookback_hours=24),
+        )
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].payload.source_name == "Refined Web Result"
+    assert candidates[0].payload.original_url == "https://example.com/refined-web-story"
+    assert candidates[0].payload.metadata["is_refined_query"] is True
+    assert searched_queries[0][0] == "ai"
+    assert searched_queries[1][0] == "refined web query"
+    # lookback_hours=24 maps to days=1 and remains strict on the refinement retry.
+    assert searched_queries[1][1] == 1
+
+
+def test_query_refiner_includes_date_and_recency_constraints(monkeypatch, tmp_path) -> None:
+    captured: dict[str, str] = {}
+
+    class FakeClient:
+        async def complete_json(self, **kwargs):
+            captured["system"] = kwargs["system"]
+            captured["prompt"] = kwargs["prompt"]
+            return {"refined_queries": ["frontier lab capex", "", "frontier lab capex", "model developer compute"]}
+
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        query_refiner.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: SimpleNamespace(client=FakeClient()),
+    )
+
+    refined = asyncio.run(
+        query_refiner.refine_queries_for_adapter(
+            "web_search",
+            TopicProfile.from_dict({"statement": "AI infrastructure", "scope": "frontier labs and compute demand"}),
+            initial_results=[],
+            initial_queries=["AI infrastructure 2026"],
+            lookback_hours=168,
+        )
+    )
+
+    prompt = json.loads(captured["prompt"])
+    assert refined == ["frontier lab capex", "model developer compute"]
+    assert prompt["lookback_hours"] == 168
+    assert "current_date" in prompt
+    assert "Do not widen the time window" in captured["system"]

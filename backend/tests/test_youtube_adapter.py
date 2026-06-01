@@ -662,3 +662,69 @@ def test_podcast_lane_isolation_from_web_candidates() -> None:
     assert "https://podcast.example.com/episode-11" in {c.payload.original_url for c in podcast_results}
     assert "https://podcast.example.com/episode-10" in {c.payload.original_url for c in podcast_results}
     assert "https://podcast.example.com/episode-0" not in {c.payload.original_url for c in podcast_results}
+
+
+def test_youtube_adapter_triggers_query_refinement(monkeypatch, tmp_path) -> None:
+    searched_queries = []
+
+    async def fake_search_youtube(**kwargs: Any) -> youtube.YouTubeSearchResult:
+        searched_queries.append(kwargs)
+        if "refined" in kwargs.get("query", ""):
+            return youtube.YouTubeSearchResult(
+                videos=(
+                    youtube.YouTubeVideo(
+                        video_id="video-refined",
+                        title="Refined Video Title",
+                        channel_name="Refined YouTube Channel",
+                        published_at="2026-05-25T12:00:00Z",
+                        description="Refined video description.",
+                        thumbnail_url="https://img.example.com/refined.jpg",
+                        duration_seconds=600,
+                        score=0.95,
+                    ),
+                ),
+                quota_units=101,
+            )
+        return youtube.YouTubeSearchResult(videos=(), quota_units=101)
+
+    async def fake_fetch_transcript(video_id: str) -> youtube.YouTubeTranscript | None:
+        return None
+
+    async def fake_refine_queries_for_adapter(
+        adapter_name: str,
+        profile: TopicProfile,
+        initial_results: list,
+        initial_queries: list[str],
+        lookback_hours: int | None = None,
+    ) -> list[str]:
+        assert lookback_hours == 10
+        return ["refined youtube query"]
+
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_YOUTUBE_API_KEY", "key")
+    monkeypatch.setattr(adapters, "search_youtube", fake_search_youtube)
+    monkeypatch.setattr(adapters, "fetch_youtube_transcript", fake_fetch_transcript)
+    monkeypatch.setattr("backend.agents.discovery.query_refiner.refine_queries_for_adapter", fake_refine_queries_for_adapter)
+
+    adapter = YouTubeSourceAdapter()
+    candidates = asyncio.run(
+        adapter.query(
+            TopicProfile.from_dict({"statement": "local robotics", "scope": "local robotics"}),
+            SourceAdapterContext(exploration_id="explore-1", candidate_limit=5, lookback_hours=10),
+        )
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].payload.source_name == "Refined YouTube Channel"
+    assert candidates[0].payload.original_url == "https://www.youtube.com/watch?v=video-refined"
+    assert candidates[0].payload.metadata["is_refined_query"] is True
+
+    # Validate retry pass keeps the strict recency window while relaxing duration only.
+    assert len(searched_queries) == 2
+    assert searched_queries[0]["query"] == "local robotics"
+    assert searched_queries[0]["duration_filter"] == "medium"
+    assert searched_queries[0]["lookback_hours"] == 10
+
+    assert searched_queries[1]["query"] == "refined youtube query"
+    assert searched_queries[1]["duration_filter"] == "any"
+    assert searched_queries[1]["lookback_hours"] == 10

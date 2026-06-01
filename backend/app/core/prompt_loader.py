@@ -96,7 +96,22 @@ Return only valid JSON with these fields:
 - confidence_note: short note only if the source text is weak or partial
 No preamble, no markdown fences. Keep the whole response under 220 tokens.
 """.strip(),
+
+    "query_refinement": """
+You are Morning Dispatch's search query refinement agent.
+Your task is to analyze why a search returned very few or no results for a specific source adapter, and suggest improved search queries.
+Respect the provided current_date and lookback_hours. Do not widen the time window, and do not add stale years unless the user's topic explicitly asks for historical content.
+
+Format your response as a strict JSON object with this shape:
+{
+  "refined_queries": ["query 1", "query 2", "query 3", "query 4"],
+  "explanation": "concise explanation of the changes made"
 }
+
+Do not include any markup, fences, or text other than the JSON object.
+""".strip(),
+}
+
 
 
 def _parse_yaml(text: str) -> Dict[str, str]:

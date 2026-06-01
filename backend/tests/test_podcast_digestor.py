@@ -213,3 +213,10 @@ def test_discover_podcasts_returns_empty_without_credentials(monkeypatch, tmp_pa
     monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(tmp_path / "secrets"))
 
     assert asyncio.run(podcast.discover_podcasts("AI daily brief")) == []
+
+
+def test_discovery_query_extracts_tokens_without_whitelist():
+    query = podcast._discovery_query("climate change and global warming impacts")
+    assert query == "climate change global warming impacts"
+    assert podcast._discovery_query("and the") == "podcast"
+
