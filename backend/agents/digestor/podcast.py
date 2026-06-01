@@ -131,7 +131,7 @@ async def _fetch_podcast_episodes(
     if not feed_sources:
         return [], decisions
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT}) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
         batches = await asyncio.gather(
             *[_timed_fetch_feed_episodes(client, source) for source in feed_sources],
             return_exceptions=True,
@@ -345,7 +345,7 @@ async def discover_podcasts(query: str, *, limit: int = 8) -> list[dict[str, Any
         "Authorization": authorization,
     }
     params = {"q": query.strip(), "max": max(1, min(limit, 25))}
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers=headers) as client:
         response = await client.get("https://api.podcastindex.org/api/1.0/search/byterm", params=params)
         response.raise_for_status()
         data = response.json()

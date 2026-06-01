@@ -1185,8 +1185,9 @@ def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchR
         if not adapter:
             adapter = r.payload.source_type or "web_search"
 
-        limit = per_source.get(adapter, 25) if isinstance(per_source, dict) else 25
-        limit = min(limit, 25)
+        max_allowed = 20 if adapter in ("youtube", "podcasts") else (40 if adapter in ("markets", "web_search", "gmail", "foreign_media") else 25)
+        limit = per_source.get(adapter, max_allowed) if isinstance(per_source, dict) else max_allowed
+        limit = min(limit, max_allowed)
 
         if r.tier != "dropped":
             current = counts.get(adapter, 0)

@@ -165,6 +165,10 @@ query_refinement: |
   Your task is to analyze why a search returned very few or no results for a specific source adapter, and suggest improved search queries.
   Respect the provided current_date and lookback_hours. Do not widen the time window, and do not add stale years unless the user's topic explicitly asks for historical content.
   
+  CRITICAL:
+  - For the "podcasts" source adapter, search queries MUST be extremely short (1 to 3 words max, e.g. "AI hardware", "semiconductor podcast", "data center power") because the podcast index directory query matching is very strict and returns zero results for long phrases.
+  - Suggest alternative synonyms or broader concepts if specific keywords are too narrow.
+  
   Format your response as a strict JSON object with this shape:
   {
     "refined_queries": ["query 1", "query 2", "query 3", "query 4"],

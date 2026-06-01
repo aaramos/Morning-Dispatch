@@ -764,7 +764,7 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                     "foreign_media": 25,
                     "gmail": 25,
                     "markets": 25,
-                    "podcasts": 25,
+                    "podcasts": 20,
                     "web_search": 5,
                     "youtube": 2,
                 },

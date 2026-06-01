@@ -230,7 +230,15 @@ class DiscoveryRunner:
             other_candidates,
             target_limit=_explicit_total_limit(profile),
         )
-        non_lane_capacity = max(0, target_capacity - len(lane_candidates))
+        is_constrained = (
+            (_explicit_total_limit(profile) is not None and _explicit_total_limit(profile) < 150) or
+            (context.candidate_limit < 150)
+        )
+        if is_constrained:
+            non_lane_capacity = max(0, target_capacity - len(lane_candidates))
+        else:
+            non_lane_capacity = _lane_limit(profile, "web_search", default=250, system_max=250)
+
         deduped_other = _dedupe_candidates(other_candidates, limit=non_lane_capacity)
 
         # Combine reserved lane results with the backfilled candidate stream.
