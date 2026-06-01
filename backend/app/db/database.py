@@ -1288,6 +1288,10 @@ def reset_exploration_for_rebuild(
                 exploration_id,
             ),
         )
+        connection.execute(
+            "DELETE FROM source_watermarks WHERE digest_id = ?",
+            (exploration_id,),
+        )
     return get_exploration(exploration_id)
 
 
