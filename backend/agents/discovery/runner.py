@@ -257,7 +257,7 @@ class DiscoveryRunner:
                     "original_url": c.payload.original_url,
                     "source_type": c.payload.source_type,
                     "source_name": c.payload.source_name,
-                    "title": c.reason or c.payload.metadata.get("title") or "Candidate item",
+                    "title": _candidate_title(c),
                     "excluded_by": ["discovery_limits"],
                     "reason": "Duplicate content or exceeded discovery lane/capacity limits.",
                 })
@@ -539,7 +539,7 @@ def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate]) -
                     "original_url": candidate.payload.original_url,
                     "source_type": candidate.payload.source_type,
                     "source_name": candidate.payload.source_name,
-                    "title": candidate.reason,
+                    "title": _candidate_title(candidate),
                     "excluded_by": ["low_topic_overlap"],
                     "reason": "Filtered because the item did not overlap the confirmed topic.",
                 }
@@ -716,3 +716,31 @@ def _adapter_signal_bonus(profile_signals: set[str], adapter_good_for: tuple[str
     if matching <= 0:
         return 0.0
     return min(0.18, matching * 0.045)
+
+
+def _candidate_title(c: Candidate) -> str:
+    metadata = c.payload.metadata or {}
+    title = (
+        metadata.get("title")
+        or metadata.get("subject")
+        or metadata.get("link_text")
+        or metadata.get("parent_subject")
+        or metadata.get("youtube_title")
+        or metadata.get("podcast_title")
+    )
+    if title:
+        title_str = str(title).strip()
+        if title_str.lower() not in {"", "approved gmail newsletter item.", "approved gmail newsletter item", "candidate item", "excluded candidate"}:
+            return title_str
+    if c.payload.source_name:
+        return c.payload.source_name
+    if c.payload.original_url:
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(c.payload.original_url)
+            host = parsed.netloc.removeprefix("www.").strip()
+            if host:
+                return host
+        except Exception:
+            pass
+    return c.reason or "Source item"

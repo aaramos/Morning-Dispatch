@@ -3,6 +3,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 from backend.app.core.config import get_settings
 from backend.app.db import database
@@ -10,6 +11,97 @@ from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.discovery.types import DiscoveryResult
 
 logger = logging.getLogger(__name__)
+
+GENERIC_TITLE_VALUES = {
+    "",
+    "approved gmail newsletter item.",
+    "approved gmail newsletter item",
+    "candidate item",
+    "excluded candidate",
+    "filtered candidate",
+}
+
+
+def _clean_title_value(value: Any) -> str:
+    title = str(value or "").strip()
+    if title.lower() in GENERIC_TITLE_VALUES:
+        return ""
+    return title
+
+
+def _title_from_url(url: Any) -> str:
+    parsed = urlparse(str(url or ""))
+    host = parsed.netloc.removeprefix("www.").strip()
+    if host:
+        return host
+    return ""
+
+
+def _title_from_metadata(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    for key in (
+        "title",
+        "subject",
+        "parent_subject",
+        "section_title",
+        "link_text",
+        "youtube_title",
+        "podcast_title",
+        "original_search_title",
+        "company_name",
+    ):
+        title = _clean_title_value(metadata.get(key))
+        if title:
+            return title
+    return ""
+
+
+def _candidate_title_from_payload(payload: Any, *, reason: Any = "", fallback: str = "Source item") -> str:
+    metadata = getattr(payload, "metadata", None) or {}
+    title = _title_from_metadata(metadata)
+    if title:
+        return title
+    for value in (
+        getattr(payload, "source_name", ""),
+        reason,
+        _title_from_url(getattr(payload, "original_url", "")),
+        fallback,
+    ):
+        title = _clean_title_value(value)
+        if title:
+            return title
+    return fallback
+
+
+def _candidate_title_from_mapping(item: Dict[str, Any], *, fallback: str = "Source item") -> str:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    title = _title_from_metadata(metadata) or _title_from_metadata(payload_metadata)
+    if title:
+        return title
+    for value in (
+        item.get("title"),
+        item.get("subject"),
+        item.get("item"),
+        item.get("source_name"),
+        item.get("reason"),
+        payload.get("source_name"),
+        _title_from_url(item.get("original_url") or item.get("url") or payload.get("original_url")),
+        fallback,
+    ):
+        title = _clean_title_value(value)
+        if title:
+            return title
+    return fallback
+
+
+def _article_title(result: ArticleFetchResult, *, fallback: str = "Source item") -> str:
+    title = _clean_title_value(result.title)
+    if title:
+        return title
+    return _candidate_title_from_payload(result.payload, fallback=fallback)
 
 
 def compile_reporting_data(
@@ -272,6 +364,12 @@ def get_or_build_reporting_log(exploration_id: str) -> List[Dict[str, Any]]:
         except Exception as exc:
             logger.warning("Failed to read reporting json for exploration %s: %s", exploration_id, exc)
 
+    exploration = database.get_exploration(exploration_id)
+    if exploration:
+        progress = exploration.get("progress") or {}
+        if "candidate_reporting_data" in progress:
+            return progress["candidate_reporting_data"]
+
     logger.info("Reconstructing reporting log on-demand for exploration %s", exploration_id)
     return reconstruct_reporting_data(exploration_id)
 
@@ -357,7 +455,7 @@ def reconstruct_reporting_data(exploration_id: str) -> List[Dict[str, Any]]:
         if not cand_id:
             continue
         url = ex.get("original_url") or ex.get("url") or ""
-        title = ex.get("title") or "Excluded Candidate"
+        title = _candidate_title_from_mapping(ex, fallback="Excluded Candidate")
         adapter = ex.get("adapter") or ex.get("source_type") or "web_search"
         reason = ex.get("reason") or "Excluded during discovery."
         excluded_by = ex.get("excluded_by") or []
@@ -387,7 +485,7 @@ def reconstruct_reporting_data(exploration_id: str) -> List[Dict[str, Any]]:
     filter_notes = progress.get("source_filter_notes") or []
     for note in filter_notes:
         url = note.get("item_url") or note.get("url") or ""
-        title = note.get("item") or note.get("source_name") or "Filtered Candidate"
+        title = _candidate_title_from_mapping(note, fallback="Filtered Candidate")
         source = note.get("source") or "web_search"
         reason = note.get("reason") or "Published outside the requested source window."
 

@@ -626,6 +626,7 @@ async def _run_exploration(
                 final_results=article_results,
                 progress=progress,
             )
+            progress["candidate_reporting_data"] = report_data
             save_reporting_log(exploration_id, report_data)
         except Exception as exc:
             logger.exception("Failed to compile or save reporting log for exploration %s: %s", exploration_id, exc)
