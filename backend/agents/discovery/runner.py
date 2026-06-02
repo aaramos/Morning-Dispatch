@@ -258,6 +258,9 @@ class DiscoveryRunner:
                     "source_type": c.payload.source_type,
                     "source_name": c.payload.source_name,
                     "title": _candidate_title(c),
+                    "subject": c.payload.metadata.get("subject") or c.payload.metadata.get("parent_subject"),
+                    "link_text": c.payload.metadata.get("link_text"),
+                    "metadata": dict(c.payload.metadata or {}),
                     "excluded_by": ["discovery_limits"],
                     "reason": "Duplicate content or exceeded discovery lane/capacity limits.",
                 })
@@ -540,6 +543,9 @@ def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate]) -
                     "source_type": candidate.payload.source_type,
                     "source_name": candidate.payload.source_name,
                     "title": _candidate_title(candidate),
+                    "subject": candidate.payload.metadata.get("subject") or candidate.payload.metadata.get("parent_subject"),
+                    "link_text": candidate.payload.metadata.get("link_text"),
+                    "metadata": dict(candidate.payload.metadata or {}),
                     "excluded_by": ["low_topic_overlap"],
                     "reason": "Filtered because the item did not overlap the confirmed topic.",
                 }
@@ -722,11 +728,11 @@ def _candidate_title(c: Candidate) -> str:
     metadata = c.payload.metadata or {}
     title = (
         metadata.get("title")
-        or metadata.get("subject")
         or metadata.get("link_text")
-        or metadata.get("parent_subject")
         or metadata.get("youtube_title")
         or metadata.get("podcast_title")
+        or metadata.get("subject")
+        or metadata.get("parent_subject")
     )
     if title:
         title_str = str(title).strip()

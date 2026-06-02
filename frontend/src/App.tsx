@@ -3897,6 +3897,13 @@ function AdminApp() {
 
   useEffect(() => {
     if (!issueRun) return;
+    const currentTab = new URLSearchParams(window.location.search).get("tab") || "status";
+    if (currentTab === "reporting") {
+      void api<{ built_with_issues: boolean; issues: ExplorationIssue[] }>(`/api/admin/explorations/${issueRun}/issues`)
+        .then(setIssueDetails)
+        .catch(() => setIssueDetails(null));
+      return;
+    }
     setTab("library");
     void api<{ built_with_issues: boolean; issues: ExplorationIssue[] }>(`/api/admin/explorations/${issueRun}/issues`)
       .then(setIssueDetails)
@@ -4842,11 +4849,7 @@ function AdminApp() {
                         className="secondary-action"
                         onClick={() => {
                           handleSelectRunId(item.exploration.exploration_id);
-                          setTab("reporting");
-                          const url = new URL(window.location.href);
-                          url.searchParams.set("tab", "reporting");
-                          url.searchParams.set("issue_run", item.exploration.exploration_id);
-                          window.history.replaceState(null, "", url.toString());
+                          changeTab("reporting");
                         }}
                       >
                         Report
@@ -5000,11 +5003,7 @@ function AdminApp() {
                         className="secondary-action"
                         onClick={() => {
                           handleSelectRunId(topic.latest_exploration!.exploration_id);
-                          setTab("reporting");
-                          const url = new URL(window.location.href);
-                          url.searchParams.set("tab", "reporting");
-                          url.searchParams.set("issue_run", topic.latest_exploration!.exploration_id);
-                          window.history.replaceState(null, "", url.toString());
+                          changeTab("reporting");
                         }}
                       >
                         Report

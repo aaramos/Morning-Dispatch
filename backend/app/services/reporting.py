@@ -19,6 +19,16 @@ GENERIC_TITLE_VALUES = {
     "candidate item",
     "excluded candidate",
     "filtered candidate",
+    "youtube metadata signal.",
+    "youtube metadata signal",
+    "youtube transcript signal.",
+    "youtube transcript signal",
+    "web result from tavily.",
+    "web result from tavily",
+    "web result from brave.",
+    "web result from brave",
+    "web result from serpapi.",
+    "web result from serpapi",
 }
 
 
@@ -42,13 +52,13 @@ def _title_from_metadata(metadata: Any) -> str:
         return ""
     for key in (
         "title",
-        "subject",
-        "parent_subject",
-        "section_title",
         "link_text",
         "youtube_title",
         "podcast_title",
         "original_search_title",
+        "subject",
+        "parent_subject",
+        "section_title",
         "company_name",
     ):
         title = _clean_title_value(metadata.get(key))
@@ -273,22 +283,30 @@ def compile_reporting_data(
         if cand_id not in after_audit_ids:
             set_reason_at_stage(cand_id, "audit", audit_reason)
 
-    # 7. Add editorial drops
     editorial_reasons = {}
     editorial_str = (progress.get("reasoning") or {}).get("editorial") or ""
     if editorial_str:
-        decisions = re.findall(
-            r'\"index\"\s*:\s*(\d+)[^}]+?\"decision\"\s*:\s*\"([^\"]+)\"[^}]+?\"reason\"\s*:\s*\"([^\"]+)\"',
-            editorial_str,
-            re.DOTALL,
-        )
-        for idx_str, decision, reason in decisions:
-            try:
-                idx = int(idx_str)
-                if 0 <= idx < len(after_audit):
+        try:
+            editorial_data = json.loads(editorial_str)
+            decisions_list = editorial_data.get("decisions") or []
+            for dec in decisions_list:
+                idx = dec.get("index")
+                reason = dec.get("reason")
+                if idx is not None and 0 <= idx < len(after_audit):
                     editorial_reasons[after_audit[idx].payload.id] = reason
-            except Exception:
-                pass
+        except Exception:
+            decisions = re.findall(
+                r'\"index\"\s*:\s*(\d+)[^}]+?\"decision\"\s*:\s*\"([^\"]+)\"[^}]+?\"reason\"\s*:\s*\"([^\"]+)\"',
+                editorial_str,
+                re.DOTALL,
+            )
+            for idx_str, decision, reason in decisions:
+                try:
+                    idx = int(idx_str)
+                    if 0 <= idx < len(after_audit):
+                        editorial_reasons[after_audit[idx].payload.id] = reason
+                except Exception:
+                    pass
 
     after_editorial_ids = {r.payload.id for r in after_editorial if r.tier != "dropped"}
     for result in after_audit:
@@ -519,28 +537,53 @@ def reconstruct_reporting_data(exploration_id: str) -> List[Dict[str, Any]]:
     reasoning = progress.get("reasoning") or {}
     editorial_str = reasoning.get("editorial") or ""
     if editorial_str:
-        decisions = re.findall(
-            r'\"index\"\s*:\s*(\d+)[^}]+?\"decision\"\s*:\s*\"([^\"]+)\"[^}]+?\"reason\"\s*:\s*\"([^\"]+)\"',
-            editorial_str,
-            re.DOTALL,
-        )
-        for idx_str, decision, reason in decisions:
-            if decision in ("exclude", "demote"):
-                key = f"editorial-exclusion-{idx_str}"
-                candidates[key] = {
-                    "title": f"Editorial Excluded Candidate (Index {idx_str})",
-                    "url": "",
-                    "source": "editorial_agent",
-                    "stages": {
-                        "discovery": None,
-                        "screening": None,
-                        "recency": None,
-                        "fetch": None,
-                        "audit": None,
-                        "editorial": reason if decision == "exclude" else None,
-                        "critic": None,
-                        "inclusion": None,
-                    },
-                }
+        try:
+            editorial_data = json.loads(editorial_str)
+            decisions_list = editorial_data.get("decisions") or []
+            for dec in decisions_list:
+                idx = dec.get("index")
+                decision = dec.get("decision")
+                reason = dec.get("reason")
+                if idx is not None and decision in ("exclude", "demote"):
+                    key = f"editorial-exclusion-{idx}"
+                    candidates[key] = {
+                        "title": f"Editorial Excluded Candidate (Index {idx})",
+                        "url": "",
+                        "source": "editorial_agent",
+                        "stages": {
+                            "discovery": None,
+                            "screening": None,
+                            "recency": None,
+                            "fetch": None,
+                            "audit": None,
+                            "editorial": reason if decision == "exclude" else None,
+                            "critic": None,
+                            "inclusion": None,
+                        },
+                    }
+        except Exception:
+            decisions = re.findall(
+                r'\"index\"\s*:\s*(\d+)[^}]+?\"decision\"\s*:\s*\"([^\"]+)\"[^}]+?\"reason\"\s*:\s*\"([^\"]+)\"',
+                editorial_str,
+                re.DOTALL,
+            )
+            for idx_str, decision, reason in decisions:
+                if decision in ("exclude", "demote"):
+                    key = f"editorial-exclusion-{idx_str}"
+                    candidates[key] = {
+                        "title": f"Editorial Excluded Candidate (Index {idx_str})",
+                        "url": "",
+                        "source": "editorial_agent",
+                        "stages": {
+                            "discovery": None,
+                            "screening": None,
+                            "recency": None,
+                            "fetch": None,
+                            "audit": None,
+                            "editorial": reason if decision == "exclude" else None,
+                            "critic": None,
+                            "inclusion": None,
+                        },
+                    }
 
     return list(candidates.values())

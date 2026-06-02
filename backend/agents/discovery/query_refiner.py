@@ -194,8 +194,11 @@ async def screen_candidates(
                     metadata = c.payload.metadata or {}
                     title = (
                         metadata.get("title")
-                        or metadata.get("subject")
                         or metadata.get("link_text")
+                        or metadata.get("subject")
+                        or metadata.get("parent_subject")
+                        or metadata.get("youtube_title")
+                        or metadata.get("podcast_title")
                         or c.payload.source_name
                         or c.reason
                     )
@@ -206,6 +209,9 @@ async def screen_candidates(
                         "source_type": c.payload.source_type,
                         "source_name": c.payload.source_name,
                         "title": title,
+                        "subject": metadata.get("subject") or metadata.get("parent_subject"),
+                        "link_text": metadata.get("link_text"),
+                        "metadata": dict(metadata),
                         "excluded_by": ["agentic_screening"],
                         "reason": "Filtered by agentic screening (spam, promotion, or off-topic).",
                     })
