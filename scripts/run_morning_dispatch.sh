@@ -15,8 +15,7 @@ mkdir -p \
   "$SECRETS_HOME/tavily" \
   "$SECRETS_HOME/brave" \
   "$SECRETS_HOME/serpapi" \
-  "$SECRETS_HOME/youtube" \
-  "$SECRETS_HOME/ollama"
+  "$SECRETS_HOME/youtube"
 chmod 700 \
   "$SECRETS_HOME" \
   "$SECRETS_HOME/gmail" \
@@ -25,8 +24,7 @@ chmod 700 \
   "$SECRETS_HOME/tavily" \
   "$SECRETS_HOME/brave" \
   "$SECRETS_HOME/serpapi" \
-  "$SECRETS_HOME/youtube" \
-  "$SECRETS_HOME/ollama"
+  "$SECRETS_HOME/youtube"
 cd "$PROJECT_DIR"
 
 # Source machine-local overrides (gitignored). Put MORNING_DISPATCH_PUBLIC_BASE_URL
@@ -76,10 +74,6 @@ fi
 
 if [[ -z "${MORNING_DISPATCH_YOUTUBE_API_KEY:-}" && -f "$SECRETS_HOME/youtube/api_key" ]]; then
   export MORNING_DISPATCH_YOUTUBE_API_KEY="$(< "$SECRETS_HOME/youtube/api_key")"
-fi
-
-if [[ -z "${MORNING_DISPATCH_OLLAMA_API_KEY:-}" && -f "$SECRETS_HOME/ollama/api_key" ]]; then
-  export MORNING_DISPATCH_OLLAMA_API_KEY="$(< "$SECRETS_HOME/ollama/api_key")"
 fi
 
 # Read local model API key from oMLX settings if not already set.
