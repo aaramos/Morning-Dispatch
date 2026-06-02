@@ -127,6 +127,16 @@ class StrategyRefinementMessage(BaseModel):
     models: dict[str, Any] = Field(default_factory=dict)
 
 
+class StrategyRefinementStreamMessage(BaseModel):
+    instruction: str = Field(min_length=1, max_length=4000)
+    models: dict[str, Any] = Field(default_factory=dict)
+
+
+class StrategyReviewStreamMessage(BaseModel):
+    profile: dict[str, Any] = Field(default_factory=dict)
+    models: dict[str, Any] = Field(default_factory=dict)
+
+
 class StrategyReviewMessage(BaseModel):
     profile: dict[str, Any] = Field(default_factory=dict)
     models: dict[str, Any] = Field(default_factory=dict)
@@ -252,6 +262,46 @@ def refine_search_strategy(session_id: str, payload: StrategyRefinementMessage) 
     if session is None:
         raise HTTPException(status_code=404, detail="Refinement session not found")
     return session
+
+
+@router.post("/explore/refinement-sessions/{session_id}/strategy/stream")
+async def stream_refine_strategy(session_id: str, payload: StrategyRefinementStreamMessage) -> StreamingResponse:
+    async def event_source() -> Any:
+        try:
+            async for event in refinement.astream_refine_strategy(
+                session_id=session_id,
+                instruction=payload.instruction,
+                models=payload.models,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@router.post("/explore/refinement-sessions/{session_id}/strategy/review/stream")
+async def stream_review_strategy(session_id: str, payload: StrategyReviewStreamMessage) -> StreamingResponse:
+    async def event_source() -> Any:
+        try:
+            async for event in refinement.astream_review_strategy(
+                session_id=session_id,
+                profile_payload=payload.profile or None,
+                models=payload.models,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @router.post("/explore/refinement-sessions/{session_id}/strategy/review")

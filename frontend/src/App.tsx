@@ -626,11 +626,33 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+type GmailCandidatePayload = {
+  candidates: Array<{
+    sender: string;
+    sender_name?: string | null;
+    message_count?: number;
+    subject?: string | null;
+    ai_rationale?: string | null;
+  }>;
+  intro: string;
+  criteria: string;
+  search_phrase: string;
+  lookback_hours: number;
+};
+
 type RefinementStreamEvent =
   | { type: "session"; session_id: string }
   | { type: "token"; text: string }
   | { type: "plan"; session: RefinementSession }
   | { type: "done"; session: RefinementSession; ready: boolean }
+  | { type: "gmail_candidates" } & GmailCandidatePayload
+  | { type: "gmail_approved"; senders: string[] }
+  | { type: "error"; message: string };
+
+type StrategyStreamEvent =
+  | { type: "token"; text: string }
+  | { type: "proposal"; session: RefinementSession }
+  | { type: "done"; session: RefinementSession; has_proposal: boolean }
   | { type: "error"; message: string };
 
 type RefinementStreamBody = {
@@ -642,13 +664,9 @@ type RefinementStreamBody = {
   just_go_now?: boolean;
 };
 
-// Streams an AI-led refinement turn over Server-Sent Events, invoking onEvent for
-// each parsed event (session id, prose tokens, the live plan snapshot, and done/error).
-async function streamRefinement(
-  body: RefinementStreamBody,
-  onEvent: (event: RefinementStreamEvent) => void,
-): Promise<void> {
-  const response = await fetch("/api/explore/refinement-sessions/stream", {
+// Generic SSE reader — POST body, yield parsed JSON events.
+async function readSSE<T>(url: string, body: unknown, onEvent: (event: T) => void): Promise<void> {
+  const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -672,7 +690,7 @@ async function streamRefinement(
         const payload = dataLine.slice(5).trim();
         if (payload) {
           try {
-            onEvent(JSON.parse(payload) as RefinementStreamEvent);
+            onEvent(JSON.parse(payload) as T);
           } catch {
             // Ignore malformed frames; the stream continues.
           }
@@ -681,6 +699,37 @@ async function streamRefinement(
       boundary = buffer.indexOf("\n\n");
     }
   }
+}
+
+async function streamRefinement(
+  body: RefinementStreamBody,
+  onEvent: (event: RefinementStreamEvent) => void,
+): Promise<void> {
+  return readSSE("/api/explore/refinement-sessions/stream", body, onEvent);
+}
+
+async function streamStrategyRefinement(
+  sessionId: string,
+  instruction: string,
+  onEvent: (event: StrategyStreamEvent) => void,
+): Promise<void> {
+  return readSSE(
+    `/api/explore/refinement-sessions/${sessionId}/strategy/stream`,
+    { instruction, models: {} },
+    onEvent,
+  );
+}
+
+async function streamStrategyReview(
+  sessionId: string,
+  profilePayload: Record<string, unknown>,
+  onEvent: (event: StrategyStreamEvent) => void,
+): Promise<void> {
+  return readSSE(
+    `/api/explore/refinement-sessions/${sessionId}/strategy/review/stream`,
+    { profile: profilePayload, models: {} },
+    onEvent,
+  );
 }
 
 function loadInterestDraft(): string {
@@ -775,6 +824,10 @@ function DispatchApp() {
   const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [strategyStreamingText, setStrategyStreamingText] = useState("");
+  const [strategyStreaming, setStrategyStreaming] = useState(false);
+  const [strategyPreparingProposal, setStrategyPreparingProposal] = useState(false);
+  const [gmailCandidates, setGmailCandidates] = useState<GmailCandidatePayload | null>(null);
   const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
   const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
   const [strategyConfirmation, setStrategyConfirmation] = useState("");
@@ -953,6 +1006,17 @@ function DispatchApp() {
         } else if (event.type === "done") {
           finalSession = event.session;
           ready = event.ready;
+        } else if (event.type === "gmail_candidates") {
+          // Pause the stream; render the approval UI — next user turn is the approval reply.
+          setGmailCandidates({
+            candidates: event.candidates,
+            intro: event.intro,
+            criteria: event.criteria,
+            search_phrase: event.search_phrase,
+            lookback_hours: event.lookback_hours,
+          });
+        } else if (event.type === "gmail_approved") {
+          setGmailCandidates(null);
         } else if (event.type === "error") {
           streamError = event.message;
         }
@@ -1054,8 +1118,10 @@ function DispatchApp() {
     const baseStatement = activeInterest || topicProfile?.statement || session?.statement || "";
     if (!baseStatement) return;
     setBusy(true);
-    setMessage("Asking AI to review your strategy feedback...");
-    beginRefinementProgress("answering", "Reviewing strategy feedback");
+    setStrategyStreaming(true);
+    setStrategyStreamingText("");
+    setStrategyPreparingProposal(false);
+    setMessage("Asking AI to review your strategy...");
     try {
       const currentSession = session ?? await api<RefinementSession>("/api/explore/refinement-sessions", {
         method: "POST",
@@ -1067,25 +1133,49 @@ function DispatchApp() {
           models: {},
         }),
       });
-      const updated = await api<RefinementSession>(`/api/explore/refinement-sessions/${currentSession.session_id}/strategy`, {
-        method: "POST",
-        body: JSON.stringify({
-          instruction: cleanInstruction,
-          models: {},
-        }),
+
+      let liveText = "";
+      let finalSession: RefinementSession | null = null;
+      let hasProposal = false;
+
+      await streamStrategyRefinement(currentSession.session_id, cleanInstruction, (event) => {
+        if (event.type === "token") {
+          liveText += event.text;
+          setStrategyStreamingText(liveText);
+        } else if (event.type === "proposal") {
+          // Prose streamed; now running critique pass — show shimmer.
+          setStrategyStreamingText("");
+          setStrategyPreparingProposal(true);
+          finalSession = event.session;
+        } else if (event.type === "done") {
+          finalSession = event.session;
+          hasProposal = event.has_proposal;
+          setStrategyPreparingProposal(false);
+        }
       });
-      setSession(updated);
-      const proposal = updated.pending_strategy_refinement?.proposed_profile;
-      if (proposal) setDraft(draftFromProfile(proposal, defaultControls.content_limits));
-      if (updated.topic_profile) setTopicProfile(updated.topic_profile);
-      setFlow("confirm");
-      setStrategyConfirmation(updated.pending_strategy_refinement?.assistant_response || "AI prepared a proposed strategy update for review.");
-      setMessage("Review the proposed strategy update");
+
+      if (finalSession) {
+        const resolved: RefinementSession = finalSession;
+        setSession(resolved);
+        const proposal = resolved.pending_strategy_refinement?.proposed_profile;
+        if (proposal) setDraft(draftFromProfile(proposal, defaultControls.content_limits));
+        if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
+        setFlow("confirm");
+        if (hasProposal) {
+          setStrategyConfirmation(resolved.pending_strategy_refinement?.assistant_response || "AI prepared a proposed strategy update for review.");
+          setMessage("Review the proposed strategy update");
+        } else {
+          setStrategyConfirmation(resolved.strategy_review?.assistant_response || "Strategy looks good — no changes needed.");
+          setMessage("Strategy review complete");
+        }
+      }
     } catch (error) {
       setMessage(errorMessage(error, "Could not update search strategy"));
     } finally {
       setBusy(false);
-      endRefinementProgress();
+      setStrategyStreaming(false);
+      setStrategyStreamingText("");
+      setStrategyPreparingProposal(false);
     }
   }
 
@@ -1156,31 +1246,54 @@ function DispatchApp() {
         models: {},
       }),
     });
-    const reviewed = await api<RefinementSession>(`/api/explore/refinement-sessions/${currentSession.session_id}/strategy/review`, {
-      method: "POST",
-      body: JSON.stringify({
-        profile: profilePayload,
-        models: {},
-      }),
-    });
-    profilePayload.refinement_session_id = reviewed.session_id;
-    setSession(reviewed);
-    const proposal = reviewed.pending_strategy_refinement?.proposed_profile;
-    if (proposal) {
+
+    profilePayload.refinement_session_id = currentSession.session_id;
+    let finalSession: RefinementSession | null = null;
+    let hasProposal = false;
+
+    setStrategyStreaming(true);
+    setStrategyStreamingText("");
+
+    try {
+      await streamStrategyReview(
+        currentSession.session_id,
+        profilePayload as Record<string, unknown>,
+        (event) => {
+          if (event.type === "token") {
+            setStrategyStreamingText((prev) => prev + event.text);
+          } else if (event.type === "proposal") {
+            finalSession = event.session;
+          } else if (event.type === "done") {
+            finalSession = event.session;
+            hasProposal = event.has_proposal;
+          }
+        },
+      );
+    } finally {
+      setStrategyStreaming(false);
+      setStrategyStreamingText("");
+    }
+
+    if (!finalSession) return true;
+    const resolved: RefinementSession = finalSession;
+    setSession(resolved);
+
+    const proposal = resolved.pending_strategy_refinement?.proposed_profile;
+    if (proposal && hasProposal) {
       setDraft(draftFromProfile(proposal, defaultControls.content_limits));
-      if (reviewed.topic_profile) setTopicProfile(reviewed.topic_profile);
+      if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
       setFlow("confirm");
       setStrategyConfirmation(
-        reviewed.pending_strategy_refinement?.assistant_response
+        resolved.pending_strategy_refinement?.assistant_response
           || "AI found strategy changes to review before building."
       );
       setMessage("Review the AI strategy proposal before building");
       return false;
     }
-    if (reviewed.strategy_review?.assistant_response) {
-      setStrategyConfirmation(reviewed.strategy_review.assistant_response);
+    if (resolved.strategy_review?.assistant_response) {
+      setStrategyConfirmation(resolved.strategy_review.assistant_response);
     }
-    if (reviewed.topic_profile) setTopicProfile(reviewed.topic_profile);
+    if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
     return true;
   }
 
@@ -1811,9 +1924,17 @@ function DispatchApp() {
               busy={busy}
               streaming={streaming}
               streamingText={streamingText}
+              gmailCandidates={gmailCandidates}
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
               onJustGo={() => void answerRefinement(true)}
+              onGmailApprove={(approvedSenders) => {
+                const reply = approvedSenders.length
+                  ? `Approved: ${approvedSenders.join(", ")}`
+                  : "none";
+                setAnswer(reply);
+                void answerRefinement(false);
+              }}
             />
           ) : null}
 
@@ -1824,6 +1945,9 @@ function DispatchApp() {
               strategyPreview={session?.strategy_preview ?? null}
               pendingStrategy={session?.pending_strategy_refinement ?? null}
               strategyConfirmation={strategyConfirmation}
+              strategyStreaming={strategyStreaming}
+              strategyStreamingText={strategyStreamingText}
+              strategyPreparingProposal={strategyPreparingProposal}
               sources={sourceSelection}
               sourceStatus={sourceStatus}
               defaultContentLimits={defaultControls.content_limits}
@@ -1962,6 +2086,93 @@ function DispatchApp() {
   );
 }
 
+function GmailApprovalCard(props: {
+  payload: GmailCandidatePayload;
+  busy: boolean;
+  onApprove: (senders: string[]) => void;
+}) {
+  const [selected, setSelected] = useState<Set<string>>(
+    () => new Set(props.payload.candidates.map((c) => c.sender)),
+  );
+
+  function toggle(sender: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(sender)) next.delete(sender);
+      else next.add(sender);
+      return next;
+    });
+  }
+
+  return (
+    <div className="gmail-approval-card">
+      <div className="gmail-approval-intro">
+        <div className="chat-avatar ai" style={{ flexShrink: 0 }}>M</div>
+        <p>{props.payload.intro}</p>
+      </div>
+      {props.payload.candidates.length > 0 ? (
+        <ul className="gmail-sender-list">
+          {props.payload.candidates.map((candidate) => {
+            const isSelected = selected.has(candidate.sender);
+            return (
+              <li
+                key={candidate.sender}
+                className={`gmail-sender-row ${isSelected ? "selected" : ""}`}
+                onClick={() => toggle(candidate.sender)}
+                role="checkbox"
+                aria-checked={isSelected}
+                tabIndex={0}
+                onKeyDown={(e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggle(candidate.sender); } }}
+              >
+                <span className={`gmail-sender-check ${isSelected ? "on" : ""}`}>
+                  {isSelected ? "✓" : ""}
+                </span>
+                <div className="gmail-sender-details">
+                  <strong>{candidate.sender_name || candidate.sender}</strong>
+                  <span className="gmail-sender-email">{candidate.sender_name ? candidate.sender : null}</span>
+                  {candidate.ai_rationale ? (
+                    <span className="gmail-sender-rationale">{candidate.ai_rationale}</span>
+                  ) : null}
+                  <span className="gmail-sender-meta">
+                    {candidate.message_count != null ? `${candidate.message_count} found` : null}
+                    {candidate.subject ? ` · Latest: ${candidate.subject}` : null}
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        <p className="gmail-no-candidates">
+          No newsletter senders matched that search. Name specific senders below, or confirm with none selected to skip Gmail.
+        </p>
+      )}
+      <div className="gmail-approval-actions">
+        <button
+          type="button"
+          className="primary-action"
+          onClick={() => props.onApprove([...selected])}
+          disabled={props.busy}
+        >
+          {selected.size > 0
+            ? `Approve ${selected.size} sender${selected.size === 1 ? "" : "s"}`
+            : "Continue without Gmail"}
+        </button>
+        {selected.size > 0 && props.payload.candidates.length > 0 ? (
+          <button
+            type="button"
+            className="secondary-action"
+            onClick={() => props.onApprove([])}
+            disabled={props.busy}
+          >
+            Skip Gmail
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function recencyText(weighting?: string, lookbackHours?: number | null): string {
   if (lookbackHours && lookbackHours > 0) {
     if (lookbackHours <= 48) return `Last ${lookbackHours} hours`;
@@ -1988,9 +2199,11 @@ function RefinementPanel(props: {
   busy: boolean;
   streaming: boolean;
   streamingText: string;
+  gmailCandidates: GmailCandidatePayload | null;
   onAnswerChange: (value: string) => void;
   onSend: () => void;
   onJustGo: () => void;
+  onGmailApprove: (approvedSenders: string[]) => void;
 }) {
   const threadRef = useRef<HTMLDivElement | null>(null);
   const messages = props.session?.messages ?? [];
@@ -2059,15 +2272,22 @@ function RefinementPanel(props: {
               <div className="chat-bubble2">Tell me what you're curious about and I'll shape the brief with you.</div>
             </div>
           ) : null}
+          {props.gmailCandidates ? (
+            <GmailApprovalCard
+              payload={props.gmailCandidates}
+              busy={props.busy}
+              onApprove={props.onGmailApprove}
+            />
+          ) : null}
         </div>
         <div className="chat-composer">
           <div className="chat-field">
             <textarea
               value={props.answer}
               onChange={(event) => props.onAnswerChange(event.target.value)}
-              placeholder={finalized ? "Add anything else…" : "Reply, or just tell me to go…"}
+              placeholder={props.gmailCandidates ? "Use the approval card above to select senders…" : finalized ? "Add anything else…" : "Reply, or just tell me to go…"}
               rows={1}
-              disabled={props.busy}
+              disabled={props.busy || Boolean(props.gmailCandidates)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -2367,6 +2587,9 @@ function ConfirmationPanel(props: {
   strategyPreview: StrategyPreview | null;
   pendingStrategy: PendingStrategyRefinement | null;
   strategyConfirmation: string;
+  strategyStreaming: boolean;
+  strategyStreamingText: string;
+  strategyPreparingProposal: boolean;
   sources: Record<SourceKey, boolean>;
   sourceStatus: SourceStatusResponse | null;
   defaultContentLimits: ContentLimitsDraft;
@@ -2521,6 +2744,9 @@ function ConfirmationPanel(props: {
           preview={reviewPreview}
           pendingStrategy={props.pendingStrategy}
           strategyConfirmation={props.strategyConfirmation}
+          streaming={props.strategyStreaming}
+          streamingText={props.strategyStreamingText}
+          preparingProposal={props.strategyPreparingProposal}
           busy={props.busy}
           onClose={() => setStrategyModalOpen(false)}
           onSubmit={props.onStrategyRefine}
@@ -2590,6 +2816,9 @@ function StrategyRefinementModal(props: {
   preview: StrategyPreview | null;
   pendingStrategy: PendingStrategyRefinement | null;
   strategyConfirmation: string;
+  streaming: boolean;
+  streamingText: string;
+  preparingProposal: boolean;
   busy: boolean;
   onClose: () => void;
   onSubmit: (instruction: string) => void;
@@ -2597,10 +2826,16 @@ function StrategyRefinementModal(props: {
 }) {
   const [instruction, setInstruction] = useState("");
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const threadRef = useRef<HTMLDivElement | null>(null);
   const turns = strategyConversationTurns(props.pendingStrategy, props.strategyConfirmation);
   const proposalSummary = props.pendingStrategy?.assistant_response || props.strategyConfirmation;
   const findings = props.pendingStrategy?.findings ?? [];
   const intentSummary = strategyIntentSummary(props.profile, props.preview);
+
+  useEffect(() => {
+    const node = threadRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [turns.length, props.streamingText, props.streaming]);
 
   function submit() {
     const clean = instruction.trim();
@@ -2624,7 +2859,7 @@ function StrategyRefinementModal(props: {
           <p>{intentSummary}</p>
         </div>
 
-        <div className="strategy-modal-thread" aria-live="polite">
+        <div className="strategy-modal-thread" ref={threadRef} aria-live="polite">
           {turns.length ? (
             turns.map((turn, index) => (
               <div className={`strategy-chat-turn ${turn.role === "user" ? "user" : "assistant"}`} key={`${turn.role}-${index}-${turn.content.slice(0, 24)}`}>
@@ -2638,9 +2873,30 @@ function StrategyRefinementModal(props: {
               <p>Tell me what is missing, too broad, too narrow, stale, or misweighted. I’ll translate your feedback into proposed search-strategy changes for review.</p>
             </div>
           )}
+          {props.streaming ? (
+            <div className="strategy-chat-turn assistant">
+              <b>AI</b>
+              {props.streamingText ? (
+                <p>
+                  {props.streamingText}
+                  <span className="stream-caret" />
+                </p>
+              ) : (
+                <span className="typing-dots">
+                  <span /><span /><span />
+                </span>
+              )}
+            </div>
+          ) : null}
+          {props.preparingProposal ? (
+            <div className="strategy-chat-turn assistant strategy-preparing">
+              <b>AI</b>
+              <p className="muted">Preparing proposal<span className="ellipsis-dot">.</span><span className="ellipsis-dot">.</span><span className="ellipsis-dot">.</span></p>
+            </div>
+          ) : null}
         </div>
 
-        {props.pendingStrategy ? (
+        {props.pendingStrategy && !props.streaming ? (
           <div className="strategy-modal-proposal">
             <strong>Proposed changes</strong>
             {proposalSummary ? <p>{proposalSummary}</p> : null}
@@ -2692,7 +2948,7 @@ function StrategyRefinementModal(props: {
             <button type="button" className="secondary-action" onClick={props.onClose} disabled={props.busy}>
               Done
             </button>
-            <button type="button" className="primary-action" onClick={submit} disabled={props.busy || !instruction.trim()}>
+            <button type="button" className="primary-action" onClick={submit} disabled={props.busy || !instruction.trim() || props.streaming}>
               Send to AI
             </button>
           </div>

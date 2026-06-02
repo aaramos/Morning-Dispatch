@@ -2426,3 +2426,49 @@ label {
 .plan-qlist li { font-size: 0.78rem; background: #ffffff; border: 1px solid #e7e6df; border-radius: 8px; padding: 7px 10px; color: #45433d; line-height: 1.4; }
 .plan-qsource { display: inline-block; font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.05em; color: #c8894b; font-weight: 700; margin-right: 6px; }
 .plan-ready-note { font-size: 0.8rem; color: #1c6b4d; background: #eef7f1; border: 1px solid #bfe2cf; border-radius: 8px; padding: 8px 10px; }
+
+/* ===== Gmail sender approval card ===== */
+.gmail-approval-card {
+  border: 1px solid #d8d7cf;
+  border-radius: 14px;
+  background: #fffdf5;
+  padding: 16px;
+  margin: 4px 0 8px;
+}
+.gmail-approval-intro {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+.gmail-approval-intro p { font-size: 0.92rem; margin: 0; line-height: 1.5; color: #1d1d1b; }
+.gmail-sender-list { list-style: none; margin: 0 0 14px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.gmail-sender-row {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 12px; border-radius: 10px;
+  border: 1px solid #d8d7cf; background: #fff;
+  cursor: pointer; transition: border-color 0.12s, background 0.12s;
+}
+.gmail-sender-row:hover { border-color: #c8894b; background: #fffaf3; }
+.gmail-sender-row.selected { border-color: #25a87c; background: #eef7f1; }
+.gmail-sender-check {
+  width: 20px; height: 20px; border-radius: 6px; border: 1.5px solid #c8c7bf;
+  display: grid; place-items: center; flex-shrink: 0;
+  font-size: 0.72rem; font-weight: 700; color: #fff; margin-top: 1px;
+  transition: background 0.12s, border-color 0.12s;
+}
+.gmail-sender-check.on { background: #25a87c; border-color: #25a87c; }
+.gmail-sender-details { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.gmail-sender-details strong { font-size: 0.88rem; color: #1d1d1b; }
+.gmail-sender-email { font-size: 0.76rem; color: #78756d; }
+.gmail-sender-rationale { font-size: 0.76rem; color: #c8894b; font-style: italic; }
+.gmail-sender-meta { font-size: 0.72rem; color: #9a9993; }
+.gmail-no-candidates { font-size: 0.88rem; color: #78756d; margin: 0 0 14px; font-style: italic; }
+.gmail-approval-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ===== Strategy modal streaming ===== */
+.strategy-preparing p { color: #9a9993; }
+.ellipsis-dot { animation: ellipsis-fade 1.4s infinite; }
+.ellipsis-dot:nth-child(2) { animation-delay: 0.2s; }
+.ellipsis-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes ellipsis-fade { 0%, 60%, 100% { opacity: 0.2; } 30% { opacity: 1; } }

@@ -290,8 +290,25 @@ async def astream_refinement(
     profile = _apply_models(profile, models)
     turn_count = int(session.get("turn_count") or 0)
     clean_answer = str(answer or "").strip()
+    pending_field = session.get("pending_field") or ""
 
     yield {"type": "session", "session_id": session_id}
+
+    # --- Gmail sender-approval intercept -------------------------------------------
+    # When the previous turn left pending_field=GMAIL_SENDER_SELECTION_FIELD the user
+    # is responding with their sender approval (numbers, names, "all", "none"). Handle
+    # this without involving the AI.
+    if pending_field == GMAIL_SENDER_SELECTION_FIELD and clean_answer and not just_go_now:
+        async for event in _astream_gmail_approval(
+            session_id=session_id,
+            session=session,
+            profile=profile,
+            messages=messages,
+            answer=clean_answer,
+            turn_count=turn_count,
+        ):
+            yield event
+        return
 
     client = _refinement_model_client(profile)
     if client is None:
@@ -372,6 +389,49 @@ async def astream_refinement(
         messages.append({"role": "assistant", "content": assistant_text})
 
     topic_id = session.get("topic_id")
+
+    # --- Gmail discovery intercept -------------------------------------------------
+    # When the AI has set gmail in source_selection but no include_senders are
+    # configured yet, treat the user's answer as Gmail search instructions, run the
+    # candidate discovery pipeline, and hand control to the sender-approval step.
+    gmail_candidates_event: dict[str, Any] | None = None
+    if (
+        not just_go_now
+        and not ready
+        and clean_answer
+        and _source_selection_dict(patched.get("source_selection")).get("gmail")
+        and not _normalize_gmail_rules(patched.get("gmail_rules")).get("include_senders")
+        and not _normalize_gmail_rules(patched.get("gmail_rules")).get("intent")
+        and pending_field != GMAIL_SENDER_SELECTION_FIELD
+    ):
+        gmail_candidates_event = await _astream_gmail_discovery(
+            patched=patched,
+            answer=clean_answer,
+        )
+        if gmail_candidates_event is not None:
+            # Update patched profile with the gmail_rules we just built.
+            patched = _coerce_profile(gmail_candidates_event["_patched_profile"])
+            gmail_candidates_event.pop("_patched_profile", None)
+            # Persist with pending_field=GMAIL_SENDER_SELECTION_FIELD so next turn
+            # knows it is an approval reply.
+            updated_gmail = database.update_refinement_session(
+                session_id,
+                profile=patched,
+                messages=messages,
+                pending_field=GMAIL_SENDER_SELECTION_FIELD,
+                turn_count=turn_count,
+                status="active",
+                topic_id=topic_id,
+            )
+            response_gmail = _session_response(updated_gmail) if updated_gmail else None
+            if response_gmail is None:
+                yield {"type": "error", "message": "Failed to persist Gmail discovery step"}
+                return
+            yield {"type": "plan", "session": response_gmail}
+            yield {**gmail_candidates_event, "type": "gmail_candidates"}
+            yield {"type": "done", "session": response_gmail, "ready": False}
+            return
+
     if ready:
         patched = _fill_defaults(patched)
         pre_critique = _diagnostics_query_snapshot(patched)
@@ -413,6 +473,133 @@ async def astream_refinement(
     yield {"type": "done", "session": response, "ready": ready}
 
 
+async def _astream_gmail_discovery(
+    *,
+    patched: dict[str, Any],
+    answer: str,
+) -> dict[str, Any] | None:
+    """Run Gmail candidate discovery from the user's search-instruction answer.
+
+    Returns a dict to merge into the gmail_candidates SSE event (plus a
+    ``_patched_profile`` key with the updated profile), or None if discovery
+    produced nothing useful.
+    """
+    try:
+        rules = await asyncio.to_thread(_gmail_rules_from_answer, answer, patched)
+        candidates = await asyncio.to_thread(_discover_gmail_candidates, rules, patched)
+    except Exception:
+        logger.exception("Gmail discovery failed in streaming path")
+        return None
+
+    notes = rules.pop("_ai_candidate_notes", {})
+    candidate_dicts = [
+        {
+            **candidate.to_dict(),
+            **({"ai_rationale": notes.get(candidate.sender.lower())} if notes.get(candidate.sender.lower()) else {}),
+        }
+        for candidate in candidates
+    ]
+    if candidates:
+        gmail_allowlist.record_candidates(candidate_dicts, source="refinement")
+
+    rules["candidates"] = candidate_dicts
+    updated_profile = dict(patched)
+    updated_profile["gmail_rules"] = rules
+    updated_profile["source_queries"] = _merge_source_queries(
+        updated_profile.get("source_queries"), {"gmail": [rules["gmail_search_query"]]}
+    )
+    updated_profile["lookback_hours"] = rules["lookback_hours"]
+    updated_profile["recency_weighting"] = _recency_from_lookback_hours(int(rules["lookback_hours"]))
+    updated_profile["source_scope_answered"] = True
+
+    if not candidates:
+        return {
+            "_patched_profile": updated_profile,
+            "candidates": [],
+            "intro": (
+                "I searched Gmail for that newsletter pattern but didn't find clear newsletter senders. "
+                "Name any sender or newsletter you want included, or say 'none' to continue without Gmail."
+            ),
+            "criteria": str(rules.get("selection_criteria") or ""),
+            "search_phrase": str(rules.get("gmail_search_query") or answer),
+            "lookback_hours": rules["lookback_hours"],
+        }
+
+    return {
+        "_patched_profile": updated_profile,
+        "candidates": candidate_dicts,
+        "intro": (
+            f"I searched Gmail for '{rules['gmail_search_query']}' and found these newsletter senders. "
+            "Which ones should I approve? Only approved senders are ever read into your brief."
+        ),
+        "criteria": str(rules.get("selection_criteria") or ""),
+        "search_phrase": str(rules.get("gmail_search_query") or answer),
+        "lookback_hours": rules["lookback_hours"],
+    }
+
+
+async def _astream_gmail_approval(
+    *,
+    session_id: str,
+    session: dict[str, Any],
+    profile: dict[str, Any],
+    messages: list[dict[str, str]],
+    answer: str,
+    turn_count: int,
+):
+    """Handle the sender-approval reply after Gmail candidates were shown.
+
+    Yields ``token`` (confirmation prose), ``gmail_approved`` (approved senders),
+    ``plan`` (session snapshot), and ``done``.
+    """
+    rules = _normalize_gmail_rules(profile.get("gmail_rules"))
+    include_senders = _selected_gmail_senders(answer, rules)
+    messages = [*messages, {"role": "user", "content": answer}]
+
+    updated_profile = dict(profile)
+    if include_senders:
+        approved = gmail_allowlist.approve_senders(include_senders, source="refinement")
+        rules["include_senders"] = approved or include_senders
+        updated_profile["requested_sources"] = _merge_requested_source_lists(
+            _normalize_requested_sources(updated_profile.get("requested_sources")),
+            [{"adapter": "gmail", "ref": sender} for sender in include_senders],
+        )
+        updated_profile["requested_sources_answered"] = True
+        updated_profile["gmail_rules"] = rules
+        confirmation = (
+            f"Added {', '.join(include_senders)} to your Gmail allowlist. "
+            "Their newsletters will be read as discovery feeds — the articles they link to feed directly into this brief."
+        )
+    else:
+        rules["include_senders"] = []
+        updated_profile["gmail_rules"] = rules
+        updated_profile["source_selection"] = {
+            **_source_selection_dict(updated_profile.get("source_selection")),
+            "gmail": False,
+        }
+        confirmation = "Got it — I'll continue without Gmail for this brief."
+
+    messages.append({"role": "assistant", "content": confirmation})
+    yield {"type": "token", "text": confirmation}
+
+    updated = database.update_refinement_session(
+        session_id,
+        profile=_coerce_profile(updated_profile),
+        messages=messages,
+        pending_field=AGENT_PENDING_FIELD,
+        turn_count=turn_count + 1,
+        status="active",
+        topic_id=session.get("topic_id"),
+    )
+    response = _session_response(updated) if updated else None
+    if response is None:
+        yield {"type": "error", "message": "Failed to persist Gmail approval"}
+        return
+    yield {"type": "gmail_approved", "senders": include_senders}
+    yield {"type": "plan", "session": response}
+    yield {"type": "done", "session": response, "ready": False}
+
+
 async def _astream_fallback(
     session_id: str,
     answer: str,
@@ -441,6 +628,406 @@ async def _astream_fallback(
         yield {"type": "token", "text": assistant}
     yield {"type": "plan", "session": result}
     yield {"type": "done", "session": result, "ready": result.get("status") == "finalized"}
+
+
+async def astream_refine_strategy(
+    *,
+    session_id: str,
+    instruction: str,
+    models: Any,
+):
+    """Stream the strategy-refinement conversation turn (the 'Refine search strategy' modal).
+
+    Yields: ``token`` (prose delta), ``proposal`` (session snapshot with pending_strategy_refinement),
+    ``done``, and ``error``. The prose streams live; after it finishes the critique/preview pass runs
+    (one additional non-streaming call) before ``proposal`` is emitted.
+    Falls back to the sync ``refine_strategy`` engine if streaming is unavailable.
+    """
+    session = database.get_refinement_session(session_id)
+    if session is None:
+        yield {"type": "error", "message": "Refinement session not found"}
+        return
+
+    profile = _apply_models(dict(session["profile"]), models)
+    current_pending = _pending_strategy_refinement(profile)
+    proposal_base = current_pending.get("proposed_profile") if current_pending else None
+    if isinstance(proposal_base, dict):
+        proposal_base = {**proposal_base, "models": profile.get("models")}
+    else:
+        proposal_base = profile
+    prior_context = _pending_strategy_context(current_pending)
+    effective_instruction = f"{prior_context}\n\nUser follow-up: {instruction}" if prior_context else instruction
+
+    client = _refinement_model_client(profile)
+    if client is None:
+        async for event in _astream_strategy_fallback(session_id, instruction, models):
+            yield event
+        return
+
+    prompt = _build_strategy_refinement_prompt(
+        profile=proposal_base,
+        instruction=effective_instruction,
+        task="Revise the current search strategy. Reply conversationally, then emit the json plan block.",
+    )
+
+    queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+
+    async def _run() -> None:
+        try:
+            await client.complete_response(
+                system=load_prompt("strategy_refinement_chat"),
+                prompt=prompt,
+                max_tokens=1800,
+                on_token=lambda text: queue.put_nowait(("token", text)),
+                json_mode=False,
+            )
+            queue.put_nowait(("end", None))
+        except Exception as exc:
+            logger.exception("Strategy streaming turn failed")
+            queue.put_nowait(("error", str(exc)))
+
+    task = asyncio.create_task(_run())
+    full_text = ""
+    emitted = 0
+    error_message: str | None = None
+    while True:
+        kind, value = await queue.get()
+        if kind == "error":
+            error_message = value or "Model streaming failed"
+            break
+        if kind == "end":
+            break
+        full_text += value or ""
+        visible, _ = _visible_prose(full_text)
+        new = visible[emitted:]
+        if new:
+            emitted += len(new)
+            yield {"type": "token", "text": new}
+    await task
+
+    if error_message is not None:
+        async for event in _astream_strategy_fallback(session_id, instruction, models, prefix_error=True):
+            yield event
+        return
+
+    final_visible, _ = _visible_prose(full_text, final=True)
+    if len(final_visible) > emitted:
+        tail = final_visible[emitted:]
+        if tail.strip():
+            yield {"type": "token", "text": tail}
+
+    prose = final_visible.strip()
+    patch_dict, _ = _parse_chat_payload(full_text)
+    raw_block = _extract_json_block(full_text)
+    requires_changes = bool((raw_block or {}).get("requires_changes", True))
+    findings = _string_list((raw_block or {}).get("findings"), limit=8)
+
+    if not requires_changes or not patch_dict:
+        assistant_response = prose or "Strategy looks good — no changes needed."
+        messages = [
+            *_messages(session),
+            {"role": "user", "content": instruction},
+            {"role": "assistant", "content": assistant_response},
+        ]
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "passed",
+            "assistant_response": assistant_response,
+            "findings": findings,
+        }
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=messages,
+            pending_field=None,
+            turn_count=int(session.get("turn_count") or 0),
+            status=session.get("status") or "finalized",
+            topic_id=session.get("topic_id"),
+        )
+        result = _session_response(updated) if updated else None
+        if result:
+            yield {"type": "proposal", "session": result}
+            yield {"type": "done", "session": result, "has_proposal": False}
+        return
+
+    agent_update = {
+        "profile_patch": patch_dict,
+        "requires_changes": True,
+        "findings": findings,
+        "assistant_response": prose,
+        "reasoning_summary": prose[:300] if prose else "",
+    }
+    pending = _build_pending_strategy_refinement(
+        proposal_base,
+        instruction=effective_instruction,
+        agent_update=agent_update,
+        readiness_reason="strategy_refinement_proposed",
+        review_mode=None,
+    )
+    pending["conversation"] = [
+        *[item for item in current_pending.get("conversation", []) if isinstance(item, dict)],
+        {"role": "user", "content": instruction},
+        {"role": "assistant", "content": str(pending.get("assistant_response") or prose or "")},
+    ]
+    profile[PENDING_STRATEGY_PROFILE_KEY] = pending
+    messages = [
+        *_messages(session),
+        {"role": "user", "content": instruction},
+        {"role": "assistant", "content": str(pending.get("assistant_response") or "")},
+    ]
+    updated = database.update_refinement_session(
+        session_id,
+        profile=profile,
+        messages=messages,
+        pending_field=PENDING_STRATEGY_FIELD,
+        turn_count=int(session.get("turn_count") or 0),
+        status=session.get("status") or "finalized",
+        topic_id=session.get("topic_id"),
+    )
+    result = _session_response(updated) if updated else None
+    if result is None:
+        yield {"type": "error", "message": "Failed to persist strategy refinement"}
+        return
+    yield {"type": "proposal", "session": result}
+    yield {"type": "done", "session": result, "has_proposal": True}
+
+
+async def astream_review_strategy(
+    *,
+    session_id: str,
+    profile_payload: dict[str, Any] | None,
+    models: Any,
+):
+    """Stream the pre-build strategy quality review.
+
+    Yields: ``token`` (prose delta), ``proposal`` (session snapshot), ``done``, ``error``.
+    Falls back to sync ``review_strategy`` if streaming unavailable.
+    """
+    session = database.get_refinement_session(session_id)
+    if session is None:
+        yield {"type": "error", "message": "Refinement session not found"}
+        return
+
+    profile = dict(session["profile"])
+    if _pending_strategy_refinement(profile):
+        result = _session_response(session)
+        yield {"type": "proposal", "session": result}
+        yield {"type": "done", "session": result, "has_proposal": bool(result.get("pending_strategy_refinement"))}
+        return
+
+    review_profile = _profile_for_strategy_review(
+        profile, profile_payload, models=models
+    )
+    current_fingerprint = _strategy_fingerprint(review_profile)
+    existing_review = profile.get(STRATEGY_REVIEW_PROFILE_KEY)
+    if (
+        isinstance(existing_review, dict)
+        and existing_review.get("fingerprint") == current_fingerprint
+        and str(existing_review.get("status") or "") in STRATEGY_REVIEW_RESOLVED_STATUSES
+    ):
+        result = _session_response(session)
+        yield {"type": "proposal", "session": result}
+        yield {"type": "done", "session": result, "has_proposal": False}
+        return
+
+    instruction = _pre_build_strategy_review_instruction(review_profile)
+    client = _refinement_model_client(review_profile)
+    if client is None:
+        result = await asyncio.to_thread(
+            review_strategy, session_id, {"profile": profile_payload or {}, "models": _models(models)}
+        )
+        if result is None:
+            yield {"type": "error", "message": "Pre-build review session not found"}
+            return
+        yield {"type": "proposal", "session": result}
+        yield {"type": "done", "session": result, "has_proposal": bool(result.get("pending_strategy_refinement"))}
+        return
+
+    prompt = _build_strategy_refinement_prompt(
+        profile=review_profile,
+        instruction=instruction,
+        task="Review the current search strategy immediately before the brief build.",
+    )
+    queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+
+    async def _run_review() -> None:
+        try:
+            await client.complete_response(
+                system=load_prompt("strategy_refinement_chat"),
+                prompt=prompt,
+                max_tokens=1200,
+                on_token=lambda text: queue.put_nowait(("token", text)),
+                json_mode=False,
+            )
+            queue.put_nowait(("end", None))
+        except Exception as exc:
+            logger.exception("Pre-build strategy review streaming failed")
+            queue.put_nowait(("error", str(exc)))
+
+    task = asyncio.create_task(_run_review())
+    full_text = ""
+    emitted = 0
+    error_message: str | None = None
+    while True:
+        kind, value = await queue.get()
+        if kind == "error":
+            error_message = value or "Model streaming failed"
+            break
+        if kind == "end":
+            break
+        full_text += value or ""
+        visible, _ = _visible_prose(full_text)
+        new = visible[emitted:]
+        if new:
+            emitted += len(new)
+            yield {"type": "token", "text": new}
+    await task
+
+    if error_message is not None:
+        result = await asyncio.to_thread(
+            review_strategy, session_id, {"profile": profile_payload or {}, "models": _models(models)}
+        )
+        if result is None:
+            yield {"type": "error", "message": "Pre-build review session not found"}
+            return
+        yield {"type": "proposal", "session": result}
+        yield {"type": "done", "session": result, "has_proposal": bool(result.get("pending_strategy_refinement"))}
+        return
+
+    final_visible, _ = _visible_prose(full_text, final=True)
+    if len(final_visible) > emitted:
+        tail = final_visible[emitted:]
+        if tail.strip():
+            yield {"type": "token", "text": tail}
+
+    prose = final_visible.strip()
+    patch_dict, _ = _parse_chat_payload(full_text)
+    raw_block = _extract_json_block(full_text)
+    requires_changes = bool((raw_block or {}).get("requires_changes", False))
+    reviewed_at = datetime.now(UTC).isoformat(timespec="seconds")
+
+    if not requires_changes or not patch_dict:
+        assistant_response = prose or "Strategy looks good for this build."
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "passed",
+            "assistant_response": assistant_response,
+            "findings": _string_list((raw_block or {}).get("findings"), limit=8),
+            "reviewed_at": reviewed_at,
+            "fingerprint": current_fingerprint,
+        }
+        messages = _messages(session)
+        messages.append({"role": "assistant", "content": assistant_response})
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=messages,
+            pending_field=None,
+            turn_count=int(session.get("turn_count") or 0),
+            status=session.get("status") or "finalized",
+            topic_id=session.get("topic_id"),
+        )
+        result = _session_response(updated) if updated else None
+        if result:
+            yield {"type": "proposal", "session": result}
+            yield {"type": "done", "session": result, "has_proposal": False}
+        return
+
+    agent_update = {
+        "profile_patch": patch_dict,
+        "requires_changes": True,
+        "findings": _string_list((raw_block or {}).get("findings"), limit=8),
+        "assistant_response": prose,
+        "reasoning_summary": prose[:300] if prose else "",
+    }
+    pending = _build_pending_strategy_refinement(
+        review_profile,
+        instruction=instruction,
+        agent_update=agent_update,
+        readiness_reason="pre_build_strategy_review_proposed",
+        review_mode="pre_build_review",
+    )
+    proposed_fingerprint = str(pending.get("proposal_fingerprint") or "")
+    if not proposed_fingerprint or proposed_fingerprint == current_fingerprint or _proposal_was_resolved(profile, proposed_fingerprint):
+        assistant_response = "Strategy quality check resolved for this plan; building can continue."
+        profile.pop(PENDING_STRATEGY_PROFILE_KEY, None)
+        profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+            "status": "suppressed",
+            "assistant_response": assistant_response,
+            "findings": pending.get("findings", []),
+            "reviewed_at": reviewed_at,
+            "fingerprint": current_fingerprint,
+        }
+        messages = _messages(session)
+        messages.append({"role": "assistant", "content": assistant_response})
+        updated = database.update_refinement_session(
+            session_id,
+            profile=profile,
+            messages=messages,
+            pending_field=None,
+            turn_count=int(session.get("turn_count") or 0),
+            status=session.get("status") or "finalized",
+            topic_id=session.get("topic_id"),
+        )
+        result = _session_response(updated) if updated else None
+        if result:
+            yield {"type": "proposal", "session": result}
+            yield {"type": "done", "session": result, "has_proposal": False}
+        return
+
+    profile[STRATEGY_REVIEW_PROFILE_KEY] = {
+        "status": "proposed",
+        "assistant_response": pending["assistant_response"],
+        "findings": pending.get("findings", []),
+        "reviewed_at": reviewed_at,
+        "fingerprint": current_fingerprint,
+        "proposal_fingerprint": proposed_fingerprint,
+    }
+    profile[PENDING_STRATEGY_PROFILE_KEY] = pending
+    messages = _messages(session)
+    messages.append({"role": "assistant", "content": pending["assistant_response"]})
+    updated = database.update_refinement_session(
+        session_id,
+        profile=profile,
+        messages=messages,
+        pending_field=PENDING_STRATEGY_FIELD,
+        turn_count=int(session.get("turn_count") or 0),
+        status=session.get("status") or "finalized",
+        topic_id=session.get("topic_id"),
+    )
+    result = _session_response(updated) if updated else None
+    if result is None:
+        yield {"type": "error", "message": "Failed to persist pre-build review"}
+        return
+    yield {"type": "proposal", "session": result}
+    yield {"type": "done", "session": result, "has_proposal": True}
+
+
+async def _astream_strategy_fallback(
+    session_id: str,
+    instruction: str,
+    models: Any,
+    *,
+    prefix_error: bool = False,
+):
+    """Sync fallback for strategy streaming when the model client is unavailable."""
+    if prefix_error:
+        yield {"type": "token", "text": "Live streaming was unavailable for this update.\n\n"}
+    result = await asyncio.to_thread(
+        refine_strategy,
+        session_id,
+        {"instruction": instruction, "models": _models(models)},
+    )
+    if result is None:
+        yield {"type": "error", "message": "Refinement session not found"}
+        return
+    messages = result.get("messages") or []
+    assistant = next(
+        (str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "assistant"),
+        "",
+    )
+    if assistant:
+        yield {"type": "token", "text": assistant}
+    yield {"type": "proposal", "session": result}
+    yield {"type": "done", "session": result, "has_proposal": bool(result.get("pending_strategy_refinement"))}
 
 
 def _visible_prose(full_text: str, *, final: bool = False) -> tuple[str, bool]:
@@ -3018,6 +3605,13 @@ def _collect_hint_text(profile: dict[str, Any]) -> str:
 
 def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
     statement = str(profile.get("statement") or "")
+    gmail_selected = _source_selection_dict(profile.get("source_selection")).get("gmail", False)
+    gmail_rules = _normalize_gmail_rules(profile.get("gmail_rules"))
+    gmail_needs_instructions = (
+        gmail_selected
+        and not gmail_rules.get("intent")
+        and not gmail_rules.get("include_senders")
+    )
     return {
         "lookback_window": _extract_lookback_constraint(statement),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")) or _extract_lookback_hours(statement),
@@ -3025,11 +3619,18 @@ def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
         "excluded_publishers_or_source_types": _string_list(profile.get("exclusions")),
         "exclusions_already_answered": bool(profile.get("exclusions_answered")) or bool(_string_list(profile.get("exclusions"))),
         "market_tracking_interest": _market_tracking_interest(statement),
+        "gmail_rules_needed": gmail_needs_instructions,
         "recommended_question_focus": (
-            "Ask about investable signals, relative comparison, source quality, catalysts, or risks. "
-            "Do not ask for recency or exclusions if they are already listed here."
-            if _market_tracking_interest(statement)
-            else "Ask for the one ambiguity that would most improve retrieval."
+            "IMPORTANT: Gmail is selected but has no search instructions yet. Ask ONLY about Gmail in this turn — "
+            "what kind of newsletters or email content the user wants (topic, recency). "
+            "Example: 'What kind of newsletters should I look for in Gmail? e.g. AI research digests from the last two weeks.'"
+            if gmail_needs_instructions
+            else (
+                "Ask about investable signals, relative comparison, source quality, catalysts, or risks. "
+                "Do not ask for recency or exclusions if they are already listed here."
+                if _market_tracking_interest(statement)
+                else "Ask for the one ambiguity that would most improve retrieval."
+            )
         ),
     }
 
