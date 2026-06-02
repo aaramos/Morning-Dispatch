@@ -352,7 +352,7 @@ def _friendly_model_error(exc: ModelClientError) -> str:
     text = str(exc).strip()
     lowered = text.lower()
     if "401" in text or "unauthorized" in lowered:
-        return "Ollama Cloud rejected the model request; check the cloud API key or route this agent local-only."
+        return "The local model server rejected the request; check the model API key in the Models tab."
     if "peer closed connection" in lowered or "incomplete chunked read" in lowered:
         return "The local model connection closed before the audit finished."
     if exc.status == "parse_error":

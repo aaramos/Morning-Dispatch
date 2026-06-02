@@ -67,16 +67,10 @@ def status(settings: Settings) -> dict[str, Any]:
             configured=bool(settings.web_search_serpapi_api_key),
         ),
         _secret_item(
-            "ollama_key",
-            "Ollama Cloud key",
-            settings.secrets_dir / "ollama" / "api_key",
-            configured=bool(settings.ollama_api_key),
-        ),
-        _virtual_item(
             "model_key",
             "Local model API key",
+            settings.secrets_dir / "model" / "api_key",
             configured=bool(settings.model_api_key),
-            storage="process environment or oMLX settings",
         ),
     ]
     directory_permissions = _permission_summary(settings.secrets_dir)

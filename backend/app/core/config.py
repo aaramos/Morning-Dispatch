@@ -6,13 +6,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_LIBRARIAN_MODEL = "Gemma4-MTP-26B-8Bit"
-DEFAULT_OLLAMA_CLOUD_MODEL = "Gemma4-MTP-26B-BF16"
 DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 150
 DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 DEFAULT_SCHEDULER_DAILY_RUN_TIME = "05:00"
 DEFAULT_SCHEDULER_TIMEZONE = "America/Los_Angeles"
 MODEL_ROUTE_AGENTS = ("refinement", "librarian", "source_audit", "editorial", "critic")
-MODEL_ROUTE_PROVIDERS = ("local", "ollama_cloud")
+# Models run on a single local OpenAI-compatible server. Cloud routing was removed.
+MODEL_ROUTE_PROVIDERS = ("local",)
 DEFAULT_MODEL_ROUTES: dict[str, dict[str, object]] = {
     agent: {"provider": "local", "model": None, "allow_private_cloud": False}
     for agent in MODEL_ROUTE_AGENTS
@@ -40,10 +40,7 @@ class Settings:
     podcast_transcribe_command: str | None = None
     model_base_url: str | None = None
     model_api_key: str | None = None
-    ollama_api_key: str | None = None
-    ollama_base_url: str = "https://ollama.com/v1"
     librarian_model: str | None = DEFAULT_LIBRARIAN_MODEL
-    ollama_cloud_model: str | None = DEFAULT_OLLAMA_CLOUD_MODEL
     librarian_use_model: bool = False
     librarian_model_max_items: int = DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS
     model_timeout_seconds: float = DEFAULT_MODEL_TIMEOUT_SECONDS
@@ -184,10 +181,6 @@ def _librarian_model_from_runtime(path: Path) -> str | None:
     return _runtime_model_value(path, "librarian_model")
 
 
-def _ollama_cloud_model_from_runtime(path: Path) -> str | None:
-    return _runtime_model_value(path, "ollama_cloud_model")
-
-
 def _model_routes_from_runtime(path: Path) -> dict[str, dict[str, object]]:
     payload = _model_settings_payload(path)
     raw_routes = payload.get("model_routes") if isinstance(payload, dict) else None
@@ -242,17 +235,11 @@ def get_settings() -> Settings:
         os.environ.get("MORNING_DISPATCH_MODEL_API_KEY")
         or os.environ.get("OMLX_API_KEY")
         or os.environ.get("LM_API_KEY")
-    )
-    ollama_api_key = os.environ.get("MORNING_DISPATCH_OLLAMA_API_KEY") or os.environ.get("OLLAMA_API_KEY") or _secret_text(
-        secrets_dir / "ollama" / "api_key"
+        or _secret_text(secrets_dir / "model" / "api_key")
     )
     librarian_model = (
         _librarian_model_from_runtime(model_settings_path)
         or os.environ.get("MORNING_DISPATCH_LIBRARIAN_MODEL", DEFAULT_LIBRARIAN_MODEL)
-    )
-    ollama_cloud_model = (
-        _ollama_cloud_model_from_runtime(model_settings_path)
-        or os.environ.get("MORNING_DISPATCH_OLLAMA_MODEL", DEFAULT_OLLAMA_CLOUD_MODEL)
     )
     podcastindex_api_key = os.environ.get("MORNING_DISPATCH_PODCASTINDEX_API_KEY") or _secret_text(
         secrets_dir / "podcastindex" / "api_key"
@@ -326,10 +313,7 @@ def get_settings() -> Settings:
         podcast_transcribe_command=os.environ.get("MORNING_DISPATCH_PODCAST_TRANSCRIBE_COMMAND"),
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
-        ollama_api_key=ollama_api_key,
-        ollama_base_url=os.environ.get("MORNING_DISPATCH_OLLAMA_BASE_URL", "https://ollama.com/v1").rstrip("/"),
         librarian_model=librarian_model,
-        ollama_cloud_model=ollama_cloud_model,
         librarian_use_model=_model_enabled(
             os.environ.get("MORNING_DISPATCH_LIBRARIAN_USE_MODEL"),
             model=librarian_model,
@@ -383,7 +367,7 @@ def ensure_runtime_dirs(settings: Settings) -> None:
         settings.secrets_dir / "serpapi",
         settings.secrets_dir / "youtube",
         settings.secrets_dir / "fred",
-        settings.secrets_dir / "ollama",
+        settings.secrets_dir / "model",
     ):
         directory.mkdir(parents=True, exist_ok=True)
         if settings.secrets_dir in (directory, *directory.parents):

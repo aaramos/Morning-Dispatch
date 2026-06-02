@@ -47,9 +47,9 @@ def test_model_client_retries_transient_connection_drop(monkeypatch):
 def test_model_client_does_not_retry_auth_error(monkeypatch):
     client = ModelClient(
         ModelClientConfig(
-            base_url="https://api.ollama.com/v1",
-            model="gpt-oss:20b",
-            provider="ollama_cloud",
+            base_url="http://127.0.0.1:1234/v1",
+            model="local-model",
+            provider="local",
         )
     )
     attempts = 0

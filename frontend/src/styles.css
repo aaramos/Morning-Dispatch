@@ -1547,13 +1547,19 @@ label {
 
 .model-route-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.2fr) minmax(140px, 0.8fr) minmax(180px, 1fr) auto;
+  grid-template-columns: minmax(180px, 1.4fr) minmax(180px, 1fr) auto;
   gap: 12px;
   align-items: end;
   padding: 12px;
   border: 1px solid #d8d7cf;
   border-radius: 8px;
   background: #fff;
+}
+
+.model-key-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 
 .model-route-row p {

@@ -254,7 +254,6 @@ type AdminStatus = {
   model?: {
     model: string | null;
     local_model?: string | null;
-    ollama_cloud_model?: string | null;
     enabled: boolean;
     api_key_configured: boolean;
     catalog: {
@@ -262,22 +261,19 @@ type AdminStatus = {
       models: Array<{ id: string }>;
       selected_model: string | null;
       selected_local_model?: string | null;
-      selected_ollama_cloud_model?: string | null;
       error: string | null;
       providers?: {
         local?: { available: boolean; models: Array<{ id: string }>; error: string | null; selected_model?: string | null };
-        ollama_cloud?: { available: boolean; configured: boolean; models: Array<{ id: string }>; error: string | null; selected_model?: string | null };
       };
     };
     routing?: {
       agents: Array<{ id: string; label: string; description: string }>;
       providers: Array<{ id: string; label: string; configured: boolean; privacy: string }>;
-      routes: Record<string, { provider: string; model: string | null; allow_private_cloud: boolean; effective_model?: string | null; label?: string }>;
-      ollama_cloud: { configured: boolean; base_url: string; key_path: string; default_model?: string | null };
-      defaults?: { local?: string | null; ollama_cloud?: string | null };
-      privacy: { rule: string; private_sources: string[] };
+      routes: Record<string, { provider: string; model: string | null; effective_model?: string | null; label?: string }>;
+      local: { configured: boolean; base_url: string | null; key_path: string; default_model?: string | null };
+      defaults?: { local?: string | null };
     };
-    selection_sources?: { local?: string; ollama_cloud?: string };
+    selection_sources?: { local?: string };
   };
   delivery?: {
     email: {
@@ -357,7 +353,7 @@ type AdminStatus = {
   };
 };
 
-type ModelRouteDraft = Record<string, { provider: string; model: string; allow_private_cloud: boolean }>;
+type ModelRouteDraft = Record<string, { model: string }>;
 
 type LibraryResponse = {
   explorations: Exploration[];
@@ -4122,10 +4118,9 @@ function AdminApp() {
   const [adminFredKey, setAdminFredKey] = useState("");
   const [adminEmailRecipients, setAdminEmailRecipients] = useState<Record<string, string>>({});
   const [selectedLocalModel, setSelectedLocalModel] = useState("");
-  const [selectedCloudModel, setSelectedCloudModel] = useState("");
   const [jobModel, setJobModel] = useState("");
   const [jobLimit, setJobLimit] = useState(100);
-  const [ollamaKey, setOllamaKey] = useState("");
+  const [modelApiKey, setModelApiKey] = useState("");
   const [modelRoutes, setModelRoutes] = useState<ModelRouteDraft>({});
   const [secretsExpanded, setSecretsExpanded] = useState(() => loadSessionValue("admin.secretsExpanded", false));
   const [sourceConfigExpanded, setSourceConfigExpanded] = useState(() => loadSessionValue("admin.sourceConfigExpanded", false));
@@ -4165,7 +4160,6 @@ function AdminApp() {
     });
   }, [digestSort, library.digests, library.legacy_digests]);
   const modelOptions = status?.model?.catalog.models ?? [];
-  const cloudModelOptions = status?.model?.catalog.providers?.ollama_cloud?.models ?? [];
   const hasActiveLibraryBuilds = useMemo(() => {
     const activeExploration = library.explorations.some((item) => item.status === "queued" || item.status === "running");
     const activeDigest = library.digests.some((topic) => {
@@ -4196,12 +4190,7 @@ function AdminApp() {
       ?? nextStatus?.model?.local_model
       ?? nextStatus?.model?.catalog.models[0]?.id
       ?? "";
-    const preferredCloudModel = nextStatus?.model?.catalog.selected_ollama_cloud_model
-      ?? nextStatus?.model?.ollama_cloud_model
-      ?? nextStatus?.model?.catalog.providers?.ollama_cloud?.models?.[0]?.id
-      ?? "";
     setSelectedLocalModel(preferredLocalModel);
-    setSelectedCloudModel(preferredCloudModel);
     setJobModel((current) => current || preferredLocalModel);
     setModelRoutes(routeDraftFromStatus(nextStatus));
     setMessage(nextStatus?.health?.headline ?? "Admin ready");
@@ -4437,17 +4426,17 @@ function AdminApp() {
     }
   }
 
-  async function saveModel(provider: "local" | "ollama_cloud") {
-    const modelName = (provider === "ollama_cloud" ? selectedCloudModel : selectedLocalModel).trim();
+  async function saveModel() {
+    const modelName = selectedLocalModel.trim();
     if (!modelName) return;
     setBusy(true);
     try {
       await api("/api/admin/model/selection", {
         method: "POST",
-        body: JSON.stringify({ provider, model_name: modelName }),
+        body: JSON.stringify({ provider: "local", model_name: modelName }),
       });
       await loadAdmin();
-      setMessage(provider === "ollama_cloud" ? "Cloud default saved" : "Local default saved");
+      setMessage("Default model saved");
     } catch (error) {
       setMessage(errorMessage(error, "Could not save model"));
     } finally {
@@ -4460,7 +4449,7 @@ function AdminApp() {
     try {
       await api("/api/admin/model/defaults/restore", { method: "POST" });
       await loadAdmin();
-      setMessage("Model defaults restored to Gemma4-MTP-26B-BF16");
+      setMessage("Model default restored");
     } catch (error) {
       setMessage(errorMessage(error, "Could not restore model defaults"));
     } finally {
@@ -4468,19 +4457,33 @@ function AdminApp() {
     }
   }
 
-  async function saveOllamaCloud() {
-    if (!ollamaKey.trim()) return;
+  async function saveModelApiKey() {
+    if (!modelApiKey.trim()) return;
     setBusy(true);
     try {
-      await api("/api/admin/model/ollama-cloud/credentials", {
+      await api("/api/admin/model/api-key", {
         method: "POST",
-        body: JSON.stringify({ api_key: ollamaKey.trim() }),
+        body: JSON.stringify({ api_key: modelApiKey.trim() }),
       });
-      setOllamaKey("");
+      setModelApiKey("");
       await loadAdmin();
-      setMessage("Ollama Cloud saved");
+      setMessage("Model API key saved");
     } catch (error) {
-      setMessage(errorMessage(error, "Could not save Ollama Cloud"));
+      setMessage(errorMessage(error, "Could not save model API key"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearModelApiKey() {
+    setBusy(true);
+    try {
+      await api("/api/admin/model/api-key", { method: "DELETE" });
+      setModelApiKey("");
+      await loadAdmin();
+      setMessage("Model API key removed");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not remove model API key"));
     } finally {
       setBusy(false);
     }
@@ -4506,9 +4509,7 @@ function AdminApp() {
     setModelRoutes((current) => ({
       ...current,
       [agent]: {
-        provider: current[agent]?.provider ?? "local",
         model: current[agent]?.model ?? "",
-        allow_private_cloud: current[agent]?.allow_private_cloud ?? false,
         ...patch,
       },
     }));
@@ -5432,30 +5433,16 @@ function AdminApp() {
           </div>
           <div className="admin-form-grid">
             <label>
-              Local default model
+              Default model
               <select value={selectedLocalModel} onChange={(event) => setSelectedLocalModel(event.target.value)} disabled={!modelOptions.length}>
-                {modelOptions.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
+                {modelOptions.length ? modelOptions.map((model) => <option key={model.id} value={model.id}>{model.id}</option>) : <option value="">No models reported</option>}
               </select>
             </label>
-            <button type="button" onClick={() => void saveModel("local")} disabled={busy || !selectedLocalModel}>Save local default</button>
-            <label>
-              Cloud default model
-              <select value={selectedCloudModel} onChange={(event) => setSelectedCloudModel(event.target.value)} disabled={!cloudModelOptions.length}>
-                {cloudModelOptions.length ? cloudModelOptions.map((model) => <option key={model.id} value={model.id}>{model.id}</option>) : <option value="">No cloud models</option>}
-              </select>
-            </label>
-            <button type="button" onClick={() => void saveModel("ollama_cloud")} disabled={busy || !selectedCloudModel || !cloudModelOptions.length}>
-              Save cloud default
-            </button>
+            <button type="button" onClick={() => void saveModel()} disabled={busy || !selectedLocalModel}>Save default model</button>
             <div className="admin-form-note">
-              <strong>Current defaults</strong>
-              <span>Local: {status?.model?.local_model ?? "Not set"}</span>
-              <span>Cloud: {status?.model?.ollama_cloud_model ?? "Not set"}</span>
-            </div>
-            <div className="admin-form-note">
-              <strong>Source</strong>
-              <span>Local: {status?.model?.selection_sources?.local ?? "environment"}</span>
-              <span>Cloud: {status?.model?.selection_sources?.ollama_cloud ?? "environment"}</span>
+              <strong>Current default</strong>
+              <span>{status?.model?.local_model ?? "Not set"}</span>
+              <span>Source: {status?.model?.selection_sources?.local ?? "environment"}</span>
             </div>
             <label>
               Batch model
@@ -5469,27 +5456,41 @@ function AdminApp() {
           </div>
           <div className="source-setup-grid model-routing-grid">
             <section className="source-setup-card">
-              <h2>Ollama Cloud</h2>
-              <p>{status?.model?.routing?.ollama_cloud.configured ? "Connected." : "Add an Ollama API key to use cloud routes."}</p>
+              <h2>Local model server</h2>
+              <p>
+                {status?.model?.routing?.local.configured
+                  ? "API key configured."
+                  : "This server requires an API key. Add it below so the model can run."}
+              </p>
+              <p className="muted">{status?.model?.routing?.local.base_url ?? "http://127.0.0.1:1234/v1"}</p>
               <label>
-                Ollama API key
-                <input type="password" value={ollamaKey} onChange={(event) => setOllamaKey(event.target.value)} />
+                Model API key
+                <input
+                  type="password"
+                  value={modelApiKey}
+                  placeholder={status?.model?.api_key_configured ? "•••••••• (configured)" : "Paste the server API key"}
+                  onChange={(event) => setModelApiKey(event.target.value)}
+                />
               </label>
-              <button type="button" onClick={() => void saveOllamaCloud()} disabled={busy || !ollamaKey.trim()}>Save Ollama Cloud</button>
+              <div className="model-key-actions">
+                <button type="button" onClick={() => void saveModelApiKey()} disabled={busy || !modelApiKey.trim()}>Save API key</button>
+                {status?.model?.api_key_configured ? (
+                  <button type="button" className="secondary-action" onClick={() => void clearModelApiKey()} disabled={busy}>Remove</button>
+                ) : null}
+              </div>
             </section>
             <section className="source-setup-card model-routing-card">
               <div className="library-section-header">
                 <div>
-                  <p className="section-kicker">Per-agent routes</p>
+                  <p className="section-kicker">Per-agent models</p>
                   <h2>Model routing</h2>
                 </div>
                 <button type="button" onClick={() => void saveModelRoutes()} disabled={busy}>Save routes</button>
               </div>
-              <p className="muted">{status?.model?.routing?.privacy.rule}</p>
+              <p className="muted">Every agent runs on the local model server. Pick a specific model per agent, or leave it on the default.</p>
               <div className="model-route-list">
                 {(status?.model?.routing?.agents ?? []).map((agent) => {
-                  const route = modelRoutes[agent.id] ?? { provider: "local", model: "", allow_private_cloud: false };
-                  const routeModels = route.provider === "ollama_cloud" ? cloudModelOptions : modelOptions;
+                  const route = modelRoutes[agent.id] ?? { model: "" };
                   return (
                     <article className="model-route-row" key={agent.id}>
                       <div>
@@ -5497,33 +5498,16 @@ function AdminApp() {
                         <p>{agent.description}</p>
                       </div>
                       <label>
-                        Provider
-                        <select
-                          value={route.provider}
-                          onChange={(event) => updateModelRoute(agent.id, {
-                            provider: event.target.value,
-                            model: event.target.value === "ollama_cloud" ? (cloudModelOptions[0]?.id ?? "") : "",
-                          })}
-                        >
-                          <option value="local">Local</option>
-                          <option value="ollama_cloud">Ollama Cloud</option>
-                        </select>
-                      </label>
-                      <label>
                         Model
                         <select
                           value={route.model}
                           onChange={(event) => updateModelRoute(agent.id, { model: event.target.value })}
                         >
                           <option value="">Default</option>
-                          {routeModels.map((model) => <option key={`${agent.id}-${route.provider}-${model.id}`} value={model.id}>{model.id}</option>)}
+                          {modelOptions.map((model) => <option key={`${agent.id}-${model.id}`} value={model.id}>{model.id}</option>)}
                         </select>
                       </label>
-                      {route.provider === "ollama_cloud" ? (
-                        <span className="status-pill">Default: {status?.model?.routing?.defaults?.ollama_cloud ?? "Cloud default"}</span>
-                      ) : (
-                        <span className="status-pill good">Default: {status?.model?.routing?.defaults?.local ?? "Local default"}</span>
-                      )}
+                      <span className="status-pill good">Default: {status?.model?.routing?.defaults?.local ?? "Local default"}</span>
                     </article>
                   );
                 })}
@@ -6375,11 +6359,7 @@ function routeDraftFromStatus(status: AdminStatus | null): ModelRouteDraft {
   const routes = status?.model?.routing?.routes ?? {};
   const draft: ModelRouteDraft = {};
   Object.entries(routes).forEach(([agent, route]) => {
-    draft[agent] = {
-      provider: route.provider || "local",
-      model: route.model ?? "",
-      allow_private_cloud: Boolean(route.allow_private_cloud),
-    };
+    draft[agent] = { model: route.model ?? "" };
   });
   return draft;
 }

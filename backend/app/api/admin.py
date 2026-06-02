@@ -62,14 +62,13 @@ class ModelSelectionPayload(BaseModel):
 class ModelRoutePayload(BaseModel):
     provider: str = Field(default="local", max_length=40)
     model: str | None = Field(default=None, max_length=180)
-    allow_private_cloud: bool = False
 
 
 class ModelRoutesPayload(BaseModel):
     routes: dict[str, ModelRoutePayload] = Field(default_factory=dict)
 
 
-class OllamaCloudCredentialsPayload(BaseModel):
+class ModelApiKeyPayload(BaseModel):
     api_key: str = Field(min_length=1, max_length=1000)
 
 
@@ -218,7 +217,6 @@ async def admin_status(request: Request) -> dict[str, Any]:
                 "enabled": settings.librarian_use_model,
                 "model": settings.librarian_model,
                 "local_model": settings.librarian_model,
-                "ollama_cloud_model": settings.ollama_cloud_model,
                 "api_key_configured": bool(settings.model_api_key),
                 "catalog": catalog,
             },
@@ -235,14 +233,12 @@ async def admin_status(request: Request) -> dict[str, Any]:
             "enabled": settings.librarian_use_model,
             "model": settings.librarian_model,
             "local_model": settings.librarian_model,
-            "ollama_cloud_model": settings.ollama_cloud_model,
             "base_url": settings.model_base_url,
             "api_key_configured": bool(settings.model_api_key),
             "max_items": settings.librarian_model_max_items,
             "selection_source": model_catalog.selected_model_source(settings),
             "selection_sources": {
                 "local": model_catalog.selected_model_source(settings, provider="local"),
-                "ollama_cloud": model_catalog.selected_model_source(settings, provider="ollama_cloud"),
             },
             "settings_path": str(settings.model_settings_path),
             "catalog": catalog,
@@ -409,32 +405,23 @@ async def get_model_catalog() -> dict[str, Any]:
 @router.post("/model/selection")
 async def select_model(payload: ModelSelectionPayload) -> dict[str, Any]:
     settings = _settings()
-    provider = payload.provider.strip().lower() or "local"
     selected_model = payload.model_name.strip()
     try:
-        if provider == "ollama_cloud":
-            models = await model_catalog.fetch_ollama_cloud_models(settings)
-        else:
-            provider = "local"
-            models = await model_catalog.fetch_available_models(settings)
+        models = await model_catalog.fetch_available_models(settings)
     except model_catalog.ModelCatalogError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     model_ids = {str(model["id"]) for model in models}
     if selected_model not in model_ids:
-        source_label = "Ollama Cloud" if provider == "ollama_cloud" else "oMLX"
-        raise HTTPException(status_code=400, detail=f"Select a model currently available in {source_label}")
+        raise HTTPException(status_code=400, detail="Select a model currently available on the local server")
 
-    model_catalog.save_selected_model(settings, selected_model, provider=provider)
+    model_catalog.save_selected_model(settings, selected_model)
     updated_settings = _settings()
     return {
-        "provider": provider,
-        "model": updated_settings.librarian_model if provider == "local" else updated_settings.ollama_cloud_model,
-        "models": {
-            "local": updated_settings.librarian_model,
-            "ollama_cloud": updated_settings.ollama_cloud_model,
-        },
-        "selection_source": model_catalog.selected_model_source(updated_settings, provider=provider),
+        "provider": "local",
+        "model": updated_settings.librarian_model,
+        "models": {"local": updated_settings.librarian_model},
+        "selection_source": model_catalog.selected_model_source(updated_settings),
         "catalog": await model_catalog.catalog_status(updated_settings),
     }
 
@@ -445,10 +432,7 @@ async def restore_default_models() -> dict[str, Any]:
     model_catalog.restore_default_models(settings)
     updated_settings = _settings()
     return {
-        "models": {
-            "local": updated_settings.librarian_model,
-            "ollama_cloud": updated_settings.ollama_cloud_model,
-        },
+        "models": {"local": updated_settings.librarian_model},
         "catalog": await model_catalog.catalog_status(updated_settings),
     }
 
@@ -459,12 +443,19 @@ def save_model_routes(payload: ModelRoutesPayload) -> dict[str, Any]:
     return model_routing.save_routes(_settings(), routes_payload)
 
 
-@router.post("/model/ollama-cloud/credentials")
-def save_ollama_cloud_credentials(payload: OllamaCloudCredentialsPayload) -> dict[str, Any]:
+@router.post("/model/api-key")
+def save_model_api_key(payload: ModelApiKeyPayload) -> dict[str, Any]:
     try:
-        return model_routing.save_ollama_api_key(_settings(), payload.api_key)
+        model_routing.save_model_api_key(_settings(), payload.api_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    return model_routing.routes_status(_settings())
+
+
+@router.delete("/model/api-key")
+def delete_model_api_key() -> dict[str, Any]:
+    model_routing.clear_model_api_key(_settings())
+    return model_routing.routes_status(_settings())
 
 
 @router.get("/model/jobs")
