@@ -162,7 +162,9 @@ class DiscoveryRunner:
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
 
         from backend.agents.discovery.query_refiner import screen_candidates
-        candidates = await screen_candidates(profile, candidates)
+        screening_exclusions = []
+        candidates = await screen_candidates(profile, candidates, exclusions=screening_exclusions)
+        pre_limit_candidates = list(candidates)
 
         # Boost scores of candidates from requested/promoted sources by 0.4 (capped at 1.0)
         boosted_candidates = []
@@ -244,6 +246,22 @@ class DiscoveryRunner:
         # Combine reserved lane results with the backfilled candidate stream.
         candidates = sorted(list(lane_candidates) + list(deduped_other), key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True)
 
+        # Capture deduplication / lane limits drops
+        final_ids = {c.payload.id for c in candidates}
+        limit_exclusions = []
+        for c in pre_limit_candidates:
+            if c.payload.id not in final_ids:
+                limit_exclusions.append({
+                    "adapter": c.adapter,
+                    "candidate_id": str(c.payload.id),
+                    "original_url": c.payload.original_url,
+                    "source_type": c.payload.source_type,
+                    "source_name": c.payload.source_name,
+                    "title": c.reason or c.payload.metadata.get("title") or "Candidate item",
+                    "excluded_by": ["discovery_limits"],
+                    "reason": "Duplicate content or exceeded discovery lane/capacity limits.",
+                })
+
         excluded_statuses = [
             AdapterStatus(name=name, status="skipped", message="Source was turned off for this exploration.")
             for name, enabled in selection.items()
@@ -253,7 +271,7 @@ class DiscoveryRunner:
             profile=profile,
             candidates=tuple(candidates),
             statuses=tuple([*statuses, *excluded_statuses]),
-            exclusions=tuple([*exclusions, *relevance_exclusions]),
+            exclusions=tuple([*exclusions, *relevance_exclusions, *screening_exclusions, *limit_exclusions]),
         )
 
     async def _run_adapter(

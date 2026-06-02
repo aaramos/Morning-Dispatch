@@ -96,6 +96,7 @@ async def refine_queries_for_adapter(
 async def screen_candidates(
     profile: TopicProfile,
     candidates: list[Any],
+    exclusions: list[dict[str, Any]] | None = None,
 ) -> list[Any]:
     """Applies an LLM-led screening pass to Gmail and Podcast candidates before lane capacity limits are enforced.
     Drops ads, promotional spam, and items with titles not aligned to the query.
@@ -189,6 +190,25 @@ async def screen_candidates(
             decision = decisions_map.get(c.payload.id)
             if decision == "drop":
                 dropped_count += 1
+                if exclusions is not None:
+                    metadata = c.payload.metadata or {}
+                    title = (
+                        metadata.get("title")
+                        or metadata.get("subject")
+                        or metadata.get("link_text")
+                        or c.payload.source_name
+                        or c.reason
+                    )
+                    exclusions.append({
+                        "adapter": c.adapter,
+                        "candidate_id": str(c.payload.id),
+                        "original_url": c.payload.original_url,
+                        "source_type": c.payload.source_type,
+                        "source_name": c.payload.source_name,
+                        "title": title,
+                        "excluded_by": ["agentic_screening"],
+                        "reason": "Filtered by agentic screening (spam, promotion, or off-topic).",
+                    })
                 continue
         screened_candidates.append(c)
 

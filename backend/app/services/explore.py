@@ -597,6 +597,7 @@ async def _run_exploration(
         _persist_progress(exploration_id, progress)
 
         stage_started = monotonic()
+        stage_started = monotonic()
         article_results = await _run_digest_core(
             profile=profile,
             payloads=payloads,
@@ -607,6 +608,27 @@ async def _run_exploration(
             persist=lambda: _persist_progress(exploration_id, progress),
         )
         stage_seconds["editorial"] = _elapsed_stage_seconds(stage_started)
+
+        # Extract intermediates and compile/save reporting log
+        intermediates = progress.pop("_intermediates", {})
+        try:
+            from backend.app.services.reporting import compile_reporting_data, save_reporting_log
+            report_data = compile_reporting_data(
+                exploration_id=exploration_id,
+                discovery=discovery,
+                fetched_articles=fetched_articles,
+                source_window_issues=source_window_issues or [],
+                enriched_articles=intermediates.get("enriched", []),
+                ranked_articles=intermediates.get("ranked", []),
+                after_audit=intermediates.get("after_audit", []),
+                after_editorial=intermediates.get("after_editorial", []),
+                after_critic=intermediates.get("after_critic", []),
+                final_results=article_results,
+                progress=progress,
+            )
+            save_reporting_log(exploration_id, report_data)
+        except Exception as exc:
+            logger.exception("Failed to compile or save reporting log for exploration %s: %s", exploration_id, exc)
         _add_final_source_mix_issues(progress, discovery, article_results, merged_selection)
         if mode == "scheduled":
             _promote_explore_sources(topic_id=topic_id, discovery=discovery, article_results=article_results)
@@ -1113,6 +1135,7 @@ async def _run_digest_core(
         inference_run_id=inference_run_id,
         max_candidates=pipeline_limits["source_audit_candidates"],
     )
+    after_audit = list(article_results)
     progress["source_audit"] = audit_summary
     if audit_summary.get("issues"):
         progress["source_filter_notes"] = [
@@ -1151,6 +1174,7 @@ async def _run_digest_core(
         inference_run_id=inference_run_id,
         max_candidates=pipeline_limits["editorial_candidates"],
     )
+    after_editorial = list(article_results)
     critic_client = model_routing.client_for_agent(
         "critic",
         settings=settings,
@@ -1167,13 +1191,22 @@ async def _run_digest_core(
         max_articles=pipeline_limits["critic_articles"],
         max_newsletter_records=pipeline_limits["critic_newsletter_records"],
     )
+    after_critic = list(article_results)
     article_results, _quality_decisions = apply_brief_quality_checks(article_results)
     _set_pipeline_stage(progress, "review", "done")
 
     if librarian_client is not None:
         database.cache_model_enrichments(article_results, model_name=_model_client_name(librarian_client, settings.librarian_model))
-    article_results = _enforce_inclusion_limits(profile, article_results)
-    return article_results
+    final_results = _enforce_inclusion_limits(profile, article_results)
+    
+    progress["_intermediates"] = {
+        "enriched": enriched_articles,
+        "ranked": ranked_articles,
+        "after_audit": after_audit,
+        "after_editorial": after_editorial,
+        "after_critic": after_critic,
+    }
+    return final_results
 
 
 def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchResult]) -> list[ArticleFetchResult]:

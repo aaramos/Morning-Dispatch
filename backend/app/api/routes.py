@@ -461,6 +461,15 @@ def exploration_brief_html(exploration_id: str) -> HTMLResponse:
     return HTMLResponse(_issue_html_for_display(html, exploration.get("finished_at"), exploration=exploration))
 
 
+@router.get("/explore/explorations/{exploration_id}/report")
+def get_exploration_report(exploration_id: str) -> list[dict[str, Any]]:
+    from backend.app.services.reporting import get_or_build_reporting_log
+    existing = database.get_exploration(exploration_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Exploration not found")
+    return get_or_build_reporting_log(exploration_id)
+
+
 @router.post("/explore/explorations/{exploration_id}/rebuild", status_code=202)
 async def rebuild_exploration(exploration_id: str, payload: ExplorationRebuildCreate) -> dict[str, Any]:
     if payload.topic_profile is not None:

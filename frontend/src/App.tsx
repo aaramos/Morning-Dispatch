@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 
 type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets";
@@ -466,7 +466,7 @@ type RefinementProgress = {
   label: string;
 };
 
-type AdminTab = "status" | "sources" | "library" | "settings" | "models" | "metrics";
+type AdminTab = "status" | "sources" | "library" | "settings" | "models" | "metrics" | "reporting";
 
 const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
   { key: "web_search", label: "Web", icon: "🌐" },
@@ -617,7 +617,7 @@ const schedulePresets: Array<{ value: SchedulePreset; label: string }> = [
 const interestDraftCookieName = "morning_dispatch_interest_draft";
 const interestDraftTtlSeconds = 60 * 60;
 const interestDraftTtlMs = interestDraftTtlSeconds * 1000;
-const adminTabOptions: AdminTab[] = ["status", "sources", "library", "settings", "models", "metrics"];
+const adminTabOptions: AdminTab[] = ["status", "sources", "library", "settings", "models", "metrics", "reporting"];
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -3073,6 +3073,281 @@ function BuildStartingPanel() {
   );
 }
 
+type CandidateReportStage = {
+  discovery: string | null;
+  screening: string | null;
+  recency: string | null;
+  fetch: string | null;
+  audit: string | null;
+  editorial: string | null;
+  critic: string | null;
+  inclusion: string | null;
+};
+
+type CandidateReportItem = {
+  id: string;
+  title: string;
+  url: string;
+  source: string;
+  stages: CandidateReportStage;
+};
+
+function ReportingTabContent(props: {
+  selectedRunId: string | null;
+  onSelectRunId: (id: string | null) => void;
+  explorations: Exploration[];
+}) {
+  const [report, setReport] = useState<CandidateReportItem[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!props.selectedRunId) {
+      setReport(null);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    api<CandidateReportItem[]>(`/api/explore/explorations/${props.selectedRunId}/report`)
+      .then((data) => {
+        setReport(data);
+      })
+      .catch((err) => {
+        setError(errorMessage(err, "Failed to load candidate report"));
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+  }, [props.selectedRunId]);
+
+  const completedExplorations = props.explorations.filter(
+    (exp) => exp.status === "complete"
+  );
+
+  return (
+    <section className="admin-panel">
+      <style>{`
+        .report-matrix-container {
+          width: 100%;
+          overflow-x: auto;
+          margin-top: 18px;
+          border: 1px solid #d8d7cf;
+          border-radius: 8px;
+          box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .report-matrix-table {
+          width: 100%;
+          border-collapse: collapse;
+          text-align: left;
+          font-size: 0.9rem;
+          min-width: 1200px;
+        }
+        .report-matrix-table th {
+          background: #f0eee7;
+          color: #4d4d49;
+          font-weight: 850;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          padding: 12px;
+          font-size: 0.76rem;
+          border-bottom: 2px solid #d8d7cf;
+          border-right: 1px solid #d8d7cf;
+          position: sticky;
+          top: 0;
+          z-index: 2;
+        }
+        .report-matrix-table th:last-child {
+          border-right: 0;
+        }
+        .report-matrix-table td {
+          padding: 10px 12px;
+          border-bottom: 1px solid #e6e5df;
+          border-right: 1px solid #e6e5df;
+          vertical-align: top;
+          line-height: 1.4;
+        }
+        .report-matrix-table td:last-child {
+          border-right: 0;
+        }
+        .report-matrix-table tr:last-child td {
+          border-bottom: 0;
+        }
+        .report-candidate-row {
+          background: #fdfdfb;
+        }
+        .report-candidate-source {
+          font-size: 0.72rem;
+          font-weight: 850;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          color: #77756f;
+          margin-bottom: 4px;
+        }
+        .report-candidate-title a {
+          font-weight: 600;
+          color: #171717;
+          text-decoration: none;
+        }
+        .report-candidate-title a:hover {
+          text-decoration: underline;
+        }
+        .report-cell-advanced {
+          background: #f4faf6;
+          color: #1b5e20;
+          font-size: 0.8rem;
+          font-weight: 550;
+          text-align: center;
+        }
+        .report-cell-dropped {
+          background: #fff6f2;
+          color: #c0392b;
+          font-size: 0.8rem;
+          font-weight: 550;
+        }
+        .report-selector-row {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 18px;
+          flex-wrap: wrap;
+        }
+        .report-selector-row label {
+          font-weight: 600;
+        }
+        .report-selector-row select {
+          padding: 6px 12px;
+          border: 1px solid #d8d7cf;
+          border-radius: 6px;
+          background: #fff;
+          font: inherit;
+        }
+      `}</style>
+      <div className="panel-title-row">
+        <div>
+          <p className="section-kicker">Reporting</p>
+          <h1>Candidate Lifecycle Log</h1>
+          <p className="muted">Track the fate of every item fetched or discovered during this run.</p>
+        </div>
+      </div>
+
+      <div className="report-selector-row">
+        <label htmlFor="report-run-select">Select Run:</label>
+        <select
+          id="report-run-select"
+          value={props.selectedRunId || ""}
+          onChange={(e) => props.onSelectRunId(e.target.value || null)}
+        >
+          <option value="">-- Choose an Exploration Run --</option>
+          {completedExplorations.map((exp) => {
+            const name = exp.progress?.brief?.title || `Run ${exp.exploration_id.slice(0, 8)}`;
+            return (
+              <option key={exp.exploration_id} value={exp.exploration_id}>
+                {name} ({formatDateTime(exp.finished_at ?? exp.started_at)})
+              </option>
+            );
+          })}
+        </select>
+      </div>
+
+      {loading ? <p>Loading candidate reporting log...</p> : null}
+      {error ? <p className="warning-text">{error}</p> : null}
+
+      {!props.selectedRunId && !loading && !error ? (
+        <p className="muted">Please select an exploration run from the dropdown above to view the candidate log.</p>
+      ) : null}
+
+      {props.selectedRunId && report && !loading && !error ? (
+        report.length === 0 ? (
+          <p className="muted">No candidates found for this exploration run.</p>
+        ) : (
+          <div className="report-matrix-container">
+            <table className="report-matrix-table">
+              <thead>
+                <tr>
+                  <th style={{ width: "240px" }}>Candidate (Source & Title)</th>
+                  <th>Discovery</th>
+                  <th>Screening</th>
+                  <th>Recency Filter</th>
+                  <th>Fetch / Extract</th>
+                  <th>Audit</th>
+                  <th>Editorial</th>
+                  <th>Critic</th>
+                  <th>Inclusion</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.map((item, index) => {
+                  const stages = ["discovery", "screening", "recency", "fetch", "audit", "editorial", "critic", "inclusion"] as const;
+                  let dropStage: string | null = null;
+                  for (const s of stages) {
+                    if (item.stages[s]) {
+                      dropStage = s;
+                      break;
+                    }
+                  }
+                  const rowBg = index % 2 === 0 ? "#fdfdfb" : "#f6f5f0";
+
+                  return (
+                    <Fragment key={item.id}>
+                      <tr className="report-candidate-row source-row" style={{ backgroundColor: rowBg }}>
+                        <td style={{ borderBottom: "none", paddingBottom: "2px" }}>
+                          <div className="report-candidate-source" style={{ fontWeight: 800, fontSize: "0.72rem", textTransform: "uppercase", color: "#77756f" }}>
+                            {formatStage(item.source)}
+                          </div>
+                        </td>
+                        {stages.map((stage) => {
+                          const reason = item.stages[stage];
+                          if (reason) {
+                            return (
+                              <td key={stage} rowSpan={2} className="report-cell-dropped" style={{ verticalAlign: "middle" }}>
+                                {reason}
+                              </td>
+                            );
+                          }
+                          
+                          const stageIndex = stages.indexOf(stage);
+                          const dropIndex = dropStage ? stages.indexOf(dropStage as any) : -1;
+                          
+                          if (dropIndex !== -1 && stageIndex > dropIndex) {
+                            return (
+                              <td key={stage} rowSpan={2} className="muted" style={{ fontSize: "0.8rem", textAlign: "center", verticalAlign: "middle" }}>
+                                —
+                              </td>
+                            );
+                          }
+
+                          return (
+                            <td key={stage} rowSpan={2} className="report-cell-advanced" style={{ verticalAlign: "middle" }}>
+                              ✓ Passed
+                            </td>
+                          );
+                        })}
+                      </tr>
+                      <tr className="report-candidate-row title-row" style={{ backgroundColor: rowBg }}>
+                        <td style={{ paddingTop: "2px", borderTop: "none" }}>
+                          <div className="report-candidate-title">
+                            {item.url ? (
+                              <a href={item.url} target="_blank" rel="noreferrer">
+                                {item.title || "Untitled Item"}
+                              </a>
+                            ) : (
+                              <span>{item.title || "Untitled Item"}</span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
+      ) : null}
+    </section>
+  );
+}
+
 function LibraryBuildProgress(props: { exploration: Exploration }) {
   const sources = Object.entries(props.exploration.progress.sources ?? {})
     .filter(([, data]) => data.status !== "disabled")
@@ -3477,8 +3752,22 @@ type GmailAllowlistResponse = {
 function AdminApp() {
   const requestedTab = new URLSearchParams(window.location.search).get("tab") ?? "status";
   const initialTab = adminTabOptions.includes(requestedTab as AdminTab) ? (requestedTab as AdminTab) : "status";
-  const issueRun = new URLSearchParams(window.location.search).get("issue_run");
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(() => {
+    return new URLSearchParams(window.location.search).get("issue_run");
+  });
+  const issueRun = selectedRunId;
   const [tab, setTab] = useState(initialTab);
+
+  function handleSelectRunId(id: string | null) {
+    setSelectedRunId(id);
+    const url = new URL(window.location.href);
+    if (id) {
+      url.searchParams.set("issue_run", id);
+    } else {
+      url.searchParams.delete("issue_run");
+    }
+    window.history.replaceState(null, "", url.toString());
+  }
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [sources, setSources] = useState<SourceStatusResponse | null>(null);
   const [library, setLibrary] = useState<LibraryResponse>({ explorations: [], deleted_explorations: [], topics: [], digests: [], legacy_digests: [] });
@@ -4547,6 +4836,22 @@ function AdminApp() {
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => openPath(briefPath(item.exploration))} disabled={!briefPath(item.exploration)}>Open</button>
+                    {item.exploration.status === "complete" ? (
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() => {
+                          handleSelectRunId(item.exploration.exploration_id);
+                          setTab("reporting");
+                          const url = new URL(window.location.href);
+                          url.searchParams.set("tab", "reporting");
+                          url.searchParams.set("issue_run", item.exploration.exploration_id);
+                          window.history.replaceState(null, "", url.toString());
+                        }}
+                      >
+                        Report
+                      </button>
+                    ) : null}
                     <button type="button" className="secondary-action" onClick={() => item.topic && openAdvancedSettings(item.topic)} disabled={busy || !item.topic}>Advanced Settings</button>
                     <button type="button" className="secondary-action" onClick={() => refineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildFromAdmin(item.exploration)} disabled={busy}>Rebuild</button>
@@ -4689,6 +4994,22 @@ function AdminApp() {
                   </div>
                   <div className="button-row">
                     <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && openPath(briefPath(topic.latest_exploration))} disabled={!topic.latest_exploration}>Open latest</button>
+                    {topic.latest_exploration && topic.latest_exploration.status === "complete" ? (
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() => {
+                          handleSelectRunId(topic.latest_exploration!.exploration_id);
+                          setTab("reporting");
+                          const url = new URL(window.location.href);
+                          url.searchParams.set("tab", "reporting");
+                          url.searchParams.set("issue_run", topic.latest_exploration!.exploration_id);
+                          window.history.replaceState(null, "", url.toString());
+                        }}
+                      >
+                        Report
+                      </button>
+                    ) : null}
                     <button type="button" className="secondary-action" onClick={() => openAdvancedSettings(topic)} disabled={busy}>Advanced Settings</button>
                     <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && refineFromAdmin(topic.latest_exploration)} disabled={busy || !topic.latest_exploration || topic.latest_exploration.status === "queued" || topic.latest_exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildDigest(topic)} disabled={busy}>Rebuild</button>
@@ -4924,11 +5245,11 @@ function AdminApp() {
                 </div>
                 {status.inference_metrics.routes.map((route) => (
                   <article className="metrics-table-row" key={`${route.route_name}-${route.model}-${route.backend ?? "unknown"}`}>
-                    <span>{formatStage(route.route_name)}</span>
                     <strong>
-                      {route.model}
-                      {currentRouteModel(status, route.route_name) === route.model ? <em>Current</em> : <em>Historical</em>}
+                      {route.route_name}
+                      {route.backend ? <em>{route.backend}</em> : null}
                     </strong>
+                    <span>{route.model}</span>
                     <span>{route.record_count}</span>
                     <span>{formatMetricMs(route.avg_total_ms)}</span>
                     <span>{formatMetricMs(route.p95_total_ms ?? null)}</span>
@@ -4944,18 +5265,18 @@ function AdminApp() {
               <div className="library-section-header">
                 <div>
                   <p className="section-kicker">By model</p>
-                  <h2>Model averages</h2>
+                  <h2>Model summary</h2>
                 </div>
               </div>
               <div className="metrics-table">
                 <div className="metrics-table-header">
                   <span>Model</span>
-                  <span>Backend</span>
+                  <span>Provider</span>
                   <span>Calls</span>
                   <span>Avg time</span>
                   <span>P95</span>
-                  <span>Avg prompt</span>
-                  <span>Avg completion</span>
+                  <span>Avg prompt tokens</span>
+                  <span>Avg completion tokens</span>
                 </div>
                 {status.inference_metrics.models.map((model) => (
                   <article className="metrics-table-row" key={`${model.model}-${model.backend ?? "unknown"}`}>
@@ -4973,6 +5294,15 @@ function AdminApp() {
           ) : null}
         </section>
       ) : null}
+
+      {tab === "reporting" ? (
+        <ReportingTabContent
+          selectedRunId={selectedRunId}
+          onSelectRunId={handleSelectRunId}
+          explorations={library.explorations}
+        />
+      ) : null}
+
       {editingAdvancedSettings ? (
         <div className="modal-backdrop" role="presentation">
           <section className="advanced-settings-modal" role="dialog" aria-modal="true" aria-labelledby="advanced-settings-title">
