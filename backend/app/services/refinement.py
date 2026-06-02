@@ -238,6 +238,302 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
     return _session_response(updated) if updated else None
 
 
+async def astream_refinement(
+    *,
+    session_id: str | None,
+    statement: str,
+    source_selection: dict[str, Any] | None,
+    models: Any,
+    answer: str,
+    just_go_now: bool,
+):
+    """AI-led streaming refinement turn.
+
+    Yields event dicts: ``session`` (the live session id), ``token`` (a prose delta the
+    user sees), ``plan`` (the persisted session snapshot), ``done`` (final snapshot), and
+    ``error``. The model leads the whole conversation here -- there is no deterministic
+    question bank on this path. If the model client is unavailable we fall back to the
+    deterministic ``advance_session`` engine for a single graceful turn.
+    """
+    session = database.get_refinement_session(session_id) if session_id else None
+    if session is None:
+        clean_statement = str(statement or "").strip()
+        if not clean_statement:
+            yield {"type": "error", "message": "Interest statement is required"}
+            return
+        profile = _seed_profile_with_hints(
+            _initial_profile(
+                {
+                    "statement": clean_statement,
+                    "source_selection": source_selection or {},
+                    "models": models,
+                }
+            )
+        )
+        session = database.create_refinement_session(
+            statement=clean_statement,
+            profile=profile,
+            messages=[],
+            pending_field=AGENT_PENDING_FIELD,
+            status="active",
+        )
+        session_id = session["session_id"]
+        messages: list[dict[str, str]] = []
+    else:
+        session_id = session["session_id"]
+        if session["status"] == "finalized":
+            yield {"type": "done", "session": _session_response(session), "ready": True}
+            return
+        profile = dict(session["profile"])
+        messages = _messages(session)
+
+    profile = _apply_models(profile, models)
+    turn_count = int(session.get("turn_count") or 0)
+    clean_answer = str(answer or "").strip()
+
+    yield {"type": "session", "session_id": session_id}
+
+    client = _refinement_model_client(profile)
+    if client is None:
+        async for event in _astream_fallback(session_id, clean_answer, just_go_now, models):
+            yield event
+        return
+
+    # Track the turn the model is responding to (the deterministic fallback re-appends
+    # the user message itself, so we only mutate the in-memory copy here).
+    if clean_answer and not just_go_now:
+        messages.append({"role": "user", "content": clean_answer})
+        turn_count += 1
+    elif just_go_now:
+        messages.append({"role": "user", "content": "Just build it now."})
+
+    prompt = _build_refinement_chat_prompt(
+        profile=profile,
+        messages=messages,
+        turn_count=turn_count,
+        just_go_now=just_go_now,
+    )
+    queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+
+    async def _run() -> None:
+        try:
+            await client.complete_response(
+                system=load_prompt("refinement_chat"),
+                prompt=prompt,
+                max_tokens=2200,
+                on_token=lambda text: queue.put_nowait(("token", text)),
+                json_mode=False,
+            )
+            queue.put_nowait(("end", None))
+        except Exception as exc:  # pragma: no cover - network timing dependent
+            logger.exception("Streaming refinement turn failed")
+            queue.put_nowait(("error", str(exc)))
+
+    task = asyncio.create_task(_run())
+    full_text = ""
+    emitted = 0
+    error_message: str | None = None
+    while True:
+        kind, value = await queue.get()
+        if kind == "error":
+            error_message = value or "Model streaming failed"
+            break
+        if kind == "end":
+            break
+        full_text += value or ""
+        visible, _ = _visible_prose(full_text)
+        new = visible[emitted:]
+        if new:
+            emitted += len(new)
+            yield {"type": "token", "text": new}
+    await task
+
+    if error_message is not None:
+        async for event in _astream_fallback(session_id, clean_answer, just_go_now, models, prefix_error=True):
+            yield event
+        return
+
+    final_visible, _ = _visible_prose(full_text, final=True)
+    if len(final_visible) > emitted:
+        tail = final_visible[emitted:]
+        if tail.strip():
+            yield {"type": "token", "text": tail}
+
+    assistant_text = final_visible.strip()
+    patch, ready_flag = _parse_chat_payload(full_text)
+    ready = bool(ready_flag) or just_go_now
+
+    patched = _merge_agent_profile_patch(profile, patch, user_text=_user_authored_text(profile, messages))
+    patched = _seed_profile_with_hints(patched)
+    if not str(patched.get("scope") or "").strip():
+        patched["scope"] = str(profile.get("statement") or "").strip()
+    if assistant_text:
+        patched["reasoning_summary"] = assistant_text[:600]
+        messages.append({"role": "assistant", "content": assistant_text})
+
+    topic_id = session.get("topic_id")
+    if ready:
+        patched = _fill_defaults(patched)
+        pre_critique = _diagnostics_query_snapshot(patched)
+        patched = _critique_search_plan(patched)
+        patched["refinement_diagnostics"] = _enrich_diagnostics(
+            patched,
+            model_profile_patch=patch,
+            pre_critique=pre_critique,
+            readiness_reason=_readiness_reason(
+                ready_requested=bool(ready_flag),
+                just_go_now=just_go_now,
+                turn_count=turn_count,
+            ),
+        )
+        patched = _coerce_profile(patched)
+        saved = explore.save_topic_profile(patched)
+        topic_id = str(saved["topic_id"])
+        status = "finalized"
+        pending = None
+    else:
+        patched = _coerce_profile(patched)
+        status = "active"
+        pending = AGENT_PENDING_FIELD
+
+    updated = database.update_refinement_session(
+        session_id,
+        profile=patched,
+        messages=messages,
+        pending_field=pending,
+        turn_count=turn_count,
+        status=status,
+        topic_id=topic_id,
+    )
+    response = _session_response(updated) if updated else None
+    if response is None:
+        yield {"type": "error", "message": "Failed to persist refinement session"}
+        return
+    yield {"type": "plan", "session": response}
+    yield {"type": "done", "session": response, "ready": ready}
+
+
+async def _astream_fallback(
+    session_id: str,
+    answer: str,
+    just_go_now: bool,
+    models: Any,
+    *,
+    prefix_error: bool = False,
+):
+    """Stream a single deterministic turn when live model streaming is unavailable."""
+    if prefix_error:
+        yield {"type": "token", "text": "Live streaming was unavailable, so I finished this step without it.\n\n"}
+    result = await asyncio.to_thread(
+        advance_session,
+        session_id,
+        {"answer": answer, "just_go_now": just_go_now, "models": _models(models)},
+    )
+    if result is None:
+        yield {"type": "error", "message": "Refinement session not found"}
+        return
+    messages = result.get("messages") or []
+    assistant = next(
+        (str(message.get("content") or "") for message in reversed(messages) if message.get("role") == "assistant"),
+        "",
+    )
+    if assistant:
+        yield {"type": "token", "text": assistant}
+    yield {"type": "plan", "session": result}
+    yield {"type": "done", "session": result, "ready": result.get("status") == "finalized"}
+
+
+def _visible_prose(full_text: str, *, final: bool = False) -> tuple[str, bool]:
+    """Return the user-visible prose (text before the json fence) and whether the fence was seen."""
+    idx = full_text.find("```")
+    if idx != -1:
+        return full_text[:idx], True
+    visible = full_text
+    if not final:
+        # Hold back a trailing backtick run that may turn into a fence on the next token.
+        stripped = visible.rstrip("`")
+        if stripped != visible:
+            visible = stripped
+    return visible, False
+
+
+def _parse_chat_payload(full_text: str) -> tuple[dict[str, Any], bool]:
+    block = _extract_json_block(full_text)
+    if not isinstance(block, dict):
+        return {}, False
+    patch = block.get("profile_patch")
+    return (patch if isinstance(patch, dict) else {}), bool(block.get("ready_to_build"))
+
+
+def _extract_json_block(text: str) -> dict[str, Any] | None:
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    candidate = fence.group(1) if fence else None
+    if candidate is None:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            candidate = text[start : end + 1]
+    if not candidate:
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _build_refinement_chat_prompt(
+    *,
+    profile: dict[str, Any],
+    messages: list[dict[str, str]],
+    turn_count: int,
+    just_go_now: bool,
+) -> str:
+    current_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    profile_snapshot = {
+        "statement": str(profile.get("statement") or ""),
+        "scope": str(profile.get("scope") or ""),
+        "subtopics": _string_list(profile.get("subtopics")),
+        "keywords": _string_list(profile.get("keywords")),
+        "search_queries": _string_list(profile.get("search_queries")),
+        "source_queries": _clean_source_queries(profile.get("source_queries")),
+        "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "depth": _normalize_depth(profile.get("depth")),
+        "recency_weighting": _normalize_recency(profile.get("recency_weighting")),
+        "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
+        "exclusions": _string_list(profile.get("exclusions")),
+        "source_selection": _source_selection_dict(profile.get("source_selection")),
+        "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
+        "gmail_rules": _normalize_gmail_rules(profile.get("gmail_rules")),
+    }
+    compact_messages = [
+        {"role": message["role"], "content": message["content"][:900]}
+        for message in messages[-14:]
+        if message.get("role") in {"assistant", "user"} and message.get("content")
+    ]
+    return json.dumps(
+        {
+            "task": "Lead the brief-setup chat. Reply conversationally to the user, then emit the json plan block.",
+            "turn_count": turn_count,
+            "just_go_now": just_go_now,
+            "is_first_turn": compact_messages == [],
+            "current_profile": profile_snapshot,
+            "conversation": compact_messages,
+            "source_guidance": {
+                "web_search": "Precise web queries with location/time/source words, aliases, concrete intent.",
+                "foreign_media": "When selected, propose any non-English language the topic warrants with idiomatic native-language queries.",
+                "youtube": "Creator/video search phrases for walkthroughs, explainers, interviews, demos.",
+                "podcasts": "Show/interview/topic phrases likely to find playable audio.",
+                "collections": "Terms likely to appear in local documents.",
+                "markets": "Exchange ticker symbols only (e.g. 'NVDA', '000660.KS'); resolve company names to tickers, one per entry.",
+            },
+            "already_inferred": _inferred_constraints(profile_snapshot),
+            "current_date_hint": f"Today is {current_utc} (UTC). Use this when judging freshness windows.",
+        },
+        ensure_ascii=False,
+    )
+
+
 def refine_strategy(session_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     session = database.get_refinement_session(session_id)
     if session is None:
@@ -2080,6 +2376,7 @@ def _ensure_source_query_coverage(profile: dict[str, Any]) -> dict[str, Any]:
             phrase_queries=phrase_queries,
             resolved_tickers=resolved_tickers,
             foreign_fallback=foreign_fallback,
+            keywords=_string_list(profile.get("keywords")),
         )
         if fallback:
             queries[source] = fallback
@@ -2121,6 +2418,7 @@ def _source_specific_fallback(
     phrase_queries: list[str],
     resolved_tickers: list[str],
     foreign_fallback: list[str],
+    keywords: list[str] = None,
 ) -> list[str]:
     """Shape fallback queries to how each source is actually searched.
 
@@ -2137,20 +2435,34 @@ def _source_specific_fallback(
     if source == "youtube":
         return [f"{query} explained" for query in base]
     if source == "podcasts":
-        return _podcast_discovery_fallback_queries(base)
+        return _podcast_discovery_fallback_queries(base, keywords=keywords)
     return list(base)
 
 
-def _podcast_discovery_fallback_queries(base: list[str]) -> list[str]:
+def _podcast_discovery_fallback_queries(base: list[str], keywords: list[str] = None) -> list[str]:
     out: list[str] = []
+    # If we have keywords, use them directly as broader search terms
+    if keywords:
+        for kw in keywords[:6]:
+            if kw and len(kw) > 2:
+                out.append(kw)
+    
+    # Also add shorter queries with podcast/interview suffixes
     for query in base[:4]:
-        out.extend(
-            [
-                f"{query} podcast",
-                f"{query} interview",
-                f"{query} audio analysis",
-            ]
-        )
+        if len(query) < 60:
+            out.extend([f"{query} podcast", f"{query} interview"])
+            
+    # Fallback to general terms if nothing else was added
+    if not out:
+        for query in base[:4]:
+            out.extend(
+                [
+                    f"{query} podcast",
+                    f"{query} interview",
+                    f"{query} audio analysis",
+                ]
+            )
+            
     return _string_list(out, limit=8)
 
 

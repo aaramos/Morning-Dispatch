@@ -216,6 +216,7 @@ class ModelClient:
         prompt: str,
         max_tokens: int = 900,
         on_token: Callable[[str], None] | None = None,
+        json_mode: bool = True,
     ) -> ModelResponse:
         attempts = _retry_attempts(self.config)
         for attempt in range(attempts):
@@ -225,6 +226,7 @@ class ModelClient:
                     prompt=prompt,
                     max_tokens=max_tokens,
                     on_token=on_token,
+                    json_mode=json_mode,
                 )
             except ModelClientError as exc:
                 if attempt >= attempts - 1 or not _should_retry(exc):
@@ -239,6 +241,7 @@ class ModelClient:
         prompt: str,
         max_tokens: int,
         on_token: Callable[[str], None] | None,
+        json_mode: bool = True,
     ) -> ModelResponse:
         if self.config.api_mode == "ollama":
             if on_token is None:
@@ -250,8 +253,8 @@ class ModelClient:
                 on_token=on_token,
             )
         if on_token is None:
-            return await self._complete_response_nonstream(system=system, prompt=prompt, max_tokens=max_tokens)
-        return await self._complete_response_stream(system=system, prompt=prompt, max_tokens=max_tokens, on_token=on_token)
+            return await self._complete_response_nonstream(system=system, prompt=prompt, max_tokens=max_tokens, json_mode=json_mode)
+        return await self._complete_response_stream(system=system, prompt=prompt, max_tokens=max_tokens, on_token=on_token, json_mode=json_mode)
 
     async def _complete_response_ollama_nonstream(
         self,
@@ -447,6 +450,7 @@ class ModelClient:
         system: str,
         prompt: str,
         max_tokens: int = 900,
+        json_mode: bool = True,
     ) -> ModelResponse:
         url = f"{self.config.base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -460,9 +464,10 @@ class ModelClient:
             ],
             "temperature": 0,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
         submitted_at = perf_counter()
         queue_wait_ms = 0
@@ -546,6 +551,7 @@ class ModelClient:
         prompt: str,
         max_tokens: int = 900,
         on_token: Callable[[str], None],
+        json_mode: bool = True,
     ) -> ModelResponse:
         url = f"{self.config.base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -559,11 +565,12 @@ class ModelClient:
             ],
             "temperature": 0,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
             "stream": True,
             "stream_options": {"include_usage": True},
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
         submitted_at = perf_counter()
         queue_wait_ms = 0

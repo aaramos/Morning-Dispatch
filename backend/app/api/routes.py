@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.app.core.config import get_settings
@@ -112,6 +113,15 @@ class RefinementMessage(BaseModel):
     just_go_now: bool = False
 
 
+class RefinementStreamMessage(BaseModel):
+    session_id: str | None = None
+    statement: str = ""
+    source_selection: dict[str, bool] = Field(default_factory=dict)
+    answer: str = ""
+    models: dict[str, Any] = Field(default_factory=dict)
+    just_go_now: bool = False
+
+
 class StrategyRefinementMessage(BaseModel):
     instruction: str = Field(min_length=1, max_length=4000)
     models: dict[str, Any] = Field(default_factory=dict)
@@ -200,6 +210,29 @@ def start_refinement(payload: RefinementStart) -> dict[str, Any]:
         return refinement.start_session(payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/explore/refinement-sessions/stream")
+async def stream_refinement(payload: RefinementStreamMessage) -> StreamingResponse:
+    async def event_source() -> Any:
+        try:
+            async for event in refinement.astream_refinement(
+                session_id=payload.session_id,
+                statement=payload.statement,
+                source_selection=payload.source_selection,
+                models=payload.models,
+                answer=payload.answer,
+                just_go_now=payload.just_go_now,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:  # pragma: no cover - defensive: surface a clean SSE error
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @router.post("/explore/refinement-sessions/{session_id}/messages")

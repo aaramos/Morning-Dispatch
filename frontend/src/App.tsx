@@ -630,6 +630,63 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+type RefinementStreamEvent =
+  | { type: "session"; session_id: string }
+  | { type: "token"; text: string }
+  | { type: "plan"; session: RefinementSession }
+  | { type: "done"; session: RefinementSession; ready: boolean }
+  | { type: "error"; message: string };
+
+type RefinementStreamBody = {
+  session_id?: string | null;
+  statement?: string;
+  source_selection?: Record<string, boolean>;
+  answer?: string;
+  models?: Record<string, unknown>;
+  just_go_now?: boolean;
+};
+
+// Streams an AI-led refinement turn over Server-Sent Events, invoking onEvent for
+// each parsed event (session id, prose tokens, the live plan snapshot, and done/error).
+async function streamRefinement(
+  body: RefinementStreamBody,
+  onEvent: (event: RefinementStreamEvent) => void,
+): Promise<void> {
+  const response = await fetch("/api/explore/refinement-sessions/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(response.ok ? "Streaming is unavailable" : await response.text());
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary !== -1) {
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
+      if (dataLine) {
+        const payload = dataLine.slice(5).trim();
+        if (payload) {
+          try {
+            onEvent(JSON.parse(payload) as RefinementStreamEvent);
+          } catch {
+            // Ignore malformed frames; the stream continues.
+          }
+        }
+      }
+      boundary = buffer.indexOf("\n\n");
+    }
+  }
+}
+
 function loadInterestDraft(): string {
   const rawCookie = document.cookie
     .split("; ")
@@ -720,6 +777,8 @@ function DispatchApp() {
   const [refinementProgress, setRefinementProgress] = useState<RefinementProgress | null>(null);
   const [refinementFallbackStartedAt, setRefinementFallbackStartedAt] = useState(0);
   const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(null);
+  const [streamingText, setStreamingText] = useState("");
+  const [streaming, setStreaming] = useState(false);
   const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
   const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
   const [strategyConfirmation, setStrategyConfirmation] = useState("");
@@ -871,6 +930,58 @@ function DispatchApp() {
     setProgressNow(Date.now());
   }, []);
 
+  // Drives one AI-led streaming turn: streams prose into the live bubble, applies the
+  // plan snapshot, and advances the flow. Returns the final session (or null on error).
+  async function runRefinementStream(
+    body: RefinementStreamBody,
+    optimisticUser?: string,
+  ): Promise<RefinementSession | null> {
+    setStreaming(true);
+    setStreamingText("");
+    if (optimisticUser) {
+      setSession((prev) =>
+        prev ? { ...prev, messages: [...prev.messages, { role: "user", content: optimisticUser }] } : prev,
+      );
+    }
+    let live = "";
+    let finalSession: RefinementSession | null = null;
+    let ready = false;
+    let streamError = "";
+    try {
+      await streamRefinement(body, (event) => {
+        if (event.type === "token") {
+          live += event.text;
+          setStreamingText(live);
+        } else if (event.type === "plan") {
+          finalSession = event.session;
+        } else if (event.type === "done") {
+          finalSession = event.session;
+          ready = event.ready;
+        } else if (event.type === "error") {
+          streamError = event.message;
+        }
+      });
+    } catch (error) {
+      setStreaming(false);
+      setStreamingText("");
+      throw error;
+    }
+    setStreaming(false);
+    if (!finalSession) {
+      setStreamingText("");
+      throw new Error(streamError || "Refinement stream ended unexpectedly");
+    }
+    const resolved: RefinementSession = finalSession;
+    setSession(resolved);
+    setDraft(draftFromProfile(resolved.profile, defaultControls.content_limits));
+    if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
+    setStreamingText("");
+    const finalized = resolved.status === "finalized" || ready;
+    setFlow(finalized ? "confirm" : "refining");
+    setMessage(finalized ? "Confirm the brief setup" : "Your turn");
+    return resolved;
+  }
+
   async function startFlow(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
     if (flow !== "idle" && flow !== "ready") return;
@@ -890,26 +1001,18 @@ function DispatchApp() {
     setSubmittedInterest(interest);
     setRefinementTargetExplorationId(null);
     setStatement("");
+    setSession(null);
     setFlow("refining");
     setBusy(true);
-    setMessage("Refining your interest...");
-    beginRefinementProgress("starting", "Starting refinement");
+    setMessage("Starting the conversation...");
     setBriefHtml("");
     setExploration(null);
     try {
-      const nextSession = await api<RefinementSession>("/api/explore/refinement-sessions", {
-        method: "POST",
-        body: JSON.stringify({
-          statement: interest,
-          source_selection: selectedEnabledSources,
-          models: {},
-        }),
+      await runRefinementStream({
+        statement: interest,
+        source_selection: selectedEnabledSources,
+        models: {},
       });
-      setSession(nextSession);
-      setDraft(draftFromProfile(nextSession.profile, defaultControls.content_limits));
-      setFlow(nextSession.status === "finalized" ? "confirm" : "refining");
-      if (nextSession.topic_profile) setTopicProfile(nextSession.topic_profile);
-      setMessage(nextSession.status === "finalized" ? "Confirm the brief setup" : "Answer a few quick questions");
     } catch (error) {
       setStatement(interest);
       saveInterestDraft(interest);
@@ -918,45 +1021,34 @@ function DispatchApp() {
       setMessage(errorMessage(error, "Could not start refinement"));
     } finally {
       setBusy(false);
-      endRefinementProgress();
     }
   }
 
   async function answerRefinement(justGoNow = false) {
     if (!activeInterest) return;
-    if (!session && !justGoNow) return;
+    if (!session && !justGoNow && !answer.trim()) return;
     if (!justGoNow && !answer.trim()) return;
+    const pendingAnswer = answer.trim();
+    setAnswer("");
     setBusy(true);
-    setMessage(justGoNow ? "Preparing confirmation..." : "Refining...");
-    beginRefinementProgress(justGoNow ? "confirming" : "answering", justGoNow ? "Preparing confirmation" : "Refining answer");
+    setMessage(justGoNow ? "Building your plan..." : "Thinking...");
     try {
-      const currentSession = session ?? await api<RefinementSession>("/api/explore/refinement-sessions", {
-        method: "POST",
-        body: JSON.stringify({
+      await runRefinementStream(
+        {
+          session_id: session?.session_id ?? null,
           statement: activeInterest,
           source_selection: selectedEnabledSources,
-          models: {},
-        }),
-      });
-      const updated = await api<RefinementSession>(`/api/explore/refinement-sessions/${currentSession.session_id}/messages`, {
-        method: "POST",
-        body: JSON.stringify({
-          answer: answer.trim(),
+          answer: justGoNow ? "" : pendingAnswer,
           just_go_now: justGoNow,
           models: {},
-        }),
-      });
-      setAnswer("");
-      setSession(updated);
-      setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
-      if (updated.topic_profile) setTopicProfile(updated.topic_profile);
-      setFlow(updated.status === "finalized" ? "confirm" : "refining");
-      setMessage(updated.status === "finalized" ? "Confirm the brief setup" : "Refinement updated");
+        },
+        justGoNow ? "Skip the questions — build it now." : pendingAnswer,
+      );
     } catch (error) {
+      if (!justGoNow && pendingAnswer) setAnswer(pendingAnswer);
       setMessage(errorMessage(error, "Could not update refinement"));
     } finally {
       setBusy(false);
-      endRefinementProgress();
     }
   }
 
@@ -1713,7 +1805,7 @@ function DispatchApp() {
             </div>
           ) : null}
 
-          {flow === "refining" || refinementProgress ? (
+          {flow === "refining" || streaming ? (
             <RefinementPanel
               session={session}
               interest={submittedInterest || statement}
@@ -1721,8 +1813,8 @@ function DispatchApp() {
               sourceSelection={selectedEnabledSources}
               answer={answer}
               busy={busy}
-              progress={activeRefinementProgress}
-              now={progressNow}
+              streaming={streaming}
+              streamingText={streamingText}
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
               onJustGo={() => void answerRefinement(true)}
@@ -1874,6 +1966,23 @@ function DispatchApp() {
   );
 }
 
+function recencyText(weighting?: string, lookbackHours?: number | null): string {
+  if (lookbackHours && lookbackHours > 0) {
+    if (lookbackHours <= 48) return `Last ${lookbackHours} hours`;
+    const days = Math.round(lookbackHours / 24);
+    return `Last ${days} day${days === 1 ? "" : "s"}`;
+  }
+  const map: Record<string, string> = {
+    breaking: "Breaking / latest",
+    recent: "Recent",
+    last_year: "Past year",
+    all_available: "Best available",
+    balanced: "Balanced",
+    evergreen: "Evergreen",
+  };
+  return weighting ? map[weighting] ?? weighting : "";
+}
+
 function RefinementPanel(props: {
   session: RefinementSession | null;
   interest: string;
@@ -1881,59 +1990,199 @@ function RefinementPanel(props: {
   sourceSelection: Record<string, boolean>;
   answer: string;
   busy: boolean;
-  progress: RefinementProgress | null;
-  now: number;
+  streaming: boolean;
+  streamingText: string;
   onAnswerChange: (value: string) => void;
   onSend: () => void;
   onJustGo: () => void;
 }) {
+  const threadRef = useRef<HTMLDivElement | null>(null);
+  const messages = props.session?.messages ?? [];
+  const preview = props.session?.strategy_preview ?? null;
+  const finalized = props.session?.status === "finalized";
+  const generalQueries = preview?.search_queries ?? props.profile?.search_queries ?? [];
+  const marketSource = (preview?.per_source ?? []).find((source) => source.key === "markets");
+  const tickers = marketSource?.tickers ?? [];
+  const sourceQueries = (preview?.per_source ?? [])
+    .filter((source) => source.key !== "markets")
+    .flatMap((source) => source.queries.map((query) => ({ source: source.source, query })));
+  const recencyLabel = recencyText(preview?.recency_weighting, preview?.lookback_hours);
+  const scopeText = preview?.scope || props.profile?.scope || "";
+
+  useEffect(() => {
+    const node = threadRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [messages.length, props.streamingText, props.streaming]);
+
   return (
-    <section className="conversation-panel">
-      <div className="refinement-workspace-header">
-        <div>
-          <p className="section-kicker">Refining brief</p>
-          <h2>{props.profile?.scope || "Turning your interest into a search plan"}</h2>
+    <section className="chat-redesign">
+      <div className="chat-main">
+        <div className="chat-head">
+          <div>
+            <p className="section-kicker">Reference librarian</p>
+            <h2>{scopeText || props.interest || "Shaping your brief"}</h2>
+          </div>
+          <span className={`status-pill ${finalized ? "good" : ""}`}>
+            <span className={`live-dot ${props.streaming ? "live" : ""}`} />
+            {finalized ? "Ready to confirm" : props.streaming ? "Thinking through your plan" : "In progress"}
+          </span>
         </div>
-        <span className="status-pill good">{props.session?.status === "finalized" ? "Ready to confirm" : "In progress"}</span>
-      </div>
-      <div className="refinement-request-card">
-        <strong>You asked</strong>
-        <p>{props.interest}</p>
-        <small>{sourcePlan(props.sourceSelection)}</small>
-      </div>
-      <RefinementStatusIndicator progress={props.progress} now={props.now} />
-      <RefinementPlanPreview profile={props.profile} />
-      <div className="chat-list">
-        {(props.session?.messages ?? []).map((message, index) => (
-          <div className={`chat-bubble ${message.role}`} key={`${message.role}-${index}`}>
-            <ChatMessageContent content={message.content} />
+        <div className="chat-thread" ref={threadRef}>
+          {messages.map((message, index) => (
+            <div className={`chat-turn ${message.role}`} key={`${message.role}-${index}`}>
+              <div className={`chat-avatar ${message.role === "user" ? "me" : "ai"}`}>
+                {message.role === "user" ? "You" : "M"}
+              </div>
+              <div className="chat-bubble2">
+                <ChatMessageContent content={message.content} />
+              </div>
+            </div>
+          ))}
+          {props.streaming ? (
+            <div className="chat-turn assistant">
+              <div className="chat-avatar ai">M</div>
+              <div className="chat-bubble2">
+                {props.streamingText ? (
+                  <>
+                    <ChatMessageContent content={props.streamingText} />
+                    <span className="stream-caret" />
+                  </>
+                ) : (
+                  <span className="typing-dots">
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                )}
+              </div>
+            </div>
+          ) : null}
+          {!props.session && !props.streaming ? (
+            <div className="chat-turn assistant">
+              <div className="chat-avatar ai">M</div>
+              <div className="chat-bubble2">Tell me what you're curious about and I'll shape the brief with you.</div>
+            </div>
+          ) : null}
+        </div>
+        <div className="chat-composer">
+          <div className="chat-field">
+            <textarea
+              value={props.answer}
+              onChange={(event) => props.onAnswerChange(event.target.value)}
+              placeholder={finalized ? "Add anything else…" : "Reply, or just tell me to go…"}
+              rows={1}
+              disabled={props.busy}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  props.onSend();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="chat-send"
+              onClick={props.onSend}
+              disabled={props.busy || !props.answer.trim()}
+              aria-label="Send"
+            >
+              →
+            </button>
           </div>
-        ))}
-        {!props.session ? (
-          <div className="chat-bubble assistant">
-            I’m preparing the first question and search strategy.
+          <div className="chat-undercaption">
+            {props.streaming ? (
+              <span className="chat-streaming-note">
+                <span className="typing-dots small">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+                Morning Dispatch is replying…
+              </span>
+            ) : (
+              <span className="muted-hint">Enter to send · Shift+Enter for a new line</span>
+            )}
+            <span className="spacer" />
+            <button type="button" className="ghost-link" onClick={props.onJustGo} disabled={props.busy}>
+              Skip the questions — build it now →
+            </button>
           </div>
-        ) : null}
+        </div>
       </div>
-      <div className="refinement-input">
-        <input
-          value={props.answer}
-          onChange={(event) => props.onAnswerChange(event.target.value)}
-          placeholder="Answer..."
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              props.onSend();
-            }
-          }}
-        />
-        <button type="button" onClick={props.onSend} disabled={props.busy || !props.answer.trim()}>
-          Send
-        </button>
-        <button type="button" className="secondary-action" onClick={props.onJustGo} disabled={props.busy}>
-          Just go now
-        </button>
-      </div>
+      <aside className="chat-plan">
+        <div className="chat-plan-head">
+          <p className="section-kicker">Search strategy</p>
+          <h3>Building as we talk</h3>
+          <p className="chat-plan-sub">Written by the AI, updates live with each reply.</p>
+        </div>
+        <div className="chat-plan-body">
+          <div className="plan-group">
+            <div className="plan-label">Scope</div>
+            <div className={`plan-value ${scopeText ? "" : "empty"}`}>{scopeText || "Being shaped…"}</div>
+          </div>
+          {(preview?.looks_at?.length ?? 0) > 0 || (preview?.ignores?.length ?? 0) > 0 ? (
+            <div className="plan-group">
+              <div className="plan-label">Sources</div>
+              <div className="plan-pillrow">
+                {(preview?.looks_at ?? []).map((label) => (
+                  <span className="plan-pill on" key={`on-${label}`}>{label}</span>
+                ))}
+                {(preview?.ignores ?? []).map((label) => (
+                  <span className="plan-pill" key={`off-${label}`}>{label}</span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {recencyLabel ? (
+            <div className="plan-group">
+              <div className="plan-label">Recency</div>
+              <div className="plan-value">{recencyLabel}</div>
+            </div>
+          ) : null}
+          {tickers.length ? (
+            <div className="plan-group">
+              <div className="plan-label">Market tickers</div>
+              <div className="plan-pillrow">
+                {tickers.map((ticker) => (
+                  <span className="plan-pill on" key={ticker}>{ticker}</span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {generalQueries.length ? (
+            <div className="plan-group">
+              <div className="plan-label">Live queries</div>
+              <ul className="plan-qlist">
+                {generalQueries.slice(0, 8).map((query, index) => (
+                  <li key={`gq-${index}`}>{query}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {sourceQueries.length ? (
+            <div className="plan-group">
+              <div className="plan-label">Source queries</div>
+              <ul className="plan-qlist">
+                {sourceQueries.slice(0, 8).map((item, index) => (
+                  <li key={`sq-${index}`}>
+                    <span className="plan-qsource">{item.source}</span>
+                    {item.query}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {(preview?.exclusions?.length ?? 0) > 0 ? (
+            <div className="plan-group">
+              <div className="plan-label">Avoiding</div>
+              <div className="plan-value">{preview!.exclusions.join(" · ")}</div>
+            </div>
+          ) : null}
+          {finalized ? (
+            <div className="plan-ready-note">The AI marks this ready — confirming below to build.</div>
+          ) : null}
+        </div>
+      </aside>
     </section>
   );
 }
@@ -2041,30 +2290,6 @@ function RefinementProgressOverlay(props: { progress: RefinementProgress; now: n
         <p className="muted">{props.summary}</p>
         <RefinementStatusIndicator progress={props.progress} now={props.now} />
       </div>
-    </div>
-  );
-}
-
-function RefinementPlanPreview(props: { profile: TopicProfile | null }) {
-  const plan = searchPlanItems(props.profile);
-  const subtopics = props.profile?.subtopics ?? [];
-  if (!props.profile && !plan.length) return null;
-  return (
-    <div className="refinement-plan-preview">
-      <div>
-        <strong>What I’ve understood</strong>
-        <p>{props.profile?.scope || "I’m extracting the angle, sources, and search terms."}</p>
-      </div>
-      {subtopics.length ? (
-        <div className="mini-chip-row">
-          {subtopics.slice(0, 5).map((subtopic) => <span key={subtopic}>{subtopic}</span>)}
-        </div>
-      ) : null}
-      {plan.length ? (
-        <div className="mini-chip-row">
-          {plan.slice(0, 6).map((query) => <span key={query}>{query}</span>)}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -3100,6 +3325,7 @@ function ReportingTabContent(props: {
   const [report, setReport] = useState<CandidateReportItem[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedSources, setSelectedSources] = useState<string[]>([]);
 
   useEffect(() => {
     if (!props.selectedRunId) {
@@ -3120,9 +3346,30 @@ function ReportingTabContent(props: {
       });
   }, [props.selectedRunId]);
 
+  useEffect(() => {
+    setSelectedSources([]);
+  }, [props.selectedRunId]);
+
   const completedExplorations = props.explorations.filter(
     (exp) => exp.status === "complete"
   );
+
+  const uniqueSources = useMemo(() => {
+    if (!report) return [];
+    const sources = new Set<string>();
+    report.forEach((item) => {
+      if (item.source) {
+        sources.add(item.source);
+      }
+    });
+    return Array.from(sources).sort();
+  }, [report]);
+
+  const filteredReport = useMemo(() => {
+    if (!report) return [];
+    if (selectedSources.length === 0) return report;
+    return report.filter((item) => selectedSources.includes(item.source));
+  }, [report, selectedSources]);
 
   return (
     <section className="admin-panel">
@@ -3221,6 +3468,45 @@ function ReportingTabContent(props: {
           background: #fff;
           font: inherit;
         }
+        .report-filter-row {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 18px;
+          flex-wrap: wrap;
+        }
+        .filter-label {
+          font-weight: 600;
+          color: #4d4d49;
+          font-size: 0.9rem;
+        }
+        .filter-pills {
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .filter-pill {
+          padding: 6px 12px;
+          border: 1px solid #d8d7cf;
+          border-radius: 20px;
+          background: #fdfdfb;
+          color: #55544f;
+          font-size: 0.8rem;
+          font-weight: 550;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          user-select: none;
+        }
+        .filter-pill:hover {
+          background: #f0eee7;
+          border-color: #c5c3b8;
+          color: #171717;
+        }
+        .filter-pill.active {
+          background: #171717;
+          color: #ffffff;
+          border-color: #171717;
+        }
       `}</style>
       <div className="panel-title-row">
         <div>
@@ -3260,88 +3546,126 @@ function ReportingTabContent(props: {
         report.length === 0 ? (
           <p className="muted">No candidates found for this exploration run.</p>
         ) : (
-          <div className="report-matrix-container">
-            <table className="report-matrix-table">
-              <thead>
-                <tr>
-                  <th style={{ width: "240px" }}>Candidate (Source & Title)</th>
-                  <th>Discovery</th>
-                  <th>Screening</th>
-                  <th>Recency Filter</th>
-                  <th>Fetch / Extract</th>
-                  <th>Audit</th>
-                  <th>Editorial</th>
-                  <th>Critic</th>
-                  <th>Inclusion</th>
-                </tr>
-              </thead>
-              <tbody>
-                {report.map((item, index) => {
-                  const stages = ["discovery", "screening", "recency", "fetch", "audit", "editorial", "critic", "inclusion"] as const;
-                  let dropStage: string | null = null;
-                  for (const s of stages) {
-                    if (item.stages[s]) {
-                      dropStage = s;
-                      break;
-                    }
-                  }
-                  const rowBg = index % 2 === 0 ? "#fdfdfb" : "#f6f5f0";
-
-                  return (
-                    <Fragment key={item.id}>
-                      <tr className="report-candidate-row source-row" style={{ backgroundColor: rowBg }}>
-                        <td style={{ borderBottom: "none", paddingBottom: "2px" }}>
-                          <div className="report-candidate-source" style={{ fontWeight: 800, fontSize: "0.72rem", textTransform: "uppercase", color: "#77756f" }}>
-                            {formatStage(item.source)}
-                          </div>
-                        </td>
-                        {stages.map((stage) => {
-                          const reason = item.stages[stage];
-                          if (reason) {
-                            return (
-                              <td key={stage} rowSpan={2} className="report-cell-dropped" style={{ verticalAlign: "middle" }}>
-                                {reason}
-                              </td>
-                            );
+          <>
+            {uniqueSources.length > 0 ? (
+              <div className="report-filter-row">
+                <span className="filter-label">Filter by Source:</span>
+                <div className="filter-pills">
+                  <button
+                    className={`filter-pill ${selectedSources.length === 0 ? "active" : ""}`}
+                    onClick={() => setSelectedSources([])}
+                  >
+                    All Sources
+                  </button>
+                  {uniqueSources.map((source) => {
+                    const isActive = selectedSources.includes(source);
+                    return (
+                      <button
+                        key={source}
+                        className={`filter-pill ${isActive ? "active" : ""}`}
+                        onClick={() => {
+                          if (isActive) {
+                            setSelectedSources(selectedSources.filter((s) => s !== source));
+                          } else {
+                            setSelectedSources([...selectedSources, source]);
                           }
-                          
-                          const stageIndex = stages.indexOf(stage);
-                          const dropIndex = dropStage ? stages.indexOf(dropStage as any) : -1;
-                          
-                          if (dropIndex !== -1 && stageIndex > dropIndex) {
-                            return (
-                              <td key={stage} rowSpan={2} className="muted" style={{ fontSize: "0.8rem", textAlign: "center", verticalAlign: "middle" }}>
-                                —
-                              </td>
-                            );
-                          }
+                        }}
+                      >
+                        {formatStage(source)}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
 
-                          return (
-                            <td key={stage} rowSpan={2} className="report-cell-advanced" style={{ verticalAlign: "middle" }}>
-                              ✓ Passed
+            {filteredReport.length === 0 ? (
+              <p className="muted" style={{ marginTop: "18px" }}>No candidates match the selected source filter.</p>
+            ) : (
+              <div className="report-matrix-container">
+                <table className="report-matrix-table">
+                  <thead>
+                    <tr>
+                      <th style={{ width: "240px" }}>Candidate (Source & Title)</th>
+                      <th>Discovery</th>
+                      <th>Screening</th>
+                      <th>Recency Filter</th>
+                      <th>Fetch / Extract</th>
+                      <th>Audit</th>
+                      <th>Editorial</th>
+                      <th>Critic</th>
+                      <th>Inclusion</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredReport.map((item, index) => {
+                      const stages = ["discovery", "screening", "recency", "fetch", "audit", "editorial", "critic", "inclusion"] as const;
+                      let dropStage: string | null = null;
+                      for (const s of stages) {
+                        if (item.stages[s]) {
+                          dropStage = s;
+                          break;
+                        }
+                      }
+                      const rowBg = index % 2 === 0 ? "#fdfdfb" : "#f6f5f0";
+
+                      return (
+                        <Fragment key={item.id}>
+                          <tr className="report-candidate-row source-row" style={{ backgroundColor: rowBg }}>
+                            <td style={{ borderBottom: "none", paddingBottom: "2px" }}>
+                              <div className="report-candidate-source" style={{ fontWeight: 800, fontSize: "0.72rem", textTransform: "uppercase", color: "#77756f" }}>
+                                {formatStage(item.source)}
+                              </div>
                             </td>
-                          );
-                        })}
-                      </tr>
-                      <tr className="report-candidate-row title-row" style={{ backgroundColor: rowBg }}>
-                        <td style={{ paddingTop: "2px", borderTop: "none" }}>
-                          <div className="report-candidate-title">
-                            {item.url ? (
-                              <a href={item.url} target="_blank" rel="noreferrer">
-                                {item.title || "Untitled Item"}
-                              </a>
-                            ) : (
-                              <span>{item.title || "Untitled Item"}</span>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    </Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                            {stages.map((stage) => {
+                              const reason = item.stages[stage];
+                              if (reason) {
+                                return (
+                                  <td key={stage} rowSpan={2} className="report-cell-dropped" style={{ verticalAlign: "middle" }}>
+                                    {reason}
+                                  </td>
+                                );
+                              }
+                              
+                              const stageIndex = stages.indexOf(stage);
+                              const dropIndex = dropStage ? stages.indexOf(dropStage as typeof stages[number]) : -1;
+                              
+                              if (dropIndex !== -1 && stageIndex > dropIndex) {
+                                return (
+                                  <td key={stage} rowSpan={2} className="muted" style={{ fontSize: "0.8rem", textAlign: "center", verticalAlign: "middle" }}>
+                                    —
+                                  </td>
+                                );
+                              }
+
+                              return (
+                                <td key={stage} rowSpan={2} className="report-cell-advanced" style={{ verticalAlign: "middle" }}>
+                                  ✓ Passed
+                                </td>
+                              );
+                            })}
+                          </tr>
+                          <tr className="report-candidate-row title-row" style={{ backgroundColor: rowBg }}>
+                            <td style={{ paddingTop: "2px", borderTop: "none" }}>
+                              <div className="report-candidate-title">
+                                {item.url ? (
+                                  <a href={item.url} target="_blank" rel="noreferrer">
+                                    {item.title || "Untitled Item"}
+                                  </a>
+                                ) : (
+                                  <span>{item.title || "Untitled Item"}</span>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        </Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )
       ) : null}
     </section>
@@ -5660,26 +5984,6 @@ function sourceReadinessItems(
     });
 }
 
-function searchPlanItems(profile: TopicProfile | null): string[] {
-  if (!profile) return [];
-  const items: string[] = [];
-  const sourceSelection = profile.source_selection ?? {};
-  const hasSourceSelection = Object.keys(sourceSelection).length > 0;
-  for (const query of profile.search_queries ?? []) {
-    if (query.trim()) items.push(query.trim());
-  }
-  for (const [source, queries] of Object.entries(profile.source_queries ?? {})) {
-    if (hasSourceSelection && !sourceSelection[source]) continue;
-    for (const query of queries) {
-      const cleaned = query.trim();
-      if (cleaned) items.push(`${formatSourceLabel(source)}: ${cleaned}`);
-    }
-  }
-  for (const item of profile.foreign_language_plan ?? []) {
-    if (item.native_query?.trim()) items.push(`${item.name || item.code}: ${item.native_query.trim()}`);
-  }
-  return Array.from(new Set(items)).slice(0, 8);
-}
 
 type SearchPlanGroup = {
   key: string;
@@ -6090,10 +6394,10 @@ function formatMetricNumber(value: number | null | undefined): string {
   return `${Math.round(value)}`;
 }
 
-function currentRouteModel(status: AdminStatus | null, routeName: string): string | null {
-  const route = status?.model?.routing?.routes?.[routeName];
-  return route?.effective_model ?? route?.model ?? status?.model?.routing?.defaults?.local ?? null;
-}
+// function _currentRouteModel(status: AdminStatus | null, routeName: string): string | null {
+//   const route = status?.model?.routing?.routes?.[routeName];
+//   return route?.effective_model ?? route?.model ?? status?.model?.routing?.defaults?.local ?? null;
+// }
 
 function formatRate(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "n/a";

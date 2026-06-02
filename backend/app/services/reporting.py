@@ -446,7 +446,7 @@ def reconstruct_reporting_data(exploration_id: str) -> List[Dict[str, Any]]:
         for url, title in media:
             url = url.strip()
             title = title.strip()
-            source = "youtube" if "youtube.com" in url or "youtu.be" in url else "podcasts"
+            source = "youtube" if "youtube.com" in url or "youtu.be" in url or url.startswith("#youtube") else "podcasts"
             candidates[url] = {
                 "title": title,
                 "url": url,
