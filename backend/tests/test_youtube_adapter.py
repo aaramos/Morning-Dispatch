@@ -355,9 +355,9 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
     settings = get_settings()
     
     status = brief_settings_status(settings)
-    assert status["youtube_presets"] == {"max": 20, "large": 20, "medium": 15, "focused": 10}
-    assert status["podcast_presets"] == {"max": 20, "large": 20, "medium": 15, "focused": 10}
-    assert status["gmail_presets"] == {"max": 40, "large": 20, "medium": 15, "focused": 10}
+    assert status["youtube_presets"] == {"max": 20, "large": 16, "medium": 12, "focused": 8}
+    assert status["podcast_presets"] == {"max": 20, "large": 16, "medium": 12, "focused": 8}
+    assert status["gmail_presets"] == {"max": 40, "large": 32, "medium": 24, "focused": 16}
     
     # Save modified defaults
     modified_defaults = {
@@ -609,11 +609,13 @@ def test_youtube_capacity_protection_and_lane_sorting() -> None:
     assert "https://youtube.com/watch?v=yt-0" in yt_urls
 
 
-def test_podcast_lane_isolation_from_web_candidates() -> None:
+def test_podcast_lane_isolation_from_web_candidates(monkeypatch, tmp_path) -> None:
     from backend.agents.discovery.runner import DiscoveryRunner
     from backend.agents.discovery.registry import SourceRegistry
     from backend.agents.discovery.types import TopicProfile, SourceAdapterContext
-    from backend.tests.test_explore_discovery import FakeAdapter, candidate
+    from backend.tests.test_explore_discovery import FakeAdapter, candidate, configure_runtime
+
+    configure_runtime(monkeypatch, tmp_path)
 
     podcast_candidates = [
         candidate("podcasts", f"https://podcast.example.com/episode-{i}", 0.55 + i * 0.02)

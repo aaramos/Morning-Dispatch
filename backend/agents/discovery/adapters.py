@@ -91,6 +91,7 @@ class PodcastSourceAdapter:
             mark_seen=False,
             seen_requires_published=True,
             include_seen=True,
+            profile=profile,
         )
         if len(payloads) < 3:
             try:
@@ -125,6 +126,7 @@ class PodcastSourceAdapter:
                     mark_seen=False,
                     seen_requires_published=True,
                     include_seen=True,
+                    profile=profile,
                 )
                 seen_episode_ids = {p.metadata.get("episode_id") or p.original_url for p in payloads if p.metadata}
                 for rp in refined_payloads:
@@ -453,6 +455,30 @@ def _approved_podcast_sources() -> list[dict[str, Any]]:
 def _podcast_diagnostic_summary(decisions: list[Any]) -> str:
     if not decisions:
         return ""
+    
+    diag_decision = next((d for d in decisions if getattr(d, "decision", "") == "diagnostics"), None)
+    if diag_decision and hasattr(diag_decision, "metadata") and diag_decision.metadata:
+        m = diag_decision.metadata
+        parts = []
+        if m.get("episode_pages_found"):
+            parts.append(f"{m['episode_pages_found']} episode page(s) found")
+        if m.get("low_relevance_rejects"):
+            parts.append(f"{m['low_relevance_rejects']} low-relevance reject(s)")
+        if m.get("feed_resolved"):
+            parts.append(f"{m['feed_resolved']} feed(s) resolved")
+        if m.get("episode_matched"):
+            parts.append(f"{m['episode_matched']} episode(s) matched")
+        if m.get("no_audio_rejects"):
+            parts.append(f"{m['no_audio_rejects']} no-audio reject(s)")
+        if m.get("date_rejects"):
+            parts.append(f"{m['date_rejects']} date reject(s)")
+        if m.get("feed_error"):
+            parts.append(f"{m['feed_error']} feed error(s)")
+        if m.get("already_seen"):
+            parts.append(f"{m['already_seen']} previously shown episode(s)")
+        if parts:
+            return "Diagnostics: " + ", ".join(parts) + "."
+
     counts: dict[str, int] = {}
     for decision in decisions:
         key = str(getattr(decision, "decision", "") or "checked")

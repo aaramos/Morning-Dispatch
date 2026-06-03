@@ -31,6 +31,57 @@ def gmail_token_scopes(settings: Settings | None = None) -> set[str]:
     return _token_scopes(settings or get_settings())
 
 
+def gmail_credentials_health(settings: Settings | None = None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    if not settings.gmail_client_secret_path.exists():
+        return {
+            "configured": False,
+            "valid": False,
+            "requires_reconnect": False,
+            "reason": "Upload a Gmail OAuth client in Admin Sources, then connect Gmail.",
+        }
+    if not settings.gmail_credentials_path.exists():
+        return {
+            "configured": True,
+            "valid": False,
+            "requires_reconnect": True,
+            "reason": "Finish the Gmail connection in Admin Sources.",
+        }
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+
+        creds = Credentials.from_authorized_user_file(str(settings.gmail_credentials_path), SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            settings.gmail_credentials_path.write_text(creds.to_json(), encoding="utf-8")
+        if creds.valid:
+            return {
+                "configured": True,
+                "valid": True,
+                "requires_reconnect": False,
+                "reason": None,
+            }
+        return {
+            "configured": True,
+            "valid": False,
+            "requires_reconnect": True,
+            "reason": "Reconnect Gmail in Admin Sources. The saved Gmail token is no longer valid.",
+        }
+    except Exception as exc:
+        detail = str(exc)
+        if "invalid_grant" in detail or "expired or revoked" in detail:
+            reason = "Reconnect Gmail in Admin Sources. Google says the saved token has expired or was revoked."
+        else:
+            reason = "Reconnect Gmail in Admin Sources. Gmail authentication failed."
+        return {
+            "configured": True,
+            "valid": False,
+            "requires_reconnect": True,
+            "reason": reason,
+        }
+
+
 async def deliver_scheduled_digest(run: dict[str, Any] | None) -> dict[str, Any] | None:
     if not run:
         return None

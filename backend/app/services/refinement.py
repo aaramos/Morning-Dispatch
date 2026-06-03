@@ -71,17 +71,46 @@ def start_session(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Interest statement is required")
     profile = _seed_profile_with_hints(_initial_profile(payload))
     messages: list[dict[str, str]] = []
-    gmail_question = _gmail_refinement_question(profile)
-    if gmail_question:
-        messages = [{"role": "assistant", "content": gmail_question}]
+    
+    selection = _source_selection_dict(profile.get("source_selection"))
+    if selection.get("gmail"):
+        rules = _gmail_rules_from_answer(statement, profile)
+        candidates = _discover_gmail_candidates(rules, profile)
+        notes = rules.pop("_ai_candidate_notes", {})
+        rules["candidates"] = [
+            {
+                **candidate.to_dict(),
+                **({"ai_rationale": notes.get(candidate.sender.lower())} if notes.get(candidate.sender.lower()) else {}),
+            }
+            for candidate in candidates
+        ]
+        if candidates:
+            gmail_allowlist.record_candidates(rules["candidates"], source="refinement")
+        profile["gmail_rules"] = rules
+        profile["source_queries"] = _merge_source_queries(profile.get("source_queries"), {"gmail": [rules["gmail_search_query"]]})
+        profile["lookback_hours"] = rules["lookback_hours"]
+        profile["recency_weighting"] = _recency_from_lookback_hours(int(rules["lookback_hours"]))
+        profile["source_scope_answered"] = True
+
+        if candidates:
+            question = _gmail_candidate_question(candidates, rules)
+        else:
+            question = (
+                "I searched Gmail for that newsletter pattern but didn’t find clear newsletter senders. "
+                "Name any sender or newsletter you want included, or say to continue without Gmail."
+            )
+        question += "\n\n*Please also provide explicit instructions on how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
+        
+        messages = [{"role": "assistant", "content": question}]
         session = database.create_refinement_session(
             statement=statement,
             profile=profile,
             messages=messages,
-            pending_field=GMAIL_RULES_FIELD,
+            pending_field=GMAIL_SENDER_SELECTION_FIELD,
             status="active",
         )
         return _session_response(session)
+
     agent_update = _run_refinement_agent(
         profile=profile,
         messages=messages,
@@ -139,6 +168,19 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
     profile = _apply_models(profile, payload.get("models"))
     just_go_now = bool(payload.get("just_go_now"))
     turn_count = int(session.get("turn_count") or 0)
+
+    # Update source selection and detect toggled-on/off Gmail
+    prev_selection = _source_selection_dict(profile.get("source_selection"))
+    incoming_selection = payload.get("source_selection") or {}
+    profile["source_selection"] = {**prev_selection, **incoming_selection}
+
+    if profile["source_selection"].get("gmail") and not prev_selection.get("gmail"):
+        profile["gmail_rules"] = {}
+        pending = None  # Force rediscovery/reprompt
+    elif not profile["source_selection"].get("gmail") and prev_selection.get("gmail"):
+        if pending == GMAIL_SENDER_SELECTION_FIELD or pending == GMAIL_RULES_FIELD:
+            pending = None
+
     answered_field = _answered_field_for_current_question(pending, messages) if answer and not just_go_now else ""
     answer_applied = False
 
@@ -270,6 +312,62 @@ async def astream_refinement(
                 }
             )
         )
+
+        selection = _source_selection_dict(profile.get("source_selection"))
+        if selection.get("gmail"):
+            rules = _gmail_rules_from_answer(clean_statement, profile)
+            candidates = _discover_gmail_candidates(rules, profile)
+            notes = rules.pop("_ai_candidate_notes", {})
+            rules["candidates"] = [
+                {
+                    **candidate.to_dict(),
+                    **({"ai_rationale": notes.get(candidate.sender.lower())} if notes.get(candidate.sender.lower()) else {}),
+                }
+                for candidate in candidates
+            ]
+            if candidates:
+                gmail_allowlist.record_candidates(rules["candidates"], source="refinement")
+            profile["gmail_rules"] = rules
+            profile["source_queries"] = _merge_source_queries(profile.get("source_queries"), {"gmail": [rules["gmail_search_query"]]})
+            profile["lookback_hours"] = rules["lookback_hours"]
+            profile["recency_weighting"] = _recency_from_lookback_hours(int(rules["lookback_hours"]))
+            profile["source_scope_answered"] = True
+
+            if candidates:
+                question = _gmail_candidate_question(candidates, rules)
+            else:
+                question = (
+                    "I searched Gmail for that newsletter pattern but didn’t find clear newsletter senders. "
+                    "Name any sender or newsletter you want included, or say to continue without Gmail."
+                )
+            question += "\n\n*Please also provide explicit instructions on how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
+
+            messages = [{"role": "assistant", "content": question}]
+            session = database.create_refinement_session(
+                statement=clean_statement,
+                profile=profile,
+                messages=messages,
+                pending_field=GMAIL_SENDER_SELECTION_FIELD,
+                status="active",
+            )
+            session_id = session["session_id"]
+            yield {"type": "session", "session_id": session_id}
+            yield {"type": "token", "text": question}
+            response = _session_response(session)
+            
+            candidate_dicts = rules["candidates"]
+            yield {
+                "type": "gmail_candidates",
+                "candidates": candidate_dicts,
+                "intro": question,
+                "criteria": str(rules.get("selection_criteria") or ""),
+                "search_phrase": str(rules.get("gmail_search_query") or clean_statement),
+                "lookback_hours": rules["lookback_hours"],
+            }
+            yield {"type": "plan", "session": response}
+            yield {"type": "done", "session": response, "ready": False}
+            return
+
         session = database.create_refinement_session(
             statement=clean_statement,
             profile=profile,
@@ -287,12 +385,74 @@ async def astream_refinement(
         profile = dict(session["profile"])
         messages = _messages(session)
 
+    # Detect if source selection toggled Gmail on/off
+    prev_selection = _source_selection_dict(profile.get("source_selection"))
+    incoming_selection = source_selection or {}
+    profile["source_selection"] = {**prev_selection, **incoming_selection}
+
+    if profile["source_selection"].get("gmail") and not prev_selection.get("gmail"):
+        profile["gmail_rules"] = {}
+        pending_field = ""
+        session = {**session, "pending_field": None}
+    elif not profile["source_selection"].get("gmail") and prev_selection.get("gmail"):
+        if pending_field == GMAIL_SENDER_SELECTION_FIELD or pending_field == GMAIL_RULES_FIELD:
+            pending_field = ""
+            session = {**session, "pending_field": None}
+
     profile = _apply_models(profile, models)
     turn_count = int(session.get("turn_count") or 0)
     clean_answer = str(answer or "").strip()
     pending_field = session.get("pending_field") or ""
 
     yield {"type": "session", "session_id": session_id}
+
+    # --- Gmail discovery intercept (early check) -----------------------------------
+    gmail_enabled = _source_selection_dict(profile.get("source_selection")).get("gmail")
+    gmail_rules = _normalize_gmail_rules(profile.get("gmail_rules"))
+    has_candidates = bool(gmail_rules.get("candidates"))
+    has_senders = bool(gmail_rules.get("include_senders"))
+    has_intent = bool(gmail_rules.get("intent"))
+
+    trigger_gmail_discovery = (
+        gmail_enabled
+        and not has_candidates
+        and not has_senders
+        and not has_intent
+        and pending_field != GMAIL_SENDER_SELECTION_FIELD
+    )
+
+    if not just_go_now and trigger_gmail_discovery:
+        discovery_query = clean_answer or profile.get("statement") or statement or ""
+        gmail_candidates_event = await _astream_gmail_discovery(
+            patched=profile,
+            answer=discovery_query,
+        )
+        if gmail_candidates_event is not None:
+            patched = _coerce_profile(gmail_candidates_event["_patched_profile"])
+            gmail_candidates_event.pop("_patched_profile", None)
+
+            intro = gmail_candidates_event.get("intro", "")
+            messages.append({"role": "assistant", "content": intro})
+
+            updated_gmail = database.update_refinement_session(
+                session_id,
+                profile=patched,
+                messages=messages,
+                pending_field=GMAIL_SENDER_SELECTION_FIELD,
+                turn_count=turn_count,
+                status="active",
+                topic_id=session.get("topic_id"),
+            )
+            response_gmail = _session_response(updated_gmail) if updated_gmail else None
+            if response_gmail is None:
+                yield {"type": "error", "message": "Failed to persist Gmail discovery step"}
+                return
+
+            yield {"type": "token", "text": intro}
+            yield {"type": "plan", "session": response_gmail}
+            yield {**gmail_candidates_event, "type": "gmail_candidates"}
+            yield {"type": "done", "session": response_gmail, "ready": False}
+            return
 
     # --- Gmail sender-approval intercept -------------------------------------------
     # When the previous turn left pending_field=GMAIL_SENDER_SELECTION_FIELD the user
@@ -660,7 +820,7 @@ async def astream_refine_strategy(
 
     client = _refinement_model_client(profile)
     if client is None:
-        async for event in _astream_strategy_fallback(session_id, instruction, models):
+        async for event in _astream_strategy_fallback(session_id, effective_instruction, models):
             yield event
         return
 
@@ -706,7 +866,7 @@ async def astream_refine_strategy(
     await task
 
     if error_message is not None:
-        async for event in _astream_strategy_fallback(session_id, instruction, models, prefix_error=True):
+        async for event in _astream_strategy_fallback(session_id, effective_instruction, models, prefix_error=True):
             yield event
         return
 
@@ -1651,9 +1811,23 @@ def _advance_gmail_refinement(
     if just_go_now:
         return None
     pending_field = str(pending or "")
-    if pending_field == GMAIL_RULES_FIELD and answer.strip():
+
+    selection = _source_selection_dict(profile.get("source_selection"))
+    gmail_rules = _normalize_gmail_rules(profile.get("gmail_rules"))
+
+    # Immediate candidates discovery scan if Gmail is active but rules/candidates are empty:
+    trigger_gmail_discovery = (
+        selection.get("gmail")
+        and not gmail_rules.get("candidates")
+        and not gmail_rules.get("include_senders")
+        and not gmail_rules.get("intent")
+        and pending_field != GMAIL_SENDER_SELECTION_FIELD
+    )
+
+    if trigger_gmail_discovery:
         updated = dict(profile)
-        rules = _gmail_rules_from_answer(answer, updated)
+        query_text = answer.strip() or updated.get("statement") or ""
+        rules = _gmail_rules_from_answer(query_text, updated)
         candidates = _discover_gmail_candidates(rules, updated)
         notes = rules.pop("_ai_candidate_notes", {})
         rules["candidates"] = [
@@ -1670,19 +1844,19 @@ def _advance_gmail_refinement(
         updated["lookback_hours"] = rules["lookback_hours"]
         updated["recency_weighting"] = _recency_from_lookback_hours(int(rules["lookback_hours"]))
         updated["source_scope_answered"] = True
+
         if candidates:
-            return (
-                _coerce_profile(updated),
-                _gmail_candidate_question(candidates, rules),
-                GMAIL_SENDER_SELECTION_FIELD,
-                "active",
-            )
-        return (
-            _coerce_profile(updated),
-            (
+            intro = _gmail_candidate_question(candidates, rules)
+        else:
+            intro = (
                 "I searched Gmail for that newsletter pattern but didn’t find clear newsletter senders. "
                 "Name any sender or newsletter you want included, or say to continue without Gmail."
-            ),
+            )
+        intro += "\n\n*Please also provide explicit instructions on how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
+
+        return (
+            _coerce_profile(updated),
+            intro,
             GMAIL_SENDER_SELECTION_FIELD,
             "active",
         )
@@ -1690,22 +1864,38 @@ def _advance_gmail_refinement(
     if pending_field == GMAIL_SENDER_SELECTION_FIELD:
         updated = dict(profile)
         rules = _normalize_gmail_rules(updated.get("gmail_rules"))
-        include_senders = _selected_gmail_senders(answer, rules)
+
+        intent_match = re.search(r"Instructions:\s*(.*)", answer, re.DOTALL | re.IGNORECASE)
+        if intent_match:
+            extraction_instructions = intent_match.group(1).strip()
+            sender_part = answer[:intent_match.start()].strip()
+        else:
+            extraction_instructions = answer.strip()
+            sender_part = answer
+
+        include_senders = _selected_gmail_senders(sender_part, rules)
         if include_senders:
             approved = gmail_allowlist.approve_senders(include_senders, source="refinement")
             rules["include_senders"] = approved or include_senders
+            if extraction_instructions:
+                rules["intent"] = extraction_instructions
             updated["requested_sources"] = _merge_requested_source_lists(
                 _normalize_requested_sources(updated.get("requested_sources")),
                 [{"adapter": "gmail", "ref": sender} for sender in include_senders],
             )
             updated["requested_sources_answered"] = True
             updated["gmail_rules"] = rules
+            
+            confirmation = (
+                f"Approved {', '.join(include_senders)} to the Gmail allowlist. "
+                "These newsletters become discovery feeds, and the articles they link to become primary content for this brief."
+            )
+            if extraction_instructions:
+                confirmation += f" I will extract items based on your instructions: '{extraction_instructions}'."
+            
             return (
                 _coerce_profile(updated),
-                (
-                    f"Approved {', '.join(include_senders)} to the Gmail allowlist. "
-                    "These newsletters become discovery feeds, and the articles they link to become primary content for this brief."
-                ),
+                confirmation,
                 None,
                 "continue",
             )

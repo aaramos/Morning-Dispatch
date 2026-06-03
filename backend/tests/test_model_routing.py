@@ -18,6 +18,7 @@ def configure_runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("MORNING_DISPATCH_DB_PATH", str(runtime / "data" / "db" / "morning_dispatch.sqlite3"))
     monkeypatch.setenv("MORNING_DISPATCH_MODEL_API_KEY", "local-key")
     monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_MODEL", "local-default")
+    monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "true")
     monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
     return runtime
 

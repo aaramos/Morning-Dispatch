@@ -317,3 +317,41 @@ candidate_screening: |
   }
 
   Do not include any markup, fences, or text other than the JSON object.
+
+podcast_relevance: |
+  You are an expert podcast research librarian.
+  Your task is to review a list of candidate podcast episodes discovered via search hits and score/filter them against the user's topic profile.
+  
+  Topic Statement:
+  {{statement}}
+  
+  Topic Scope:
+  {{scope}}
+  
+  Exclusions:
+  {{exclusions}}
+  
+  Here is the list of candidates to evaluate:
+  {{candidates_json}}
+  
+  For each candidate, output a JSON object containing its index (from the input list), your decision ("keep" or "drop"), a relevance score between 0.0 and 1.0, and a concise reason.
+  
+  Rules:
+  1. Set decision to "drop" and score to < 0.35 if the episode has low relevance, is generic spam, or matches any exclusion.
+  2. Otherwise set decision to "keep".
+  3. Keep the reason under 15 words.
+  
+  Format your response as a strict JSON object with this shape:
+  {
+    "decisions": [
+      {
+        "index": 0,
+        "decision": "keep|drop",
+        "score": 0.85,
+        "reason": "short explanation"
+      }
+    ]
+  }
+  
+  Do not include any markup, fences, or text other than the JSON object.
+

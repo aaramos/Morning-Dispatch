@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from backend.agents.critic import MAX_CRITIC_ARTICLES, MAX_NEWSLETTER_RECORDS
@@ -25,44 +26,62 @@ MAX_TARGET_ITEMS = 250
 MODEL_REFINEMENT_LIMIT = 150
 MAX_ARTICLE_FETCH_CONCURRENCY = 20
 
+SYSTEM_CONTENT_LIMITS: dict[str, Any] = {
+    "total_items": MAX_CANDIDATE_BUDGET,
+    "target_items": 25,
+    "lead_items": 5,
+    "quality_floor": "standard",
+    "per_source": {
+        "web_search": 40,
+        "foreign_media": 40,
+        "gmail": 40,
+        "podcasts": 20,
+        "youtube": 20,
+        "collections": 25,
+        "markets": 40,
+    },
+}
+
+
+def _scaled_content_limits(scale: float) -> dict[str, Any]:
+    def scaled(value: int) -> int:
+        return max(1, math.ceil(value * scale))
+
+    return {
+        "total_items": scaled(int(SYSTEM_CONTENT_LIMITS["total_items"])),
+        "target_items": scaled(int(SYSTEM_CONTENT_LIMITS["target_items"])),
+        "lead_items": scaled(int(SYSTEM_CONTENT_LIMITS["lead_items"])),
+        "quality_floor": "standard",
+        "per_source": {
+            key: scaled(int(value))
+            for key, value in SYSTEM_CONTENT_LIMITS["per_source"].items()
+        },
+    }
+
 DEFAULT_YOUTUBE_PRESETS: dict[str, int] = {
     "max": 20,
-    "large": 20,
-    "medium": 15,
-    "focused": 10,
+    "large": 16,
+    "medium": 12,
+    "focused": 8,
 }
 
 DEFAULT_PODCAST_PRESETS: dict[str, int] = {
     "max": 20,
-    "large": 20,
-    "medium": 15,
-    "focused": 10,
+    "large": 16,
+    "medium": 12,
+    "focused": 8,
 }
 
 DEFAULT_GMAIL_PRESETS: dict[str, int] = {
     "max": 40,
-    "large": 20,
-    "medium": 15,
-    "focused": 10,
+    "large": 32,
+    "medium": 24,
+    "focused": 16,
 }
 
 DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
     "lookback_hours": 336,
-    "content_limits": {
-        "total_items": 250,
-        "target_items": 25,
-        "lead_items": 5,
-        "quality_floor": "standard",
-        "per_source": {
-            "web_search": 25,
-            "foreign_media": 25,
-            "gmail": 25,
-            "podcasts": 20,
-            "youtube": 20,
-            "collections": 25,
-            "markets": 25,
-        },
-    },
+    "content_limits": _scaled_content_limits(0.6),
 }
 
 DEFAULT_PIPELINE_LIMITS: dict[str, int] = {
@@ -128,9 +147,9 @@ def normalize_youtube_presets(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
     return {
         "max": _bounded_int(raw.get("max"), 1, 20) or 20,
-        "large": _bounded_int(raw.get("large"), 1, 20) or 20,
-        "medium": _bounded_int(raw.get("medium"), 1, 20) or 15,
-        "focused": _bounded_int(raw.get("focused"), 1, 20) or 10,
+        "large": _bounded_int(raw.get("large"), 1, 20) or 16,
+        "medium": _bounded_int(raw.get("medium"), 1, 20) or 12,
+        "focused": _bounded_int(raw.get("focused"), 1, 20) or 8,
     }
 
 
@@ -138,9 +157,9 @@ def normalize_podcast_presets(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
     return {
         "max": _bounded_int(raw.get("max"), 1, 20) or 20,
-        "large": _bounded_int(raw.get("large"), 1, 20) or 20,
-        "medium": _bounded_int(raw.get("medium"), 1, 20) or 15,
-        "focused": _bounded_int(raw.get("focused"), 1, 20) or 10,
+        "large": _bounded_int(raw.get("large"), 1, 20) or 16,
+        "medium": _bounded_int(raw.get("medium"), 1, 20) or 12,
+        "focused": _bounded_int(raw.get("focused"), 1, 20) or 8,
     }
 
 
@@ -148,9 +167,9 @@ def normalize_gmail_presets(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
     return {
         "max": _bounded_int(raw.get("max"), 1, 40) or 40,
-        "large": _bounded_int(raw.get("large"), 1, 40) or 20,
-        "medium": _bounded_int(raw.get("medium"), 1, 40) or 15,
-        "focused": _bounded_int(raw.get("focused"), 1, 40) or 10,
+        "large": _bounded_int(raw.get("large"), 1, 40) or 32,
+        "medium": _bounded_int(raw.get("medium"), 1, 40) or 24,
+        "focused": _bounded_int(raw.get("focused"), 1, 40) or 16,
     }
 
 

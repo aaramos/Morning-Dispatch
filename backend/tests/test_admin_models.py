@@ -74,10 +74,10 @@ def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
 
     assert initial.status_code == 200
     assert initial.json()["defaults"]["lookback_hours"] == 336
-    assert initial.json()["defaults"]["content_limits"]["total_items"] == 250
-    assert initial.json()["defaults"]["content_limits"]["target_items"] == 25
-    assert initial.json()["defaults"]["content_limits"]["lead_items"] == 5
-    assert initial.json()["defaults"]["content_limits"]["per_source"]["gmail"] == 25
+    assert initial.json()["defaults"]["content_limits"]["total_items"] == 150
+    assert initial.json()["defaults"]["content_limits"]["target_items"] == 15
+    assert initial.json()["defaults"]["content_limits"]["lead_items"] == 3
+    assert initial.json()["defaults"]["content_limits"]["per_source"]["gmail"] == 24
     assert initial.json()["pipeline_limits"]["article_fetches"] == 250
     assert any(group["group"] == "AI review caps" for group in initial.json()["system_limits"])
     assert updated.status_code == 200

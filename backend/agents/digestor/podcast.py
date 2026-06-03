@@ -24,6 +24,7 @@ from backend.agents.librarian.text_utils import keyword_set
 from backend.app.core.config import get_settings
 from backend.app.db import database
 from backend.db.queries import get_watermark, upsert_watermark
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ async def fetch_podcast_episodes(
     mark_seen: bool = True,
     seen_requires_published: bool = False,
     include_seen: bool = False,
+    profile: TopicProfile | None = None,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     decisions: list[AgentDecision] = []
     try:
@@ -77,6 +79,7 @@ async def fetch_podcast_episodes(
             seen_requires_published=seen_requires_published,
             include_seen=include_seen,
             decisions=decisions,
+            profile=profile,
         )
     except Exception as exc:
         logger.info("Podcast ingestion failed: %s", exc)
@@ -106,6 +109,7 @@ async def _fetch_podcast_episodes(
     seen_requires_published: bool,
     include_seen: bool,
     decisions: list[AgentDecision],
+    profile: TopicProfile | None = None,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     podcast_sources = _podcast_sources(sources)
     if not podcast_sources:
@@ -114,94 +118,186 @@ async def _fetch_podcast_episodes(
     feed_sources = [source for source in podcast_sources if _source_feed_url(source)]
     search_sources = [source for source in podcast_sources if not _source_feed_url(source)]
 
-    discovered = await _discover_sources(search_sources, digest_interest) if search_sources else []
-    for source in discovered:
-        decisions.append(
-            _decision(
-                target=str(source.get("title") or source.get("feed_url") or "podcast"),
-                decision="watch",
-                action="sample_feed",
-                confidence=0.74,
-                reason="Podcast Scout found a candidate show through aggregator search.",
-                metadata={"feed_url": source.get("feed_url"), "aggregator": source.get("aggregator")},
-            )
+    diagnostics = {
+        "episode_pages_found": 0,
+        "low_relevance_rejects": 0,
+        "feed_resolved": 0,
+        "episode_matched": 0,
+        "no_audio_rejects": 0,
+        "date_rejects": 0,
+    }
+
+    resolved_search_episodes = []
+    discovered = []
+    if search_sources:
+        resolved_search_episodes = await _episode_first_search_and_resolve(
+            digest_interest=digest_interest,
+            lookback_hours=lookback_hours,
+            search_sources=search_sources,
+            profile=profile,
+            decisions=decisions,
+            diagnostics=diagnostics,
+            max_episodes=max_episodes,
         )
+        if not resolved_search_episodes:
+            decisions.append(
+                _decision(
+                    target="podcast discovery",
+                    decision="fallback",
+                    action="show_first_discovery",
+                    confidence=0.7,
+                    reason="Episode-first search yielded no candidate episodes, falling back to show-first discovery.",
+                )
+            )
+            discovered = await _discover_sources(search_sources, digest_interest)
+            for source in discovered:
+                decisions.append(
+                    _decision(
+                        target=str(source.get("title") or source.get("feed_url") or "podcast"),
+                        decision="watch",
+                        action="sample_feed",
+                        confidence=0.74,
+                        reason="Podcast Scout found a candidate show through aggregator search.",
+                        metadata={"feed_url": source.get("feed_url"), "aggregator": source.get("aggregator")},
+                    )
+                )
 
     feed_sources.extend(discovered)
-    if not feed_sources:
-        return [], decisions
-
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-        batches = await asyncio.gather(
-            *[_timed_fetch_feed_episodes(client, source) for source in feed_sources],
-            return_exceptions=True,
-        )
+    
+    batches = []
+    if feed_sources:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+            batches = await asyncio.gather(
+                *[_timed_fetch_feed_episodes(client, source) for source in feed_sources],
+                return_exceptions=True,
+            )
 
     candidates: list[tuple[float, PodcastEpisode, dict[str, Any]]] = []
     feed_fetch_ms_by_url: dict[str, int] = {}
-    for source, batch in zip(feed_sources, batches):
-        if isinstance(batch, Exception):
-            logger.info("Podcast feed failed for %s: %s", _source_feed_url(source), batch)
+    
+    if feed_sources and batches:
+        for source, batch in zip(feed_sources, batches):
+            if isinstance(batch, Exception):
+                logger.info("Podcast feed failed for %s: %s", _source_feed_url(source), batch)
+                decisions.append(
+                    _decision(
+                        target=str(source.get("title") or _source_feed_url(source) or "podcast"),
+                        decision="feed_error",
+                        action="skip",
+                        confidence=0.82,
+                        reason="Podcast Scout could not read the feed this run.",
+                        metadata={"error": str(batch)[:240]},
+                    )
+                )
+                continue
+            feed_episodes, feed_fetch_ms = batch
+            for episode in feed_episodes:
+                feed_fetch_ms_by_url[episode.feed_url] = feed_fetch_ms
+            for episode in feed_episodes:
+                if not _inside_lookback(episode.published_at, lookback_hours):
+                    continue
+                already_seen = _already_seen(digest_id, episode, require_published=seen_requires_published)
+                if already_seen and not force_refresh and not include_seen:
+                    _record_skipped_podcast_metric(
+                        digest_id=digest_id,
+                        inference_run_id=inference_run_id,
+                        episode=episode,
+                        status="already_seen",
+                        feed_fetch_ms=feed_fetch_ms,
+                    )
+                    continue
+                score = _score_episode(episode, digest_interest)
+                if score < MIN_EPISODE_SCORE:
+                    _record_skipped_podcast_metric(
+                        digest_id=digest_id,
+                        inference_run_id=inference_run_id,
+                        episode=episode,
+                        status="low_score",
+                        feed_fetch_ms=feed_fetch_ms,
+                        score=score,
+                    )
+                    decisions.append(
+                        _decision(
+                            target=episode.title,
+                            decision="skip",
+                            action="skip_episode",
+                            confidence=0.78,
+                            reason="Podcast Triage found weak overlap with the digest interests.",
+                            metadata={"score": score, "show": episode.show_name},
+                        )
+                    )
+                    continue
+                if already_seen:
+                    decisions.append(
+                        _decision(
+                            target=episode.title,
+                            decision="recent_episode_reused",
+                            action="reuse_cached_episode",
+                            confidence=0.82,
+                            reason="Podcast Scout reused a recent episode so the regenerated digest keeps podcast coverage without re-discovery.",
+                            metadata={"score": score, "show": episode.show_name},
+                        )
+                    )
+                candidates.append((score, episode, source))
+
+    # Add resolved search episodes to candidates
+    for episode in resolved_search_episodes:
+        already_seen = _already_seen(digest_id, episode, require_published=seen_requires_published)
+        if already_seen and not force_refresh and not include_seen:
+            _record_skipped_podcast_metric(
+                digest_id=digest_id,
+                inference_run_id=inference_run_id,
+                episode=episode,
+                status="already_seen",
+                feed_fetch_ms=100,
+            )
+            continue
+        score = _score_episode(episode, digest_interest)
+        if score < MIN_EPISODE_SCORE:
+            _record_skipped_podcast_metric(
+                digest_id=digest_id,
+                inference_run_id=inference_run_id,
+                episode=episode,
+                status="low_score",
+                feed_fetch_ms=100,
+                score=score,
+            )
             decisions.append(
                 _decision(
-                    target=str(source.get("title") or _source_feed_url(source) or "podcast"),
-                    decision="feed_error",
-                    action="skip",
-                    confidence=0.82,
-                    reason="Podcast Scout could not read the feed this run.",
-                    metadata={"error": str(batch)[:240]},
+                    target=episode.title,
+                    decision="skip",
+                    action="skip_episode",
+                    confidence=0.78,
+                    reason="Podcast Triage found weak overlap with the digest interests.",
+                    metadata={"score": score, "show": episode.show_name},
                 )
             )
             continue
-        feed_episodes, feed_fetch_ms = batch
-        for episode in feed_episodes:
-            feed_fetch_ms_by_url[episode.feed_url] = feed_fetch_ms
-        for episode in feed_episodes:
-            if not _inside_lookback(episode.published_at, lookback_hours):
-                continue
-            already_seen = _already_seen(digest_id, episode, require_published=seen_requires_published)
-            if already_seen and not force_refresh and not include_seen:
-                _record_skipped_podcast_metric(
-                    digest_id=digest_id,
-                    inference_run_id=inference_run_id,
-                    episode=episode,
-                    status="already_seen",
-                    feed_fetch_ms=feed_fetch_ms,
+        if already_seen:
+            decisions.append(
+                _decision(
+                    target=episode.title,
+                    decision="recent_episode_reused",
+                    action="reuse_cached_episode",
+                    confidence=0.82,
+                    reason="Podcast Scout reused a recent episode so the regenerated brief keeps podcast coverage without re-discovery.",
+                    metadata={"score": score, "show": episode.show_name},
                 )
-                continue
-            score = _score_episode(episode, digest_interest)
-            if score < MIN_EPISODE_SCORE:
-                _record_skipped_podcast_metric(
-                    digest_id=digest_id,
-                    inference_run_id=inference_run_id,
-                    episode=episode,
-                    status="low_score",
-                    feed_fetch_ms=feed_fetch_ms,
-                    score=score,
-                )
-                decisions.append(
-                    _decision(
-                        target=episode.title,
-                        decision="skip",
-                        action="skip_episode",
-                        confidence=0.78,
-                        reason="Podcast Triage found weak overlap with the digest interests.",
-                        metadata={"score": score, "show": episode.show_name},
-                    )
-                )
-                continue
-            if already_seen:
-                decisions.append(
-                    _decision(
-                        target=episode.title,
-                        decision="recent_episode_reused",
-                        action="reuse_cached_episode",
-                        confidence=0.82,
-                        reason="Podcast Scout reused a recent episode so the regenerated digest keeps podcast coverage without re-discovery.",
-                        metadata={"score": score, "show": episode.show_name},
-                    )
-                )
-            candidates.append((score, episode, source))
+            )
+        source = search_sources[0] if search_sources else {"type": "podcast_search", "title": episode.show_name}
+        candidates.append((score, episode, source))
+
+    if search_sources:
+        decisions.append(
+            _decision(
+                target="diagnostics",
+                decision="diagnostics",
+                action="report_diagnostics",
+                confidence=1.0,
+                reason="Episode-first search diagnostics report.",
+                metadata=diagnostics,
+            )
+        )
 
     ranked = sorted(candidates, key=lambda item: item[0], reverse=True)[:max(1, max_episodes)]
     payloads: list[NormalizedPayload] = []
@@ -1039,3 +1135,428 @@ def _decision(
         reason=reason,
         metadata=metadata or {},
     )
+
+
+async def _episode_first_search_and_resolve(
+    digest_interest: str,
+    lookback_hours: int,
+    search_sources: list[dict[str, Any]],
+    profile: TopicProfile | None,
+    decisions: list[AgentDecision],
+    diagnostics: dict[str, int],
+    max_episodes: int = MAX_PODCAST_EPISODES,
+) -> list[PodcastEpisode]:
+    from backend.agents.discovery.web_search import lookback_to_days, search_web
+    from backend.agents.discovery.types import TopicProfile
+    days = lookback_to_days(lookback_hours)
+
+    queries = []
+    for source in search_sources:
+        q = str(source.get("query") or source.get("title") or "").strip()
+        if q:
+            queries.append(q)
+    if not queries:
+        queries = [digest_interest]
+
+    # Dynamically scale limits based on requested episodes (Issue 3)
+    queries_limit = max(2, max_episodes // 3)
+    search_hits_limit = max(8, max_episodes * 2)
+    resolution_attempts_limit = max(6, max_episodes + 2)
+
+    web_queries = []
+    for q in queries[:queries_limit]:
+        web_queries.append(f"{q} podcast episode")
+        web_queries.append(f"{q} interview conversation podcast")
+
+    search_tasks = [search_web(wq, limit=search_hits_limit, days=days) for wq in web_queries]
+    search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+    hits = []
+    seen_urls = set()
+    for res in search_results:
+        if isinstance(res, list):
+            for hit in res:
+                url_normalized = _normalize_url_for_match(hit.url)
+                if url_normalized not in seen_urls:
+                    seen_urls.add(url_normalized)
+                    hits.append(hit)
+
+    diagnostics["episode_pages_found"] += len(hits)
+    if not hits:
+        return []
+
+    kept = await _screen_episodes_with_agent(
+        hits=hits,
+        digest_interest=digest_interest,
+        profile=profile,
+        decisions=decisions,
+        diagnostics=diagnostics,
+    )
+
+    resolved_episodes = []
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as http_client:
+        for hit in kept[:resolution_attempts_limit]:
+            feed_url = await _resolve_feed_url(http_client, hit.url, hit.title, decisions)
+            if not feed_url:
+                continue
+
+            diagnostics["feed_resolved"] += 1
+
+            try:
+                response = await http_client.get(feed_url)
+                response.raise_for_status()
+                episodes = parse_podcast_feed(response.text, feed_url=feed_url)
+            except Exception as exc:
+                logger.info("Failed to fetch resolved feed %s: %s", feed_url, exc)
+                continue
+
+            matched_ep = _match_episode_in_feed(episodes, hit)
+            if not matched_ep:
+                continue
+
+            diagnostics["episode_matched"] += 1
+
+            if not matched_ep.audio_url:
+                diagnostics["no_audio_rejects"] += 1
+                decisions.append(
+                    _decision(
+                        target=matched_ep.title,
+                        decision="skip",
+                        action="exclude_no_audio",
+                        confidence=0.9,
+                        reason="Excluded because the resolved episode has no playable audio URL.",
+                        metadata={"feed_url": feed_url},
+                    )
+                )
+                continue
+
+            if not _inside_lookback(matched_ep.published_at, lookback_hours):
+                diagnostics["date_rejects"] += 1
+                continue
+
+            apple_url = await _lookup_apple_podcast_url(http_client, matched_ep, {"title": matched_ep.show_name})
+            if apple_url:
+                matched_ep = replace(matched_ep, apple_podcasts_url=apple_url)
+
+            resolved_episodes.append(matched_ep)
+
+    return resolved_episodes
+
+
+async def _screen_episodes_with_agent(
+    hits: list[Any],
+    digest_interest: str,
+    profile: TopicProfile | None,
+    decisions: list[AgentDecision],
+    diagnostics: dict[str, int],
+) -> list[Any]:
+    from backend.app.services import model_routing
+    from backend.agents.discovery.types import TopicProfile
+    from backend.app.core.prompt_loader import load_prompt
+    settings = get_settings()
+    try:
+        resolution = model_routing.client_for_agent("refinement", settings=settings)
+        client = resolution.client
+    except Exception as exc:
+        logger.warning("Failed to obtain client for podcast relevance agent: %s", exc)
+        client = None
+
+    if client is None:
+        kept = []
+        for hit in hits:
+            score = _feed_fit_score(f"{hit.title} {hit.snippet}", digest_interest)
+            if score >= 0.08:
+                kept.append(hit)
+            else:
+                diagnostics["low_relevance_rejects"] += 1
+        return kept
+
+    statement = profile.statement if profile else digest_interest
+    scope = profile.scope if profile else digest_interest
+    exclusions = ", ".join(profile.exclusions) if (profile and profile.exclusions) else ""
+
+    cand_list = []
+    for idx, hit in enumerate(hits):
+        cand_list.append({
+            "index": idx,
+            "title": hit.title,
+            "url": hit.url,
+            "snippet": hit.snippet[:300] if hit.snippet else "",
+        })
+
+    system_prompt = load_prompt("podcast_relevance")
+    system_prompt = system_prompt.replace("{{statement}}", statement)
+    system_prompt = system_prompt.replace("{{scope}}", scope)
+    system_prompt = system_prompt.replace("{{exclusions}}", exclusions)
+
+    try:
+        payload = await client.complete_json(
+            system=system_prompt,
+            prompt=json.dumps(cand_list, ensure_ascii=False),
+            max_tokens=2000,
+        )
+        decisions_list = payload.get("decisions", [])
+        decisions_map = {}
+        for d in decisions_list:
+            if isinstance(d, dict) and d.get("index") is not None:
+                decisions_map[int(d["index"])] = (
+                    str(d.get("decision")).strip().lower(),
+                    float(d.get("score") if d.get("score") is not None else 0.0),
+                    str(d.get("reason") or ""),
+                )
+    except Exception as exc:
+        logger.warning("LLM podcast relevance screening failed: %s", exc)
+        kept = []
+        for hit in hits:
+            score = _feed_fit_score(f"{hit.title} {hit.snippet}", digest_interest)
+            if score >= 0.08:
+                kept.append(hit)
+            else:
+                diagnostics["low_relevance_rejects"] += 1
+        return kept
+
+    kept = []
+    borderline_candidates = []
+    reject_decisions = {"drop", "skip"}
+    for idx, hit in enumerate(hits):
+        decision_info = decisions_map.get(idx)
+        if decision_info:
+            decision, score, reason = decision_info
+            if decision == "keep" and score >= 0.35:
+                kept.append(hit)
+                decisions.append(
+                    _decision(
+                        target=hit.title,
+                        decision="keep",
+                        action="keep_episode_candidate",
+                        confidence=score,
+                        reason=f"Podcast relevance agent approved: {reason}",
+                        metadata={"url": hit.url},
+                    )
+                )
+            elif decision in reject_decisions:
+                # Explicit drop/skip decision (Issue 5 / Drop Bug Fix)
+                diagnostics["low_relevance_rejects"] += 1
+                decisions.append(
+                    _decision(
+                        target=hit.title,
+                        decision="skip",
+                        action="drop_episode_candidate",
+                        confidence=score,
+                        reason=f"Podcast relevance agent rejected: {reason}",
+                        metadata={"url": hit.url},
+                    )
+                )
+                if 0.25 <= score < 0.35:
+                    borderline_candidates.append(hit)
+            else:
+                # Uncertain or invalid decision string - keep it (Issue 5)
+                kept.append(hit)
+                decisions.append(
+                    _decision(
+                        target=hit.title,
+                        decision="keep_uncertain",
+                        action="keep_episode_candidate",
+                        confidence=score,
+                        reason=f"Podcast relevance agent uncertain (decision: {decision}): {reason}",
+                        metadata={"url": hit.url},
+                    )
+                )
+        else:
+            kept.append(hit)
+
+    # If everything got screened out, pick up to 2 borderline candidates as fallback (Issue 5)
+    if not kept and borderline_candidates:
+        fallback_sample = borderline_candidates[:2]
+        kept.extend(fallback_sample)
+        # Log fallback sample inclusion
+        for hit in fallback_sample:
+            decisions.append(
+                _decision(
+                    target=hit.title,
+                    decision="keep_fallback",
+                    action="keep_episode_candidate",
+                    confidence=0.3,
+                    reason="Retained candidate as borderline LLM fallback to preserve discovery recall.",
+                    metadata={"url": hit.url},
+                )
+            )
+
+    return kept
+
+
+async def _resolve_feed_url(
+    client: httpx.AsyncClient,
+    url: str,
+    title: str,
+    decisions: list[AgentDecision],
+) -> str | None:
+    if "podcasts.apple.com" in url or "itunes.apple.com" in url:
+        match = re.search(r"/id(\d+)", url)
+        if match:
+            itunes_id = match.group(1)
+            try:
+                response = await client.get(
+                    "https://itunes.apple.com/lookup",
+                    params={"id": itunes_id},
+                )
+                response.raise_for_status()
+                data = response.json()
+                results = data.get("results", [])
+                if results and isinstance(results[0], dict):
+                    feed_url = results[0].get("feedUrl")
+                    if feed_url:
+                        decisions.append(
+                            _decision(
+                                target=title,
+                                decision="resolved",
+                                action="itunes_lookup",
+                                confidence=0.95,
+                                reason=f"Resolved RSS feed from Apple iTunes ID {itunes_id}.",
+                                metadata={"feed_url": feed_url},
+                            )
+                        )
+                        return feed_url
+            except Exception as exc:
+                logger.info("iTunes lookup failed for ID %s: %s", itunes_id, exc)
+
+    show_name = _extract_show_name_from_hit_title(title)
+    if show_name:
+        try:
+            results = await discover_podcasts(show_name, limit=3)
+            if results:
+                feed_url = results[0].get("feed_url")
+                if feed_url:
+                    decisions.append(
+                        _decision(
+                            target=title,
+                            decision="resolved",
+                            action="podcast_index_lookup",
+                            confidence=0.85,
+                            reason=f"Resolved RSS feed from Podcast Index show search for '{show_name}'.",
+                            metadata={"feed_url": feed_url},
+                        )
+                    )
+                    return feed_url
+        except Exception as exc:
+            logger.info("Podcast Index lookup failed for show '%s': %s", show_name, exc)
+
+    try:
+        response = await client.get(url, timeout=10.0)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        for link in soup.find_all("link", rel="alternate"):
+            link_type = str(link.get("type") or "").lower()
+            link_href = str(link.get("href") or "").strip()
+            if ("rss" in link_type or "xml" in link_type) and link_href:
+                from urllib.parse import urljoin
+                feed_url = urljoin(url, link_href)
+                decisions.append(
+                    _decision(
+                        target=title,
+                        decision="resolved",
+                        action="rss_autodiscovery",
+                        confidence=0.88,
+                        reason="Resolved RSS feed via autodiscovery link on page.",
+                        metadata={"feed_url": feed_url},
+                    )
+                )
+                return feed_url
+    except Exception as exc:
+        logger.info("RSS Autodiscovery failed for URL %s: %s", url, exc)
+
+    if show_name:
+        web_query = f"{show_name} podcast RSS feed"
+        try:
+            from backend.agents.discovery.web_search import lookback_to_days, search_web
+            days = lookback_to_days(24 * 365)
+            hits = await search_web(web_query, limit=3, days=days)
+            for hit in hits:
+                feed_url = _feed_url_from_search_hit(hit.url)
+                if feed_url:
+                    decisions.append(
+                        _decision(
+                            target=title,
+                            decision="resolved",
+                            action="rss_web_search",
+                            confidence=0.80,
+                            reason=f"Resolved RSS feed via web search for '{show_name} RSS feed'.",
+                            metadata={"feed_url": feed_url},
+                        )
+                    )
+                    return feed_url
+        except Exception as exc:
+            logger.info("RSS web search fallback failed for show '%s': %s", show_name, exc)
+
+    return None
+
+
+def _extract_show_name_from_hit_title(title: str) -> str:
+    cleaned = re.sub(r"\s*[-|•:|]\s*(apple podcasts|spotify|podcast addict|listen notes|podcasts?|youtube)\s*$", "", title, flags=re.I).strip()
+    for sep in ("|", "-", "•", ":"):
+        if sep in cleaned:
+            parts = cleaned.split(sep)
+            for part in parts:
+                p = part.strip()
+                if "episode" not in p.lower() and "interview" not in p.lower() and len(p.split()) <= 5 and len(p) > 2:
+                    return p
+    return cleaned
+
+
+def _match_episode_in_feed(episodes: list[PodcastEpisode], hit: Any) -> PodcastEpisode | None:
+    cand_url = _normalize_url_for_match(hit.url).lower()
+    for ep in episodes:
+        if ep.episode_url:
+            ep_url_norm = _normalize_url_for_match(ep.episode_url).lower()
+            if ep_url_norm in cand_url or cand_url in ep_url_norm:
+                return ep
+        if ep.audio_url:
+            ep_audio_norm = _normalize_url_for_match(ep.audio_url).lower()
+            if ep_audio_norm in cand_url or cand_url in ep_audio_norm:
+                return ep
+
+    # Try Szymkiewicz-Simpson token overlap matching
+    from backend.agents.librarian.text_utils import keyword_set
+    cand_tokens = keyword_set(hit.title)
+    if cand_tokens:
+        for ep in episodes:
+            ep_tokens = keyword_set(ep.title)
+            if not ep_tokens:
+                continue
+            overlap = len(cand_tokens & ep_tokens) / max(1, min(len(cand_tokens), len(ep_tokens)))
+            if overlap >= 0.65:
+                return ep
+
+    # Fallback to normalized subtitle/substring matching (Issue 4)
+    def clean_title_for_soft_match(t: str, show_name: str | None = None) -> str:
+        t_clean = t.lower()
+        if show_name:
+            # Strip show name suffix/prefix
+            sn = show_name.lower()
+            t_clean = re.sub(rf"\b{re.escape(sn)}\b", "", t_clean)
+        # Strip common podcast markers & episode numbering patterns
+        t_clean = re.sub(r"\b(episode|ep|show)\s*\d+\b", "", t_clean)
+        t_clean = re.sub(r"[^\w\s]", " ", t_clean)
+        return " ".join(t_clean.split())
+
+    for ep in episodes:
+        cand_clean = clean_title_for_soft_match(hit.title, ep.show_name)
+        ep_clean = clean_title_for_soft_match(ep.title, ep.show_name)
+        if not cand_clean or not ep_clean:
+            continue
+        # Check substring containment
+        if cand_clean in ep_clean or ep_clean in cand_clean:
+            return ep
+        # Cleaned token overlap
+        cand_clean_tokens = set(cand_clean.split())
+        ep_clean_tokens = set(ep_clean.split())
+        # Filter short/worthless tokens
+        cand_clean_tokens = {tok for tok in cand_clean_tokens if len(tok) > 2}
+        ep_clean_tokens = {tok for tok in ep_clean_tokens if len(tok) > 2}
+        if cand_clean_tokens and ep_clean_tokens:
+            overlap = len(cand_clean_tokens & ep_clean_tokens) / max(1, min(len(cand_clean_tokens), len(ep_clean_tokens)))
+            if overlap >= 0.75:
+                return ep
+
+    return None
+

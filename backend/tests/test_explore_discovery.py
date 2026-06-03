@@ -759,15 +759,15 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         assert updated.status_code == 200
         assert updated.json()["profile"]["content_limits"] == {
             "lead_items": 2,
-                "per_source": {
-                    "collections": 25,
-                    "foreign_media": 25,
-                    "gmail": 25,
-                    "markets": 25,
-                    "podcasts": 20,
-                    "web_search": 5,
-                    "youtube": 2,
-                },
+            "per_source": {
+                "collections": 15,
+                "foreign_media": 24,
+                "gmail": 24,
+                "markets": 24,
+                "podcasts": 12,
+                "web_search": 5,
+                "youtube": 2,
+            },
             "quality_floor": "strong",
             "target_items": 6,
             "total_items": 9,
@@ -1184,7 +1184,8 @@ def test_final_source_mix_issues_explain_missing_requested_sources() -> None:
     assert progress["built_with_issues"] is True
 
 
-def test_discovery_runner_dedupes_and_marks_opt_outs() -> None:
+def test_discovery_runner_dedupes_and_marks_opt_outs(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
     profile = TopicProfile.from_dict(
         {
             "statement": "AI agents for local infrastructure",
@@ -1219,7 +1220,8 @@ def test_discovery_runner_dedupes_and_marks_opt_outs() -> None:
     assert "reddit" not in statuses
 
 
-def test_discovery_runner_applies_per_source_content_limits() -> None:
+def test_discovery_runner_applies_per_source_content_limits(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
     profile = TopicProfile.from_dict(
         {
             "statement": "AI agents for local infrastructure",
@@ -1265,7 +1267,8 @@ def test_discovery_runner_applies_per_source_content_limits() -> None:
     ]
 
 
-def test_discovery_runner_reserves_each_dedicated_lane_before_global_backfill() -> None:
+def test_discovery_runner_reserves_each_dedicated_lane_before_global_backfill(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
     profile = TopicProfile.from_dict(
         {
             "statement": "AI infrastructure investment signals",
@@ -1506,7 +1509,8 @@ def test_discovery_runner_drops_cross_topic_source_bleed_when_no_topic_matches()
     assert any(entry["candidate_id"] == "ai" and "low_topic_overlap" in entry["excluded_by"] for entry in result.exclusions)
 
 
-def test_discovery_runner_keeps_promoted_source_through_topic_gate() -> None:
+def test_discovery_runner_keeps_promoted_source_through_topic_gate(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
     profile = TopicProfile.from_dict(
         {
             "statement": "Mexico City travel in August 2026",
@@ -1650,7 +1654,8 @@ def test_discovery_runner_times_out_slow_adapter() -> None:
     assert result.statuses[0].status == "timed_out"
 
 
-def test_discovery_runner_applies_good_for_ranking_weights() -> None:
+def test_discovery_runner_applies_good_for_ranking_weights(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
     profile = TopicProfile.from_dict(
         {
             "statement": "Breaking latest headlines and fresh AI updates",
@@ -2605,23 +2610,15 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
             },
         )
         assert started.status_code == 201
-        assert started.json()["pending_field"] == "gmail_rules"
-        assert "How do you want me to use Gmail" in started.json()["messages"][0]["content"]
-
-        searched = client.post(
-            f"/api/explore/refinement-sessions/{started.json()['session_id']}/messages",
-            json={"answer": "AI related newsletters received in last 7 days"},
-        )
-        assert searched.status_code == 200
-        body = searched.json()
+        body = started.json()
         assert body["pending_field"] == "gmail_sender_selection"
         assert body["profile"]["gmail_rules"]["lookback_hours"] == 168
         assert body["profile"]["gmail_rules"]["candidates"][0]["sender"] == "ai@example.com"
-        assert "AI Weekly" in body["messages"][-1]["content"]
+        assert "AI Weekly" in body["messages"][0]["content"]
 
         confirmed = client.post(
             f"/api/explore/refinement-sessions/{started.json()['session_id']}/messages",
-            json={"answer": "1"},
+            json={"answer": "1\nInstructions: Extract AI topics and ignore ads"},
         )
         assert confirmed.status_code == 200
         confirmed_body = confirmed.json()
@@ -2629,6 +2626,7 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
         # sender the session must keep interviewing instead of finalizing.
         assert confirmed_body["status"] == "active"
         assert confirmed_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
+        assert confirmed_body["profile"]["gmail_rules"]["intent"] == "Extract AI topics and ignore ads"
         assert {"adapter": "gmail", "ref": "ai@example.com"} in confirmed_body["profile"]["requested_sources"]
         assert "Approved ai@example.com" in confirmed_body["messages"][-2]["content"]
         # A real follow-up question is asked rather than ending the conversation.
@@ -2643,6 +2641,7 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
         final_body = finalized.json()
         assert final_body["status"] == "finalized"
         assert final_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
+        assert final_body["profile"]["gmail_rules"]["intent"] == "Extract AI topics and ignore ads"
         assert {"adapter": "gmail", "ref": "ai@example.com"} in final_body["profile"]["requested_sources"]
 
 

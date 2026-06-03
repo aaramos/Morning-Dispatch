@@ -1,6 +1,7 @@
-from __future__ import annotations
-
 import asyncio
+import os
+
+os.environ["MORNING_DISPATCH_LIBRARIAN_USE_MODEL"] = "false"
 
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.editor import build_issue_snapshot, prepare_issue_articles

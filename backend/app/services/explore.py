@@ -24,7 +24,7 @@ from backend.agents.discovery import (
     default_source_registry,
 )
 from backend.agents.digestor.base import NormalizedPayload
-from backend.app.services import brief_settings, mcp_status, model_routing
+from backend.app.services import brief_settings, email_delivery, mcp_status, model_routing
 from backend.app.services.brief_strategy import selected_source_labels, summarize_search_strategy
 from backend.app.services.brief_title import tight_brief_title
 from backend.agents.editor import prepare_issue_articles
@@ -165,13 +165,9 @@ async def source_status() -> dict[str, Any]:
         or settings.web_search_brave_api_key
         or settings.web_search_serpapi_api_key
     )
-    gmail_enabled = bool(settings.gmail_credentials_path.exists())
-    gmail_reason = None
-    if not gmail_enabled:
-        if not settings.gmail_client_secret_path.exists():
-            gmail_reason = "Upload a Gmail OAuth client in Admin Sources, then connect Gmail."
-        else:
-            gmail_reason = "Finish the Gmail connection in Admin Sources."
+    gmail_health = email_delivery.gmail_credentials_health(settings)
+    gmail_enabled = bool(gmail_health.get("valid"))
+    gmail_reason = None if gmail_enabled else str(gmail_health.get("reason") or "Reconnect Gmail in Admin Sources.")
     podcast_sources = _all_configured_podcast_sources()
     podcast_enabled = bool(
         settings.podcastindex_api_key

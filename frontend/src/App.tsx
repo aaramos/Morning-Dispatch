@@ -498,36 +498,51 @@ const defaultContentLimits: ContentLimitsDraft = {
   target_items: 25,
   lead_items: 5,
   per_source: {
-    web_search: 25,
-    foreign_media: 25,
-    gmail: 25,
-    podcasts: 25,
-    youtube: 25,
+    web_search: 40,
+    foreign_media: 40,
+    gmail: 40,
+    podcasts: 20,
+    youtube: 20,
     collections: 25,
-    markets: 50,
+    markets: 40,
+  },
+  quality_floor: "standard",
+};
+const defaultMediumContentLimits: ContentLimitsDraft = {
+  total_items: 150,
+  target_items: 15,
+  lead_items: 3,
+  per_source: {
+    web_search: 24,
+    foreign_media: 24,
+    gmail: 24,
+    podcasts: 12,
+    youtube: 12,
+    collections: 15,
+    markets: 24,
   },
   quality_floor: "standard",
 };
 const defaultBriefControls: BriefControlsDraft = {
   lookback_hours: 336,
-  content_limits: defaultContentLimits,
+  content_limits: defaultMediumContentLimits,
   youtube_presets: {
-    max: 25,
-    large: 20,
-    medium: 15,
-    focused: 10,
+    max: 20,
+    large: 16,
+    medium: 12,
+    focused: 8,
   },
   podcast_presets: {
-    max: 25,
-    large: 20,
-    medium: 15,
-    focused: 10,
+    max: 20,
+    large: 16,
+    medium: 12,
+    focused: 8,
   },
   gmail_presets: {
-    max: 25,
-    large: 20,
-    medium: 15,
-    focused: 10,
+    max: 40,
+    large: 32,
+    medium: 24,
+    focused: 16,
   },
 };
 const briefControlBounds = {
@@ -537,6 +552,24 @@ const briefControlBounds = {
   lead_items: { min: 0, max: 20 },
   per_source: { min: 1, max: 50 },
 };
+
+function scaleContentLimits(limits: ContentLimitsDraft, scale: number): ContentLimitsDraft {
+  const scaleValue = (value: number, min: number, max: number) => (
+    clampContentLimit(Math.ceil(value * scale), min, max)
+  );
+  const perSource: Partial<Record<SourceKey, number>> = {};
+  for (const source of sourceOptions) {
+    const value = limits.per_source[source.key] ?? briefControlBounds.per_source.max;
+    perSource[source.key] = scaleValue(value, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
+  }
+  return {
+    ...limits,
+    total_items: scaleValue(limits.total_items, briefControlBounds.total_items.min, briefControlBounds.total_items.max),
+    target_items: scaleValue(limits.target_items, briefControlBounds.target_items.min, briefControlBounds.target_items.max),
+    lead_items: scaleValue(limits.lead_items, briefControlBounds.lead_items.min, briefControlBounds.lead_items.max),
+    per_source: perSource,
+  };
+}
 const defaultPipelineLimits: PipelineLimitsDraft = {
   article_fetches: 250,
   article_fetch_concurrency: 10,
@@ -689,11 +722,13 @@ async function readSSE<T>(url: string, body: unknown, onEvent: (event: T) => voi
       if (dataLine) {
         const payload = dataLine.slice(5).trim();
         if (payload) {
+          let parsed: T | null = null;
           try {
-            onEvent(JSON.parse(payload) as T);
+            parsed = JSON.parse(payload) as T;
           } catch {
             // Ignore malformed frames; the stream continues.
           }
+          if (parsed) onEvent(parsed);
         }
       }
       boundary = buffer.indexOf("\n\n");
@@ -718,6 +753,13 @@ async function streamStrategyRefinement(
     { instruction, models: {} },
     onEvent,
   );
+}
+
+async function requestStrategyRefinement(sessionId: string, instruction: string): Promise<RefinementSession> {
+  return api<RefinementSession>(`/api/explore/refinement-sessions/${sessionId}/strategy`, {
+    method: "POST",
+    body: JSON.stringify({ instruction, models: {} }),
+  });
 }
 
 async function streamStrategyReview(
@@ -827,6 +869,7 @@ function DispatchApp() {
   const [strategyStreamingText, setStrategyStreamingText] = useState("");
   const [strategyStreaming, setStrategyStreaming] = useState(false);
   const [strategyPreparingProposal, setStrategyPreparingProposal] = useState(false);
+  const [strategyError, setStrategyError] = useState("");
   const [gmailCandidates, setGmailCandidates] = useState<GmailCandidatePayload | null>(null);
   const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
   const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
@@ -1084,11 +1127,12 @@ function DispatchApp() {
     }
   }
 
-  async function answerRefinement(justGoNow = false) {
+  async function answerRefinement(justGoNow = false, answerOverride?: string) {
     if (!activeInterest) return;
-    if (!session && !justGoNow && !answer.trim()) return;
-    if (!justGoNow && !answer.trim()) return;
-    const pendingAnswer = answer.trim();
+    const effectiveAnswer = (answerOverride ?? answer).trim();
+    if (!session && !justGoNow && !effectiveAnswer) return;
+    if (!justGoNow && !effectiveAnswer) return;
+    const pendingAnswer = effectiveAnswer;
     setAnswer("");
     setBusy(true);
     setMessage(justGoNow ? "Building your plan..." : "Thinking...");
@@ -1116,10 +1160,16 @@ function DispatchApp() {
     const cleanInstruction = instruction.trim();
     if (!cleanInstruction) return;
     const baseStatement = activeInterest || topicProfile?.statement || session?.statement || "";
-    if (!baseStatement) return;
+    if (!baseStatement) {
+      const message = "I do not have an active brief plan to refine. Close this and start from the brief interest again.";
+      setStrategyError(message);
+      setMessage(message);
+      return;
+    }
     setBusy(true);
     setStrategyStreaming(true);
     setStrategyStreamingText("");
+    setStrategyError("");
     setStrategyPreparingProposal(false);
     setMessage("Asking AI to review your strategy...");
     try {
@@ -1138,21 +1188,41 @@ function DispatchApp() {
       let finalSession: RefinementSession | null = null;
       let hasProposal = false;
 
-      await streamStrategyRefinement(currentSession.session_id, cleanInstruction, (event) => {
-        if (event.type === "token") {
-          liveText += event.text;
-          setStrategyStreamingText(liveText);
-        } else if (event.type === "proposal") {
-          // Prose streamed; now running critique pass — show shimmer.
-          setStrategyStreamingText("");
-          setStrategyPreparingProposal(true);
-          finalSession = event.session;
-        } else if (event.type === "done") {
-          finalSession = event.session;
-          hasProposal = event.has_proposal;
+      try {
+        await streamStrategyRefinement(currentSession.session_id, cleanInstruction, (event) => {
+          if (event.type === "token") {
+            liveText += event.text;
+            setStrategyStreamingText(liveText);
+          } else if (event.type === "proposal") {
+            // Prose streamed; now running critique pass — show shimmer.
+            setStrategyStreamingText("");
+            setStrategyPreparingProposal(true);
+            finalSession = event.session;
+          } else if (event.type === "done") {
+            finalSession = event.session;
+            hasProposal = event.has_proposal;
+            setStrategyPreparingProposal(false);
+          } else if (event.type === "error") {
+            throw new Error(event.message || "AI strategy refinement failed before returning a proposal.");
+          }
+        });
+      } catch (streamError) {
+        setStrategyStreaming(false);
+        setStrategyStreamingText("");
+        setStrategyPreparingProposal(true);
+        setMessage("Streaming failed; retrying the AI request directly...");
+        try {
+          finalSession = await requestStrategyRefinement(currentSession.session_id, cleanInstruction);
+          hasProposal = Boolean(finalSession.pending_strategy_refinement);
+        } catch (fallbackError) {
+          throw new Error(
+            errorMessage(fallbackError, errorMessage(streamError, "AI strategy refinement failed")),
+            { cause: fallbackError },
+          );
+        } finally {
           setStrategyPreparingProposal(false);
         }
-      });
+      }
 
       if (finalSession) {
         const resolved: RefinementSession = finalSession;
@@ -1168,9 +1238,13 @@ function DispatchApp() {
           setStrategyConfirmation(resolved.strategy_review?.assistant_response || "Strategy looks good — no changes needed.");
           setMessage("Strategy review complete");
         }
+      } else {
+        throw new Error("AI strategy refinement finished without returning a proposal.");
       }
     } catch (error) {
-      setMessage(errorMessage(error, "Could not update search strategy"));
+      const message = errorMessage(error, "Could not update search strategy");
+      setStrategyError(message);
+      setMessage(message);
     } finally {
       setBusy(false);
       setStrategyStreaming(false);
@@ -1266,6 +1340,8 @@ function DispatchApp() {
           } else if (event.type === "done") {
             finalSession = event.session;
             hasProposal = event.has_proposal;
+          } else if (event.type === "error") {
+            throw new Error(event.message || "AI strategy review failed before returning a proposal.");
           }
         },
       );
@@ -1299,11 +1375,7 @@ function DispatchApp() {
 
   async function buildBrief() {
     if (!canBuild) return;
-    if (session?.pending_strategy_refinement) {
-      setFlow("confirm");
-      setMessage("Apply or discard the proposed strategy update before building.");
-      return;
-    }
+    const buildHasPendingStrategy = Boolean(session?.pending_strategy_refinement);
     const buildDraft = draft;
     const blocked = firstBlockedSelectedSource(sourceSelection, sourceStatus);
     if (blocked) {
@@ -1319,7 +1391,18 @@ function DispatchApp() {
     beginRefinementProgress("confirming", "Reviewing search strategy");
     let startedExploration: Exploration | null = null;
     try {
-      const strategyReady = await reviewSearchStrategyBeforeBuild(profilePayload);
+      let strategyReady = true;
+      if (!buildHasPendingStrategy) {
+        try {
+          strategyReady = await reviewSearchStrategyBeforeBuild(profilePayload);
+        } catch (error) {
+          setStrategyConfirmation(`${errorMessage(error, "AI strategy review was unavailable")}. Continuing with the current confirmed strategy.`);
+          setMessage("Strategy review unavailable; building with current strategy");
+        }
+      } else {
+        setStrategyConfirmation("Building with the proposed strategy update.");
+        setMessage("Building with proposed strategy");
+      }
       endRefinementProgress();
       if (!strategyReady) return;
       setFlow("building");
@@ -1636,6 +1719,25 @@ function DispatchApp() {
     setMessage("Ready");
   }
 
+  async function syncSourceSelectionToBackend(updatedSources: Record<string, boolean>) {
+    if (!activeInterest) return;
+    setBusy(true);
+    try {
+      await runRefinementStream({
+        session_id: session?.session_id ?? null,
+        statement: activeInterest,
+        source_selection: updatedSources,
+        answer: "",
+        just_go_now: false,
+        models: {},
+      });
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not update sources"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function updateSource(key: SourceKey) {
     if (sourceLocked) return;
     const status = sourceStatus?.sources[key];
@@ -1643,7 +1745,17 @@ function DispatchApp() {
       setEnableSource(key);
       return;
     }
-    setSourceSelection((current) => ({ ...current, [key]: !current[key] }));
+    setSourceSelection((current) => {
+      const next = { ...current, [key]: !current[key] };
+      if (flow === "refining" || flow === "confirm") {
+        const selectedEnabled = Object.keys(next).reduce((acc, k) => {
+          if (next[k as SourceKey]) acc[k] = true;
+          return acc;
+        }, {} as Record<string, boolean>);
+        void syncSourceSelectionToBackend(selectedEnabled);
+      }
+      return next;
+    });
   }
 
   async function refreshSourcesAndSelect(key: SourceKey) {
@@ -1914,12 +2026,13 @@ function DispatchApp() {
             </div>
           ) : null}
 
-          {flow === "refining" || streaming ? (
+          {flow === "idle" || flow === "refining" || flow === "confirm" || streaming ? (
             <RefinementPanel
+              flow={flow === "idle" || flow === "confirm" ? flow : "refining"}
               session={session}
               interest={submittedInterest || statement}
               profile={session?.profile ?? topicProfile?.profile ?? null}
-              sourceSelection={selectedEnabledSources}
+              sourceSelection={sourceSelection}
               answer={answer}
               busy={busy}
               streaming={streaming}
@@ -1928,38 +2041,27 @@ function DispatchApp() {
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
               onJustGo={() => void answerRefinement(true)}
-              onGmailApprove={(approvedSenders) => {
-                const reply = approvedSenders.length
-                  ? `Approved: ${approvedSenders.join(", ")}`
-                  : "none";
-                setAnswer(reply);
-                void answerRefinement(false);
+              onGmailApprove={(approvedSenders, instructions) => {
+                let reply = "none";
+                if (approvedSenders.length) {
+                  reply = `Approved: ${approvedSenders.join(", ")}`;
+                  if (instructions.trim()) {
+                    reply += `\nInstructions: ${instructions.trim()}`;
+                  }
+                }
+                void answerRefinement(false, reply);
               }}
-            />
-          ) : null}
-
-          {flow === "confirm" ? (
-            <ConfirmationPanel
-              draft={draft}
-              profile={session?.profile ?? topicProfile?.profile ?? null}
-              strategyPreview={session?.strategy_preview ?? null}
-              pendingStrategy={session?.pending_strategy_refinement ?? null}
-              strategyConfirmation={strategyConfirmation}
-              strategyStreaming={strategyStreaming}
-              strategyStreamingText={strategyStreamingText}
-              strategyPreparingProposal={strategyPreparingProposal}
-              sources={sourceSelection}
+              statement={statement}
+              onStatementChange={setStatement}
               sourceStatus={sourceStatus}
-              defaultContentLimits={defaultControls.content_limits}
-              busy={busy}
-              onDraftChange={setDraft}
-              onSourceClick={updateSource}
-              onStrategyRefine={(instruction) => void refineSearchStrategy(instruction)}
-              onStrategyConfirm={(apply) => void confirmStrategyRefinement(apply)}
+              sourceLocked={sourceLocked}
+              onSourceToggle={updateSource}
               onBuild={() => void buildBrief()}
-              youtubePresets={briefSettings?.youtube_presets ?? defaultBriefControls.youtube_presets}
-              podcastPresets={briefSettings?.podcast_presets ?? defaultBriefControls.podcast_presets}
-              gmailPresets={briefSettings?.gmail_presets ?? defaultBriefControls.gmail_presets}
+              canSubmitInterest={canSubmitInterest}
+              onSubmitInterest={(event) => {
+                if (event) event.preventDefault();
+                void startFlow();
+              }}
             />
           ) : null}
 
@@ -2005,45 +2107,6 @@ function DispatchApp() {
             />
           ) : null}
         </section>
-
-        {flow === "idle" || flow === "ready" ? (
-        <form className="composer" onSubmit={startFlow}>
-          <textarea
-            value={statement}
-            onChange={(event) => {
-              setStatement(event.target.value);
-              if (flow === "ready") {
-                setFlow("idle");
-                setExploration(null);
-                setBriefHtml("");
-                setRefinementTargetExplorationId(null);
-              }
-            }}
-            onFocus={() => {
-              if (flow === "idle" && statement.trim()) saveInterestDraft(statement);
-            }}
-            placeholder="Describe what you're interested in?"
-            rows={4}
-            disabled={busy}
-          />
-          {activeRefinementProgress ? (
-            <div className="composer-progress">
-              <RefinementStatusIndicator progress={activeRefinementProgress} now={progressNow} />
-            </div>
-          ) : null}
-          <div className="composer-footer">
-            <SourceChips
-              selection={sourceSelection}
-              status={sourceStatus}
-              locked={sourceLocked}
-              onToggle={updateSource}
-            />
-            <button className="primary-action" type="submit" disabled={!canSubmitInterest}>
-              Submit
-            </button>
-          </div>
-        </form>
-        ) : null}
       </section>
       <p className="screen-reader-status" aria-live="polite">{message}</p>
       {enableSource ? (
@@ -2089,11 +2152,12 @@ function DispatchApp() {
 function GmailApprovalCard(props: {
   payload: GmailCandidatePayload;
   busy: boolean;
-  onApprove: (senders: string[]) => void;
+  onApprove: (senders: string[], instructions: string) => void;
 }) {
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set(props.payload.candidates.map((c) => c.sender)),
   );
+  const [extractionRules, setExtractionRules] = useState("");
 
   function toggle(sender: string) {
     setSelected((prev) => {
@@ -2104,11 +2168,15 @@ function GmailApprovalCard(props: {
     });
   }
 
+  const isSubmitDisabled = props.busy || (selected.size > 0 && !extractionRules.trim());
+
   return (
     <div className="gmail-approval-card">
       <div className="gmail-approval-intro">
-        <div className="chat-avatar ai" style={{ flexShrink: 0 }}>M</div>
-        <p>{props.payload.intro}</p>
+        <p>
+          {props.payload.intro} I need your approval before I read from any inbox sender.
+          Select senders here, or reply below in plain English.
+        </p>
       </div>
       {props.payload.candidates.length > 0 ? (
         <ul className="gmail-sender-list">
@@ -2147,12 +2215,30 @@ function GmailApprovalCard(props: {
           No newsletter senders matched that search. Name specific senders below, or confirm with none selected to skip Gmail.
         </p>
       )}
+
+      {selected.size > 0 ? (
+        <div style={{ marginTop: "14px", marginBottom: "14px" }} className="gmail-instructions-block">
+          <label style={{ display: "block", marginBottom: "6px", fontSize: "0.88rem", fontWeight: 700, color: "#1d1d1b" }} htmlFor="gmail-rules-textarea">
+            Provide explicit instructions on how I should extract information from these newsletters (required):
+          </label>
+          <textarea
+            id="gmail-rules-textarea"
+            style={{ width: "100%", padding: "10px", border: "1px solid #c8c7bf", borderRadius: "8px", fontFamily: "inherit", fontSize: "0.9rem", boxSizing: "border-box" }}
+            value={extractionRules}
+            onChange={(e) => setExtractionRules(e.target.value)}
+            placeholder="e.g. Extract dev tools and ignore sponsorships"
+            rows={3}
+            disabled={props.busy}
+          />
+        </div>
+      ) : null}
+
       <div className="gmail-approval-actions">
         <button
           type="button"
           className="primary-action"
-          onClick={() => props.onApprove([...selected])}
-          disabled={props.busy}
+          onClick={() => props.onApprove([...selected], extractionRules.trim())}
+          disabled={isSubmitDisabled}
         >
           {selected.size > 0
             ? `Approve ${selected.size} sender${selected.size === 1 ? "" : "s"}`
@@ -2162,13 +2248,16 @@ function GmailApprovalCard(props: {
           <button
             type="button"
             className="secondary-action"
-            onClick={() => props.onApprove([])}
+            onClick={() => props.onApprove([], "")}
             disabled={props.busy}
           >
             Skip Gmail
           </button>
         ) : null}
       </div>
+      <p className="gmail-approval-hint">
+        You can also type things like "approve 2, 3, and 5", "only Tech Brew", "all", or "none" in the same chat box.
+      </p>
     </div>
   );
 }
@@ -2191,6 +2280,7 @@ function recencyText(weighting?: string, lookbackHours?: number | null): string 
 }
 
 function RefinementPanel(props: {
+  flow: "idle" | "refining" | "confirm";
   session: RefinementSession | null;
   interest: string;
   profile: TopicProfile | null;
@@ -2203,12 +2293,21 @@ function RefinementPanel(props: {
   onAnswerChange: (value: string) => void;
   onSend: () => void;
   onJustGo: () => void;
-  onGmailApprove: (approvedSenders: string[]) => void;
+  onGmailApprove: (approvedSenders: string[], instructions: string) => void;
+  // Starting Flow props
+  statement: string;
+  onStatementChange: (value: string) => void;
+  sourceStatus: SourceStatusResponse | null;
+  sourceLocked: boolean;
+  onSourceToggle: (source: SourceKey) => void;
+  onBuild: () => void;
+  canSubmitInterest: boolean;
+  onSubmitInterest: (event?: React.FormEvent) => void;
 }) {
   const threadRef = useRef<HTMLDivElement | null>(null);
   const messages = props.session?.messages ?? [];
   const preview = props.session?.strategy_preview ?? null;
-  const finalized = props.session?.status === "finalized";
+  const finalized = props.flow === "confirm" || props.session?.status === "finalized";
   const generalQueries = preview?.search_queries ?? props.profile?.search_queries ?? [];
   const marketSource = (preview?.per_source ?? []).find((source) => source.key === "markets");
   const tickers = marketSource?.tickers ?? [];
@@ -2221,7 +2320,7 @@ function RefinementPanel(props: {
   useEffect(() => {
     const node = threadRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [messages.length, props.streamingText, props.streaming]);
+  }, [messages.length, props.streamingText, props.streaming, props.gmailCandidates]);
 
   return (
     <section className="chat-redesign">
@@ -2229,7 +2328,7 @@ function RefinementPanel(props: {
         <div className="chat-head">
           <div>
             <p className="section-kicker">Reference librarian</p>
-            <h2>{scopeText || props.interest || "Shaping your brief"}</h2>
+            <h2>{scopeText || props.interest || props.statement || "Shaping your brief"}</h2>
           </div>
           <span className={`status-pill ${finalized ? "good" : ""}`}>
             <span className={`live-dot ${props.streaming ? "live" : ""}`} />
@@ -2237,92 +2336,198 @@ function RefinementPanel(props: {
           </span>
         </div>
         <div className="chat-thread" ref={threadRef}>
-          {messages.map((message, index) => (
-            <div className={`chat-turn ${message.role}`} key={`${message.role}-${index}`}>
-              <div className={`chat-avatar ${message.role === "user" ? "me" : "ai"}`}>
-                {message.role === "user" ? "You" : "M"}
-              </div>
-              <div className="chat-bubble2">
-                <ChatMessageContent content={message.content} />
-              </div>
-            </div>
-          ))}
-          {props.streaming ? (
+          {props.flow === "idle" ? (
             <div className="chat-turn assistant">
               <div className="chat-avatar ai">M</div>
               <div className="chat-bubble2">
-                {props.streamingText ? (
-                  <>
-                    <ChatMessageContent content={props.streamingText} />
-                    <span className="stream-caret" />
-                  </>
-                ) : (
-                  <span className="typing-dots">
-                    <span />
-                    <span />
-                    <span />
-                  </span>
-                )}
+                Hello! I'm the Reference Librarian. Tell me what topic or question you'd like to explore and design a brief for.
               </div>
             </div>
-          ) : null}
-          {!props.session && !props.streaming ? (
-            <div className="chat-turn assistant">
-              <div className="chat-avatar ai">M</div>
-              <div className="chat-bubble2">Tell me what you're curious about and I'll shape the brief with you.</div>
-            </div>
-          ) : null}
-          {props.gmailCandidates ? (
-            <GmailApprovalCard
-              payload={props.gmailCandidates}
-              busy={props.busy}
-              onApprove={props.onGmailApprove}
-            />
-          ) : null}
+          ) : (
+            <>
+              {messages.map((message, index) => (
+                <div className={`chat-turn ${message.role}`} key={`${message.role}-${index}`}>
+                  <div className={`chat-avatar ${message.role === "user" ? "me" : "ai"}`}>
+                    {message.role === "user" ? "You" : "M"}
+                  </div>
+                  <div className="chat-bubble2">
+                    <ChatMessageContent content={message.content} />
+                  </div>
+                </div>
+              ))}
+              {props.streaming ? (
+                <div className="chat-turn assistant">
+                  <div className="chat-avatar ai">M</div>
+                  <div className="chat-bubble2">
+                    {props.streamingText ? (
+                      <>
+                        <ChatMessageContent content={props.streamingText} />
+                        <span className="stream-caret" />
+                      </>
+                    ) : (
+                      <span className="typing-dots">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+              {!props.session && !props.streaming ? (
+                <div className="chat-turn assistant">
+                  <div className="chat-avatar ai">M</div>
+                  <div className="chat-bubble2">Tell me what you're curious about and I'll shape the brief with you.</div>
+                </div>
+              ) : null}
+              {props.gmailCandidates ? (
+                <div className="chat-turn assistant gmail-approval-turn">
+                  <div className="chat-avatar ai">M</div>
+                  <div className="chat-bubble2 gmail-chat-bubble">
+                    <GmailApprovalCard
+                      payload={props.gmailCandidates}
+                      busy={props.busy}
+                      onApprove={props.onGmailApprove}
+                    />
+                  </div>
+                </div>
+              ) : null}
+            </>
+          )}
         </div>
         <div className="chat-composer">
-          <div className="chat-field">
-            <textarea
-              value={props.answer}
-              onChange={(event) => props.onAnswerChange(event.target.value)}
-              placeholder={props.gmailCandidates ? "Use the approval card above to select senders…" : finalized ? "Add anything else…" : "Reply, or just tell me to go…"}
-              rows={1}
-              disabled={props.busy || Boolean(props.gmailCandidates)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  props.onSend();
-                }
-              }}
-            />
-            <button
-              type="button"
-              className="chat-send"
-              onClick={props.onSend}
-              disabled={props.busy || !props.answer.trim()}
-              aria-label="Send"
-            >
-              →
-            </button>
-          </div>
-          <div className="chat-undercaption">
-            {props.streaming ? (
-              <span className="chat-streaming-note">
-                <span className="typing-dots small">
-                  <span />
-                  <span />
-                  <span />
-                </span>
-                Morning Dispatch is replying…
-              </span>
-            ) : (
-              <span className="muted-hint">Enter to send · Shift+Enter for a new line</span>
-            )}
-            <span className="spacer" />
-            <button type="button" className="ghost-link" onClick={props.onJustGo} disabled={props.busy}>
-              Skip the questions — build it now →
-            </button>
-          </div>
+          {props.flow === "idle" ? (
+            <form onSubmit={props.onSubmitInterest} style={{ display: "contents" }}>
+              <div className="chat-field" style={{ padding: "12px", alignItems: "stretch" }}>
+                <textarea
+                  style={{ width: "100%", border: 0, resize: "none", font: "inherit", outline: "none", fontSize: "0.95rem", background: "transparent" }}
+                  value={props.statement}
+                  onChange={(event) => props.onStatementChange(event.target.value)}
+                  placeholder="Describe what you're interested in?"
+                  rows={4}
+                  disabled={props.busy}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      props.onSubmitInterest?.();
+                    }
+                  }}
+                />
+              </div>
+              <div className="chat-undercaption" style={{ marginTop: "12px", display: "flex", flexDirection: "column", alignItems: "stretch", gap: "10px" }}>
+                <SourceChips
+                  selection={props.sourceSelection}
+                  status={props.sourceStatus}
+                  locked={props.sourceLocked}
+                  onToggle={props.onSourceToggle}
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "4px" }}>
+                  <button
+                    className="primary-action"
+                    type="submit"
+                    disabled={!props.canSubmitInterest || props.busy}
+                  >
+                    Submit
+                  </button>
+                </div>
+              </div>
+            </form>
+          ) : props.flow === "confirm" ? (
+            <div>
+              <div className="chat-field">
+                <textarea
+                  value={props.answer}
+                  onChange={(event) => props.onAnswerChange(event.target.value)}
+                  placeholder="Add anything else to adjust..."
+                  rows={1}
+                  disabled={props.busy}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      props.onSend();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="chat-send"
+                  onClick={props.onSend}
+                  disabled={props.busy || !props.answer.trim()}
+                  aria-label="Send"
+                >
+                  →
+                </button>
+              </div>
+              <div className="chat-undercaption" style={{ marginTop: "12px", display: "flex", flexDirection: "column", alignItems: "stretch", gap: "10px" }}>
+                <SourceChips
+                  selection={props.sourceSelection}
+                  status={props.sourceStatus}
+                  locked={props.sourceLocked}
+                  onToggle={props.onSourceToggle}
+                />
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", width: "100%" }}>
+                  <span className="muted-hint">Or type further adjustments above</span>
+                  <button
+                    className="primary-action build-brief-action"
+                    type="button"
+                    onClick={props.onBuild}
+                    disabled={props.busy}
+                  >
+                    Confirm & Build Brief
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="chat-field">
+                <textarea
+                  value={props.answer}
+                  onChange={(event) => props.onAnswerChange(event.target.value)}
+                  placeholder={props.gmailCandidates ? "Reply with numbers, names, all, none, or click senders above…" : finalized ? "Add anything else…" : "Reply, or just tell me to go…"}
+                  rows={1}
+                  disabled={props.busy}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      props.onSend();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="chat-send"
+                  onClick={props.onSend}
+                  disabled={props.busy || !props.answer.trim()}
+                  aria-label="Send"
+                >
+                  →
+                </button>
+              </div>
+              <div className="chat-undercaption" style={{ marginTop: "12px", display: "flex", flexDirection: "column", alignItems: "stretch", gap: "10px" }}>
+                <SourceChips
+                  selection={props.sourceSelection}
+                  status={props.sourceStatus}
+                  locked={props.sourceLocked}
+                  onToggle={props.onSourceToggle}
+                />
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
+                  {props.streaming ? (
+                    <span className="chat-streaming-note">
+                      <span className="typing-dots small"><span/><span/><span/></span>
+                      Morning Dispatch is replying…
+                    </span>
+                  ) : (
+                    <span className="muted-hint">Enter to send · Shift+Enter for a new line</span>
+                  )}
+                  <span style={{ flex: 1 }} />
+                  <button type="button" className="ghost-link" onClick={props.onJustGo} disabled={props.busy}>
+                    Skip the questions — build it now →
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
       <aside className="chat-plan">
@@ -2590,9 +2795,11 @@ function ConfirmationPanel(props: {
   strategyStreaming: boolean;
   strategyStreamingText: string;
   strategyPreparingProposal: boolean;
+  strategyError: string;
   sources: Record<SourceKey, boolean>;
   sourceStatus: SourceStatusResponse | null;
   defaultContentLimits: ContentLimitsDraft;
+  canBuild: boolean;
   busy: boolean;
   onDraftChange: (draft: ConfirmationDraft) => void;
   onSourceClick: (source: SourceKey) => void;
@@ -2620,16 +2827,34 @@ function ConfirmationPanel(props: {
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [strategyModalOpen, setStrategyModalOpen] = useState(false);
+  const [inlineStrategyInstruction, setInlineStrategyInstruction] = useState("");
+  const [pendingInlineStrategyRequest, setPendingInlineStrategyRequest] = useState("");
   const reviewProfile = props.pendingStrategy?.proposed_profile ?? props.profile;
   const reviewPreview = props.pendingStrategy?.strategy_preview ?? props.strategyPreview;
   const contentLimitErrors = validateContentLimits(props.draft.content_limits, props.sources);
   const searchPlanGroups = sourceSearchPlanGroups(reviewProfile);
   const readinessItems = sourceReadinessItems(props.sources, props.sourceStatus, reviewProfile);
-  const buildBlockedByProposal = Boolean(props.pendingStrategy);
+  const strategyTurns = strategyConversationTurns(props.pendingStrategy, props.strategyConfirmation);
+  const strategyFindings = props.pendingStrategy?.findings ?? [];
+  const proposalSummary = props.pendingStrategy?.assistant_response || props.strategyConfirmation;
 
   function updateContentLimits(next: ContentLimitsDraft) {
     props.onDraftChange({ ...props.draft, content_limits: next });
   }
+
+  function submitInlineStrategyRefinement() {
+    const clean = inlineStrategyInstruction.trim();
+    if (!clean || props.busy || props.strategyStreaming) return;
+    setPendingInlineStrategyRequest(clean);
+    props.onStrategyRefine(clean);
+    setInlineStrategyInstruction("");
+  }
+
+  useEffect(() => {
+    if (!props.strategyStreaming && !props.strategyPreparingProposal) {
+      setPendingInlineStrategyRequest("");
+    }
+  }, [props.strategyPreparingProposal, props.strategyStreaming]);
 
   return (
     <section className="confirmation-panel">
@@ -2723,20 +2948,105 @@ function ConfirmationPanel(props: {
       ) : null}
       <div className="strategy-refine-box">
         {reviewPreview ? <StrategyReviewCard preview={reviewPreview} /> : null}
-        {props.strategyConfirmation ? (
+        <div className="strategy-inline-session">
+          <div className="strategy-inline-head">
+            <div>
+              <strong>Refine search strategy</strong>
+              <p>Tell the AI what to adjust. I’ll keep the request, response, and proposed changes here before you build.</p>
+            </div>
+            <button
+              type="button"
+              className="ghost-link"
+              onClick={() => setStrategyModalOpen(true)}
+              disabled={props.busy}
+            >
+              Open larger chat
+            </button>
+          </div>
+          {strategyTurns.length ? (
+            <div className="strategy-inline-thread" aria-live="polite">
+              {strategyTurns.slice(-4).map((turn, index) => (
+                <div className={`strategy-turn ${turn.role === "user" ? "user" : "assistant"}`} key={`${turn.role}-${index}-${turn.content.slice(0, 24)}`}>
+                  <b>{turn.role === "user" ? "You asked" : "AI replied"}</b>
+                  <span>{turn.content}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {pendingInlineStrategyRequest ? (
+            <div className="strategy-inline-thread pending-request" aria-live="polite">
+              <div className="strategy-turn user">
+                <b>You asked</b>
+                <span>{pendingInlineStrategyRequest}</span>
+              </div>
+            </div>
+          ) : null}
+          {props.strategyStreaming || props.strategyPreparingProposal ? (
+            <div className="strategy-turn assistant strategy-preparing" aria-live="polite">
+              <b>AI is working</b>
+              <span>
+                {props.strategyStreamingText || (
+                  <>Reviewing your request and preparing proposed changes<span className="ellipsis-dot">.</span><span className="ellipsis-dot">.</span><span className="ellipsis-dot">.</span></>
+                )}
+              </span>
+            </div>
+          ) : null}
+          {props.strategyError ? (
+            <div className="strategy-turn assistant error" role="alert">
+              <b>AI request failed</b>
+              <span>{props.strategyError}</span>
+            </div>
+          ) : null}
+          <div className="strategy-inline-composer">
+            <textarea
+              value={inlineStrategyInstruction}
+              onChange={(event) => setInlineStrategyInstruction(event.target.value)}
+              placeholder="Example: include frontier labs as demand signals, keep markets ticker-only, and remove stale year-specific queries..."
+              rows={3}
+              disabled={props.busy || props.strategyStreaming}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  submitInlineStrategyRefinement();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="secondary-action"
+              onClick={submitInlineStrategyRefinement}
+              disabled={props.busy || props.strategyStreaming || !inlineStrategyInstruction.trim()}
+            >
+              Send to AI
+            </button>
+          </div>
+        </div>
+        {proposalSummary ? (
           <div className={`strategy-confirmation ${props.pendingStrategy ? "pending" : ""}`}>
             <strong>{props.pendingStrategy ? "AI proposed update" : "AI update"}</strong>
-            <p>{props.strategyConfirmation}</p>
+            <p>{proposalSummary}</p>
+            {strategyFindings.length ? (
+              <ul className="strategy-findings">
+                {strategyFindings.map((finding) => (
+                  <li key={finding}>{finding}</li>
+                ))}
+              </ul>
+            ) : null}
+            {props.pendingStrategy ? (
+              <div className="strategy-proposal-actions">
+                <button type="button" className="primary-action" onClick={() => props.onStrategyConfirm(true)} disabled={props.busy}>
+                  Apply proposed strategy
+                </button>
+                <button type="button" className="secondary-action" onClick={() => setInlineStrategyInstruction("")} disabled={props.busy}>
+                  Keep refining
+                </button>
+                <button type="button" className="secondary-action" onClick={() => props.onStrategyConfirm(false)} disabled={props.busy}>
+                  Discard
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
-        <button
-          type="button"
-          className="secondary-action"
-          onClick={() => setStrategyModalOpen(true)}
-          disabled={props.busy}
-        >
-          {props.pendingStrategy ? "Open refinement session" : "Refine search strategy"}
-        </button>
       </div>
       {strategyModalOpen ? (
         <StrategyRefinementModal
@@ -2753,7 +3063,9 @@ function ConfirmationPanel(props: {
           onConfirm={(apply) => {
             props.onStrategyConfirm(apply);
             if (!apply) setStrategyModalOpen(false);
+            if (apply) setStrategyModalOpen(false);
           }}
+          error={props.strategyError}
         />
       ) : null}
       <div className="advanced-settings-shell">
@@ -2797,14 +3109,9 @@ function ConfirmationPanel(props: {
           type="button"
           className="primary-action build-brief-action"
           onClick={props.onBuild}
-          disabled={props.busy || contentLimitErrors.length > 0 || buildBlockedByProposal}
-          title={
-            buildBlockedByProposal
-              ? "Apply or discard the proposed strategy update before building."
-              : undefined
-          }
+          disabled={!props.canBuild || props.busy || contentLimitErrors.length > 0}
         >
-          {props.pendingStrategy ? "Review proposal first" : "Build brief"}
+          {props.busy ? "Working..." : props.pendingStrategy ? "Build with proposed strategy" : "Build brief"}
         </button>
       </div>
     </section>
@@ -2820,22 +3127,37 @@ function StrategyRefinementModal(props: {
   streamingText: string;
   preparingProposal: boolean;
   busy: boolean;
+  error: string;
   onClose: () => void;
   onSubmit: (instruction: string) => void;
   onConfirm: (apply: boolean) => void;
 }) {
   const [instruction, setInstruction] = useState("");
+  const [pendingRequest, setPendingRequest] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const turns = strategyConversationTurns(props.pendingStrategy, props.strategyConfirmation);
   const proposalSummary = props.pendingStrategy?.assistant_response || props.strategyConfirmation;
   const findings = props.pendingStrategy?.findings ?? [];
   const intentSummary = strategyIntentSummary(props.profile, props.preview);
+  const visibleProfile = props.pendingStrategy?.proposed_profile ?? props.profile;
+  const visiblePreview = props.pendingStrategy?.strategy_preview ?? props.preview;
 
   useEffect(() => {
     const node = threadRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [turns.length, props.streamingText, props.streaming]);
+  }, [turns.length, pendingRequest, props.streamingText, props.streaming]);
+
+  useEffect(() => {
+    if (!pendingRequest || props.streaming || props.preparingProposal) return;
+    const normalizedPending = pendingRequest.trim().toLowerCase();
+    const requestIsInThread = turns.some((turn) => (
+      turn.role === "user" && turn.content.trim().toLowerCase() === normalizedPending
+    ));
+    if (requestIsInThread || props.pendingStrategy) {
+      setPendingRequest(null);
+    }
+  }, [pendingRequest, props.pendingStrategy, props.preparingProposal, props.streaming, turns]);
 
   function submit() {
     const clean = instruction.trim();
@@ -2843,6 +3165,7 @@ function StrategyRefinementModal(props: {
       inputRef.current?.focus();
       return;
     }
+    setPendingRequest(clean);
     props.onSubmit(clean);
     setInstruction("");
   }
@@ -2873,6 +3196,12 @@ function StrategyRefinementModal(props: {
               <p>Tell me what is missing, too broad, too narrow, stale, or misweighted. I’ll translate your feedback into proposed search-strategy changes for review.</p>
             </div>
           )}
+          {pendingRequest ? (
+            <div className="strategy-chat-turn user pending">
+              <b>You</b>
+              <p>{pendingRequest}</p>
+            </div>
+          ) : null}
           {props.streaming ? (
             <div className="strategy-chat-turn assistant">
               <b>AI</b>
@@ -2896,6 +3225,27 @@ function StrategyRefinementModal(props: {
           ) : null}
         </div>
 
+        {props.streaming || props.preparingProposal ? (
+          <div className="strategy-modal-status" role="status">
+            <span className="activity-pulse" />
+            <div>
+              <strong>{props.preparingProposal ? "Preparing proposed strategy" : "Waiting for AI"}</strong>
+              <p>
+                {props.streamingText
+                  ? "The AI is responding in this conversation."
+                  : "Your request was sent. If the model is unavailable, I’ll show the error here instead of silently doing nothing."}
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {props.error ? (
+          <div className="strategy-modal-error" role="alert">
+            <strong>AI request failed</strong>
+            <p>{props.error}</p>
+          </div>
+        ) : null}
+
         {props.pendingStrategy && !props.streaming ? (
           <div className="strategy-modal-proposal">
             <strong>Proposed changes</strong>
@@ -2907,13 +3257,7 @@ function StrategyRefinementModal(props: {
                 ))}
               </ul>
             ) : null}
-            {props.pendingStrategy.strategy_preview ? (
-              <div className="strategy-modal-preview">
-                <span>{sourceSearchPlanGroups(props.pendingStrategy.proposed_profile).length} source plan group(s)</span>
-                <span>{props.pendingStrategy.strategy_preview.search_queries.length} general search(es)</span>
-                <span>{props.pendingStrategy.strategy_preview.lookback_hours ? gmailLookbackLabel(props.pendingStrategy.strategy_preview.lookback_hours) : "Open-ended recency"}</span>
-              </div>
-            ) : null}
+            <StrategyModalPlanPreview profile={visibleProfile} preview={visiblePreview} proposed />
             <div className="strategy-proposal-actions">
               <button type="button" className="primary-action" onClick={() => props.onConfirm(true)} disabled={props.busy}>
                 Apply proposed strategy
@@ -2927,10 +3271,14 @@ function StrategyRefinementModal(props: {
             </div>
           </div>
         ) : null}
+        {!props.pendingStrategy ? (
+          <StrategyModalPlanPreview profile={visibleProfile} preview={visiblePreview} />
+        ) : null}
 
         <div className="strategy-modal-composer">
           <label>
             Continue the conversation
+            <span className="composer-hint">Your note will appear in this thread, then the AI will respond here with proposed strategy changes.</span>
             <textarea
               ref={inputRef}
               value={instruction}
@@ -2954,6 +3302,48 @@ function StrategyRefinementModal(props: {
           </div>
         </div>
       </section>
+    </div>
+  );
+}
+
+function StrategyModalPlanPreview(props: {
+  profile: TopicProfile | null;
+  preview: StrategyPreview | null;
+  proposed?: boolean;
+}) {
+  const groups = sourceSearchPlanGroups(props.profile).filter((group) => group.queries.length).slice(0, 5);
+  const queryCount = groups.reduce((total, group) => total + group.queries.filter((query) => query.trim()).length, 0);
+  const lookback = props.preview?.lookback_hours ?? props.profile?.lookback_hours ?? null;
+  const sourceLabels = Object.entries(props.profile?.source_selection ?? {})
+    .filter(([, enabled]) => enabled)
+    .map(([source]) => formatSourceLabel(source))
+    .filter((source) => source !== "Collections")
+    .slice(0, 6);
+  if (!props.profile && !props.preview) return null;
+  return (
+    <div className="strategy-modal-plan">
+      <div className="strategy-modal-plan-head">
+        <strong>{props.proposed ? "Updated search strategy" : "Current search strategy"}</strong>
+        <div className="strategy-modal-preview">
+          <span>{lookback ? gmailLookbackLabel(lookback) : "Open-ended recency"}</span>
+          <span>{sourceLabels.length ? sourceLabels.join(", ") : "Selected sources"}</span>
+          <span>{queryCount} planned query(s)</span>
+        </div>
+      </div>
+      {groups.length ? (
+        <div className="strategy-modal-plan-groups">
+          {groups.map((group) => (
+            <div className="strategy-modal-plan-group" key={group.key}>
+              <b>{group.label}</b>
+              <ul>
+                {group.queries.slice(0, 3).map((query) => (
+                  <li key={query}>{query}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -3026,47 +3416,7 @@ function ContentLimitsPanel(props: {
   }
 
   function applyPreset(scale: number) {
-    const scaled = (value: number, min: number, max: number) => clampContentLimit(Math.round(value * scale), min, max);
-    const nextPerSource: Partial<Record<SourceKey, number>> = {};
-    const presets = props.youtubePresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
-    const podcastPresets = props.podcastPresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
-    const gmailPresets = props.gmailPresets ?? { max: 25, large: 20, medium: 15, focused: 10 };
-    const systemMax = defaultContentLimits;
-    
-    for (const source of sourceOptions) {
-      if (source.key === "youtube") {
-        let ytVal = presets.medium;
-        if (scale === 1.0) ytVal = presets.max;
-        else if (scale === 0.8) ytVal = presets.large;
-        else if (scale === 0.6) ytVal = presets.medium;
-        else if (scale === 0.4) ytVal = presets.focused;
-        nextPerSource[source.key] = ytVal;
-      } else if (source.key === "podcasts") {
-        let podcastVal = podcastPresets.medium;
-        if (scale === 1.0) podcastVal = podcastPresets.max;
-        else if (scale === 0.8) podcastVal = podcastPresets.large;
-        else if (scale === 0.6) podcastVal = podcastPresets.medium;
-        else if (scale === 0.4) podcastVal = podcastPresets.focused;
-        nextPerSource[source.key] = podcastVal;
-      } else if (source.key === "gmail") {
-        let gmailVal = gmailPresets.medium;
-        if (scale === 1.0) gmailVal = gmailPresets.max;
-        else if (scale === 0.8) gmailVal = gmailPresets.large;
-        else if (scale === 0.6) gmailVal = gmailPresets.medium;
-        else if (scale === 0.4) gmailVal = gmailPresets.focused;
-        nextPerSource[source.key] = gmailVal;
-      } else {
-        const maxValue = systemMax.per_source[source.key] ?? briefControlBounds.per_source.max;
-        nextPerSource[source.key] = scaled(maxValue, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
-      }
-    }
-    props.onChange({
-      ...props.limits,
-      total_items: scaled(systemMax.total_items, briefControlBounds.total_items.min, briefControlBounds.total_items.max),
-      target_items: scaled(systemMax.target_items, briefControlBounds.target_items.min, briefControlBounds.target_items.max),
-      lead_items: scaled(systemMax.lead_items, briefControlBounds.lead_items.min, briefControlBounds.lead_items.max),
-      per_source: nextPerSource,
-    });
+    props.onChange(scaleContentLimits(defaultContentLimits, scale));
   }
 
   return (
@@ -3144,9 +3494,9 @@ function BriefControlsPanel(props: {
   onChange: (controls: BriefControlsDraft) => void;
 }) {
   const sourceWindowDays = Math.max(0, Math.round((Number(props.controls.lookback_hours) || 0) / 24));
-  const presets = props.controls.youtube_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
-  const podcastPresets = props.controls.podcast_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
-  const gmailPresets = props.controls.gmail_presets ?? { max: 25, large: 20, medium: 15, focused: 10 };
+  const presets = props.controls.youtube_presets ?? { max: 20, large: 16, medium: 12, focused: 8 };
+  const podcastPresets = props.controls.podcast_presets ?? { max: 20, large: 16, medium: 12, focused: 8 };
+  const gmailPresets = props.controls.gmail_presets ?? { max: 40, large: 32, medium: 24, focused: 16 };
 
   return (
     <div className="brief-controls-panel">
@@ -3171,7 +3521,7 @@ function BriefControlsPanel(props: {
       />
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>YouTube scale presets</strong>
-        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source video limits for YouTube for each profile scale (Max 25).</p>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source video limits for YouTube for each profile scale (Max 20).</p>
         <div className="content-limit-grid">
           <NumberStepper
             label="Max profile"
@@ -3217,7 +3567,7 @@ function BriefControlsPanel(props: {
       </div>
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>Podcast scale presets</strong>
-        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for podcast items for each profile scale (Max 25).</p>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for podcast items for each profile scale (Max 20).</p>
         <div className="content-limit-grid">
           <NumberStepper
             label="Max profile"
@@ -3263,7 +3613,7 @@ function BriefControlsPanel(props: {
       </div>
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>Gmail scale presets</strong>
-        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for Gmail items for each profile scale (Max 25).</p>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for Gmail items for each profile scale (Max 40).</p>
         <div className="content-limit-grid">
           <NumberStepper
             label="Max profile"

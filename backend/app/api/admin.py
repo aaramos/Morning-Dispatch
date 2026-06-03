@@ -140,19 +140,22 @@ def gmail_status(request: Request) -> dict[str, Any]:
     settings = _settings()
     redirect_uri = _callback_url(request, settings)
     redirect_warning = _redirect_warning(redirect_uri)
+    health = email_delivery.gmail_credentials_health(settings)
     token_scopes = email_delivery.gmail_token_scopes(settings)
     scopes = required_scopes(hosted_mcp_enabled=settings.gmail_remote_mcp_enabled)
     missing_scopes = sorted(set(scopes) - token_scopes) if settings.gmail_credentials_path.exists() else []
     cloud_scope = "https://www.googleapis.com/auth/cloud-platform"
+    requires_reconnect = bool(missing_scopes) or bool(health.get("requires_reconnect"))
     return {
-        "configured": settings.gmail_client_secret_path.exists(),
-        "connected": settings.gmail_credentials_path.exists(),
+        "configured": bool(health.get("configured")),
+        "connected": bool(health.get("valid")),
         "client_secret_path": str(settings.gmail_client_secret_path),
         "credentials_path": str(settings.gmail_credentials_path),
         "scopes": scopes,
         "token_scopes": sorted(token_scopes),
         "missing_scopes": missing_scopes,
-        "requires_reconnect": bool(missing_scopes),
+        "requires_reconnect": requires_reconnect,
+        "reason": health.get("reason"),
         "hosted_gmail_mcp_enabled": settings.gmail_remote_mcp_enabled,
         "hosted_gmail_mcp_ready": bool(
             settings.gmail_remote_mcp_enabled
