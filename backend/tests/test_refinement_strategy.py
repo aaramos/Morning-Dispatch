@@ -134,7 +134,7 @@ def test_strategy_preview_exposes_diagnostics():
     assert preview["diagnostics"]["readiness_reason"] == "defaults_filled"
 
 
-def test_apply_agent_update_records_readiness_and_patch(monkeypatch):
+def test_apply_agent_update_ignores_model_ready_without_user_confirmation(monkeypatch):
     # Keep the second model pass inert so the test never touches the network.
     monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)
 
@@ -153,12 +153,11 @@ def test_apply_agent_update_records_readiness_and_patch(monkeypatch):
         turn_count=5,
     )
 
-    assert ready is True
-    assert next_question is None
-    diagnostics = patched["refinement_diagnostics"]
-    assert diagnostics["readiness_reason"] == "model_ready"
-    assert "model_profile_patch" in diagnostics
-    assert "critique_changes" in diagnostics
+    assert ready is False
+    assert next_question
+    assert "Nvidia HBM roadmap" in patched["search_queries"]
+    assert "TSMC CoWoS capacity" in patched["search_queries"]
+    assert patched["refinement_diagnostics"] == {}
 
 
 def test_just_go_now_readiness_reason():

@@ -137,6 +137,10 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert "Digest Stats" not in html.text
         assert "brief-sidebar" in html.text
         assert "About this brief" in html.text
+        assert "Source mix" in html.text
+        source_mix = BeautifulSoup(html.text, "html.parser").select_one(".source-mix")
+        assert source_mix is not None
+        assert "Gmail" in source_mix.get_text(" ")
         assert "Provenance" not in html.text
         assert "AI tokens" in html.text
         assert "AI calls" in html.text

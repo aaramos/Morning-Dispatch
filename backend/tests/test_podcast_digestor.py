@@ -288,7 +288,11 @@ def test_episode_first_search_and_resolve_flow(monkeypatch, tmp_path):
         ]
     }
 
-    podcast_rss_xml = """
+    from datetime import datetime, UTC
+    from email.utils import format_datetime
+    pub_date_str = format_datetime(datetime.now(UTC))
+
+    podcast_rss_xml = f"""
     <rss version="2.0">
       <channel>
         <title>The Agentic Developer</title>
@@ -296,7 +300,7 @@ def test_episode_first_search_and_resolve_flow(monkeypatch, tmp_path):
           <title>Episode 42: Agentic Workflows with DeepMind</title>
           <link>https://podcasts.apple.com/us/podcast/id123456789</link>
           <description>A deep discussion on agentic workflows and local coding models.</description>
-          <pubDate>Mon, 01 Jun 2026 12:00:00 GMT</pubDate>
+          <pubDate>{pub_date_str}</pubDate>
           <enclosure url="https://cdn.example.com/episode42.mp3" type="audio/mpeg" length="45000000"/>
           <guid>episode-42</guid>
         </item>

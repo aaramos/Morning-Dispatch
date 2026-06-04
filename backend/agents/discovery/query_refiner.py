@@ -97,6 +97,7 @@ async def screen_candidates(
     profile: TopicProfile,
     candidates: list[Any],
     exclusions: list[dict[str, Any]] | None = None,
+    low_yield: bool = False,
 ) -> list[Any]:
     """Applies an LLM-led screening pass to Gmail and Podcast candidates before lane capacity limits are enforced.
     Drops ads, promotional spam, and items with titles not aligned to the query.
@@ -158,6 +159,15 @@ async def screen_candidates(
         system_prompt = system_prompt.replace("{{statement}}", profile.statement)
         system_prompt = system_prompt.replace("{{exclusions}}", ", ".join(profile.exclusions))
         system_prompt = system_prompt.replace("{{candidates_json}}", json.dumps(cand_list, ensure_ascii=False))
+
+        if low_yield:
+            system_prompt += (
+                "\n\nCRITICAL: We are in a low-yield retrieval mode. "
+                "Please be EXTREMELY permissive. Only drop candidates if they are "
+                "unquestionably spam, advertising, or completely unrelated to the topic. "
+                "If a candidate has any reasonable connection to the topic statement, "
+                "choose 'keep' instead of 'drop'."
+            )
 
         try:
             payload = await client.complete_json(

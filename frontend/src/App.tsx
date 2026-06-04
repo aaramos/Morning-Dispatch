@@ -284,6 +284,7 @@ type AdminStatus = {
       last_delivered_at?: string | null;
       last_error?: string | null;
     };
+    scheduled_failures?: ScheduledDeliveryFailure[];
   };
   digests?: Digest[];
   inference_metrics?: {
@@ -351,6 +352,15 @@ type AdminStatus = {
     }>;
     external_plaintext: Array<{ server: string; location: string; key: string; path: string }>;
   };
+};
+
+type ScheduledDeliveryFailure = {
+  topic_id: string;
+  name: string;
+  schedule?: string | null;
+  error: string;
+  last_attempted_at?: string | null;
+  latest_exploration_id?: string | null;
 };
 
 type ModelRouteDraft = Record<string, { model: string }>;
@@ -888,6 +898,10 @@ function DispatchApp() {
 
   const topicById = useMemo(() => new Map(allTopics.map((topic) => [topic.topic_id, topic])), [allTopics]);
   const activeDigest = scheduledTopics[0] ?? null;
+  const scheduledDeliveryFailures = useMemo(
+    () => deliveryFailuresFromStatus(adminStatus, scheduledTopics),
+    [adminStatus, scheduledTopics],
+  );
   const homeRecentItems = useMemo<HomeRecentItem[]>(() => {
     const topicIdsWithExplorations = new Set(recentExplorations.map((item) => item.topic_id));
     const digestTopicIds = new Set(scheduledTopics.map((topic) => topic.topic_id));
@@ -1077,6 +1091,7 @@ function DispatchApp() {
     const resolved: RefinementSession = finalSession;
     setSession(resolved);
     setDraft(draftFromProfile(resolved.profile, defaultControls.content_limits));
+    setSourceSelection(sourceSelectionFromRecord(resolved.profile.source_selection));
     if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
     setStreamingText("");
     const finalized = resolved.status === "finalized" || ready;
@@ -1135,7 +1150,7 @@ function DispatchApp() {
     const pendingAnswer = effectiveAnswer;
     setAnswer("");
     setBusy(true);
-    setMessage(justGoNow ? "Building your plan..." : "Thinking...");
+    setMessage(justGoNow ? "Confirming search strategy..." : "Thinking...");
     try {
       await runRefinementStream(
         {
@@ -1146,7 +1161,7 @@ function DispatchApp() {
           just_go_now: justGoNow,
           models: {},
         },
-        justGoNow ? "Skip the questions — build it now." : pendingAnswer,
+        justGoNow ? "Search strategy confirmed." : pendingAnswer,
       );
     } catch (error) {
       if (!justGoNow && pendingAnswer) setAnswer(pendingAnswer);
@@ -1537,6 +1552,26 @@ function DispatchApp() {
     throw new Error("Brief build timed out while waiting for the finished brief");
   }
 
+  async function stopExploration(record = exploration) {
+    if (!record || (record.status !== "queued" && record.status !== "running")) return;
+    setBusy(true);
+    setMessage("Stopping the build...");
+    try {
+      const result = await api<{ status: string; exploration: Exploration }>(
+        `/api/explore/explorations/${record.exploration_id}/cancel`,
+        { method: "POST" },
+      );
+      setExploration(result.exploration);
+      await loadHome();
+      setFlow("building");
+      setMessage("Build stopped.");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not stop the build"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function fetchBriefHtml(record: Exploration): Promise<string | null> {
     const path = briefPath(record);
     if (!path) return null;
@@ -1719,25 +1754,6 @@ function DispatchApp() {
     setMessage("Ready");
   }
 
-  async function syncSourceSelectionToBackend(updatedSources: Record<string, boolean>) {
-    if (!activeInterest) return;
-    setBusy(true);
-    try {
-      await runRefinementStream({
-        session_id: session?.session_id ?? null,
-        statement: activeInterest,
-        source_selection: updatedSources,
-        answer: "",
-        just_go_now: false,
-        models: {},
-      });
-    } catch (error) {
-      setMessage(errorMessage(error, "Could not update sources"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   function updateSource(key: SourceKey) {
     if (sourceLocked) return;
     const status = sourceStatus?.sources[key];
@@ -1746,15 +1762,7 @@ function DispatchApp() {
       return;
     }
     setSourceSelection((current) => {
-      const next = { ...current, [key]: !current[key] };
-      if (flow === "refining" || flow === "confirm") {
-        const selectedEnabled = Object.keys(next).reduce((acc, k) => {
-          if (next[k as SourceKey]) acc[k] = true;
-          return acc;
-        }, {} as Record<string, boolean>);
-        void syncSourceSelectionToBackend(selectedEnabled);
-      }
-      return next;
+      return { ...current, [key]: !current[key] };
     });
   }
 
@@ -1950,6 +1958,15 @@ function DispatchApp() {
     };
   }, [initialRefineExplorationId]);
 
+  // Retained for the legacy confirmation panel while the unified refinement UI rolls out.
+  void strategyStreamingText;
+  void strategyStreaming;
+  void strategyPreparingProposal;
+  void strategyError;
+  void strategyConfirmation;
+  void refineSearchStrategy;
+  void confirmStrategyRefinement;
+
   return (
     <main className="dispatch-page">
       <section className="dispatch-frame">
@@ -1963,6 +1980,9 @@ function DispatchApp() {
         </header>
 
         <section className="dispatch-body">
+          {scheduledDeliveryFailures.length ? (
+            <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} />
+          ) : null}
           {homeRecentItems.length || activeDigest ? (
             <div className="recent-block">
               <div className="section-header-row">
@@ -2041,10 +2061,13 @@ function DispatchApp() {
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
               onJustGo={() => void answerRefinement(true)}
-              onGmailApprove={(approvedSenders, instructions) => {
-                let reply = "none";
-                if (approvedSenders.length) {
-                  reply = `Approved: ${approvedSenders.join(", ")}`;
+	              onGmailApprove={(approvedSenders, instructions) => {
+	                let reply = "none";
+	                if (!approvedSenders.length) {
+	                  setSourceSelection((current) => ({ ...current, gmail: false }));
+	                }
+	                if (approvedSenders.length) {
+	                  reply = `Approved: ${approvedSenders.join(", ")}`;
                   if (instructions.trim()) {
                     reply += `\nInstructions: ${instructions.trim()}`;
                   }
@@ -2070,7 +2093,12 @@ function DispatchApp() {
           ) : null}
 
           {visibleBuild ? (
-            <ProgressPanel exploration={visibleBuild} sourceSelection={visibleBuild.source_selection ?? selectedEnabledSources} />
+            <ProgressPanel
+              exploration={visibleBuild}
+              sourceSelection={visibleBuild.source_selection ?? selectedEnabledSources}
+              onStop={() => void stopExploration(visibleBuild)}
+              stopping={busy}
+            />
           ) : null}
 
           {flow === "ready" && exploration ? (
@@ -2332,7 +2360,7 @@ function RefinementPanel(props: {
           </div>
           <span className={`status-pill ${finalized ? "good" : ""}`}>
             <span className={`live-dot ${props.streaming ? "live" : ""}`} />
-            {finalized ? "Ready to confirm" : props.streaming ? "Thinking through your plan" : "In progress"}
+            {finalized ? "Strategy confirmed" : props.streaming ? "Thinking through your plan" : "In progress"}
           </span>
         </div>
         <div className="chat-thread" ref={threadRef}>
@@ -2340,7 +2368,7 @@ function RefinementPanel(props: {
             <div className="chat-turn assistant">
               <div className="chat-avatar ai">M</div>
               <div className="chat-bubble2">
-                Hello! I'm the Reference Librarian. Tell me what topic or question you'd like to explore and design a brief for.
+                Hello. What should this brief help you understand, decide, or monitor?
               </div>
             </div>
           ) : (
@@ -2473,7 +2501,7 @@ function RefinementPanel(props: {
                     onClick={props.onBuild}
                     disabled={props.busy}
                   >
-                    Confirm & Build Brief
+                    Build brief
                   </button>
                 </div>
               </div>
@@ -2484,7 +2512,7 @@ function RefinementPanel(props: {
                 <textarea
                   value={props.answer}
                   onChange={(event) => props.onAnswerChange(event.target.value)}
-                  placeholder={props.gmailCandidates ? "Reply with numbers, names, all, none, or click senders above…" : finalized ? "Add anything else…" : "Reply, or just tell me to go…"}
+                  placeholder={props.gmailCandidates ? "Reply with numbers, names, all, none, or click senders above…" : finalized ? "Add anything else…" : "Answer the next question or refine the strategy…"}
                   rows={1}
                   disabled={props.busy}
                   onKeyDown={(event) => {
@@ -2521,8 +2549,8 @@ function RefinementPanel(props: {
                     <span className="muted-hint">Enter to send · Shift+Enter for a new line</span>
                   )}
                   <span style={{ flex: 1 }} />
-                  <button type="button" className="ghost-link" onClick={props.onJustGo} disabled={props.busy}>
-                    Skip the questions — build it now →
+                  <button type="button" className="primary-action strategy-confirm-action" onClick={props.onJustGo} disabled={props.busy}>
+                    Confirm Search Strategy
                   </button>
                 </div>
               </div>
@@ -2600,7 +2628,7 @@ function RefinementPanel(props: {
             </div>
           ) : null}
           {finalized ? (
-            <div className="plan-ready-note">The AI marks this ready — confirming below to build.</div>
+            <div className="plan-ready-note">Search strategy confirmed. Build the brief when you are ready.</div>
           ) : null}
         </div>
       </aside>
@@ -3117,6 +3145,8 @@ function ConfirmationPanel(props: {
     </section>
   );
 }
+
+void ConfirmationPanel;
 
 function StrategyRefinementModal(props: {
   profile: TopicProfile | null;
@@ -3782,7 +3812,12 @@ function NumberStepper(props: {
   );
 }
 
-function ProgressPanel(props: { exploration: Exploration; sourceSelection: Record<string, boolean> }) {
+function ProgressPanel(props: {
+  exploration: Exploration;
+  sourceSelection: Record<string, boolean>;
+  onStop?: () => void;
+  stopping?: boolean;
+}) {
   const pipeline = Object.entries(props.exploration.progress.pipeline ?? {});
   const sources = Object.entries(props.exploration.progress.sources ?? {});
   const filterNotes = filterDecisionNotes(props.exploration);
@@ -3797,9 +3832,21 @@ function ProgressPanel(props: { exploration: Exploration; sourceSelection: Recor
           <p className="section-kicker">{props.exploration.status === "queued" ? "Queued" : "Full pipeline running"}</p>
           <h2>{progressHeadline(props.exploration)}</h2>
         </div>
-        <span className={`status-pill ${props.exploration.status === "running" ? "good" : ""} ${isModelDegraded(props.exploration) ? "warning" : ""}`}>
-          {isModelDegraded(props.exploration) ? "Needs attention" : formatStage(props.exploration.status)}
-        </span>
+        <div className="progress-heading-actions">
+          {props.exploration.status === "queued" || props.exploration.status === "running" ? (
+            <button
+              type="button"
+              className="secondary-action destructive compact-action"
+              onClick={props.onStop}
+              disabled={!props.onStop}
+            >
+              Stop
+            </button>
+          ) : null}
+          <span className={`status-pill ${props.exploration.status === "running" ? "good" : ""} ${isModelDegraded(props.exploration) ? "warning" : ""}`}>
+            {isModelDegraded(props.exploration) ? "Needs attention" : formatStage(props.exploration.status)}
+          </span>
+        </div>
       </div>
       <p className="queue-note">{progressDetail(props.exploration)}</p>
       <p className="section-kicker">{sourcePlan(props.sourceSelection)}</p>
@@ -4765,6 +4812,10 @@ function AdminApp() {
       return digestLibraryDate(b) - digestLibraryDate(a);
     });
   }, [digestSort, library.digests, library.legacy_digests]);
+  const scheduledDeliveryFailures = useMemo(
+    () => deliveryFailuresFromStatus(status, library.digests),
+    [library.digests, status],
+  );
   const modelOptions = status?.model?.catalog.models ?? [];
   const hasActiveLibraryBuilds = useMemo(() => {
     const activeExploration = library.explorations.some((item) => item.status === "queued" || item.status === "running");
@@ -5724,6 +5775,9 @@ function AdminApp() {
 
       {tab === "library" ? (
         <section className="admin-panel">
+          {scheduledDeliveryFailures.length ? (
+            <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} />
+          ) : null}
           {issueDetails?.built_with_issues ? (
             <div className="issue-note admin-issue-note">
               <strong>Built with issues</strong>
@@ -6362,6 +6416,59 @@ function SecretHealthPanel(props: {
       ) : null}
     </section>
   );
+}
+
+function ScheduledDeliveryAlert(props: { failures: ScheduledDeliveryFailure[] }) {
+  if (!props.failures.length) return null;
+  return (
+    <div className="delivery-alert" role="alert">
+      <div>
+        <p className="section-kicker">Email delivery paused</p>
+        <strong>Scheduled brief email failed.</strong>
+        <p>
+          I will keep building scheduled briefs, but I will not keep trying to send email for the failed schedule
+          until you reconnect Gmail or save the schedule again.
+        </p>
+      </div>
+      <ul>
+        {props.failures.slice(0, 4).map((failure) => (
+          <li key={failure.topic_id}>
+            <span>{failure.name}</span>
+            <em>{failure.error}</em>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function deliveryFailuresFromStatus(
+  status: AdminStatus | null,
+  topics: TopicProfileResponse[] = [],
+): ScheduledDeliveryFailure[] {
+  const failures = new Map<string, ScheduledDeliveryFailure>();
+  for (const failure of status?.delivery?.scheduled_failures ?? []) {
+    failures.set(failure.topic_id, failure);
+  }
+  for (const topic of topics) {
+    const config = topic.profile.delivery_config ?? {};
+    const failed = config.delivery_disabled_after_failure === true || config.last_delivery_status === "failed";
+    if (!failed) continue;
+    const error = typeof config.last_error === "string"
+      ? config.last_error
+      : typeof config.last_delivery_error === "string"
+        ? config.last_delivery_error
+        : "Email delivery failed.";
+    failures.set(topic.topic_id, {
+      topic_id: topic.topic_id,
+      name: profileName(topic),
+      schedule: topic.schedule,
+      error,
+      last_attempted_at: typeof config.last_delivery_attempted_at === "string" ? config.last_delivery_attempted_at : null,
+      latest_exploration_id: topic.latest_exploration?.exploration_id ?? null,
+    });
+  }
+  return [...failures.values()];
 }
 
 function LibrarySection(props: {

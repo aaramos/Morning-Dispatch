@@ -386,6 +386,14 @@ def schedule_topic_profile(topic_id: str, payload: TopicProfileSchedule) -> dict
         "timezone": (payload.timezone or "America/Los_Angeles").strip() or "America/Los_Angeles",
     } if schedule else {}
     delivery_config = dict(record["profile"].get("delivery_config") or {})
+    for key in (
+        "delivery_disabled_after_failure",
+        "last_delivery_status",
+        "last_delivery_error",
+        "last_error",
+        "last_delivery_attempted_at",
+    ):
+        delivery_config.pop(key, None)
     if payload.email_enabled is not None:
         delivery_config["email_enabled"] = bool(payload.email_enabled)
     profile = {
@@ -510,6 +518,17 @@ def get_exploration(exploration_id: str) -> dict[str, Any]:
     if exploration is None:
         raise HTTPException(status_code=404, detail="Exploration not found")
     return exploration
+
+
+@router.post("/explore/explorations/{exploration_id}/cancel")
+def cancel_exploration(exploration_id: str) -> dict[str, Any]:
+    exploration = explore.cancel_exploration(exploration_id)
+    if exploration is None:
+        raise HTTPException(status_code=404, detail="Exploration not found")
+    return {
+        "status": "cancelled" if exploration.get("progress", {}).get("cancel_requested") else exploration.get("status"),
+        "exploration": exploration,
+    }
 
 
 @router.delete("/explore/explorations/{exploration_id}")

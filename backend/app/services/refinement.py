@@ -118,20 +118,21 @@ def start_session(payload: dict[str, Any]) -> dict[str, Any]:
         just_go_now=False,
     )
     if agent_update is not None:
-        profile, next_question, ready = _apply_agent_update(
+        profile, next_question, _ready = _apply_agent_update(
             profile=profile,
             messages=messages,
             agent_update=agent_update,
             just_go_now=False,
             turn_count=0,
         )
-        pending = None if ready else AGENT_PENDING_FIELD
-        messages = [{"role": "assistant", "content": next_question}] if next_question and not ready else []
-        status = "finalized" if ready else "active"
+        pending = AGENT_PENDING_FIELD
+        messages = [{"role": "assistant", "content": next_question or _strategy_deepening_question(profile, messages)}]
+        status = "active"
     else:
-        pending = _next_missing(profile)
-        messages = [{"role": "assistant", "content": _deterministic_question(pending, profile)}] if pending else []
-        status = "active" if pending else "finalized"
+        pending = AGENT_PENDING_FIELD
+        missing = _next_missing(profile)
+        messages = [{"role": "assistant", "content": _deterministic_question(missing, profile) if missing else _strategy_deepening_question(profile, messages)}]
+        status = "active"
     session = database.create_refinement_session(
         statement=statement,
         profile=profile,
@@ -139,18 +140,6 @@ def start_session(payload: dict[str, Any]) -> dict[str, Any]:
         pending_field=pending,
         status=status,
     )
-    if status == "finalized":
-        saved = explore.save_topic_profile(_fill_defaults(profile))
-        updated = database.update_refinement_session(
-            session["session_id"],
-            profile=_fill_defaults(profile),
-            messages=[*messages, {"role": "assistant", "content": "Topic profile is ready."}],
-            pending_field=None,
-            turn_count=0,
-            status="finalized",
-            topic_id=str(saved["topic_id"]),
-        )
-        return _session_response(updated) if updated else _session_response(session)
     return _session_response(session)
 
 
@@ -158,15 +147,18 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
     session = database.get_refinement_session(session_id)
     if session is None:
         return None
+    answer = str(payload.get("answer") or "").strip()
+    just_go_now = bool(payload.get("just_go_now"))
     if session["status"] == "finalized":
-        return _session_response(session)
+        if answer and not just_go_now:
+            session = {**session, "status": "active", "pending_field": AGENT_PENDING_FIELD}
+        else:
+            return _session_response(session)
 
     profile = dict(session["profile"])
     messages = _messages(session)
     pending = session.get("pending_field")
-    answer = str(payload.get("answer") or "").strip()
     profile = _apply_models(profile, payload.get("models"))
-    just_go_now = bool(payload.get("just_go_now"))
     turn_count = int(session.get("turn_count") or 0)
 
     # Update source selection and detect toggled-on/off Gmail
@@ -193,6 +185,13 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
 
     if just_go_now:
         messages.append({"role": "user", "content": "Just go now."})
+        if pending in {GMAIL_SENDER_SELECTION_FIELD, GMAIL_RULES_FIELD}:
+            rules = _normalize_gmail_rules(profile.get("gmail_rules"))
+            rules["include_senders"] = []
+            profile["gmail_rules"] = rules
+            profile["source_selection"] = {**_source_selection_dict(profile.get("source_selection")), "gmail": False}
+            pending = None
+            messages.append({"role": "assistant", "content": "Got it. I'll continue without Gmail for this brief."})
 
     gmail_result = _advance_gmail_refinement(profile, pending, answer=answer, just_go_now=just_go_now)
     if gmail_result is not None:
@@ -251,17 +250,21 @@ def advance_session(session_id: str, payload: dict[str, Any]) -> dict[str, Any] 
             messages.append({"role": "assistant", "content": "Topic profile is ready."})
     else:
         if answer and not just_go_now and not answer_applied:
-            profile = _apply_answer_with_model(profile, answered_field, answer)
+            if pending == AGENT_PENDING_FIELD:
+                profile = _apply_freeform_refinement_answer(profile, answer)
+            else:
+                profile = _apply_answer_with_model(profile, answered_field, answer)
         profile = _seed_profile_with_hints(profile)
-        profile = _fill_defaults(profile) if just_go_now or turn_count >= MAX_REFINEMENT_TURNS else profile
-        if just_go_now or turn_count >= MAX_REFINEMENT_TURNS or answered_field == "exclusions":
+        profile = _fill_defaults(profile) if just_go_now else profile
+        if just_go_now:
             next_pending = None
         else:
-            next_pending = _next_missing(profile)
+            next_pending = AGENT_PENDING_FIELD
         status = "finalized" if next_pending is None else "active"
         topic_id = session.get("topic_id")
         if status == "active":
-            messages.append({"role": "assistant", "content": _deterministic_question(next_pending, profile)})
+            missing = _next_missing(profile)
+            messages.append({"role": "assistant", "content": _deterministic_question(missing, profile) if missing else _strategy_deepening_question(profile, messages)})
         else:
             profile = _fill_defaults(profile)
             saved = explore.save_topic_profile(profile)
@@ -297,6 +300,7 @@ async def astream_refinement(
     question bank on this path. If the model client is unavailable we fall back to the
     deterministic ``advance_session`` engine for a single graceful turn.
     """
+    clean_answer = str(answer or "").strip()
     session = database.get_refinement_session(session_id) if session_id else None
     if session is None:
         clean_statement = str(statement or "").strip()
@@ -380,8 +384,11 @@ async def astream_refinement(
     else:
         session_id = session["session_id"]
         if session["status"] == "finalized":
-            yield {"type": "done", "session": _session_response(session), "ready": True}
-            return
+            if clean_answer and not just_go_now:
+                session = {**session, "status": "active", "pending_field": AGENT_PENDING_FIELD}
+            else:
+                yield {"type": "done", "session": _session_response(session), "ready": True}
+                return
         profile = dict(session["profile"])
         messages = _messages(session)
 
@@ -401,7 +408,6 @@ async def astream_refinement(
 
     profile = _apply_models(profile, models)
     turn_count = int(session.get("turn_count") or 0)
-    clean_answer = str(answer or "").strip()
     pending_field = session.get("pending_field") or ""
 
     yield {"type": "session", "session_id": session_id}
@@ -458,7 +464,12 @@ async def astream_refinement(
     # When the previous turn left pending_field=GMAIL_SENDER_SELECTION_FIELD the user
     # is responding with their sender approval (numbers, names, "all", "none"). Handle
     # this without involving the AI.
-    if pending_field == GMAIL_SENDER_SELECTION_FIELD and clean_answer and not just_go_now:
+    if (
+        pending_field == GMAIL_SENDER_SELECTION_FIELD
+        and clean_answer
+        and not just_go_now
+        and _is_gmail_approval_response(clean_answer, gmail_rules)
+    ):
         async for event in _astream_gmail_approval(
             session_id=session_id,
             session=session,
@@ -482,7 +493,7 @@ async def astream_refinement(
         messages.append({"role": "user", "content": clean_answer})
         turn_count += 1
     elif just_go_now:
-        messages.append({"role": "user", "content": "Just build it now."})
+        messages.append({"role": "user", "content": "Search strategy confirmed."})
 
     prompt = _build_refinement_chat_prompt(
         profile=profile,
@@ -538,7 +549,7 @@ async def astream_refinement(
 
     assistant_text = final_visible.strip()
     patch, ready_flag = _parse_chat_payload(full_text)
-    ready = bool(ready_flag) or just_go_now
+    ready = just_go_now
 
     patched = _merge_agent_profile_patch(profile, patch, user_text=_user_authored_text(profile, messages))
     patched = _seed_profile_with_hints(patched)
@@ -612,6 +623,10 @@ async def astream_refinement(
         status = "finalized"
         pending = None
     else:
+        if not assistant_text:
+            fallback_question = _strategy_deepening_question(patched, messages)
+            messages.append({"role": "assistant", "content": fallback_question})
+            yield {"type": "token", "text": fallback_question}
         patched = _coerce_profile(patched)
         status = "active"
         pending = AGENT_PENDING_FIELD
@@ -742,13 +757,16 @@ async def _astream_gmail_approval(
     messages.append({"role": "assistant", "content": confirmation})
     yield {"type": "token", "text": confirmation}
 
+    next_pending = AGENT_PENDING_FIELD if include_senders else None
+    ready = not include_senders
+
     updated = database.update_refinement_session(
         session_id,
         profile=_coerce_profile(updated_profile),
         messages=messages,
-        pending_field=AGENT_PENDING_FIELD,
+        pending_field=next_pending,
         turn_count=turn_count + 1,
-        status="active",
+        status="finalized" if ready else "active",
         topic_id=session.get("topic_id"),
     )
     response = _session_response(updated) if updated else None
@@ -757,7 +775,7 @@ async def _astream_gmail_approval(
         return
     yield {"type": "gmail_approved", "senders": include_senders}
     yield {"type": "plan", "session": response}
-    yield {"type": "done", "session": response, "ready": False}
+    yield {"type": "done", "session": response, "ready": ready}
 
 
 async def _astream_fallback(
@@ -1864,6 +1882,8 @@ def _advance_gmail_refinement(
     if pending_field == GMAIL_SENDER_SELECTION_FIELD:
         updated = dict(profile)
         rules = _normalize_gmail_rules(updated.get("gmail_rules"))
+        if not _is_gmail_approval_response(answer, rules):
+            return None
 
         intent_match = re.search(r"Instructions:\s*(.*)", answer, re.DOTALL | re.IGNORECASE)
         if intent_match:
@@ -1906,7 +1926,7 @@ def _advance_gmail_refinement(
             _coerce_profile(updated),
             "Got it. I'll continue without Gmail for this brief.",
             None,
-            "continue",
+            "finalized",
         )
 
     return None
@@ -2200,13 +2220,11 @@ def _build_refinement_agent_prompt(
                 "confirmations, not open questions. Never emit an internal field name. Never ask "
                 "about a constraint already present in already_inferred. If recency, exclusions, "
                 "companies, or named sources are already present, ask about source quality, "
-                "comparison angles, signal types, decision criteria, or what would make the brief useful. Ask at "
-                "least min_turns meaningful refinement questions before marking ready unless the "
-                "user clicks just_go_now. Mark ready_to_build true as soon as that floor is met "
-                "and the plan is defensible; do not pad beyond useful questions. If "
-                "just_go_now is true or turn_count == max_turns, finalize now with best inferred "
-                "defaults. min_turns is a floor on quality: if intent is already clear, ask a "
-                "concrete confirmation or constraint question rather than a generic form question."
+                "comparison angles, signal types, decision criteria, or what would make the brief useful. "
+                "Always include one next question that would further elicit the user's requirements. "
+                "Do not say the plan is complete, ready, or that you have what you need. There is no "
+                "minimum or maximum question count. Only the user's explicit search-strategy confirmation "
+                "button ends refinement; if just_go_now is true, finalize now with best inferred defaults."
             ),
             "revisit_policy": (
                 "If this is an existing profile being revisited, ask how to sharpen the search plan "
@@ -2238,7 +2256,7 @@ def _apply_agent_update(
     if reasoning_summary:
         patched["reasoning_summary"] = reasoning_summary
     ready_requested = bool(agent_update.get("ready_to_build"))
-    ready = ready_requested or just_go_now or turn_count >= MAX_REFINEMENT_TURNS
+    ready = just_go_now
     next_question = _clean_next_question(agent_update.get("next_question"))
     if next_question and _is_generic_actionable_question(next_question):
         next_question = _strategy_deepening_question(patched, messages)
@@ -2246,22 +2264,14 @@ def _apply_agent_update(
         next_question = _strategy_deepening_question(patched, messages)
     next_question = _dedupe_next_question(next_question, patched, messages)
 
-    if ready and not just_go_now and turn_count < MIN_REFINEMENT_TURNS:
-        ready = False
-        if not next_question:
-            fallback_pending = _next_missing(patched)
-            next_question = _deterministic_question(fallback_pending, patched) if fallback_pending else _search_strategy_question(patched)
-            next_question = _dedupe_next_question(next_question, patched, messages)
-
     if not next_question and not ready:
         fallback_pending = _next_missing(patched)
-        next_question = _deterministic_question(fallback_pending, patched) if fallback_pending else None
+        next_question = _deterministic_question(fallback_pending, patched) if fallback_pending else _strategy_deepening_question(patched, messages)
         if next_question and _question_repeats_answered_constraint(next_question, patched):
             next_question = _strategy_deepening_question(patched, messages)
         next_question = _dedupe_next_question(next_question, patched, messages)
-        ready = fallback_pending is None
-        if not next_question and turn_count >= MIN_REFINEMENT_TURNS:
-            ready = True
+        if not next_question:
+            next_question = _search_strategy_question(patched)
     if ready:
         readiness_reason = _readiness_reason(
             ready_requested=ready_requested,
@@ -2716,6 +2726,35 @@ def _selected_gmail_senders(answer: str, rules: dict[str, Any]) -> list[str]:
     return _email_list(selected)
 
 
+def _is_gmail_approval_response(answer: str, rules: dict[str, Any]) -> bool:
+    clean = str(answer or "").strip()
+    if not clean:
+        return False
+    lowered = clean.lower()
+    if any(token in lowered for token in ("none", "no gmail", "skip gmail", "without gmail")):
+        return True
+    if _email_list(clean):
+        return True
+
+    candidates = [candidate for candidate in rules.get("candidates", []) if isinstance(candidate, dict)]
+    if not candidates:
+        return False
+    if re.search(r"\ball\b|\bevery\b", lowered):
+        return True
+    for number in re.findall(r"\b\d+\b", clean):
+        index = int(number) - 1
+        if 0 <= index < len(candidates):
+            return True
+    for candidate in candidates:
+        sender = str(candidate.get("sender") or "").strip().lower()
+        name = str(candidate.get("sender_name") or "").strip().lower()
+        if sender and sender in lowered:
+            return True
+        if name and name in lowered:
+            return True
+    return False
+
+
 def _lookback_label(hours: int) -> str:
     if hours % 168 == 0 and hours >= 168:
         weeks = hours // 168
@@ -2842,6 +2881,34 @@ def _apply_answer_with_model(profile: dict[str, Any], field: str, answer: str) -
             profile = _coerce_profile(_merge_requested_source_hints({**profile, **model_updates}, answer))
             return profile
     return _apply_answer(profile, field, answer)
+
+
+def _apply_freeform_refinement_answer(profile: dict[str, Any], answer: str) -> dict[str, Any]:
+    clean = " ".join(str(answer or "").split()).strip()
+    if not clean:
+        return profile
+
+    updated = dict(profile)
+    statement = str(updated.get("statement") or "").strip()
+    scope = str(updated.get("scope") or "").strip()
+    if not scope or scope == statement:
+        updated["scope"] = clean[:220]
+        updated["scope_answered"] = True
+    else:
+        related = _merge_string_lists(updated.get("related_interests"), [clean], limit=12)
+        if related:
+            updated["related_interests"] = related
+            updated["related_interests_answered"] = True
+
+    keywords = _merge_string_lists(updated.get("keywords"), _keywords(clean), limit=24)
+    if keywords:
+        updated["keywords"] = keywords
+
+    queries = _merge_string_lists(updated.get("search_queries"), [clean], limit=12)
+    if queries:
+        updated["search_queries"] = queries
+
+    return _coerce_profile(_merge_requested_source_hints(updated, clean))
 
 
 def _extract_model_updates(

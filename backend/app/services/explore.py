@@ -13,6 +13,7 @@ import logging
 import re
 from time import monotonic
 from typing import Any
+import inspect
 
 from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.critic import apply_critic_repairs
@@ -33,6 +34,7 @@ from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles
 from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
 from backend.agents.source_audit import apply_source_audit
 from backend.app.core.config import ensure_runtime_dirs, get_settings
+from backend.app.core.prompt_loader import load_prompt
 from backend.app.db import database
 from backend.agents.discovery.collections_source import collections_status, setup_collections_root
 from backend.agents.discovery.markets import markets_available
@@ -91,6 +93,12 @@ _MONTHS = {
     "nov": 11,
     "dec": 12,
 }
+
+
+class BuildCancelled(RuntimeError):
+    pass
+
+
 async def start_build_queue() -> None:
     global _BUILD_QUEUE_TASK, _BUILD_QUEUE_EVENT
     requeued = database.requeue_running_explorations()
@@ -117,6 +125,19 @@ async def stop_build_queue() -> None:
 def _signal_build_queue() -> None:
     if _BUILD_QUEUE_EVENT is not None:
         _BUILD_QUEUE_EVENT.set()
+
+
+def cancel_exploration(exploration_id: str) -> dict[str, Any] | None:
+    return database.cancel_exploration(exploration_id)
+
+
+def _raise_if_cancelled(exploration_id: str) -> None:
+    current = database.get_exploration(exploration_id)
+    if current is None:
+        return
+    progress = current.get("progress") or {}
+    if current.get("status") == "failed" and progress.get("cancel_requested"):
+        raise BuildCancelled(str(progress.get("error") or "Build stopped by user."))
 
 
 async def _build_queue_worker() -> None:
@@ -356,6 +377,16 @@ async def run_discovery(
             "exploration": completed or exploration,
             "discovery": result.to_dict(),
         }
+    except BuildCancelled as exc:
+        progress["cancel_requested"] = True
+        progress["error"] = str(exc) or "Build stopped by user."
+        _set_pipeline_stage(progress, "done", "failed")
+        database.update_exploration_progress(exploration_id, progress=progress)
+        database.update_exploration_status(
+            exploration_id,
+            status="failed",
+        )
+        return None
     except Exception as exc:  # pragma: no cover - important path for production reliability.
         logger.exception(
             "Exploration discovery %s failed for topic profile %s",
@@ -481,6 +512,16 @@ async def run_scheduled(
     )
 
 
+def _accepts_param(func: Any, param_name: str) -> bool:
+    try:
+        sig = inspect.signature(func)
+        if param_name in sig.parameters:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except (TypeError, ValueError):
+        return False
+
+
 async def _run_exploration(
     topic_id: str,
     *,
@@ -526,84 +567,152 @@ async def _run_exploration(
     _set_pipeline_stage(progress, "discovery", "running")
     _persist_progress(exploration_id, progress)
     try:
-        context = SourceAdapterContext(
-            exploration_id=exploration_id,
-            candidate_limit=candidate_limit,
-            lookback_hours=lookback_hours,
-        )
+        current_profile = profile
+        low_yield_mode = False
+        threshold = 0.45
+        max_attempts = 2
 
-        def on_adapter_status(status) -> None:
-            _set_source_status(progress, status)
+        for attempt in range(1, max_attempts + 1):
+            _raise_if_cancelled(exploration_id)
+            context = SourceAdapterContext(
+                exploration_id=exploration_id,
+                candidate_limit=candidate_limit,
+                lookback_hours=lookback_hours,
+            )
+
+            def on_adapter_status(status) -> None:
+                _set_source_status(progress, status)
+                _persist_progress(exploration_id, progress)
+
+            _set_pipeline_stage(progress, "discovery", "running")
+            _persist_progress(exploration_id, progress)
+            # 1. Run DiscoveryRunner with inspect signature check
+            runner = DiscoveryRunner(registry)
+            run_kwargs = {
+                "profile": current_profile,
+                "source_selection": merged_selection,
+                "context": context,
+                "on_adapter_status": on_adapter_status,
+            }
+            if _accepts_param(runner.run, "low_yield"):
+                run_kwargs["low_yield"] = low_yield_mode
+
+            discovery = await runner.run(**run_kwargs)
+            _raise_if_cancelled(exploration_id)
+            _set_pipeline_stage(progress, "discovery", "done")
+            _set_exclusion_reasons(progress, discovery.exclusions)
+            _set_requested_source_issues(progress, _build_source_issues(current_profile, discovery, merged_selection))
             _persist_progress(exploration_id, progress)
 
-        discovery = await DiscoveryRunner(registry).run(
-            profile,
-            source_selection=merged_selection,
-            context=context,
-            on_adapter_status=on_adapter_status,
-        )
-        _set_pipeline_stage(progress, "discovery", "done")
-        _set_exclusion_reasons(progress, discovery.exclusions)
-        _set_requested_source_issues(progress, _build_source_issues(profile, discovery, merged_selection))
-        _persist_progress(exploration_id, progress)
+            for status in discovery.statuses:
+                _set_source_status(progress, status)
+            _set_candidate_count(progress, len(discovery.payloads()))
 
-        for status in discovery.statuses:
-            _set_source_status(progress, status)
-        _set_candidate_count(progress, len(discovery.payloads()))
-
-        payloads = discovery.payloads()
-        stage_seconds: dict[str, float] = {"discovery": round(monotonic() - started_at, 3)}
-        _set_pipeline_stage(progress, "fetch", "running")
-        _persist_progress(exploration_id, progress)
-
-        stage_started = monotonic()
-        pipeline_limits = brief_settings.pipeline_limits_for_profile(get_settings(), profile)
-        fetched_articles = await fetch_articles_for_payloads(
-            payloads,
-            max_articles=pipeline_limits["article_fetches"],
-            concurrency=pipeline_limits["article_fetch_concurrency"],
-        )
-        stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
-        fetched_articles, date_review_summary = await _adjudicate_dates_before_source_window_filter(
-            profile,
-            fetched_articles,
-            lookback_hours=lookback_hours,
-            inference_run_id=exploration_id,
-            max_candidates=pipeline_limits["source_audit_candidates"],
-        )
-        if date_review_summary:
-            progress["source_date_review"] = date_review_summary
+            payloads = discovery.payloads()
+            stage_seconds = {"discovery": round(monotonic() - started_at, 3)}
+            _set_pipeline_stage(progress, "fetch", "running")
             _persist_progress(exploration_id, progress)
-        fetched_articles, source_window_issues = _apply_source_window_filter(
-            profile,
-            fetched_articles,
-            lookback_hours=lookback_hours,
-        )
-        progress["source_window"] = {
-            "status": "completed",
-            "source_scope": _source_scope_label(lookback_hours),
-            "excluded_count": len(source_window_issues),
-        }
-        if source_window_issues:
-            progress["source_filter_notes"] = [
-                *list(progress.get("source_filter_notes") or []),
-                *source_window_issues,
-            ]
-        _set_pipeline_stage(progress, "fetch", "done")
-        _persist_progress(exploration_id, progress)
 
-        stage_started = monotonic()
-        stage_started = monotonic()
-        article_results = await _run_digest_core(
-            profile=profile,
-            payloads=payloads,
-            fetched_articles=fetched_articles,
-            lookback_hours=lookback_hours,
-            inference_run_id=exploration_id,
-            progress=progress,
-            persist=lambda: _persist_progress(exploration_id, progress),
-        )
-        stage_seconds["editorial"] = _elapsed_stage_seconds(stage_started)
+            stage_started = monotonic()
+            _raise_if_cancelled(exploration_id)
+            pipeline_limits = brief_settings.pipeline_limits_for_profile(get_settings(), current_profile)
+            fetched_articles = await fetch_articles_for_payloads(
+                payloads,
+                max_articles=pipeline_limits["article_fetches"],
+                concurrency=pipeline_limits["article_fetch_concurrency"],
+            )
+            _raise_if_cancelled(exploration_id)
+            stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
+
+            # 2. Run _adjudicate_dates_before_source_window_filter with inspect signature check
+            adjudicate_kwargs = {
+                "profile": current_profile,
+                "article_results": fetched_articles,
+                "lookback_hours": lookback_hours,
+                "inference_run_id": exploration_id,
+                "max_candidates": pipeline_limits["source_audit_candidates"],
+            }
+            if _accepts_param(_adjudicate_dates_before_source_window_filter, "low_yield"):
+                adjudicate_kwargs["low_yield"] = low_yield_mode
+
+            fetched_articles, date_review_summary = await _adjudicate_dates_before_source_window_filter(**adjudicate_kwargs)
+            _raise_if_cancelled(exploration_id)
+            if date_review_summary:
+                progress["source_date_review"] = date_review_summary
+                _persist_progress(exploration_id, progress)
+            fetched_articles, source_window_issues = _apply_source_window_filter(
+                current_profile,
+                fetched_articles,
+                lookback_hours=lookback_hours,
+            )
+            progress["source_window"] = {
+                "status": "completed",
+                "source_scope": _source_scope_label(lookback_hours),
+                "excluded_count": len(source_window_issues),
+            }
+            if source_window_issues:
+                progress["source_filter_notes"] = [
+                    *list(progress.get("source_filter_notes") or []),
+                    *source_window_issues,
+                ]
+            _set_pipeline_stage(progress, "fetch", "done")
+            _persist_progress(exploration_id, progress)
+
+            stage_started = monotonic()
+            _raise_if_cancelled(exploration_id)
+
+            # 3. Run _run_digest_core with inspect signature check
+            digest_kwargs = {
+                "profile": current_profile,
+                "payloads": payloads,
+                "fetched_articles": fetched_articles,
+                "lookback_hours": lookback_hours,
+                "inference_run_id": exploration_id,
+                "progress": progress,
+                "persist": lambda: _persist_progress(exploration_id, progress),
+            }
+            if _accepts_param(_run_digest_core, "threshold"):
+                digest_kwargs["threshold"] = threshold
+            if _accepts_param(_run_digest_core, "low_yield"):
+                digest_kwargs["low_yield"] = low_yield_mode
+
+            article_results = await _run_digest_core(**digest_kwargs)
+            _raise_if_cancelled(exploration_id)
+            stage_seconds["editorial"] = _elapsed_stage_seconds(stage_started)
+
+            # Check yield to see if it is low content yield
+            included_count = sum(1 for r in article_results if r.tier != "dropped")
+            target_yield = 3
+            if isinstance(current_profile.content_limits, dict) and current_profile.content_limits.get("target_items") is not None:
+                target_yield = int(current_profile.content_limits["target_items"])
+
+            if included_count < target_yield and attempt < max_attempts:
+                logger.info(
+                    "Attempt %d yielded only %d items (target: %d). Retrying with broadened queries and relaxed thresholds.",
+                    attempt,
+                    included_count,
+                    target_yield,
+                )
+                progress["queue"] = {
+                    "status": "running",
+                    "message": f"Initial run yielded low content ({included_count} item(s)). Retrying with broadened search strategy...",
+                    "action": queue_action or "build",
+                }
+                _persist_progress(exploration_id, progress)
+
+                # 1. Broaden search queries using LLM-assisted helper
+                current_profile = await broaden_queries_with_agent(current_profile)
+
+                # 2. Relax filtering settings
+                low_yield_mode = True
+                threshold = 0.30
+
+                # Reset pipeline stages and rerun
+                progress["pipeline"] = {stage: "pending" for stage in _PIPELINE_STAGES}
+                _persist_progress(exploration_id, progress)
+                continue
+
+            break
 
         # Extract intermediates and compile/save reporting log
         intermediates = progress.pop("_intermediates", {})
@@ -633,7 +742,8 @@ async def _run_exploration(
         _set_candidate_count(progress, len(payloads))
 
         stage_started = monotonic()
-        title = _brief_title(profile)
+        _raise_if_cancelled(exploration_id)
+        title = _brief_title(current_profile)
         configured_source_count = _selected_source_count(discovery, merged_selection)
         snapshot = database.ingested_snapshot(payloads, configured_source_count, article_results)
         newsletter_source_notes = _newsletter_source_notes_for_brief(payloads, article_results)
@@ -649,7 +759,7 @@ async def _run_exploration(
                 inference_run_id=exploration_id,
                 stage_seconds=stage_seconds,
             )
-            stats["search_strategy"] = _brief_search_strategy(profile, merged_selection, lookback_hours)
+            stats["search_strategy"] = _brief_search_strategy(current_profile, merged_selection, lookback_hours)
             return stats
 
         digest_stats = build_stats()
@@ -683,7 +793,7 @@ async def _run_exploration(
         )
         brief_ref = _write_exploration_brief(exploration_id, html)
         database.record_served_undated_items(
-            profile.topic_id,
+            current_profile.topic_id,
             _served_undated_items_from_results(article_results),
         )
 
@@ -699,6 +809,7 @@ async def _run_exploration(
         _set_pipeline_stage(progress, "done", "done")
         _persist_progress(exploration_id, progress)
 
+        _raise_if_cancelled(exploration_id)
         completed = database.update_exploration_status(
             exploration_id,
             status="complete",
@@ -1063,12 +1174,14 @@ async def _run_digest_core(
     inference_run_id: str,
     progress: dict[str, Any],
     persist: Callable[[], None],
+    threshold: float = 0.45,
+    low_yield: bool = False,
 ) -> list[ArticleFetchResult]:
     digest = {
         "id": profile.topic_id,
         "name": _brief_title(profile),
         "interest": profile.search_text(),
-        "threshold": 0.45,
+        "threshold": threshold,
         "content_limits": dict(profile.content_limits),
         "recency_weighting": profile.recency_weighting,
     }
@@ -1131,6 +1244,7 @@ async def _run_digest_core(
         model_client=audit_client,
         inference_run_id=inference_run_id,
         max_candidates=pipeline_limits["source_audit_candidates"],
+        low_yield=low_yield,
     )
     after_audit = list(article_results)
     progress["source_audit"] = audit_summary
@@ -1238,6 +1352,7 @@ async def _adjudicate_dates_before_source_window_filter(
     lookback_hours: int | None,
     inference_run_id: str,
     max_candidates: int | None,
+    low_yield: bool = False,
 ) -> tuple[list[ArticleFetchResult], dict[str, Any]]:
     if lookback_hours is None:
         return article_results, {}
@@ -1267,6 +1382,7 @@ async def _adjudicate_dates_before_source_window_filter(
         model_client=audit_client,
         inference_run_id=inference_run_id,
         max_candidates=limit,
+        low_yield=low_yield,
     )
     updated = list(article_results)
     resolved_count = 0
@@ -1876,6 +1992,63 @@ def _resolve_candidate_limit(profile: TopicProfile, candidate_limit: int | None)
     if candidate_limit is not None:
         return max(1, min(int(candidate_limit), 250))
     return 250
+
+
+async def broaden_queries_with_agent(profile: TopicProfile) -> TopicProfile:
+    """Uses LLM to broaden search queries by removing narrow qualifiers/terms."""
+    settings = get_settings()
+    try:
+        resolution = model_routing.client_for_agent("refinement", settings=settings)
+        client = resolution.client
+        if client is None:
+            logger.warning("No LLM client configured for refinement agent. Skipping query broadening.")
+            return profile
+
+        prompt_data = {
+            "statement": profile.statement,
+            "scope": profile.scope,
+            "exclusions": list(profile.exclusions),
+            "search_queries": list(profile.search_queries),
+            "source_queries": {key: list(val) for key, val in profile.source_queries.items()},
+        }
+
+        system_prompt = load_prompt("query_broadening")
+        prompt_str = json.dumps(prompt_data, ensure_ascii=False)
+
+        logger.info("Running query broadening agent...")
+        payload = await client.complete_json(
+            system=system_prompt,
+            prompt=prompt_str,
+            max_tokens=1000,
+        )
+
+        broadened_search = payload.get("search_queries")
+        broadened_source = payload.get("source_queries")
+
+        updates = {}
+        if isinstance(broadened_search, list):
+            cleaned_search = [str(q).strip() for q in broadened_search if str(q).strip()]
+            if cleaned_search:
+                updates["search_queries"] = tuple(cleaned_search)
+
+        if isinstance(broadened_source, dict):
+            cleaned_source = {}
+            for key, val in broadened_source.items():
+                if isinstance(val, list):
+                    cleaned_val = [str(q).strip() for q in val if str(q).strip()]
+                    if cleaned_val:
+                        cleaned_source[key] = tuple(cleaned_val)
+            if cleaned_source:
+                updates["source_queries"] = cleaned_source
+
+        if updates:
+            logger.info("Broadened queries: %s", updates)
+            return replace(profile, **updates)
+
+    except Exception as exc:
+        logger.exception("Failed to broaden queries: %s", exc)
+
+    return profile
 
 
 def _strengthen_profile_for_run(profile: TopicProfile) -> TopicProfile:

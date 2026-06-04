@@ -374,6 +374,11 @@ a {
   color: #8a1f1f;
 }
 
+.compact-action {
+  min-height: 36px;
+  padding: 0 14px;
+}
+
 .conversation-panel,
 .confirmation-panel,
 .progress-panel,
@@ -1606,6 +1611,14 @@ label {
   margin-bottom: 14px;
 }
 
+.progress-heading-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .progress-heading h2 {
   margin: 0;
   font-size: clamp(1.35rem, 2.4vw, 2rem);
@@ -2240,6 +2253,53 @@ label {
   margin-top: 34px;
   padding-top: 26px;
   border-top: 1px solid #d8d7cf;
+}
+
+.delivery-alert {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 18px;
+  padding: 16px;
+  border: 1px solid #d9a441;
+  border-radius: 8px;
+  background: #fff7df;
+  color: #4f3510;
+}
+
+.delivery-alert strong {
+  display: block;
+  margin: 2px 0 4px;
+  font-size: 1rem;
+}
+
+.delivery-alert p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.delivery-alert ul {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.delivery-alert li {
+  display: grid;
+  gap: 3px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(79, 53, 16, .16);
+}
+
+.delivery-alert li span {
+  font-weight: 850;
+}
+
+.delivery-alert li em {
+  color: #7d5a1e;
+  font-style: normal;
+  line-height: 1.35;
 }
 
 .library-list {

@@ -869,6 +869,54 @@ def get_topic_profile(topic_id: str) -> dict[str, Any] | None:
     return _topic_profile_row_to_dict(row) if row else None
 
 
+def update_topic_delivery_config(topic_id: str, updates: dict[str, Any], *, clear_failure: bool = False) -> dict[str, Any] | None:
+    record = get_topic_profile(topic_id)
+    if record is None:
+        return None
+    delivery_config = dict(record["profile"].get("delivery_config") or {})
+    if clear_failure:
+        for key in (
+            "delivery_disabled_after_failure",
+            "last_delivery_status",
+            "last_delivery_error",
+            "last_error",
+            "last_delivery_attempted_at",
+        ):
+            delivery_config.pop(key, None)
+    delivery_config.update(updates)
+    profile = {
+        **record["profile"],
+        "topic_id": topic_id,
+        "statement": record["statement"],
+        "delivery_config": delivery_config,
+    }
+    return upsert_topic_profile(profile)
+
+
+def record_topic_delivery_result(
+    *,
+    topic_id: str,
+    status: str,
+    error: str | None = None,
+    delivered_at: str | None = None,
+) -> dict[str, Any] | None:
+    updates: dict[str, Any] = {
+        "last_delivery_status": status,
+        "last_delivery_attempted_at": utc_now(),
+        "last_error": error,
+        "last_delivery_error": error,
+        "last_delivered_at": delivered_at,
+    }
+    if status == "failed":
+        updates["delivery_disabled_after_failure"] = True
+    elif status == "sent":
+        updates["delivery_disabled_after_failure"] = False
+        updates["last_error"] = None
+        updates["last_delivery_error"] = None
+        updates["last_delivered_at"] = delivered_at or utc_now()
+    return update_topic_delivery_config(topic_id, updates)
+
+
 def create_refinement_session(
     *,
     statement: str,
@@ -1039,7 +1087,12 @@ def update_exploration_status(
     if status in {"complete", "failed"}:
         queue = dict(progress.get("queue") or {})
         queue["status"] = status
-        queue["message"] = "Brief ready." if status == "complete" else "Build failed."
+        if status == "complete":
+            queue["message"] = "Brief ready."
+        elif progress.get("cancel_requested"):
+            queue["message"] = str(progress.get("error") or queue.get("message") or "Build stopped by user.")
+        else:
+            queue["message"] = "Build failed."
         progress["queue"] = queue
     with connect() as connection:
         connection.execute(
@@ -1060,6 +1113,39 @@ def update_exploration_status(
                 json.dumps(progress, sort_keys=True),
                 exploration_id,
             ),
+        )
+    return get_exploration(exploration_id)
+
+
+def cancel_exploration(exploration_id: str, *, reason: str = "Build stopped by user.") -> dict[str, Any] | None:
+    existing = get_exploration(exploration_id)
+    if existing is None:
+        return None
+    if existing.get("status") not in {"queued", "running"}:
+        return existing
+    progress = dict(existing.get("progress") or {})
+    progress["cancel_requested"] = True
+    progress["error"] = reason
+    queue = dict(progress.get("queue") or {})
+    queue["status"] = "failed"
+    queue["message"] = reason
+    progress["queue"] = queue
+    pipeline = dict(progress.get("pipeline") or {})
+    for stage, state in list(pipeline.items()):
+        if state == "running":
+            pipeline[stage] = "failed"
+    progress["pipeline"] = pipeline
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE explorations
+            SET status = 'failed',
+                finished_at = ?,
+                progress_json = ?
+            WHERE exploration_id = ?
+              AND status IN ('queued', 'running')
+            """,
+            (utc_now(), json.dumps(progress, sort_keys=True), exploration_id),
         )
     return get_exploration(exploration_id)
 
@@ -2480,6 +2566,7 @@ def render_ingested_issue(
         newsletter_count=len(newsletter_items),
         article_count=len(story_articles),
         media_count=len(media_articles),
+        source_results=[*story_articles, *media_articles, *market_articles],
         lookback_hours=lookback_hours,
     )
     empty_state = ""
@@ -2623,6 +2710,12 @@ def render_ingested_issue(
     .side-stat {{ border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 9px; }}
     .side-stat span {{ display: block; font: 700 .66rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
     .side-stat strong {{ display: block; margin-top: 3px; font-family: var(--display); font-size: 1.45rem; line-height: 1; }}
+    .source-mix {{ margin-top: 16px; border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 13px; }}
+    .source-mix h3 {{ margin: 0 0 9px; font: 800 .74rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .source-mix-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid rgba(34, 29, 24, .12); }}
+    .source-mix-row:first-of-type {{ border-top: 0; }}
+    .source-mix-label {{ color: #4f463d; font: 700 .82rem/1.25 var(--body); }}
+    .source-mix-count {{ font: 800 .82rem/1 var(--mono); color: var(--ink); }}
     .side-note {{ margin-top: 16px; border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 13px; }}
     .side-note h3 {{ margin: 0 0 7px; font: 800 .74rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
     .side-note p {{ margin: 0; color: #4f463d; font-size: .86rem; line-height: 1.45; }}
@@ -3751,6 +3844,7 @@ def _render_brief_sidebar(
     newsletter_count: int,
     article_count: int,
     media_count: int,
+    source_results: list[ArticleFetchResult],
     lookback_hours: int,
 ) -> str:
     total_model_calls = int(stats.get("model_call_count") or 0)
@@ -3776,6 +3870,7 @@ def _render_brief_sidebar(
         f'<div class="side-stat"><span>{escape(label)}</span><strong class="side-value">{escape(value)}</strong></div>'
         for label, value in side_stats
     )
+    source_mix_html = _render_source_mix(source_results)
     stage_seconds = stats.get("stage_seconds") if isinstance(stats.get("stage_seconds"), dict) else {}
     stage_html = ""
     if stage_seconds:
@@ -3809,6 +3904,7 @@ def _render_brief_sidebar(
           <div class="section-kicker">Sources & process</div>
           <h2>About this brief</h2>
           <div class="side-stats">{stat_html}</div>
+          {source_mix_html}
           {strategy_html}
           {model_usage_html}
           {stage_html}
@@ -3817,6 +3913,61 @@ def _render_brief_sidebar(
         </section>
       </aside>
     """
+
+
+def _render_source_mix(results: list[ArticleFetchResult]) -> str:
+    counts: dict[str, int] = {}
+    for result in results:
+        if result.tier == "dropped":
+            continue
+        label = _brief_source_count_label(result.payload.source_type)
+        counts[label] = counts.get(label, 0) + 1
+    if not counts:
+        return ""
+    ordered_labels = [
+        "Gmail",
+        "Web",
+        "Foreign media",
+        "YouTube",
+        "Podcast",
+        "Markets",
+        "Collections",
+        "SEC filings",
+        "Macro",
+    ]
+    rows: list[tuple[str, int]] = [(label, counts.pop(label)) for label in ordered_labels if label in counts]
+    rows.extend(sorted(counts.items(), key=lambda item: item[0].lower()))
+    row_html = "\n".join(
+        f'<div class="source-mix-row"><span class="source-mix-label">{escape(label)}</span>'
+        f'<strong class="source-mix-count">{escape(_format_int(count))}</strong></div>'
+        for label, count in rows
+    )
+    return f"""
+          <div class="source-mix" aria-label="Included items by source">
+            <h3>Source mix</h3>
+            {row_html}
+          </div>
+    """
+
+
+def _brief_source_count_label(source_type: str) -> str:
+    if source_type in {"gmail", "gmail_link"}:
+        return "Gmail"
+    if source_type == "foreign_web":
+        return "Foreign media"
+    if source_type == "youtube_video":
+        return "YouTube"
+    if source_type == "podcast_episode":
+        return "Podcast"
+    if source_type == "market_snapshot":
+        return "Markets"
+    if source_type == "collection_chunk":
+        return "Collections"
+    if source_type == "sec_filing":
+        return "SEC filings"
+    if source_type == "fred_series":
+        return "Macro"
+    return "Web"
 
 
 def _render_sidebar_note(title: str, text: str | None) -> str:

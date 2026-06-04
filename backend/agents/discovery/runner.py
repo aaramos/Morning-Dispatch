@@ -145,6 +145,7 @@ class DiscoveryRunner:
         source_selection: dict[str, bool] | None = None,
         context: SourceAdapterContext,
         on_adapter_status: Callable[[AdapterStatus], None] | None = None,
+        low_yield: bool = False,
     ) -> DiscoveryResult:
         selection = source_selection or profile.source_selection
         adapters = self.registry.selected(selection)
@@ -159,11 +160,11 @@ class DiscoveryRunner:
         statuses = [status for _candidates, status in results]
         all_raw_candidates = [candidate for adapter_candidates, _status in results for candidate in adapter_candidates]
         candidates, exclusions = _apply_exclusions(profile, all_raw_candidates)
-        candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates)
+        candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates, low_yield=low_yield)
 
         from backend.agents.discovery.query_refiner import screen_candidates
         screening_exclusions = []
-        candidates = await screen_candidates(profile, candidates, exclusions=screening_exclusions)
+        candidates = await screen_candidates(profile, candidates, exclusions=screening_exclusions, low_yield=low_yield)
         pre_limit_candidates = list(candidates)
 
         # Boost scores of candidates from requested/promoted sources by 0.4 (capped at 1.0)
@@ -516,7 +517,7 @@ def _is_candidate_from_requested_source(candidate: Candidate, profile: TopicProf
     return False
 
 
-def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate]) -> tuple[list[Candidate], list[dict[str, Any]]]:
+def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate], low_yield: bool = False) -> tuple[list[Candidate], list[dict[str, Any]]]:
     topic_tokens = _topic_tokens(profile)
     if len(topic_tokens) < 2:
         return candidates, []
@@ -532,7 +533,7 @@ def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate]) -
         if _is_candidate_from_requested_source(candidate, profile):
             kept.append(candidate)
             continue
-        if _candidate_matches_topic(candidate, topic_tokens):
+        if _candidate_matches_topic(candidate, topic_tokens, low_yield=low_yield):
             kept.append(candidate)
         else:
             dropped.append(
@@ -589,11 +590,13 @@ def _topic_tokens(profile: TopicProfile) -> set[str]:
     return {token for token in tokens if token not in generic and len(token) > 2}
 
 
-def _candidate_matches_topic(candidate: Candidate, topic_tokens: set[str]) -> bool:
+def _candidate_matches_topic(candidate: Candidate, topic_tokens: set[str], low_yield: bool = False) -> bool:
     candidate_tokens = keyword_set(_candidate_relevance_text(candidate))
     if not candidate_tokens:
         return False
     overlap = candidate_tokens & topic_tokens
+    if low_yield:
+        return len(overlap) >= 1
     if len(overlap) >= 2:
         return True
     if len(overlap) == 1 and len(topic_tokens) <= 4:

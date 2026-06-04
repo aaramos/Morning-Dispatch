@@ -89,6 +89,11 @@ async def deliver_scheduled_digest(run: dict[str, Any] | None) -> dict[str, Any]
     settings = database.get_delivery_settings(digest_id)
     if not settings.get("enabled") or not settings.get("recipient_email"):
         return None
+    if settings.get("last_delivery_status") == "failed":
+        return {
+            "status": "suppressed",
+            "error": settings.get("last_error") or "Scheduled email delivery is paused after a failed send.",
+        }
     return send_latest_digest(digest_id, recipient_email=str(settings["recipient_email"]))
 
 

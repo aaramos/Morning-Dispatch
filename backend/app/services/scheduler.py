@@ -67,6 +67,7 @@ async def run_due_digests_once(now: datetime | None = None) -> int:
     current_time = now or datetime.now(UTC)
     _last_check_at = current_time.isoformat(timespec="seconds")
     started_count = 0
+    delivery_error_seen = False
 
     for digest in database.list_digests():
         digest_id = str(digest["id"])
@@ -112,9 +113,25 @@ async def run_due_digests_once(now: datetime | None = None) -> int:
             )
             if result is None:
                 raise RuntimeError("Scheduled topic profile was not found.")
+            delivery_config = topic.get("profile", {}).get("delivery_config") if isinstance(topic.get("profile"), dict) else {}
+            if not _scheduled_email_enabled(delivery_config):
+                continue
+            if _scheduled_delivery_paused(delivery_config):
+                logger.warning("Scheduled email delivery is paused after a failed send for topic %s", topic_id)
+                continue
             delivery = email_delivery.send_exploration_brief(str(result["exploration"]["exploration_id"]))
             if delivery.get("status") == "failed":
-                raise RuntimeError(delivery.get("error") or "Email delivery failed.")
+                error = str(delivery.get("error") or "Email delivery failed.")
+                database.record_topic_delivery_result(topic_id=topic_id, status="failed", error=error)
+                _last_error = f"Scheduled explore {topic_id}: {error}"
+                delivery_error_seen = True
+                logger.warning("Scheduled email delivery failed for topic %s: %s", topic_id, error)
+            elif delivery.get("status") == "sent":
+                database.record_topic_delivery_result(
+                    topic_id=topic_id,
+                    status="sent",
+                    delivered_at=str(delivery.get("delivered_at") or datetime.now(UTC).isoformat(timespec="seconds")),
+                )
         except Exception as exc:  # pragma: no cover - scheduler must keep running.
             _last_error = f"Scheduled explore {topic_id}: {exc}"
             logger.exception("Scheduled topic profile run failed for %s", topic_id)
@@ -122,9 +139,19 @@ async def run_due_digests_once(now: datetime | None = None) -> int:
             _running_digest_ids.discard(running_key)
 
     _last_started_count = started_count
-    if started_count:
+    if started_count and not delivery_error_seen:
         _last_error = None
     return started_count
+
+
+def _scheduled_email_enabled(delivery_config: Any) -> bool:
+    return isinstance(delivery_config, dict) and bool(delivery_config.get("email_enabled"))
+
+
+def _scheduled_delivery_paused(delivery_config: Any) -> bool:
+    if not isinstance(delivery_config, dict):
+        return False
+    return bool(delivery_config.get("delivery_disabled_after_failure")) or delivery_config.get("last_delivery_status") == "failed"
 
 
 def is_due(digest: dict[str, Any], latest_run: dict[str, Any] | None, now: datetime | None = None) -> bool:

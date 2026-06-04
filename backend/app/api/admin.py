@@ -760,7 +760,47 @@ def _delivery_status(request: Request, settings: Settings, digests: list[dict[st
             **delivery_settings,
             **email_delivery.delivery_capability(settings),
         },
+        "scheduled_failures": _scheduled_delivery_failures(digests),
     }
+
+
+def _scheduled_delivery_failures(digests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for digest in digests:
+        digest_id = str(digest.get("id") or "")
+        if not digest_id:
+            continue
+        delivery_settings = database.get_delivery_settings(digest_id)
+        if delivery_settings.get("last_delivery_status") != "failed":
+            continue
+        failures.append(
+            {
+                "topic_id": digest_id,
+                "name": str(digest.get("name") or "Scheduled brief"),
+                "schedule": digest.get("schedule"),
+                "error": str(delivery_settings.get("last_error") or "Email delivery failed."),
+                "last_attempted_at": delivery_settings.get("updated_at"),
+                "latest_exploration_id": None,
+            }
+        )
+    for topic in database.list_scheduled_topic_profiles(include_paused=True):
+        profile = topic.get("profile") if isinstance(topic.get("profile"), dict) else {}
+        delivery_config = profile.get("delivery_config") if isinstance(profile.get("delivery_config"), dict) else {}
+        if not delivery_config.get("delivery_disabled_after_failure") and delivery_config.get("last_delivery_status") != "failed":
+            continue
+        topic_id = str(topic.get("topic_id") or "")
+        latest = database.get_latest_exploration(topic_id=topic_id, mode="scheduled")
+        failures.append(
+            {
+                "topic_id": topic_id,
+                "name": str(profile.get("scope") or topic.get("statement") or "Scheduled brief"),
+                "schedule": topic.get("schedule"),
+                "error": str(delivery_config.get("last_error") or delivery_config.get("last_delivery_error") or "Email delivery failed."),
+                "last_attempted_at": delivery_config.get("last_delivery_attempted_at"),
+                "latest_exploration_id": latest.get("exploration_id") if latest else None,
+            }
+        )
+    return failures
 
 
 def _podcast_status(settings: Settings, digests: list[dict[str, Any]]) -> dict[str, Any]:

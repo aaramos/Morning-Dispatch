@@ -163,6 +163,7 @@ def test_scheduler_runs_due_topic_profiles(monkeypatch, tmp_path):
             "scope": "Local AI and tools",
             "source_selection": {"gmail": False, "reddit": False, "podcasts": False, "web_search": False},
             "schedule": "hourly",
+            "delivery_config": {"email_enabled": True},
         }
     )
 
@@ -191,6 +192,56 @@ def test_scheduler_runs_due_topic_profiles(monkeypatch, tmp_path):
     assert len(delivered) == 1
     assert len(scheduled_exploration_ids) == 1
     assert delivered == scheduled_exploration_ids
+
+
+def test_scheduler_pauses_topic_email_after_first_delivery_failure(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = database.upsert_topic_profile(
+        {
+            "statement": "Explore local AI news",
+            "scope": "Local AI and tools",
+            "source_selection": {"gmail": False, "reddit": False, "podcasts": False, "web_search": False},
+            "schedule": "hourly",
+            "delivery_config": {"email_enabled": True},
+        }
+    )
+
+    started: list[str] = []
+    sent: list[str] = []
+
+    async def fake_run_scheduled(topic_id: str, source_selection: dict[str, bool] | None = None):
+        started.append(topic_id)
+        exploration = database.create_exploration(topic_id=topic_id, mode="scheduled", source_selection=source_selection or {})
+        database.update_exploration_status(exploration["exploration_id"], status="complete", brief_ref="/tmp/fake-brief.html")
+        return {"exploration": {"exploration_id": exploration["exploration_id"]}}
+
+    def fake_send_exploration_brief(exploration_id: str, recipient_email: str | None = None) -> dict[str, str]:
+        sent.append(exploration_id)
+        return {"status": "failed", "error": "Gmail send permission is missing."}
+
+    monkeypatch.setattr(scheduler.explore, "run_scheduled", fake_run_scheduled)
+    monkeypatch.setattr(scheduler.email_delivery, "send_exploration_brief", fake_send_exploration_brief)
+    monkeypatch.setattr(scheduler, "is_topic_due", lambda *_args, **_kwargs: True)
+
+    count = asyncio.run(scheduler.run_due_digests_once(datetime(2026, 5, 22, 12, 0, tzinfo=UTC)))
+
+    assert count == 1
+    assert len(started) == 1
+    assert len(sent) == 1
+    updated = database.get_topic_profile(topic["topic_id"])
+    delivery_config = updated["profile"]["delivery_config"]
+    assert delivery_config["delivery_disabled_after_failure"] is True
+    assert delivery_config["last_delivery_status"] == "failed"
+    assert delivery_config["last_error"] == "Gmail send permission is missing."
+
+    started.clear()
+    sent.clear()
+    count = asyncio.run(scheduler.run_due_digests_once(datetime(2026, 5, 22, 14, 0, tzinfo=UTC)))
+
+    assert count == 1
+    assert len(started) == 1
+    assert sent == []
 
 
 def test_topic_due_checks_hourly_interval(monkeypatch, tmp_path):

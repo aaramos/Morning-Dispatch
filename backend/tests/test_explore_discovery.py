@@ -554,6 +554,44 @@ def test_completed_exploration_clears_running_queue_marker(monkeypatch, tmp_path
     assert completed["progress"]["queue"]["message"] == "Brief ready."
 
 
+def test_cancel_exploration_marks_running_build_failed(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    profile = database.upsert_topic_profile(
+        {
+            "statement": "Track local AI infrastructure",
+            "scope": "Local AI inference and Apple Silicon tools",
+            "source_selection": {"web_search": True},
+        }
+    )
+    exploration = database.create_exploration(
+        topic_id=profile["topic_id"],
+        mode="show_now",
+        source_selection={"web_search": True},
+        status="running",
+    )
+    database.update_exploration_progress(
+        exploration["exploration_id"],
+        progress={
+            "queue": {"status": "running", "message": "Building now.", "action": "build"},
+            "pipeline": {"discovery": "running", "fetch": "pending"},
+        },
+    )
+
+    client = TestClient(create_app(), client=("127.0.0.1", 50000))
+    cancelled = client.post(f"/api/explore/explorations/{exploration['exploration_id']}/cancel")
+    client.close()
+
+    assert cancelled.status_code == 200
+    body = cancelled.json()
+    assert body["status"] == "cancelled"
+    assert body["exploration"]["status"] == "failed"
+    assert body["exploration"]["progress"]["cancel_requested"] is True
+    assert body["exploration"]["progress"]["queue"]["message"] == "Build stopped by user."
+    assert body["exploration"]["progress"]["pipeline"]["discovery"] == "failed"
+
+
 def test_run_digest_core_emits_editorial_and_critic_reasoning(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
@@ -1819,7 +1857,7 @@ def test_refinement_session_finalizes_topic_profile(monkeypatch, tmp_path) -> No
         )
         assert started.status_code == 201
         session_id = started.json()["session_id"]
-        assert started.json()["pending_field"] == "scope"
+        assert started.json()["pending_field"] == "refinement_agent"
         assert started.json()["messages"][0]["role"] == "assistant"
 
         answered_scope = client.post(
@@ -1827,39 +1865,12 @@ def test_refinement_session_finalizes_topic_profile(monkeypatch, tmp_path) -> No
             json={"answer": "Small team deployment patterns and practical tools"},
         )
         assert answered_scope.status_code == 200
-        assert answered_scope.json()["pending_field"] == "related_interests"
-
-        answered_related = client.post(
-            f"/api/explore/refinement-sessions/{session_id}/messages",
-            json={"answer": "MCP servers and local inference"},
-        )
-        assert answered_related.status_code == 200
-        assert answered_related.json()["pending_field"] == "depth"
-
-        answered_depth = client.post(
-            f"/api/explore/refinement-sessions/{session_id}/messages",
-            json={"answer": "balanced"},
-        )
-        assert answered_depth.status_code == 200
-        assert answered_depth.json()["pending_field"] == "recency_weighting"
-
-        answered_recency = client.post(
-            f"/api/explore/refinement-sessions/{session_id}/messages",
-            json={"answer": "balanced"},
-        )
-        assert answered_recency.status_code == 200
-        assert answered_recency.json()["pending_field"] == "requested_sources"
-
-        answered_sources = client.post(
-            f"/api/explore/refinement-sessions/{session_id}/messages",
-            json={"answer": "include the podcast: The Daily AI Brief"},
-        )
-        assert answered_sources.status_code == 200
-        assert answered_sources.json()["pending_field"] == "exclusions"
+        assert answered_scope.json()["pending_field"] == "refinement_agent"
+        assert answered_scope.json()["status"] == "active"
 
         finalized = client.post(
             f"/api/explore/refinement-sessions/{session_id}/messages",
-            json={"answer": "consumer chatbot rumors", "just_go_now": False},
+            json={"just_go_now": True},
         )
 
     assert finalized.status_code == 200
@@ -1867,10 +1878,86 @@ def test_refinement_session_finalizes_topic_profile(monkeypatch, tmp_path) -> No
     assert body["status"] == "finalized"
     assert body["topic_id"]
     assert body["topic_profile"]["profile"]["scope"] == "Small team deployment patterns and practical tools"
-    assert body["topic_profile"]["profile"]["exclusions"] == ["consumer chatbot rumors"]
-    assert body["topic_profile"]["profile"]["requested_sources"] == [
-        {"adapter": "podcasts", "ref": "The Daily AI Brief"}
-    ]
+
+
+def test_finalized_refinement_session_accepts_strategy_correction(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Explore AI news",
+                "source_selection": {"gmail": False, "podcasts": True, "web_search": True},
+            },
+        )
+        session_id = started.json()["session_id"]
+        finalized = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/messages",
+            json={"just_go_now": True},
+        )
+        corrected = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/messages",
+            json={"answer": "Actually add The AI Daily Brief podcast to the search strategy."},
+        )
+
+    assert finalized.status_code == 200
+    assert finalized.json()["status"] == "finalized"
+    assert corrected.status_code == 200
+    corrected_body = corrected.json()
+    assert corrected_body["status"] == "active"
+    assert corrected_body["pending_field"] == "refinement_agent"
+    assert any(
+        "The AI Daily Brief" in message["content"]
+        for message in corrected_body["messages"]
+        if message["role"] == "user"
+    )
+    assert corrected_body["topic_id"] == finalized.json()["topic_id"]
+
+
+def test_streaming_finalized_refinement_session_accepts_strategy_correction(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Explore AI news",
+                "source_selection": {"gmail": False, "podcasts": True, "web_search": True},
+            },
+        )
+        session_id = started.json()["session_id"]
+        finalized = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/messages",
+            json={"just_go_now": True},
+        )
+
+    events: list[dict[str, Any]] = []
+
+    async def collect_events() -> None:
+        async for event in refinement.astream_refinement(
+            session_id=session_id,
+            statement="Explore AI news",
+            source_selection={"gmail": False, "podcasts": True, "web_search": True},
+            models={},
+            answer="Actually add The AI Daily Brief podcast to the search strategy.",
+            just_go_now=False,
+        ):
+            events.append(event)
+
+    asyncio.run(collect_events())
+
+    assert finalized.status_code == 200
+    assert finalized.json()["status"] == "finalized"
+    done = next(event for event in reversed(events) if event["type"] == "done")
+    assert done["ready"] is False
+    assert done["session"]["status"] == "active"
+    assert done["session"]["pending_field"] == "refinement_agent"
+    assert any(
+        "The AI Daily Brief" in message["content"]
+        for message in done["session"]["messages"]
+        if message["role"] == "user"
+    )
 
 
 def test_refinement_session_default_sources_are_web_only(monkeypatch, tmp_path) -> None:
@@ -1894,7 +1981,7 @@ def test_refinement_session_default_sources_are_web_only(monkeypatch, tmp_path) 
     }
 
 
-def test_refinement_agent_requires_two_answers_before_finalizing(monkeypatch, tmp_path) -> None:
+def test_refinement_agent_requires_user_confirmation_before_finalizing(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
 
@@ -1939,21 +2026,29 @@ def test_refinement_agent_requires_two_answers_before_finalizing(monkeypatch, tm
             f"/api/explore/refinement-sessions/{session_id}/messages",
             json={"answer": "Focus on recent material"},
         )
+        confirmed = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/messages",
+            json={"just_go_now": True},
+        )
 
     assert started.status_code == 201
     assert first.status_code == 200
     assert second.status_code == 200
+    assert confirmed.status_code == 200
     assert started.json()["status"] == "active"
     assert first.json()["status"] == "active"
     body = second.json()
-    assert body["status"] == "finalized"
-    assert body["topic_profile"]["profile"]["scope"] == "Local AI deployment patterns"
-    assert body["topic_profile"]["profile"]["depth"] == "practitioner"
-    assert body["topic_profile"]["profile"]["recency_weighting"] == "recent"
+    assert body["status"] == "active"
+    assert body["pending_field"] == "refinement_agent"
+    confirmed_body = confirmed.json()
+    assert confirmed_body["status"] == "finalized"
+    assert confirmed_body["topic_profile"]["profile"]["scope"] == "Local AI deployment patterns"
+    assert confirmed_body["topic_profile"]["profile"]["depth"] == "practitioner"
+    assert confirmed_body["topic_profile"]["profile"]["recency_weighting"] == "recent"
     prompt_payload = model_client.calls[0]["prompt"]
     assert isinstance(prompt_payload, str)
-    assert '"min_turns": 2' in prompt_payload
-    assert "Ask at least min_turns meaningful refinement questions" in prompt_payload
+    assert "Only the user's explicit search-strategy confirmation" in prompt_payload
+    assert "Ask at least min_turns meaningful refinement questions" not in prompt_payload
 
 
 def test_refinement_agent_does_not_reask_stated_market_recency_and_exclusions(monkeypatch, tmp_path) -> None:
@@ -2404,6 +2499,10 @@ def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None
             f"/api/explore/refinement-sessions/{session_id}/messages",
             json={"answer": "drop anything about hype", "models": {"refinement": "conversation-model"}},
         )
+        confirmed = client.post(
+            f"/api/explore/refinement-sessions/{session_id}/messages",
+            json={"just_go_now": True, "models": {"refinement": "conversation-model"}},
+        )
 
     assert scope.status_code == 200
     assert related.status_code == 200
@@ -2411,7 +2510,9 @@ def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None
     assert recency.status_code == 200
     assert requested.status_code == 200
     assert finalized.status_code == 200
+    assert confirmed.status_code == 200
     body = finalized.json()
+    confirmed_body = confirmed.json()
     assert body["profile"]["scope"] == "Small team infrastructure workflows"
     assert body["profile"]["depth"] == "practitioner"
     assert body["profile"]["recency_weighting"] == "all_available"
@@ -2421,10 +2522,12 @@ def test_refinement_session_uses_refinement_model(monkeypatch, tmp_path) -> None
     assert "reddit" not in body["profile"]["source_queries"]
     assert body["profile"]["requested_sources"] == []
     assert body["profile"]["source_selection"]["youtube"] is False
-    assert body["topic_profile"]["profile"]["scope"] == "Small team infrastructure workflows"
-    assert body["topic_profile"]["profile"]["depth"] == "practitioner"
-    assert body["topic_profile"]["profile"]["recency_weighting"] == "all_available"
-    assert body["topic_profile"]["profile"]["models"]["refinement"] == "conversation-model"
+    assert body["status"] == "active"
+    assert confirmed_body["status"] == "finalized"
+    assert confirmed_body["topic_profile"]["profile"]["scope"] == "Small team infrastructure workflows"
+    assert confirmed_body["topic_profile"]["profile"]["depth"] == "practitioner"
+    assert confirmed_body["topic_profile"]["profile"]["recency_weighting"] == "all_available"
+    assert confirmed_body["topic_profile"]["profile"]["models"]["refinement"] == "conversation-model"
     assert len(model_client.calls) >= 3
 
 
@@ -2482,7 +2585,7 @@ def test_refinement_session_accepts_no_exclusions(monkeypatch, tmp_path) -> None
         )
         finalized = client.post(
             f"/api/explore/refinement-sessions/{session_id}/messages",
-            json={"answer": "none"},
+            json={"just_go_now": True},
         )
 
     assert finalized.status_code == 200
@@ -2643,6 +2746,82 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
         assert final_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
         assert final_body["profile"]["gmail_rules"]["intent"] == "Extract AI topics and ignore ads"
         assert {"adapter": "gmail", "ref": "ai@example.com"} in final_body["profile"]["requested_sources"]
+
+
+def test_gmail_refinement_can_continue_without_gmail_after_empty_scan(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    async def fake_discover_newsletter_candidates(**_kwargs: Any) -> list[Any]:
+        return []
+
+    from backend.app.services import refinement
+
+    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Track AI model updates and local LLM tools",
+                "source_selection": {"gmail": True, "web_search": True},
+            },
+        )
+        assert started.status_code == 201
+        body = started.json()
+        assert body["pending_field"] == "gmail_sender_selection"
+        assert body["profile"]["source_selection"]["gmail"] is True
+        assert body["profile"]["gmail_rules"]["candidates"] == []
+
+        skipped = client.post(
+            f"/api/explore/refinement-sessions/{body['session_id']}/messages",
+            json={"answer": "no gmail"},
+        )
+        assert skipped.status_code == 200
+        skipped_body = skipped.json()
+        assert skipped_body["status"] == "finalized"
+        assert skipped_body["pending_field"] is None
+        assert skipped_body["profile"]["source_selection"]["gmail"] is False
+        assert skipped_body["profile"]["gmail_rules"].get("include_senders", []) == []
+        assert any("without Gmail" in message["content"] for message in skipped_body["messages"])
+
+
+def test_gmail_refinement_pending_step_allows_strategy_correction(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    async def fake_discover_newsletter_candidates(**_kwargs: Any) -> list[Any]:
+        return []
+
+    from backend.app.services import refinement
+
+    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Track AI model updates and local LLM tools",
+                "source_selection": {"gmail": True, "podcasts": True, "web_search": True},
+            },
+        )
+        assert started.status_code == 201
+        body = started.json()
+        assert body["pending_field"] == "gmail_sender_selection"
+
+        corrected = client.post(
+            f"/api/explore/refinement-sessions/{body['session_id']}/messages",
+            json={"answer": "Actually add The AI Daily Brief podcast to the search strategy."},
+        )
+
+    assert corrected.status_code == 200
+    corrected_body = corrected.json()
+    assert corrected_body["status"] == "active"
+    assert corrected_body["pending_field"] == "refinement_agent"
+    assert corrected_body["profile"]["source_selection"]["gmail"] is True
+    assert any(
+        "The AI Daily Brief" in message["content"]
+        for message in corrected_body["messages"]
+        if message["role"] == "user"
+    )
 
 
 def test_create_topic_profile_accepts_model_override(monkeypatch, tmp_path) -> None:
@@ -3184,7 +3363,7 @@ def test_refinement_session_auto_prefills_depth_from_statement(monkeypatch, tmp_
 
     assert post_scope.status_code == 200
     assert post_scope.json()["profile"]["depth"] == "practitioner"
-    assert post_scope.json()["pending_field"] == "related_interests"
+    assert post_scope.json()["pending_field"] == "refinement_agent"
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         followup = client.post(
@@ -3193,7 +3372,7 @@ def test_refinement_session_auto_prefills_depth_from_statement(monkeypatch, tmp_
         )
 
     assert followup.status_code == 200
-    assert followup.json()["pending_field"] == "depth"
+    assert followup.json()["pending_field"] == "refinement_agent"
 
 
 def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> None:

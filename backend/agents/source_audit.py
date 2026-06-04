@@ -63,6 +63,7 @@ async def apply_source_audit(
     model_client: ModelClient | None = None,
     inference_run_id: str | None = None,
     max_candidates: int | None = None,
+    low_yield: bool = False,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision], dict[str, Any]]:
     result_list = list(results)
     candidates = _candidate_indexes(result_list, max_candidates=max_candidates)
@@ -104,6 +105,7 @@ async def apply_source_audit(
             article_id="source_audit_batch",
             max_tokens=1600,
             compact=False,
+            low_yield=low_yield,
         )
     except ModelClientError as first_error:
         retry_candidates = _retry_candidate_indexes(result_list, candidates)
@@ -119,6 +121,7 @@ async def apply_source_audit(
                     article_id="source_audit_retry",
                     max_tokens=900,
                     compact=True,
+                    low_yield=low_yield,
                 )
             except ModelClientError as retry_error:
                 return _heuristic_audit_result(
@@ -157,13 +160,24 @@ async def _complete_audit(
     article_id: str,
     max_tokens: int,
     compact: bool,
+    low_yield: bool = False,
 ) -> tuple[dict[str, Any], int]:
     prompt = _audit_prompt(profile, result_list, candidates, lookback_hours, compact=compact)
+    system_prompt = load_prompt("source_audit")
+    if low_yield:
+        system_prompt += (
+            "\n\nCRITICAL: We are in a low-yield retrieval mode. "
+            "Please be EXTREMELY permissive. Only exclude articles that are "
+            "unquestionably spam, advertising, or completely unrelated to the topic. "
+            "If an article has any reasonable connection or contains useful context/background, "
+            "choose 'include' or 'include_as_context' instead of 'exclude'. "
+            "Relax your freshness/recency checks unless they are flagrantly old (e.g. from prior years)."
+        )
     started_at = perf_counter()
     try:
         if hasattr(client, "complete_json_with_metrics"):
             response, payload = await client.complete_json_with_metrics(
-                system=load_prompt("source_audit"),
+                system=system_prompt,
                 prompt=prompt,
                 max_tokens=max_tokens,
             )
@@ -173,11 +187,11 @@ async def _complete_audit(
                 mode="source_audit",
                 model_client=client,
                 response=response,
-                system_prompt=load_prompt("source_audit"),
+                system_prompt=system_prompt,
                 prompt=prompt,
             )
             return payload, _elapsed_ms(started_at)
-        payload = await client.complete_json(system=load_prompt("source_audit"), prompt=prompt, max_tokens=max_tokens)
+        payload = await client.complete_json(system=system_prompt, prompt=prompt, max_tokens=max_tokens)
         return payload, _elapsed_ms(started_at)
     except ModelClientError as exc:
         _record_audit_error(
@@ -187,6 +201,7 @@ async def _complete_audit(
             article_id=article_id,
             prompt=prompt,
             started_at=started_at,
+            system_prompt=system_prompt,
         )
         raise
 
@@ -199,13 +214,14 @@ def _record_audit_error(
     article_id: str,
     prompt: str,
     started_at: float,
+    system_prompt: str,
 ) -> None:
     record_model_error_metric(
         run_id=inference_run_id,
         article_id=article_id,
         mode="source_audit",
         model_client=client,
-        system_prompt=load_prompt("source_audit"),
+        system_prompt=system_prompt,
         prompt=prompt,
         status=exc.status,
         error_detail=str(exc),
