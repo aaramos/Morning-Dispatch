@@ -13,6 +13,11 @@ from backend.app.services import model_routing
 
 logger = logging.getLogger(__name__)
 
+_SCREENING_BATCH_SIZE = 15
+_SCREENING_MAX_CANDIDATES_PER_SOURCE = 80
+_SCREENING_MAX_CONCURRENCY = 4
+_SCREENING_BATCH_TIMEOUT_SECONDS = 45.0
+
 
 async def refine_queries_for_adapter(
     adapter_name: str,
@@ -109,12 +114,20 @@ async def screen_candidates(
     if not gmail_cands and not podcast_cands:
         return candidates
 
-    to_screen = gmail_cands + podcast_cands
+    to_screen = [
+        *_screening_sample(gmail_cands),
+        *_screening_sample(podcast_cands),
+    ]
+    if not to_screen:
+        return candidates
+
+    skipped_count = len(gmail_cands) + len(podcast_cands) - len(to_screen)
     logger.info(
-        "Running agentic screening pass on %d candidates (Gmail: %d, Podcasts: %d)...",
+        "Running bounded agentic screening pass on %d candidates (Gmail: %d, Podcasts: %d, unscreened kept: %d)...",
         len(to_screen),
-        len(gmail_cands),
-        len(podcast_cands),
+        sum(1 for c in to_screen if c.adapter == "gmail"),
+        sum(1 for c in to_screen if c.adapter == "podcasts"),
+        max(0, skipped_count),
     )
 
     try:
@@ -127,63 +140,66 @@ async def screen_candidates(
         logger.warning("Failed to obtain model client for candidate screening: %s", exc)
         return candidates
 
-    batch_size = 15
-    batches = [to_screen[i : i + batch_size] for i in range(0, len(to_screen), batch_size)]
+    batches = [to_screen[i : i + _SCREENING_BATCH_SIZE] for i in range(0, len(to_screen), _SCREENING_BATCH_SIZE)]
+    semaphore = asyncio.Semaphore(_SCREENING_MAX_CONCURRENCY)
 
     async def screen_batch(batch: list[Any]) -> dict[str, str]:
-        cand_list = []
-        for c in batch:
-            metadata = c.payload.metadata or {}
-            title = (
-                metadata.get("title")
-                or metadata.get("subject")
-                or metadata.get("link_text")
-                or c.payload.source_name
-            )
-            cand_list.append({
-                "id": c.payload.id,
-                "title": title,
-                "source": c.payload.source_name,
-                "snippet": c.payload.raw_text[:200] if c.payload.raw_text else "",
-            })
+        async with semaphore:
+            cand_list = []
+            for c in batch:
+                metadata = c.payload.metadata or {}
+                title = (
+                    metadata.get("title")
+                    or metadata.get("subject")
+                    or metadata.get("link_text")
+                    or c.payload.source_name
+                )
+                cand_list.append({
+                    "id": c.payload.id,
+                    "title": title,
+                    "source": c.payload.source_name,
+                    "snippet": c.payload.raw_text[:200] if c.payload.raw_text else "",
+                })
 
-        prompt_data = {
-            "statement": profile.statement,
-            "scope": profile.scope,
-            "exclusions": list(profile.exclusions),
-            "candidates_json": json.dumps(cand_list, ensure_ascii=False),
-        }
-
-        # Render custom template fields by replacing variables manually (or let the model handle it if supported)
-        system_prompt = load_prompt("candidate_screening")
-        system_prompt = system_prompt.replace("{{statement}}", profile.statement)
-        system_prompt = system_prompt.replace("{{exclusions}}", ", ".join(profile.exclusions))
-        system_prompt = system_prompt.replace("{{candidates_json}}", json.dumps(cand_list, ensure_ascii=False))
-
-        if low_yield:
-            system_prompt += (
-                "\n\nCRITICAL: We are in a low-yield retrieval mode. "
-                "Please be EXTREMELY permissive. Only drop candidates if they are "
-                "unquestionably spam, advertising, or completely unrelated to the topic. "
-                "If a candidate has any reasonable connection to the topic statement, "
-                "choose 'keep' instead of 'drop'."
-            )
-
-        try:
-            payload = await client.complete_json(
-                system=system_prompt,
-                prompt=json.dumps(cand_list, ensure_ascii=False),
-                max_tokens=2000,
-            )
-            decisions = payload.get("decisions", [])
-            return {
-                str(d.get("id")): str(d.get("decision")).strip().lower()
-                for d in decisions
-                if isinstance(d, dict) and "id" in d
+            prompt_data = {
+                "statement": profile.statement,
+                "scope": profile.scope,
+                "exclusions": list(profile.exclusions),
+                "candidates_json": json.dumps(cand_list, ensure_ascii=False),
             }
-        except Exception as exc:
-            logger.warning("Screening call failed for batch: %s", exc)
-            return {}
+
+            system_prompt = load_prompt("candidate_screening")
+            system_prompt = system_prompt.replace("{{statement}}", profile.statement)
+            system_prompt = system_prompt.replace("{{exclusions}}", ", ".join(profile.exclusions))
+            system_prompt = system_prompt.replace("{{candidates_json}}", json.dumps(cand_list, ensure_ascii=False))
+
+            if low_yield:
+                system_prompt += (
+                    "\n\nCRITICAL: We are in a low-yield retrieval mode. "
+                    "Please be EXTREMELY permissive. Only drop candidates if they are "
+                    "unquestionably spam, advertising, or completely unrelated to the topic. "
+                    "If a candidate has any reasonable connection to the topic statement, "
+                    "choose 'keep' instead of 'drop'."
+                )
+
+            try:
+                payload = await asyncio.wait_for(
+                    client.complete_json(
+                        system=system_prompt,
+                        prompt=json.dumps(prompt_data, ensure_ascii=False),
+                        max_tokens=2000,
+                    ),
+                    timeout=_SCREENING_BATCH_TIMEOUT_SECONDS,
+                )
+                decisions = payload.get("decisions", [])
+                return {
+                    str(d.get("id")): str(d.get("decision")).strip().lower()
+                    for d in decisions
+                    if isinstance(d, dict) and "id" in d
+                }
+            except Exception as exc:
+                logger.warning("Screening call failed or timed out for batch: %s", exc)
+                return {}
 
     # Run batches in parallel
     results = await asyncio.gather(*(screen_batch(b) for b in batches), return_exceptions=True)
@@ -197,7 +213,7 @@ async def screen_candidates(
     dropped_count = 0
     for c in candidates:
         if c.adapter in {"gmail", "podcasts"}:
-            decision = decisions_map.get(c.payload.id)
+            decision = decisions_map.get(str(c.payload.id))
             if decision == "drop":
                 dropped_count += 1
                 if exclusions is not None:
@@ -229,8 +245,23 @@ async def screen_candidates(
         screened_candidates.append(c)
 
     logger.info(
-        "Agentic screening pass complete. Dropped %d candidates of %d screened.",
+        "Agentic screening pass complete. Dropped %d candidates of %d screened; kept %d unscreened overflow candidates.",
         dropped_count,
         len(to_screen),
+        max(0, skipped_count),
     )
     return screened_candidates
+
+
+def _screening_sample(candidates: list[Any]) -> list[Any]:
+    if len(candidates) <= _SCREENING_MAX_CANDIDATES_PER_SOURCE:
+        return candidates
+    ranked = sorted(
+        candidates,
+        key=lambda c: (
+            getattr(c, "score", 0.0),
+            getattr(c.payload, "published_at", None) or getattr(c.payload, "fetched_at", None) or "",
+        ),
+        reverse=True,
+    )
+    return ranked[:_SCREENING_MAX_CANDIDATES_PER_SOURCE]

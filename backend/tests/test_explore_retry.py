@@ -253,6 +253,55 @@ async def test_screen_candidates_prompt_relaxation(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
+async def test_screen_candidates_is_bounded_and_fails_open(monkeypatch) -> None:
+    from backend.agents.discovery import query_refiner
+
+    calls = []
+
+    class SlowClient:
+        async def complete_json(self, system: str, prompt: str, max_tokens: int = 2000):
+            calls.append(prompt)
+            await asyncio.sleep(0.05)
+            return {"decisions": [{"id": "gmail-0", "decision": "drop"}]}
+
+    class FakeResolution:
+        client = SlowClient()
+
+    from backend.app.services import model_routing
+
+    monkeypatch.setattr(model_routing, "client_for_agent", lambda *args, **kwargs: FakeResolution())
+    monkeypatch.setattr(query_refiner, "_SCREENING_MAX_CANDIDATES_PER_SOURCE", 2)
+    monkeypatch.setattr(query_refiner, "_SCREENING_BATCH_SIZE", 1)
+    monkeypatch.setattr(query_refiner, "_SCREENING_MAX_CONCURRENCY", 1)
+    monkeypatch.setattr(query_refiner, "_SCREENING_BATCH_TIMEOUT_SECONDS", 0.01)
+
+    profile = TopicProfile(
+        topic_id="test",
+        statement="AI chip capex",
+        scope="AI capex",
+    )
+    candidates = [
+        Candidate(
+            adapter="gmail",
+            score=1.0 - (index * 0.1),
+            payload=NormalizedPayload(
+                id=f"gmail-{index}",
+                source_type="gmail",
+                source_name="Gmail",
+                original_url=f"https://example.com/gmail/{index}",
+                metadata={"subject": f"Gmail item {index}"},
+            ),
+        )
+        for index in range(5)
+    ]
+
+    screened = await query_refiner.screen_candidates(profile, candidates)
+
+    assert len(screened) == 5
+    assert len(calls) == 2
+
+
+@pytest.mark.anyio
 async def test_source_audit_prompt_relaxation(monkeypatch) -> None:
     from backend.agents.source_audit import apply_source_audit
 
