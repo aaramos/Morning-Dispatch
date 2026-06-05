@@ -7,13 +7,13 @@ from typing import Any, Literal, Protocol
 
 from backend.agents.digestor.base import NormalizedPayload
 
-AdapterName = Literal["gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"]
+AdapterName = Literal["gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit"]
 AdapterStatusValue = Literal["pending", "running", "completed", "timed_out", "failed", "skipped"]
 Depth = Literal["practitioner", "informed-generalist"]
 RecencyWeighting = Literal["breaking", "recent", "last_year", "all_available"]
 ScheduleValue = Literal["hourly", "daily", "weekdays", "weekly", "monthly"]
 VALID_SCHEDULES: set[str] = {"hourly", "daily", "weekdays", "weekly", "monthly"}
-VALID_SOURCE_ADAPTERS: set[str] = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets"}
+VALID_SOURCE_ADAPTERS: set[str] = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit"}
 
 DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
     "gmail": True,
@@ -23,6 +23,7 @@ DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
     "youtube": False,
     "collections": False,
     "markets": False,
+    "reddit": False,
 }
 
 DEFAULT_EXPLORE_SOURCE_SELECTION: dict[str, bool] = {
@@ -33,6 +34,7 @@ DEFAULT_EXPLORE_SOURCE_SELECTION: dict[str, bool] = {
     "youtube": False,
     "collections": False,
     "markets": False,
+    "reddit": False,
 }
 
 

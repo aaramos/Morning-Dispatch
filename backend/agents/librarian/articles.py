@@ -106,11 +106,12 @@ async def fetch_articles_for_payloads(
 def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[ArticleFetchResult]:
     results: list[ArticleFetchResult] = []
     for payload in payloads:
-        if payload.source_type not in {"gmail", "reddit_thread", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot", "sec_filing", "fred_series"} or not payload.original_url:
+        if payload.source_type not in {"gmail", "reddit_thread", "reddit_post", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot", "sec_filing", "fred_series"} or not payload.original_url:
             continue
         canonical_url = canonicalize_url(payload.original_url)
         title = _payload_title(payload) or payload.source_name or "Direct source"
         text = _clean_text(payload.raw_text)
+        is_reddit = payload.source_type in ("reddit_thread", "reddit_post")
         is_podcast = payload.source_type == "podcast_episode"
         is_youtube = payload.source_type == "youtube_video"
         is_collection = payload.source_type == "collection_chunk"

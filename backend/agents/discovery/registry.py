@@ -9,6 +9,7 @@ from backend.agents.discovery.adapters import (
     PodcastSourceAdapter,
     WebSearchSourceAdapter,
     YouTubeSourceAdapter,
+    RedditSourceAdapter,
 )
 from backend.agents.discovery.foreign_media import ForeignMediaSourceAdapter
 from backend.agents.discovery.types import SourceAdapter
@@ -47,5 +48,6 @@ def default_source_registry() -> SourceRegistry:
             YouTubeSourceAdapter(),
             CollectionsSourceAdapter(),
             MarketsSourceAdapter(),
+            RedditSourceAdapter(),
         ]
     )

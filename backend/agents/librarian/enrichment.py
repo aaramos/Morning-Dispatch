@@ -710,7 +710,7 @@ def _translation_source_metadata(result: ArticleFetchResult) -> dict[str, object
 
 
 def _detect_non_english_script(result: ArticleFetchResult) -> tuple[str, str] | None:
-    if result.payload.source_type in {"podcast_episode", "youtube_video", "collection_chunk", "market_snapshot"}:
+    if result.payload.source_type in {"podcast_episode", "youtube_video", "collection_chunk", "market_snapshot", "reddit_post", "reddit_thread"}:
         return None
     text = " ".join(
         str(part or "")
@@ -779,8 +779,8 @@ Text:
 3. Keep the summary under 70 words. Keep keyword labels short. Return compact JSON only.
 """
 
-    if result.payload.source_type == "reddit_thread":
-        source_label = "Source"
+    if result.payload.source_type in ("reddit_thread", "reddit_post"):
+        source_label = "Reddit Post"
     elif result.payload.source_type == "podcast_episode":
         source_label = "Podcast"
     elif result.payload.source_type == "youtube_video":

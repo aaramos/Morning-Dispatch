@@ -68,6 +68,11 @@ class Settings:
     scheduler_interval_seconds: int = 300
     scheduler_daily_run_time: str = DEFAULT_SCHEDULER_DAILY_RUN_TIME
     scheduler_timezone: str = DEFAULT_SCHEDULER_TIMEZONE
+    reddit_min_post_score: int = 10
+    reddit_max_subreddits: int = 8
+    reddit_fetch_limit_per_source: int = 25
+    reddit_fetch_comments: int = 10
+    reddit_request_timeout_seconds: float = 10.0
 
 
 def _path_from_env(name: str, default: Path) -> Path:
@@ -347,6 +352,11 @@ def get_settings() -> Settings:
             DEFAULT_SCHEDULER_DAILY_RUN_TIME,
         ),
         scheduler_timezone=os.environ.get("MORNING_DISPATCH_SCHEDULER_TIMEZONE", DEFAULT_SCHEDULER_TIMEZONE),
+        reddit_min_post_score=_int_from_env("MORNING_DISPATCH_REDDIT_MIN_POST_SCORE", 10),
+        reddit_max_subreddits=_int_from_env("MORNING_DISPATCH_REDDIT_MAX_SUBREDDITS", 8),
+        reddit_fetch_limit_per_source=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_LIMIT_PER_SOURCE", 25),
+        reddit_fetch_comments=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_COMMENTS", 10),
+        reddit_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_REQUEST_TIMEOUT_SECONDS", 10.0),
     )
 
 

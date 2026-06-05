@@ -17,6 +17,7 @@ dependencies = [
     "uvicorn[standard]>=0.38.0",
     "yfinance>=0.2.66",
     "youtube-transcript-api>=1.2.0",
+    "feedparser>=6.0.0",
 ]
 
 [dependency-groups]

@@ -945,6 +945,7 @@ def _adapter_from_payload_type(source_type: str, metadata: dict[str, Any] | None
         "market_snapshot": "markets",
         "collection_chunk": "collections",
         "web_search": "web_search",
+        "reddit_post": "reddit",
     }.get(source_type, "")
 
 
@@ -1039,6 +1040,8 @@ def _infer_payload_adapter(payload: Any) -> str | None:
         return "podcasts"
     if source_type == "youtube_video":
         return "youtube"
+    if source_type == "reddit_post":
+        return "reddit"
     if source_type == "foreign_web":
         return "foreign_media"
     if source_type == "collection_chunk":
@@ -1104,6 +1107,12 @@ def _extract_promoted_source(*, adapter: str | None, payload: Any) -> dict[str, 
 
     if normalized_adapter == "markets":
         ref = str(metadata.get("ticker") or source_name).strip()
+        if not ref:
+            return None
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    if normalized_adapter == "reddit":
+        ref = str(metadata.get("subreddit") or source_name).strip()
         if not ref:
             return None
         return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
@@ -1329,7 +1338,7 @@ def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchR
         if not adapter:
             adapter = r.payload.source_type or "web_search"
 
-        max_allowed = 20 if adapter in ("youtube", "podcasts") else (40 if adapter in ("markets", "web_search", "gmail", "foreign_media") else 25)
+        max_allowed = 20 if adapter in ("youtube", "podcasts", "reddit") else (40 if adapter in ("markets", "web_search", "gmail", "foreign_media") else 25)
         limit = per_source.get(adapter, max_allowed) if isinstance(per_source, dict) else max_allowed
         limit = min(limit, max_allowed)
 
@@ -1529,6 +1538,8 @@ def _source_label_for_result(result: ArticleFetchResult) -> str:
         return "Podcast"
     if source_type == "youtube_video":
         return "YouTube"
+    if source_type == "reddit_post":
+        return "Reddit"
     if source_type == "market_snapshot":
         return "Markets"
     if source_type == "foreign_web":

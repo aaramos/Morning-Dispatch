@@ -131,6 +131,34 @@ _GOOD_FOR_SIGNAL_MAP: dict[str, tuple[str, ...]] = {
         "collection",
         "list",
     ),
+    "community_discussion": (
+        "community",
+        "forum",
+        "discussion",
+        "social",
+        "reddit",
+        "thread",
+        "comments",
+    ),
+    "emerging_topics": (
+        "emerging",
+        "trend",
+        "latest",
+        "new",
+        "hype",
+        "upcoming",
+        "rising",
+        "future",
+    ),
+    "expert_opinion": (
+        "expert",
+        "opinion",
+        "commentary",
+        "analysis",
+        "review",
+        "critique",
+        "thought",
+    ),
 }
 
 
@@ -190,6 +218,7 @@ class DiscoveryRunner:
             ("podcasts", _lane_limit(profile, "podcasts", default=250, system_max=250)),
             ("gmail", _lane_limit(profile, "gmail", default=250, system_max=250)),
             ("foreign_media", _lane_limit(profile, "foreign_media", default=250, system_max=250)),
+            ("reddit", _lane_limit(profile, "reddit", default=250, system_max=250)),
         )
 
         lane_candidates: list[Candidate] = []

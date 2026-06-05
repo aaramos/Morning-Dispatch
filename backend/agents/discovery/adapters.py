@@ -3,9 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import math
+import feedparser
+from datetime import datetime, UTC, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+from backend.agents.discovery.reddit_expander import expand_reddit_targets, clean_subreddit_name
 
 logger = logging.getLogger(__name__)
 
@@ -455,7 +460,7 @@ def _approved_podcast_sources() -> list[dict[str, Any]]:
 def _podcast_diagnostic_summary(decisions: list[Any]) -> str:
     if not decisions:
         return ""
-    
+
     diag_decision = next((d for d in decisions if getattr(d, "decision", "") == "diagnostics"), None)
     if diag_decision and hasattr(diag_decision, "metadata") and diag_decision.metadata:
         m = diag_decision.metadata
@@ -860,3 +865,550 @@ def _trim_query(value: str, *, limit: int = 340) -> str:
         return cleaned
     clipped = cleaned[:limit].rsplit(" ", 1)[0].strip()
     return clipped or cleaned[:limit].strip()
+
+
+class RedditSourceAdapter:
+    name = "reddit"
+    cost_profile = CostProfile(label="medium", timeout_seconds=45.0)
+    good_for = ("community_discussion", "emerging_topics", "expert_opinion", "broad_discovery")
+
+    async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
+        settings = get_settings()
+        min_post_score = getattr(settings, "reddit_min_post_score", 10)
+        limit_per_source = getattr(settings, "reddit_fetch_limit_per_source", 25)
+        comments_limit = getattr(settings, "reddit_fetch_comments", 10)
+        request_timeout = getattr(settings, "reddit_request_timeout_seconds", 10.0)
+        reddit_candidate_cap = min(max(1, context.candidate_limit), 20)
+
+        # 1. Expand search targets
+        targets = await expand_reddit_targets(profile)
+
+        # Determine lookback cutoff
+        cutoff = None
+        if context.lookback_hours is not None:
+            cutoff = datetime.now(UTC) - timedelta(hours=max(1, context.lookback_hours))
+
+        # Time filter mapping for Reddit Search API
+        t_filter = "all"
+        if context.lookback_hours is not None:
+            if context.lookback_hours <= 24:
+                t_filter = "day"
+            elif context.lookback_hours <= 168:
+                t_filter = "week"
+            elif context.lookback_hours <= 720:
+                t_filter = "month"
+            elif context.lookback_hours <= 8760:
+                t_filter = "year"
+
+        # Requested subreddits for scoring boost
+        requested_subs = {
+            clean_subreddit_name(src.get("ref") or src.get("source_name"))
+            for src in profile.requested_sources
+            if isinstance(src, dict) and src.get("adapter") == "reddit"
+        }
+        requested_subs = {s for s in requested_subs if s}
+
+        # Shared client and semaphores
+        # Post list fetching semaphore (max 4 concurrent)
+        fetch_semaphore = asyncio.Semaphore(4)
+        # Comment fetching semaphore (max 2 concurrent)
+        comments_semaphore = asyncio.Semaphore(2)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        rss_headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/xml, application/rss+xml, text/xml, */*",
+        }
+
+        import httpx
+
+        async def fetch_subreddit_json_or_rss(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
+            url = f"https://www.reddit.com/r/{sub}/hot.json"
+            params = {"limit": limit_per_source, "raw_json": 1}
+
+            async with fetch_semaphore:
+                try:
+                    logger.info("Fetching subreddit hot posts: r/%s", sub)
+                    response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
+
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        sleep_time = 5.0
+                        if retry_after:
+                            try:
+                                sleep_time = min(10.0, float(retry_after))
+                            except ValueError:
+                                pass
+                        logger.warning("Reddit API 429 for r/%s. Sleeping %.1fs before retry", sub, sleep_time)
+                        await asyncio.sleep(sleep_time)
+                        response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
+
+                    if response.status_code == 403:
+                        logger.info("Reddit JSON returned 403 for r/%s. Falling back to RSS.", sub)
+                        return await fetch_subreddit_rss(client, sub)
+
+                    if response.status_code != 200:
+                        logger.warning("Reddit JSON returned status %d for r/%s", response.status_code, sub)
+                        return []
+
+                    data = response.json()
+                    children = data.get("data", {}).get("children", [])
+                    posts = []
+                    for child in children:
+                        cdata = child.get("data", {})
+                        post_id = cdata.get("id")
+                        title = cdata.get("title")
+                        permalink = cdata.get("permalink")
+                        if not post_id or not title or not permalink:
+                            continue
+
+                        created_utc = cdata.get("created_utc")
+                        published_at = None
+                        if created_utc:
+                            published_at = datetime.fromtimestamp(created_utc, UTC).isoformat(timespec="seconds")
+
+                        posts.append({
+                            "id": post_id,
+                            "title": title,
+                            "selftext": cdata.get("selftext", ""),
+                            "url": cdata.get("url"),
+                            "permalink": permalink,
+                            "score": cdata.get("score", 0),
+                            "upvote_ratio": cdata.get("upvote_ratio", 1.0),
+                            "num_comments": cdata.get("num_comments", 0),
+                            "flair": cdata.get("link_flair_text"),
+                            "subreddit": cdata.get("subreddit", sub),
+                            "published_at": published_at,
+                            "is_self": cdata.get("is_self", True),
+                            "fetch_mode": "subreddit",
+                        })
+                    return posts
+                except Exception as exc:
+                    logger.warning("Exception fetching hot JSON for r/%s: %s. Falling back to RSS.", sub, exc)
+                    return await fetch_subreddit_rss(client, sub)
+
+        async def fetch_subreddit_rss(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
+            rss_url = f"https://www.reddit.com/r/{sub}/hot/.rss"
+            try:
+                response = await client.get(rss_url, headers=rss_headers, timeout=request_timeout)
+                if response.status_code != 200:
+                    logger.warning("Reddit RSS returned status %d for r/%s", response.status_code, sub)
+                    return []
+
+                feed = feedparser.parse(response.text)
+                posts = []
+                for entry in feed.entries:
+                    link = entry.get("link", "")
+                    # Extract post ID from link
+                    match = re.search(r"/comments/([a-z0-9]+)/", link)
+                    post_id = match.group(1) if match else str(hash(link))
+                    title = entry.get("title", "Reddit Post")
+
+                    published_at = None
+                    if entry.get("published_parsed"):
+                        try:
+                            published_at = datetime(*entry.published_parsed[:6], tzinfo=UTC).isoformat(timespec="seconds")
+                        except Exception:
+                            pass
+
+                    # RSS does not contain score, upvote ratio, flairs or comments details
+                    posts.append({
+                        "id": post_id,
+                        "title": title,
+                        "selftext": entry.get("content", [{"value": entry.get("summary", "")}])[0].get("value", ""),
+                        "url": link,
+                        "permalink": link,
+                        "score": 10,  # fallback score
+                        "upvote_ratio": 1.0,
+                        "num_comments": 0,
+                        "flair": None,
+                        "subreddit": sub,
+                        "published_at": published_at,
+                        "is_self": True,
+                        "fetch_mode": "subreddit",
+                    })
+                return posts
+            except Exception as exc:
+                logger.warning("Exception fetching hot RSS for r/%s: %s", sub, exc)
+                return []
+
+        async def fetch_search_json(client: httpx.AsyncClient, q: str) -> list[dict[str, Any]]:
+            url = "https://www.reddit.com/search.json"
+            params = {"q": q, "sort": "relevance", "limit": 10, "t": t_filter}
+
+            async with fetch_semaphore:
+                try:
+                    logger.info("Searching Reddit: %s", q)
+                    response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
+
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        sleep_time = 5.0
+                        if retry_after:
+                            try:
+                                sleep_time = min(10.0, float(retry_after))
+                            except ValueError:
+                                pass
+                        logger.warning("Reddit API 429 for search query: %s. Sleeping %.1fs before retry", q, sleep_time)
+                        await asyncio.sleep(sleep_time)
+                        response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
+
+                    if response.status_code != 200:
+                        logger.warning("Reddit Search returned status %d for query %s", response.status_code, q)
+                        return []
+
+                    data = response.json()
+                    children = data.get("data", {}).get("children", [])
+                    posts = []
+                    for child in children:
+                        cdata = child.get("data", {})
+                        post_id = cdata.get("id")
+                        title = cdata.get("title")
+                        permalink = cdata.get("permalink")
+                        if not post_id or not title or not permalink:
+                            continue
+
+                        created_utc = cdata.get("created_utc")
+                        published_at = None
+                        if created_utc:
+                            published_at = datetime.fromtimestamp(created_utc, UTC).isoformat(timespec="seconds")
+
+                        posts.append({
+                            "id": post_id,
+                            "title": title,
+                            "selftext": cdata.get("selftext", ""),
+                            "url": cdata.get("url"),
+                            "permalink": permalink,
+                            "score": cdata.get("score", 0),
+                            "upvote_ratio": cdata.get("upvote_ratio", 1.0),
+                            "num_comments": cdata.get("num_comments", 0),
+                            "flair": cdata.get("link_flair_text"),
+                            "subreddit": cdata.get("subreddit"),
+                            "published_at": published_at,
+                            "is_self": cdata.get("is_self", True),
+                            "fetch_mode": "search",
+                        })
+                    return posts
+                except Exception as exc:
+                    logger.warning("Exception searching Reddit for query %s: %s", q, exc)
+                    return []
+
+        async def fetch_comments_for_post(client: httpx.AsyncClient, sub: str, post_id: str) -> str:
+            url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.json"
+            params = {"limit": comments_limit, "depth": 2, "sort": "top", "raw_json": 1}
+
+            async with comments_semaphore:
+                try:
+                    response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
+
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        sleep_time = 5.0
+                        if retry_after:
+                            try:
+                                sleep_time = min(10.0, float(retry_after))
+                            except ValueError:
+                                pass
+                        await asyncio.sleep(sleep_time)
+                        response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
+
+                    if response.status_code == 403:
+                        logger.warning("Comments returned 403 for post %s, continuing without comments", post_id)
+                        return ""
+
+                    if response.status_code != 200:
+                        return ""
+
+                    list_data = response.json()
+                    if not isinstance(list_data, list) or len(list_data) < 2:
+                        return ""
+
+                    comments_listing = list_data[1]
+                    extracted = _extract_comments_tree(comments_listing.get("data", {}).get("children", []), current_depth=1)
+                    if not extracted:
+                        return ""
+
+                    lines = ["--- Top Comments ---"]
+                    for c in extracted[:comments_limit]:
+                        author = c["author"]
+                        body = c["body"]
+                        score = c["score"]
+                        indent = "  " * (c["depth"] - 1)
+                        lines.append(f"{indent}[{author} ({score} pts)]: {body}")
+                    return "\n".join(lines)
+                except Exception as exc:
+                    logger.warning("Exception fetching comments for post %s: %s", post_id, exc)
+                    return ""
+
+        def _extract_comments_tree(children: list[dict[str, Any]], current_depth: int) -> list[dict[str, Any]]:
+            extracted = []
+            for child in children:
+                if child.get("kind") != "t1":
+                    continue
+                cdata = child.get("data", {})
+                author = cdata.get("author")
+                body = cdata.get("body")
+                score = cdata.get("score", 0)
+                distinguished = cdata.get("distinguished")
+
+                if not author or not body:
+                    continue
+                if author.lower() == "automoderator" or distinguished == "moderator":
+                    continue
+
+                extracted.append({
+                    "author": author,
+                    "body": " ".join(body.strip().split()),  # clean spacing/newlines
+                    "score": score,
+                    "depth": current_depth,
+                })
+
+                replies_val = cdata.get("replies")
+                if isinstance(replies_val, dict) and current_depth < 2:
+                    rdata = replies_val.get("data", {})
+                    rchildren = rdata.get("children", [])
+                    extracted.extend(_extract_comments_tree(rchildren, current_depth + 1))
+            return extracted
+
+        # Run initial fetch
+        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+            subreddit_tasks = [fetch_subreddit_json_or_rss(client, sub) for sub in targets.subreddits]
+            search_tasks = [fetch_search_json(client, q) for q in targets.search_queries]
+
+            results = await asyncio.gather(*(subreddit_tasks + search_tasks), return_exceptions=True)
+
+            # Aggregate and deduplicate by permalink URL
+            seen_permalinks = set()
+            raw_candidates = []
+            for res in results:
+                if isinstance(res, list):
+                    for post in res:
+                        permalink = post["permalink"]
+                        # Build absolute permalink URL
+                        discussion_url = permalink
+                        if permalink.startswith("/"):
+                            discussion_url = "https://www.reddit.com" + permalink
+
+                        # Deduplicate
+                        if discussion_url.lower() in seen_permalinks:
+                            continue
+                        seen_permalinks.add(discussion_url.lower())
+
+                        # Apply minimum post score filter
+                        if post["score"] < min_post_score:
+                            continue
+
+                        # Apply lookback cutoff filter
+                        if cutoff is not None and post["published_at"]:
+                            try:
+                                pub_dt = datetime.fromisoformat(post["published_at"])
+                                if pub_dt < cutoff:
+                                    continue
+                            except Exception:
+                                pass
+
+                        post["discussion_url"] = discussion_url
+                        raw_candidates.append(post)
+
+            # Sort raw candidates preliminarily to select the top candidate_limit
+            # before fetching comments, to conserve API requests.
+            # Base log scaling for score:
+            for post in raw_candidates:
+                log_score = math.log10(max(1, post["score"]))
+                norm_score = 0.15 + (min(3.0, max(0.0, log_score - 1.0)) / 3.0) * 0.60
+                norm_ratio = max(0.0, min(1.0, post["upvote_ratio"] or 0.8)) * 0.18
+                score = norm_score + norm_ratio
+
+                # Small boosts
+                sub_lower = str(post["subreddit"]).lower()
+                boost = 0.0
+                if sub_lower in requested_subs:
+                    boost += 0.05
+                if sub_lower in targets.subreddits:
+                    boost += 0.02
+                if post["fetch_mode"] == "subreddit":
+                    boost += 0.02
+
+                post["prelim_score"] = min(0.98, score + boost)
+
+            raw_candidates.sort(key=lambda x: x["prelim_score"], reverse=True)
+            target_raw = raw_candidates[:reddit_candidate_cap]
+
+            # Fetch comments in parallel for selected posts
+            comment_tasks = [fetch_comments_for_post(client, post["subreddit"], post["id"]) for post in target_raw]
+            comments_results = await asyncio.gather(*comment_tasks)
+
+            # Build Candidates list
+            candidates = []
+            for post, comments_str in zip(target_raw, comments_results, strict=True):
+                # Construct NormalizedPayload
+                original_url = post["discussion_url"] if post["is_self"] else post["url"]
+
+                # Build raw_text
+                text_parts = [post["title"]]
+                if post["selftext"]:
+                    text_parts.append(post["selftext"])
+                if comments_str:
+                    text_parts.append(comments_str)
+                raw_text = "\n\n".join(text_parts)
+
+                metadata = {
+                    "subreddit": post["subreddit"],
+                    "post_score": post["score"],
+                    "upvote_ratio": post["upvote_ratio"],
+                    "num_comments": post["num_comments"],
+                    "flair": post["flair"],
+                    "discussion_url": post["discussion_url"],
+                    "fetch_mode": post["fetch_mode"],
+                }
+
+                payload = NormalizedPayload(
+                    source_type="reddit_post",
+                    source_name=f"r/{post['subreddit']}",
+                    raw_text=raw_text,
+                    original_url=original_url,
+                    published_at=post["published_at"],
+                    metadata=metadata,
+                )
+
+                candidates.append(
+                    Candidate(
+                        adapter=self.name,
+                        payload=payload,
+                        score=post["prelim_score"],
+                        reason=f"Reddit post from r/{post['subreddit']} with score {post['score']}.",
+                    )
+                )
+
+        # 4. Query Refinement (Low-Yield Recovery)
+        if len(candidates) < 3:
+            logger.info("Low-yield detected for Reddit adapter. Initiating query refinement...")
+            try:
+                from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+                refined_queries = await refine_queries_for_adapter(
+                    adapter_name=self.name,
+                    profile=profile,
+                    initial_results=candidates,
+                    initial_queries=targets.search_queries,
+                    lookback_hours=context.lookback_hours,
+                )
+            except Exception as exc:
+                logger.warning("Failed to refine queries for Reddit adapter: %s", exc)
+                refined_queries = []
+
+            if refined_queries:
+                refined_queries = refined_queries[:3]
+                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+                    ref_search_tasks = [fetch_search_json(client, q) for q in refined_queries]
+                    ref_results = await asyncio.gather(*ref_search_tasks, return_exceptions=True)
+
+                    ref_raw_candidates = []
+                    for res in ref_results:
+                        if isinstance(res, list):
+                            for post in res:
+                                permalink = post["permalink"]
+                                discussion_url = permalink
+                                if permalink.startswith("/"):
+                                    discussion_url = "https://www.reddit.com" + permalink
+
+                                # Deduplicate against all seen permalinks
+                                if discussion_url.lower() in seen_permalinks:
+                                    continue
+                                seen_permalinks.add(discussion_url.lower())
+
+                                # Filters
+                                if post["score"] < min_post_score:
+                                    continue
+                                if cutoff is not None and post["published_at"]:
+                                    try:
+                                        pub_dt = datetime.fromisoformat(post["published_at"])
+                                        if pub_dt < cutoff:
+                                            continue
+                                    except Exception:
+                                        pass
+
+                                post["discussion_url"] = discussion_url
+                                ref_raw_candidates.append(post)
+
+                    # Score and sort refined raw candidates
+                    for post in ref_raw_candidates:
+                        log_score = math.log10(max(1, post["score"]))
+                        norm_score = 0.15 + (min(3.0, max(0.0, log_score - 1.0)) / 3.0) * 0.60
+                        norm_ratio = max(0.0, min(1.0, post["upvote_ratio"] or 0.8)) * 0.18
+                        score = norm_score + norm_ratio
+
+                        # Small boosts
+                        sub_lower = str(post["subreddit"]).lower()
+                        boost = 0.0
+                        if sub_lower in requested_subs:
+                            boost += 0.05
+                        if post["fetch_mode"] == "subreddit":
+                            boost += 0.02
+
+                        post["prelim_score"] = min(0.98, score + boost)
+
+                    ref_raw_candidates.sort(key=lambda x: x["prelim_score"], reverse=True)
+                    remaining_capacity = max(0, reddit_candidate_cap - len(candidates))
+                    ref_target_raw = ref_raw_candidates[:remaining_capacity]
+
+                    # Fetch comments for refined
+                    ref_comment_tasks = [fetch_comments_for_post(client, post["subreddit"], post["id"]) for post in ref_target_raw]
+                    ref_comments_results = await asyncio.gather(*ref_comment_tasks)
+
+                    # Build refined candidates
+                    for post, comments_str in zip(ref_target_raw, ref_comments_results, strict=True):
+                        original_url = post["discussion_url"] if post["is_self"] else post["url"]
+
+                        text_parts = [post["title"]]
+                        if post["selftext"]:
+                            text_parts.append(post["selftext"])
+                        if comments_str:
+                            text_parts.append(comments_str)
+                        raw_text = "\n\n".join(text_parts)
+
+                        metadata = {
+                            "subreddit": post["subreddit"],
+                            "post_score": post["score"],
+                            "upvote_ratio": post["upvote_ratio"],
+                            "num_comments": post["num_comments"],
+                            "flair": post["flair"],
+                            "discussion_url": post["discussion_url"],
+                            "fetch_mode": post["fetch_mode"],
+                            "is_refined_query": True,
+                        }
+
+                        payload = NormalizedPayload(
+                            source_type="reddit_post",
+                            source_name=f"r/{post['subreddit']}",
+                            raw_text=raw_text,
+                            original_url=original_url,
+                            published_at=post["published_at"],
+                            metadata=metadata,
+                        )
+
+                        candidates.append(
+                            Candidate(
+                                adapter=self.name,
+                                payload=payload,
+                                score=post["prelim_score"],
+                                reason=f"Refined Reddit search result from r/{post['subreddit']} with score {post['score']}.",
+                            )
+                        )
+
+        # 5. Handle AdapterUnavailable
+        if not candidates:
+            searched_subreddits = ", ".join(targets.subreddits)
+            searched_queries = ", ".join(targets.search_queries)
+            diagnostic = f"Tried subreddits: [{searched_subreddits}]. Tried queries: [{searched_queries}]."
+            raise AdapterUnavailable(
+                f"Reddit adapter found zero recent candidates. {diagnostic}"
+            )
+
+        return candidates[:reddit_candidate_cap]
+
+    async def fetch(self, candidate: Candidate) -> Any:
+        return candidate.payload

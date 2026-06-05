@@ -1112,15 +1112,16 @@ def test_scheduled_run_promotes_kept_sources(monkeypatch, tmp_path) -> None:
     assert "web search" in strategy["summary"]
 
     promoted_sources = database.list_promoted_sources(topic["topic_id"])
-    assert len(promoted_sources) == 2
+    assert len(promoted_sources) == 3
     promoted_keys = {
         (source["adapter"], source["ref"], source["has_feed"], source["feed_url"]) for source in promoted_sources
     }
     assert ("gmail", "newsletter@localai.example", False, None) in promoted_keys
     assert ("podcasts", "Practical AI Podcast", True, "https://podcast.example.com/feed") in promoted_keys
+    assert ("reddit", "localAI", False, None) in promoted_keys
 
     topic_profile_after = database.get_topic_profile(topic["topic_id"]) or {}
-    assert len(topic_profile_after["profile"].get("promoted_sources", [])) == 2
+    assert len(topic_profile_after["profile"].get("promoted_sources", [])) == 3
 
 
 def test_scheduled_run_promotes_deduped_sources(monkeypatch, tmp_path) -> None:
@@ -1284,7 +1285,7 @@ def test_discovery_runner_dedupes_and_marks_opt_outs(monkeypatch, tmp_path) -> N
         {
             "statement": "AI agents for local infrastructure",
             "scope": "Practical agent workflows",
-            "source_selection": {"gmail": True, "reddit": False},
+            "source_selection": {"gmail": True, "unregistered_fake": False},
         }
     )
     registry = SourceRegistry(
@@ -1296,7 +1297,7 @@ def test_discovery_runner_dedupes_and_marks_opt_outs(monkeypatch, tmp_path) -> N
                     candidate("gmail", "https://example.com/story", 0.6),
                 ],
             ),
-            FakeAdapter("reddit", [candidate("reddit", "https://reddit.com/r/test/1", 0.9)]),
+            FakeAdapter("unregistered_fake", [candidate("unregistered_fake", "https://reddit.com/r/test/1", 0.9)]),
         ]
     )
 
@@ -1311,7 +1312,7 @@ def test_discovery_runner_dedupes_and_marks_opt_outs(monkeypatch, tmp_path) -> N
     assert result.candidates[0].score == 0.7
     statuses = {status.name: status.status for status in result.statuses}
     assert statuses["gmail"] == "completed"
-    assert "reddit" not in statuses
+    assert "unregistered_fake" not in statuses
 
 
 def test_discovery_runner_applies_per_source_content_limits(monkeypatch, tmp_path) -> None:
@@ -1820,7 +1821,8 @@ def test_explore_api_creates_topic_profile(monkeypatch, tmp_path) -> None:
     assert response.status_code == 201
     body = response.json()
     assert body["statement"] == "Explore local AI infrastructure"
-    assert "reddit" not in body["profile"]["source_selection"]
+    assert "reddit" in body["profile"]["source_selection"]
+    assert body["profile"]["source_selection"]["reddit"] is False
     assert discovery.status_code == 202
     discovery_body = discovery.json()
     assert discovery_body["exploration"]["status"] == "complete"
@@ -2028,12 +2030,13 @@ def test_refinement_session_default_sources_are_web_only(monkeypatch, tmp_path) 
     assert started.status_code == 201
     assert started.json()["profile"]["source_selection"] == {
         "gmail": False,
-            "podcasts": False,
-            "web_search": True,
-            "foreign_media": False,
-            "youtube": False,
+        "podcasts": False,
+        "web_search": True,
+        "foreign_media": False,
+        "youtube": False,
         "collections": False,
         "markets": False,
+        "reddit": False,
     }
 
 

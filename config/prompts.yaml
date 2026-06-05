@@ -392,3 +392,36 @@ query_broadening: |
   }
 
   Do not include any markup, fences, or text other than the JSON object.
+
+reddit_expansion: |
+  You are an expert Reddit research librarian.
+  Your task is to semantically expand the user's interest profile into relevant subreddits and Reddit search queries.
+
+  Interest Statement:
+  {{statement}}
+
+  Interest Scope:
+  {{scope}}
+
+  Keywords:
+  {{keywords}}
+
+  Subtopics:
+  {{subtopics}}
+
+  Search Queries:
+  {{search_queries}}
+
+  Rules:
+  1. Infer subreddits that are highly relevant to the interest profile. Subreddit names must contain only alphanumeric characters and underscores, and must NOT have any "/r/" prefix or "r/" prefix (e.g. use "machinelearning", not "/r/machinelearning").
+  2. Max 8 subreddits.
+  3. Infer Reddit search queries (free-form strings) optimized for Reddit's search engine.
+  4. Max 5 search queries.
+
+  Format your response as a strict JSON object with this shape:
+  {
+    "subreddits": ["subreddit1", "subreddit2"],
+    "search_queries": ["query1", "query2"]
+  }
+
+  Do not include any markup, fences, or text other than the JSON object.

@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 
-type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets";
+type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets" | "reddit";
 type FlowState = "idle" | "refining" | "confirm" | "building" | "ready" | "schedule";
 type SortMode = "recent" | "name";
 type SchedulePreset = "daily" | "weekdays" | "weekly" | "monthly";
@@ -484,6 +484,7 @@ const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
   { key: "youtube", label: "YouTube", icon: "▶" },
   { key: "collections", label: "Collections", icon: "▣" },
   { key: "markets", label: "Markets", icon: "$" },
+  { key: "reddit", label: "Reddit", icon: "👽" },
 ];
 
 const defaultSourceSelection: Record<SourceKey, boolean> = {
@@ -494,6 +495,7 @@ const defaultSourceSelection: Record<SourceKey, boolean> = {
   youtube: false,
   collections: false,
   markets: false,
+  reddit: false,
 };
 const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   web_search: true,
@@ -503,6 +505,7 @@ const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   youtube: true,
   collections: true,
   markets: true,
+  reddit: true,
 };
 
 const defaultContentLimits: ContentLimitsDraft = {
@@ -517,6 +520,7 @@ const defaultContentLimits: ContentLimitsDraft = {
     youtube: 20,
     collections: 25,
     markets: 40,
+    reddit: 20,
   },
   quality_floor: "standard",
 };
@@ -532,6 +536,7 @@ const defaultMediumContentLimits: ContentLimitsDraft = {
     youtube: 12,
     collections: 15,
     markets: 24,
+    reddit: 12,
   },
   quality_floor: "standard",
 };
@@ -6853,6 +6858,7 @@ function enabledSourceSelection(selection: Record<SourceKey, boolean>, status: S
     youtube: Boolean(selection.youtube && status?.sources.youtube?.enabled),
     collections: Boolean(selection.collections && status?.sources.collections?.enabled),
     markets: Boolean(selection.markets && status?.sources.markets?.enabled),
+    reddit: Boolean(selection.reddit && status?.sources.reddit?.enabled),
   };
 }
 
