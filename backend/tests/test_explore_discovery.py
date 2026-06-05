@@ -848,6 +848,62 @@ def test_rebuild_preserves_topic_profile_lookback(monkeypatch, tmp_path) -> None
     assert rebuilt["progress"]["queue_options"]["lookback_hours"] == 72
 
 
+def test_clone_exploration_topic_profile_for_refinement(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = database.upsert_topic_profile(
+        {
+            "statement": "Track AI infrastructure companies",
+            "scope": "Public companies benefiting from AI infrastructure spending",
+            "subtopics": ["memory", "data center cooling"],
+            "keywords": ["HBM", "EUV"],
+            "search_queries": ["AI infrastructure capex 2026"],
+            "source_queries": {
+                "web_search": ["AI infrastructure spending signals"],
+                "markets": ["NVDA", "TSM"],
+            },
+            "lookback_hours": 168,
+            "source_selection": {"web_search": True, "gmail": False, "youtube": True, "markets": True},
+            "content_limits": {
+                "total_items": 100,
+                "target_items": 12,
+                "per_source": {"web_search": 12, "youtube": 5, "markets": 10},
+            },
+            "schedule": "daily",
+            "schedule_config": {"frequency": "daily", "time_of_day": "08:00"},
+            "delivery_config": {"email_enabled": True, "last_delivery_status": "failed"},
+        }
+    )
+    exploration = database.create_exploration(
+        topic_id=topic["topic_id"],
+        mode="show_now",
+        source_selection={"web_search": True, "gmail": False, "youtube": True, "markets": True},
+        status="complete",
+    )
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        response = client.post(f"/api/explore/explorations/{exploration['exploration_id']}/clone-topic-profile")
+
+    assert response.status_code == 201
+    body = response.json()
+    cloned = body["topic_profile"]
+    assert cloned["topic_id"] != topic["topic_id"]
+    assert body["source_exploration_id"] == exploration["exploration_id"]
+    assert body["source_topic_id"] == topic["topic_id"]
+    assert cloned["statement"] == topic["statement"]
+    assert cloned["profile"]["scope"] == topic["profile"]["scope"]
+    assert cloned["profile"]["search_queries"] == topic["profile"]["search_queries"]
+    assert cloned["profile"]["source_queries"] == topic["profile"]["source_queries"]
+    assert cloned["profile"]["lookback_hours"] == 168
+    assert cloned["profile"]["source_selection"]["web_search"] is True
+    assert cloned["profile"]["source_selection"]["gmail"] is False
+    assert cloned["profile"]["content_limits"]["per_source"]["youtube"] == 5
+    assert cloned["profile"]["schedule"] is None
+    assert cloned["profile"]["schedule_config"] == {}
+    assert cloned["profile"]["delivery_config"] == {}
+    assert database.get_topic_profile(topic["topic_id"])["profile"]["schedule"] == "daily"
+
+
 def test_refined_rebuild_updates_same_topic_and_clears_session(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()

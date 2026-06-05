@@ -365,6 +365,39 @@ async def create_topic_profile_and_queue_build(payload: TopicProfileBuildCreate)
     return {"topic_profile": topic_profile, "exploration": exploration}
 
 
+@router.post("/explore/explorations/{exploration_id}/clone-topic-profile", status_code=201)
+def clone_exploration_topic_profile(exploration_id: str) -> dict[str, Any]:
+    exploration = database.get_exploration(exploration_id)
+    if exploration is None:
+        raise HTTPException(status_code=404, detail="Exploration not found")
+    source_topic = database.get_topic_profile(str(exploration["topic_id"]))
+    if source_topic is None:
+        raise HTTPException(status_code=404, detail="Topic profile not found")
+
+    source_profile = dict(source_topic.get("profile") or {})
+    clone_payload = {
+        **source_profile,
+        "topic_id": None,
+        "statement": source_topic.get("statement") or source_profile.get("statement") or "",
+        "source_selection": dict(exploration.get("source_selection") or source_profile.get("source_selection") or {}),
+        "schedule": None,
+        "schedule_config": {},
+        "delivery_config": {},
+        "status": "active",
+        "archived": False,
+        "deleted": False,
+    }
+    try:
+        cloned_topic = explore.save_topic_profile(clone_payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "topic_profile": cloned_topic,
+        "source_exploration_id": exploration_id,
+        "source_topic_id": source_topic["topic_id"],
+    }
+
+
 @router.get("/explore/topic-profiles/{topic_id}")
 def get_topic_profile(topic_id: str) -> dict[str, Any]:
     profile = database.get_topic_profile(topic_id)
@@ -721,6 +754,14 @@ def update_digest(digest_id: str, payload: DigestUpdate) -> dict[str, Any]:
     if digest is None:
         raise HTTPException(status_code=404, detail="Digest not found")
     return digest
+
+
+@router.delete("/digests/{digest_id}")
+def delete_digest(digest_id: str) -> dict[str, Any]:
+    deleted = database.delete_digest(digest_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    return {"digest_id": digest_id, "deleted": True}
 
 
 @router.post("/digests/{digest_id}/run", status_code=202)

@@ -1346,84 +1346,96 @@ async def _episode_first_search_and_resolve(
     )
 
     resolved_episodes = []
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as http_client:
-        for hit in kept[:resolution_attempts_limit]:
-            url_norm = _normalize_url_for_match(hit.url)
-            cached_res = get_cached_podcast_resolution(url_norm)
+    sem = asyncio.Semaphore(3)
 
-            if cached_res is not None:
-                feed_url = cached_res.get("feed_url")
-                resolution_method = "cache"
-            else:
+    async def resolve_one(hit: Any, http_client: httpx.AsyncClient) -> PodcastEpisode | None:
+        url_norm = _normalize_url_for_match(hit.url)
+        cached_res = get_cached_podcast_resolution(url_norm)
+
+        if cached_res is not None:
+            feed_url = cached_res.get("feed_url")
+            resolution_method = "cache"
+        else:
+            async with sem:
                 feed_url = await _resolve_feed_url(http_client, hit.url, hit.title, decisions)
-                resolution_method = "network"
+            resolution_method = "network"
 
-            if not feed_url:
-                # Cache failure for 1 hour (3600 seconds)
-                set_cached_podcast_resolution(url_norm, None, None, None, 3600)
-                continue
+        if not feed_url:
+            # Cache failure for 1 hour (3600 seconds)
+            set_cached_podcast_resolution(url_norm, None, None, None, 3600)
+            return None
 
-            # Cache success for 7 days (604800 seconds)
-            if cached_res is None:
-                set_cached_podcast_resolution(url_norm, feed_url, None, None, 7 * 24 * 3600)
+        # Cache success for 7 days (604800 seconds)
+        if cached_res is None:
+            set_cached_podcast_resolution(url_norm, feed_url, None, None, 7 * 24 * 3600)
 
-            diagnostics["feed_resolved"] += 1
+        diagnostics["feed_resolved"] += 1
 
-            try:
-                response = await http_client.get(feed_url)
-                response.raise_for_status()
-                episodes = parse_podcast_feed(response.text, feed_url=feed_url)
-            except Exception as exc:
-                logger.info("Failed to fetch resolved feed %s: %s", feed_url, exc)
-                continue
+        try:
+            response = await http_client.get(feed_url)
+            response.raise_for_status()
+            episodes = parse_podcast_feed(response.text, feed_url=feed_url)
+        except Exception as exc:
+            logger.info("Failed to fetch resolved feed %s: %s", feed_url, exc)
+            return None
 
-            matched_ep = _match_episode_in_feed(episodes, hit)
-            if not matched_ep:
-                continue
+        matched_ep = _match_episode_in_feed(episodes, hit)
+        if not matched_ep:
+            return None
 
-            diagnostics["episode_matched"] += 1
+        diagnostics["episode_matched"] += 1
 
-            if not matched_ep.audio_url:
-                diagnostics["no_audio_rejects"] += 1
-                decisions.append(
-                    _decision(
-                        target=matched_ep.title,
-                        decision="skip",
-                        action="exclude_no_audio",
-                        confidence=0.9,
-                        reason="Excluded because the resolved episode has no playable audio URL.",
-                        metadata={"feed_url": feed_url},
-                    )
+        if not matched_ep.audio_url:
+            diagnostics["no_audio_rejects"] += 1
+            decisions.append(
+                _decision(
+                    target=matched_ep.title,
+                    decision="skip",
+                    action="exclude_no_audio",
+                    confidence=0.9,
+                    reason="Excluded because the resolved episode has no playable audio URL.",
+                    metadata={"feed_url": feed_url},
                 )
-                continue
+            )
+            return None
 
-            if not _inside_lookback(matched_ep.published_at, lookback_hours):
-                diagnostics["date_rejects"] += 1
-                continue
+        if not _inside_lookback(matched_ep.published_at, lookback_hours):
+            diagnostics["date_rejects"] += 1
+            return None
 
-            # Check if apple_url is cached
-            apple_url = cached_res.get("apple_url") if cached_res else None
-            if not apple_url:
+        # Check if apple_url is cached
+        apple_url = cached_res.get("apple_url") if cached_res else None
+        if not apple_url:
+            async with sem:
                 apple_url = await _lookup_apple_podcast_url(http_client, matched_ep, {"title": matched_ep.show_name})
-                if apple_url:
-                    # Update resolution cache with the apple_url
-                    set_cached_podcast_resolution(url_norm, feed_url, None, apple_url, 7 * 24 * 3600)
-
             if apple_url:
-                matched_ep = replace(matched_ep, apple_podcasts_url=apple_url)
+                # Update resolution cache with the apple_url
+                set_cached_podcast_resolution(url_norm, feed_url, None, apple_url, 7 * 24 * 3600)
 
-            # Inject provenance/query metadata
-            prov = provenance_by_url.get(url_norm, {})
-            meta = {
-                "discovery_query": prov.get("discovery_query"),
-                "discovery_query_type": prov.get("discovery_query_type"),
-                "resolution_method": resolution_method,
-            }
-            if prov.get("priority_term"):
-                meta["priority_term"] = prov["priority_term"]
+        if apple_url:
+            matched_ep = replace(matched_ep, apple_podcasts_url=apple_url)
 
-            matched_ep = replace(matched_ep, metadata=meta)
-            resolved_episodes.append(matched_ep)
+        # Inject provenance/query metadata
+        prov = provenance_by_url.get(url_norm, {})
+        meta = {
+            "discovery_query": prov.get("discovery_query"),
+            "discovery_query_type": prov.get("discovery_query_type"),
+            "resolution_method": resolution_method,
+        }
+        if prov.get("priority_term"):
+            meta["priority_term"] = prov["priority_term"]
+
+        matched_ep = replace(matched_ep, metadata=meta)
+        return matched_ep
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as http_client:
+        tasks = [resolve_one(hit, http_client) for hit in kept[:resolution_attempts_limit]]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                logger.warning("Failed to resolve candidate episode: %s", res)
+            elif res is not None:
+                resolved_episodes.append(res)
 
     return resolved_episodes
 

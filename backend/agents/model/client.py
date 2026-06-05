@@ -669,6 +669,38 @@ class ModelClient:
         )
 
 
+def _repair_json_string(s: str) -> str:
+    import re
+    # 0. Clean up escaped single quotes which are invalid in JSON double-quoted strings
+    s = s.replace("\\'", "'")
+    s = s.replace(r"\'", "'")
+
+    # Safely convert single quotes enclosing keys/values to double quotes,
+    # leaving single quotes inside text untouched (e.g. "It's good")
+    s = re.sub(r"'\s*:", '":', s)
+    s = re.sub(r":\s*'", ': "', s)
+    s = re.sub(r",\s*'", ', "', s)
+    s = re.sub(r"'\s*,", '",', s)
+    s = re.sub(r"\[\s*'", '["', s)
+    s = re.sub(r"'\s*\]", '"]', s)
+    s = re.sub(r"\{\s*'", '{"', s)
+    s = re.sub(r"'\s*\}", '"}', s)
+
+    # 1. Missing comma between objects: } { -> },{
+    s = re.sub(r'\}\s*\{', '},{', s)
+    # 2. Missing comma between arrays: ] [ -> ],[
+    s = re.sub(r'\]\s*\[', '],[', s)
+    # 3. Missing comma between quote/value and object/quote
+    s = re.sub(r'\}\s*"', '},"', s)
+    s = re.sub(r'"\s*\{', '", {', s)
+    # 4. Trailing commas before closing braces: , } -> } and , ] -> ]
+    s = re.sub(r',\s*\}', '}', s)
+    s = re.sub(r',\s*\]', ']', s)
+    # 5. Missing quotes around keys: {id: 1 -> {"id": 1
+    s = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', s)
+    return s
+
+
 def _parse_json_object(value: str) -> dict[str, Any]:
     cleaned = value.strip()
     if cleaned.startswith("```"):
@@ -682,7 +714,11 @@ def _parse_json_object(value: str) -> dict[str, Any]:
     try:
         parsed = json.loads(cleaned[start : end + 1])
     except json.JSONDecodeError as exc:
-        raise ModelClientError("Model response JSON could not be parsed", status="parse_error") from exc
+        try:
+            repaired = _repair_json_string(cleaned[start : end + 1])
+            parsed = json.loads(repaired)
+        except Exception:
+            raise ModelClientError("Model response JSON could not be parsed", status="parse_error") from exc
     if not isinstance(parsed, dict):
         raise ModelClientError("Model response JSON was not an object", status="parse_error")
     return parsed

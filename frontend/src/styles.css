@@ -2080,27 +2080,6 @@ label {
   z-index: 10;
 }
 
-.refinement-progress-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 12;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: rgba(23, 23, 23, 0.28);
-}
-
-.refinement-progress-modal {
-  width: min(560px, 100%);
-  display: grid;
-  gap: 12px;
-  padding: 28px;
-  border: 1px solid #d8d7cf;
-  border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 24px 70px rgba(23, 23, 23, 0.24);
-}
-
 .advanced-settings-modal {
   position: relative;
   width: min(720px, 100%);
@@ -2133,19 +2112,6 @@ label {
   gap: 10px;
   padding-top: 14px;
   border-top: 1px solid #deddd6;
-}
-
-.refinement-progress-modal h2,
-.refinement-progress-modal p {
-  margin: 0;
-}
-
-.refinement-progress-modal .section-kicker {
-  margin: 0;
-}
-
-.refinement-progress-modal .refinement-status-card {
-  margin-bottom: 0;
 }
 
 .enable-card {
@@ -2594,6 +2560,7 @@ label {
 }
 .chat-turn { display: flex; gap: 10px; max-width: 680px; }
 .chat-turn.gmail-approval-turn { max-width: 760px; }
+.chat-turn.status-turn { max-width: 620px; }
 .chat-turn.user { flex-direction: row-reverse; margin-left: auto; }
 .chat-avatar {
   width: 28px; height: 28px; border-radius: 50%; flex: 0 0 28px;
@@ -2640,6 +2607,39 @@ label {
 .chat-undercaption { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 0.78rem; color: #9a9993; }
 .chat-undercaption .spacer { flex: 1; }
 .chat-streaming-note { display: inline-flex; align-items: center; gap: 7px; color: #78756d; }
+.chat-refinement-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: min(460px, 100%);
+  padding: 9px 12px;
+  border: 1px solid #e7e6df;
+  border-radius: 12px;
+  background: #fffdf5;
+  color: #45433d;
+  font-size: 0.84rem;
+}
+.chat-refinement-status.alert {
+  border-color: #d9a441;
+  background: #fff7df;
+}
+.chat-refinement-status strong {
+  display: block;
+  color: #1d1d1b;
+  font-size: 0.84rem;
+  line-height: 1.25;
+}
+.chat-refinement-status small {
+  display: block;
+  color: #78756d;
+  line-height: 1.35;
+}
+.chat-refinement-elapsed {
+  margin-left: auto;
+  color: #78756d;
+  font-weight: 800;
+  white-space: nowrap;
+}
 .muted-hint { color: #9a9993; }
 .ghost-link { border: 0; background: transparent; color: #c8894b; font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer; padding: 0; }
 .ghost-link:disabled { color: #cbb69e; cursor: not-allowed; }

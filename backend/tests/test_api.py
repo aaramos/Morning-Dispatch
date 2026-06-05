@@ -241,6 +241,41 @@ def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
         assert published_payload["published_issue_id"]
 
 
+def test_delete_legacy_digest_removes_library_record(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "false")
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        created = client.post(
+            "/api/digests",
+            json={
+                "name": "Disposable Digest",
+                "interest": "Temporary brief",
+                "schedule": "daily",
+                "sources": [{"type": "web_search", "query": "temporary"}],
+            },
+        )
+        assert created.status_code == 201
+        digest_id = created.json()["id"]
+
+        deleted = client.delete(f"/api/digests/{digest_id}")
+        assert deleted.status_code == 200
+        assert deleted.json() == {"digest_id": digest_id, "deleted": True}
+
+        missing = client.get(f"/api/digests/{digest_id}")
+        assert missing.status_code == 404
+        library = client.get("/api/admin/library")
+        assert library.status_code == 200
+        assert digest_id not in {digest["id"] for digest in library.json()["legacy_digests"]}
+
+
 def test_newsletter_cleanup_removes_boilerplate_without_losing_content():
     cleaned = database._clean_newsletter_text(
         "AlphaSignal Stay updated with today's top AI news, papers, and repos. "

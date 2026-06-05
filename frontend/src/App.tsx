@@ -117,7 +117,7 @@ type RefinementSession = {
   statement: string;
   status: "active" | "finalized";
   turn_count: number;
-  messages: Array<{ role: "assistant" | "user"; content: string }>;
+  messages: ChatMessage[];
   profile: TopicProfile;
   topic_id: string | null;
   topic_profile?: TopicProfileResponse;
@@ -126,6 +126,8 @@ type RefinementSession = {
   pending_strategy_refinement?: PendingStrategyRefinement | null;
   strategy_review?: StrategyReview | null;
 };
+
+type ChatMessage = { role: "assistant" | "user"; content: string };
 
 type ConfirmedProfilePayload = {
   topic_id?: string;
@@ -894,7 +896,19 @@ function DispatchApp() {
     }
     return refineExplorationId;
   });
+  const [initialRefineTopicId] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const refineTopicId = params.get("refine_topic");
+    if (refineTopicId) {
+      params.delete("refine_topic");
+      const nextUrl = `${window.location.pathname}${params.toString() ? `?${params}` : ""}`;
+      window.history.replaceState(null, "", nextUrl);
+    }
+    return refineTopicId;
+  });
   const [progressNow, setProgressNow] = useState(0);
+  const activeRefinementStreams = useRef(0);
+  const activeRefinementTurns = useRef(0);
 
   const topicById = useMemo(() => new Map(allTopics.map((topic) => [topic.topic_id, topic])), [allTopics]);
   const activeDigest = scheduledTopics[0] ?? null;
@@ -1036,14 +1050,41 @@ function DispatchApp() {
     setProgressNow(Date.now());
   }, []);
 
+  function beginRefinementTurn() {
+    activeRefinementTurns.current += 1;
+    setBusy(true);
+  }
+
+  function endRefinementTurn() {
+    activeRefinementTurns.current = Math.max(0, activeRefinementTurns.current - 1);
+    if (activeRefinementTurns.current === 0) {
+      setBusy(false);
+    }
+  }
+
+  function beginLiveRefinementStream() {
+    activeRefinementStreams.current += 1;
+    if (activeRefinementStreams.current === 1) {
+      setStreamingText("");
+    }
+    setStreaming(true);
+  }
+
+  function endLiveRefinementStream() {
+    activeRefinementStreams.current = Math.max(0, activeRefinementStreams.current - 1);
+    if (activeRefinementStreams.current === 0) {
+      setStreaming(false);
+      setStreamingText("");
+    }
+  }
+
   // Drives one AI-led streaming turn: streams prose into the live bubble, applies the
   // plan snapshot, and advances the flow. Returns the final session (or null on error).
   async function runRefinementStream(
     body: RefinementStreamBody,
     optimisticUser?: string,
   ): Promise<RefinementSession | null> {
-    setStreaming(true);
-    setStreamingText("");
+    beginLiveRefinementStream();
     if (optimisticUser) {
       setSession((prev) =>
         prev ? { ...prev, messages: [...prev.messages, { role: "user", content: optimisticUser }] } : prev,
@@ -1079,21 +1120,22 @@ function DispatchApp() {
         }
       });
     } catch (error) {
-      setStreaming(false);
-      setStreamingText("");
+      endLiveRefinementStream();
       throw error;
     }
-    setStreaming(false);
+    endLiveRefinementStream();
     if (!finalSession) {
-      setStreamingText("");
       throw new Error(streamError || "Refinement stream ended unexpectedly");
     }
     const resolved: RefinementSession = finalSession;
-    setSession(resolved);
+    setSession((prev) => (
+      prev && prev.session_id === resolved.session_id
+        ? { ...resolved, messages: mergeChatMessages(resolved.messages, prev.messages) }
+        : resolved
+    ));
     setDraft(draftFromProfile(resolved.profile, defaultControls.content_limits));
     setSourceSelection(sourceSelectionFromRecord(resolved.profile.source_selection));
     if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
-    setStreamingText("");
     const finalized = resolved.status === "finalized" || ready;
     setFlow(finalized ? "confirm" : "refining");
     setMessage(finalized ? "Confirm the brief setup" : "Your turn");
@@ -1149,7 +1191,7 @@ function DispatchApp() {
     if (!justGoNow && !effectiveAnswer) return;
     const pendingAnswer = effectiveAnswer;
     setAnswer("");
-    setBusy(true);
+    beginRefinementTurn();
     setMessage(justGoNow ? "Confirming search strategy..." : "Thinking...");
     try {
       await runRefinementStream(
@@ -1167,7 +1209,7 @@ function DispatchApp() {
       if (!justGoNow && pendingAnswer) setAnswer(pendingAnswer);
       setMessage(errorMessage(error, "Could not update refinement"));
     } finally {
-      setBusy(false);
+      endRefinementTurn();
     }
   }
 
@@ -1958,6 +2000,61 @@ function DispatchApp() {
     };
   }, [initialRefineExplorationId]);
 
+  useEffect(() => {
+    if (!initialRefineTopicId) return;
+    const topicId = initialRefineTopicId;
+    let cancelled = false;
+    setBusy(true);
+    setFlow("refining");
+    setMessage("Loading cloned strategy to refine...");
+    const now = Date.now();
+    setRefinementFallbackStartedAt(now);
+    setProgressNow(now);
+    setRefinementProgress({ phase: "starting", label: "Opening cloned strategy", startedAt: now });
+    void (async () => {
+      try {
+        const topic = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${topicId}`);
+        const nextSourceSelection = sourceSelectionFromRecord(topic.profile.source_selection);
+        const nextSession = await api<RefinementSession>("/api/explore/refinement-sessions", {
+          method: "POST",
+          body: JSON.stringify({
+            statement: topic.statement,
+            topic_id: topic.topic_id,
+            revisit: true,
+            source_selection: nextSourceSelection,
+            models: {},
+          }),
+        });
+        if (cancelled) return;
+        clearInterestDraft();
+        setExploration(null);
+        setRefinementTargetExplorationId(null);
+        setTopicProfile(topic);
+        setSubmittedInterest(topic.statement);
+        setStatement("");
+        setSourceSelection(nextSourceSelection);
+        setSession(nextSession);
+        setDraft(draftFromProfile(nextSession.profile));
+        setAnswer("");
+        setBriefHtml("");
+        setFlow(nextSession.status === "finalized" ? "confirm" : "refining");
+        setMessage(nextSession.status === "finalized" ? "Confirm the cloned strategy" : "Refine the cloned strategy");
+      } catch (error) {
+        if (!cancelled) setMessage(errorMessage(error, "Could not load cloned strategy"));
+      } finally {
+        if (!cancelled) {
+          setBusy(false);
+          setRefinementProgress(null);
+          setRefinementFallbackStartedAt(0);
+          setProgressNow(Date.now());
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [initialRefineTopicId]);
+
   // Retained for the legacy confirmation panel while the unified refinement UI rolls out.
   void strategyStreamingText;
   void strategyStreaming;
@@ -2057,6 +2154,8 @@ function DispatchApp() {
               busy={busy}
               streaming={streaming}
               streamingText={streamingText}
+              refinementProgress={activeRefinementProgress}
+              progressNow={progressNow}
               gmailCandidates={gmailCandidates}
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
@@ -2164,13 +2263,6 @@ function DispatchApp() {
           onSaveFred={() => void saveFredCredentials()}
           onSetupCollections={() => void setupCollectionsSource()}
           onRetry={() => void refreshSourcesAndSelect(enableSource)}
-        />
-      ) : null}
-      {activeRefinementProgress ? (
-        <RefinementProgressOverlay
-          progress={activeRefinementProgress}
-          now={progressNow}
-          summary={progressIntentSummary(session?.profile ?? topicProfile?.profile ?? null, submittedInterest || statement)}
         />
       ) : null}
     </main>
@@ -2317,6 +2409,8 @@ function RefinementPanel(props: {
   busy: boolean;
   streaming: boolean;
   streamingText: string;
+  refinementProgress: RefinementProgress | null;
+  progressNow: number;
   gmailCandidates: GmailCandidatePayload | null;
   onAnswerChange: (value: string) => void;
   onSend: () => void;
@@ -2344,11 +2438,15 @@ function RefinementPanel(props: {
     .flatMap((source) => source.queries.map((query) => ({ source: source.source, query })));
   const recencyLabel = recencyText(preview?.recency_weighting, preview?.lookback_hours);
   const scopeText = preview?.scope || props.profile?.scope || "";
+  const progressState = props.refinementProgress
+    ? refinementProgressState(props.refinementProgress, props.progressNow)
+    : null;
+  const thinking = props.streaming || Boolean(progressState);
 
   useEffect(() => {
     const node = threadRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [messages.length, props.streamingText, props.streaming, props.gmailCandidates]);
+  }, [messages.length, props.streamingText, props.streaming, props.gmailCandidates, progressState?.stage, progressState?.detail]);
 
   return (
     <section className="chat-redesign">
@@ -2359,8 +2457,8 @@ function RefinementPanel(props: {
             <h2>{scopeText || props.interest || props.statement || "Shaping your brief"}</h2>
           </div>
           <span className={`status-pill ${finalized ? "good" : ""}`}>
-            <span className={`live-dot ${props.streaming ? "live" : ""}`} />
-            {finalized ? "Strategy confirmed" : props.streaming ? "Thinking through your plan" : "In progress"}
+            <span className={`live-dot ${thinking ? "live" : ""}`} />
+            {finalized ? "Strategy confirmed" : thinking ? "Thinking through your plan" : "In progress"}
           </span>
         </div>
         <div className="chat-thread" ref={threadRef}>
@@ -2399,6 +2497,30 @@ function RefinementPanel(props: {
                         <span />
                       </span>
                     )}
+                  </div>
+                </div>
+              ) : null}
+              {progressState ? (
+                <div className="chat-turn assistant status-turn">
+                  <div className="chat-avatar ai">M</div>
+                  <div
+                    className={`chat-refinement-status ${progressState.alert ? "alert" : ""}`}
+                    role="status"
+                    aria-live="polite"
+                    aria-label={`${progressState.stage}. ${progressState.detail}`}
+                  >
+                    <span className="typing-dots small" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                    <div>
+                      <strong>{progressState.stage}</strong>
+                      <small>{progressState.detail}</small>
+                    </div>
+                    <span className="chat-refinement-elapsed" aria-hidden="true">
+                      {formatElapsed(progressState.elapsedMs)}
+                    </span>
                   </div>
                 </div>
               ) : null}
@@ -2468,7 +2590,6 @@ function RefinementPanel(props: {
                   onChange={(event) => props.onAnswerChange(event.target.value)}
                   placeholder="Add anything else to adjust..."
                   rows={1}
-                  disabled={props.busy}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
@@ -2480,7 +2601,7 @@ function RefinementPanel(props: {
                   type="button"
                   className="chat-send"
                   onClick={props.onSend}
-                  disabled={props.busy || !props.answer.trim()}
+                  disabled={!props.answer.trim()}
                   aria-label="Send"
                 >
                   →
@@ -2514,7 +2635,6 @@ function RefinementPanel(props: {
                   onChange={(event) => props.onAnswerChange(event.target.value)}
                   placeholder={props.gmailCandidates ? "Reply with numbers, names, all, none, or click senders above…" : finalized ? "Add anything else…" : "Answer the next question or refine the strategy…"}
                   rows={1}
-                  disabled={props.busy}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
@@ -2526,7 +2646,7 @@ function RefinementPanel(props: {
                   type="button"
                   className="chat-send"
                   onClick={props.onSend}
-                  disabled={props.busy || !props.answer.trim()}
+                  disabled={!props.answer.trim()}
                   aria-label="Send"
                 >
                   →
@@ -2699,48 +2819,6 @@ function parseGmailCandidateMessage(content: string): { intro: string; candidate
     candidates,
     prompt: lines.slice(promptStart).join(" "),
   };
-}
-
-function RefinementStatusIndicator(props: { progress: RefinementProgress | null; now: number }) {
-  if (!props.progress) {
-    return (
-      <div className="refinement-status-card idle">
-        <div>
-          <strong>Waiting for your next answer</strong>
-          <p>The current search strategy is saved in this workspace.</p>
-        </div>
-      </div>
-    );
-  }
-  const state = refinementProgressState(props.progress, props.now);
-  return (
-    <div className={`refinement-status-card ${state.alert ? "alert" : ""}`}>
-      <div className="refinement-status-top">
-        <div>
-          <strong>{state.stage}</strong>
-          <p>{state.detail}</p>
-        </div>
-        <span>{formatElapsed(state.elapsedMs)}</span>
-      </div>
-      <div className="refinement-activity-row">
-        <span className="activity-pulse" />
-        <small>{state.activity}</small>
-      </div>
-    </div>
-  );
-}
-
-function RefinementProgressOverlay(props: { progress: RefinementProgress; now: number; summary: string }) {
-  return (
-    <div className="refinement-progress-backdrop" role="status" aria-live="polite">
-      <div className="refinement-progress-modal">
-        <p className="section-kicker">Refinement running</p>
-        <h2>Working on your brief plan</h2>
-        <p className="muted">{props.summary}</p>
-        <RefinementStatusIndicator progress={props.progress} now={props.now} />
-      </div>
-    </div>
-  );
 }
 
 function StrategyReviewCard(props: { preview: StrategyPreview }) {
@@ -5213,6 +5291,20 @@ function AdminApp() {
     window.location.href = `/?refine_exploration=${encodeURIComponent(exploration.exploration_id)}`;
   }
 
+  async function cloneAndRefineFromAdmin(exploration: Exploration) {
+    setBusy(true);
+    try {
+      const result = await api<{ topic_profile: TopicProfileResponse }>(
+        `/api/explore/explorations/${exploration.exploration_id}/clone-topic-profile`,
+        { method: "POST" },
+      );
+      window.location.href = `/?refine_topic=${encodeURIComponent(result.topic_profile.topic_id)}`;
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not clone search strategy"));
+      setBusy(false);
+    }
+  }
+
   function openAdvancedSettings(topic: TopicProfileResponse) {
     const systemDefaults = briefSettings?.pipeline_limits ?? defaultPipelineLimits;
     setEditingAdvancedSettings({
@@ -5498,6 +5590,20 @@ function AdminApp() {
     setBusy(true);
     try {
       await api(`/api/explore/topic-profiles/${topic.topic_id}`, { method: "DELETE" });
+      await loadAdmin();
+      setMessage("Digest deleted");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not delete digest"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteLegacyDigest(digest: Digest) {
+    if (!window.confirm(`Delete "${digest.name || "Digest"}" from the library?`)) return;
+    setBusy(true);
+    try {
+      await api(`/api/digests/${digest.id}`, { method: "DELETE" });
       await loadAdmin();
       setMessage("Digest deleted");
     } catch (error) {
@@ -5842,6 +5948,7 @@ function AdminApp() {
                     ) : null}
                     <button type="button" className="secondary-action" onClick={() => item.topic && openAdvancedSettings(item.topic)} disabled={busy || !item.topic}>Advanced Settings</button>
                     <button type="button" className="secondary-action" onClick={() => refineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Refine</button>
+                    <button type="button" className="secondary-action" onClick={() => void cloneAndRefineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Clone and refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildFromAdmin(item.exploration)} disabled={busy}>Rebuild</button>
                     <button
                       type="button"
@@ -5963,10 +6070,11 @@ function AdminApp() {
                       <strong>{item.digest.name}</strong>
                       <small>Legacy digest · {formatStage(item.digest.schedule)} · {item.digest.status}</small>
                     </div>
-                    <div className="button-row">
-                      <button type="button" className="secondary-action" onClick={() => openPath("/brief")}>Open latest</button>
-                      <button type="button" className="secondary-action" onClick={() => void rebuildLegacyDigest(item.digest)} disabled={busy}>Rebuild</button>
-                    </div>
+	                    <div className="button-row">
+	                      <button type="button" className="secondary-action" onClick={() => openPath("/brief")}>Open latest</button>
+	                      <button type="button" className="secondary-action" onClick={() => void rebuildLegacyDigest(item.digest)} disabled={busy}>Rebuild</button>
+	                      <button type="button" className="secondary-action destructive" onClick={() => void deleteLegacyDigest(item.digest)} disabled={busy}>Delete</button>
+	                    </div>
                   </article>
                 );
               }
@@ -6990,6 +7098,19 @@ function formatStage(value: string): string {
   return value.split("_").filter(Boolean).map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(" ");
 }
 
+function mergeChatMessages(serverMessages: ChatMessage[], localMessages: ChatMessage[]): ChatMessage[] {
+  const merged = [...serverMessages];
+  const seen = new Set(merged.map((message) => `${message.role}\u0000${message.content}`));
+  for (const message of localMessages) {
+    const key = `${message.role}\u0000${message.content}`;
+    if (!seen.has(key)) {
+      merged.push(message);
+      seen.add(key);
+    }
+  }
+  return merged;
+}
+
 function formatDateTime(value: string | null | undefined): string {
   if (!value) return "Never";
   const date = new Date(value);
@@ -7011,25 +7132,6 @@ function releaseStamp(status: AdminStatus | null): string {
   if (timestamp) return `Release ${timestamp}`;
   if (revision) return `Release ${revision}`;
   return "Release unknown";
-}
-
-function progressIntentSummary(profile: TopicProfile | null, fallback: string): string {
-  if (!profile) {
-    const cleaned = fallback.trim();
-    return cleaned ? truncateSentence(cleaned, 160) : "Reviewing your brief plan and source strategy.";
-  }
-  const scope = profile.scope || profile.statement || fallback || "Reviewing your brief plan";
-  const sources = Object.entries(profile.source_selection ?? {})
-    .filter(([, enabled]) => enabled)
-    .map(([source]) => formatSourceLabel(source))
-    .filter((source) => source !== "Collections")
-    .slice(0, 5);
-  const lookback = profile.lookback_hours
-    ? `over the last ${Math.max(1, Math.round(Number(profile.lookback_hours) / 24))} days`
-    : "";
-  const exclusions = profile.exclusions?.length ? ` while avoiding ${profile.exclusions.slice(0, 2).join(" and ")}` : "";
-  const sourceText = sources.length ? ` across ${sources.join(", ")}` : "";
-  return truncateSentence(`${scope}${sourceText}${lookback ? ` ${lookback}` : ""}${exclusions}.`, 160);
 }
 
 function truncateSentence(value: string, maxLength: number): string {

@@ -1751,8 +1751,17 @@ def _delete_standalone_topic_if_orphaned(connection: sqlite3.Connection, topic_i
     )
     if remaining_count:
         return
-    connection.execute("DELETE FROM promoted_sources WHERE topic_id = ?", (topic_id,))
-    connection.execute("DELETE FROM topic_profiles WHERE topic_id = ?", (topic_id,))
+    try:
+        connection.execute("DELETE FROM exploration_feedback WHERE topic_id = ?", (topic_id,))
+        connection.execute("UPDATE refinement_sessions SET topic_id = NULL WHERE topic_id = ?", (topic_id,))
+        connection.execute("DELETE FROM promoted_sources WHERE topic_id = ?", (topic_id,))
+        connection.execute("DELETE FROM topic_profiles WHERE topic_id = ?", (topic_id,))
+    except sqlite3.IntegrityError as exc:
+        logger.warning(
+            "Failed to delete standalone topic_profile '%s' due to constraint violation: %s",
+            topic_id,
+            exc,
+        )
 
 
 def _set_topic_deleted(connection: sqlite3.Connection, topic_id: str, topic: sqlite3.Row, *, deleted: bool) -> None:
@@ -1978,6 +1987,60 @@ def update_digest(digest_id: str, payload: dict[str, Any]) -> dict[str, Any] | N
             ),
         )
     return get_digest(digest_id)
+
+
+def delete_digest(digest_id: str) -> bool:
+    if not digest_id:
+        return False
+    with connect() as connection:
+        existing = connection.execute("SELECT id FROM digests WHERE id = ?", (digest_id,)).fetchone()
+        if existing is None:
+            return False
+        run_rows = connection.execute(
+            "SELECT id FROM digest_runs WHERE digest_id = ?",
+            (digest_id,),
+        ).fetchall()
+        run_ids = [str(row["id"]) for row in run_rows]
+        item_rows = connection.execute(
+            "SELECT id FROM digest_items WHERE digest_id = ?",
+            (digest_id,),
+        ).fetchall()
+        item_ids = [str(row["id"]) for row in item_rows]
+
+        if item_ids:
+            placeholders = ", ".join("?" for _ in item_ids)
+            connection.execute(
+                f"DELETE FROM feedback WHERE digest_item_id IN ({placeholders})",
+                tuple(item_ids),
+            )
+            connection.execute(
+                f"UPDATE exploration_feedback SET digest_item_id = NULL WHERE digest_item_id IN ({placeholders})",
+                tuple(item_ids),
+            )
+
+        if run_ids:
+            placeholders = ", ".join("?" for _ in run_ids)
+            connection.execute(
+                f"DELETE FROM agent_decisions WHERE run_id IN ({placeholders})",
+                tuple(run_ids),
+            )
+            connection.execute(
+                f"DELETE FROM digest_issues WHERE run_id IN ({placeholders})",
+                tuple(run_ids),
+            )
+
+        connection.execute("DELETE FROM feedback WHERE digest_id = ?", (digest_id,))
+        connection.execute("UPDATE exploration_feedback SET digest_id = NULL WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM agent_decisions WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM digest_items WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM digest_issues WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM digest_runs WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM podcast_metrics WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM digest_delivery_settings WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM source_weights WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM source_watermarks WHERE digest_id = ?", (digest_id,))
+        connection.execute("DELETE FROM digests WHERE id = ?", (digest_id,))
+    return True
 
 
 def list_podcast_sources(digest_id: str | None = None) -> list[dict[str, Any]]:

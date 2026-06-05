@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 _SCREENING_BATCH_SIZE = 15
 _SCREENING_MAX_CANDIDATES_PER_SOURCE = 80
 _SCREENING_MAX_CONCURRENCY = 4
-_SCREENING_BATCH_TIMEOUT_SECONDS = 45.0
+_SCREENING_BATCH_TIMEOUT_SECONDS = 90.0
 
 
 async def refine_queries_for_adapter(
@@ -183,13 +183,14 @@ async def screen_candidates(
                 )
 
             try:
+                timeout_seconds = max(_SCREENING_BATCH_TIMEOUT_SECONDS, float(settings.model_timeout_seconds or 0.0))
                 payload = await asyncio.wait_for(
                     client.complete_json(
                         system=system_prompt,
                         prompt=json.dumps(prompt_data, ensure_ascii=False),
                         max_tokens=2000,
                     ),
-                    timeout=_SCREENING_BATCH_TIMEOUT_SECONDS,
+                    timeout=timeout_seconds,
                 )
                 decisions = payload.get("decisions", [])
                 return {
