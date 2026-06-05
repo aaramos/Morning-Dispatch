@@ -388,6 +388,98 @@ def test_issue_renderer_can_hide_scanned_newsletters_from_topic_brief():
     assert "Mexico City Travel Guide" in html
 
 
+def test_newsletter_link_story_uses_resolved_external_article_url():
+    payload = NormalizedPayload(
+        id="gmail-link-1",
+        source_type="gmail_link",
+        source_name="newsletter@example.com",
+        original_url="https://newsletter.example.com/click/abc",
+        raw_text="Newsletter context around the linked article.",
+        published_at="2026-06-01T12:00:00+00:00",
+        metadata={
+            "sender_email": "newsletter@example.com",
+            "parent_subject": "AI links",
+            "link_text": "Read the full article",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url="https://newsletter.example.com/click/abc",
+        final_url="https://external.example.com/full-article",
+        canonical_url="https://external.example.com/full-article",
+        title="External AI article",
+        text="The fetched article body is hosted outside the newsletter.",
+        excerpt="The fetched article body is hosted outside the newsletter.",
+        domain="external.example.com",
+        status="fetched",
+        tier="lead",
+    )
+
+    html = database.render_ingested_issue(
+        "Newsletter Link Brief",
+        "A brief with a newsletter link.",
+        [payload],
+        [result],
+        lookback_hours=24,
+        issue_id="issue-1",
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    link = soup.select_one(".lead-title a")
+
+    assert link is not None
+    assert link["href"] == "https://external.example.com/full-article"
+    assert link.get("target") == "_blank"
+    assert "mail.google.com" not in link["href"]
+    assert not soup.select(".newsletter-modal")
+
+
+def test_embedded_newsletter_story_opens_reader_modal():
+    payload = NormalizedPayload(
+        id="gmail-body-1",
+        source_type="gmail",
+        source_name="newsletter@example.com",
+        original_url="https://mail.google.com/mail/u/0/#inbox/msg-1#section-1",
+        raw_text="Embedded newsletter story paragraph one.\n\nEmbedded paragraph two with detail.",
+        published_at="2026-06-01T12:00:00+00:00",
+        metadata={
+            "sender_email": "newsletter@example.com",
+            "subject": "Embedded AI story",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url,
+        final_url=payload.original_url,
+        canonical_url=payload.original_url,
+        title="Embedded AI story",
+        text=payload.raw_text,
+        excerpt="Embedded newsletter story paragraph one.",
+        domain="mail.google.com",
+        status="fetched",
+        tier="lead",
+    )
+
+    html = database.render_ingested_issue(
+        "Embedded Newsletter Brief",
+        "A brief with embedded newsletter content.",
+        [payload],
+        [result],
+        lookback_hours=24,
+        issue_id="issue-1",
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    link = soup.select_one(".lead-title a")
+    modal = soup.select_one(".newsletter-modal")
+
+    assert link is not None
+    assert link["href"].startswith("#newsletter-")
+    assert link.get("data-newsletter-modal-target")
+    assert link.get("target") is None
+    assert modal is not None
+    assert "Embedded newsletter story paragraph one." in modal.get_text(" ")
+    assert "Embedded paragraph two with detail." in modal.get_text(" ")
+
+
 def test_issue_renderer_surfaces_market_snapshot_sparklines():
     payload = NormalizedPayload(
         source_type="market_snapshot",

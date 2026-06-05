@@ -40,7 +40,7 @@ class DigestUpdate(BaseModel):
 class FeedbackCreate(BaseModel):
     issue_id: str = Field(min_length=1)
     url: str = Field(min_length=8)
-    signal: Literal["up", "down"]
+    signal: Literal["up", "down", "click", "love", "like", "neutral", "dislike"]
 
 
 class TopicProfileCreate(BaseModel):
@@ -64,6 +64,10 @@ class TopicProfileCreate(BaseModel):
     schedule_config: dict[str, Any] = Field(default_factory=dict)
     delivery_config: dict[str, Any] = Field(default_factory=dict)
     content_limits: dict[str, Any] = Field(default_factory=dict)
+    direct_episode_queries: list[str] = Field(default_factory=list)
+    related_episode_queries: list[str] = Field(default_factory=list)
+    negative_constraints: list[str] = Field(default_factory=list)
+    priority_terms: list[str] = Field(default_factory=list)
 
 
 class ExplorationCreate(BaseModel):

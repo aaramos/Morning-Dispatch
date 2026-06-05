@@ -308,13 +308,39 @@ CREATE TABLE IF NOT EXISTS digest_delivery_settings (
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS feedback (
-  id             TEXT PRIMARY KEY,
-  digest_item_id TEXT NOT NULL REFERENCES digest_items(id),
-  article_id     TEXT NOT NULL REFERENCES articles(id),
-  digest_id      TEXT NOT NULL REFERENCES digests(id),
-  signal         TEXT NOT NULL CHECK(signal IN ('up','down')),
-  created_at     TEXT NOT NULL
+  id                  TEXT PRIMARY KEY,
+  digest_item_id      TEXT REFERENCES digest_items(id),
+  article_id          TEXT REFERENCES articles(id),
+  digest_id           TEXT NOT NULL REFERENCES digests(id),
+  exploration_id      TEXT REFERENCES explorations(exploration_id),
+  url                 TEXT,
+  source_type         TEXT,
+  source_name         TEXT,
+  adapter             TEXT,
+  tags_json           TEXT,
+  query_metadata_json TEXT,
+  signal              TEXT NOT NULL CHECK(signal IN ('click', 'love', 'like', 'neutral', 'dislike', 'up', 'down')),
+  created_at          TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS podcast_discovery_cache (
+  query_normalized TEXT NOT NULL,
+  provider         TEXT NOT NULL,
+  lookback_bucket  TEXT NOT NULL,
+  results_json     TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  expires_at       TEXT NOT NULL,
+  PRIMARY KEY (query_normalized, provider, lookback_bucket)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS podcast_resolution_cache (
+  episode_url_normalized TEXT PRIMARY KEY,
+  feed_url               TEXT,
+  podcast_index_id       TEXT,
+  apple_url              TEXT,
+  resolved_at            TEXT NOT NULL,
+  expires_at             TEXT NOT NULL
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS source_watermarks (
   digest_id      TEXT NOT NULL,

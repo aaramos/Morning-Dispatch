@@ -356,7 +356,7 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
     
     status = brief_settings_status(settings)
     assert status["youtube_presets"] == {"max": 20, "large": 16, "medium": 12, "focused": 8}
-    assert status["podcast_presets"] == {"max": 20, "large": 16, "medium": 12, "focused": 8}
+    assert status["podcast_presets"] == {"max": 5, "large": 4, "medium": 3, "focused": 2}
     assert status["gmail_presets"] == {"max": 40, "large": 32, "medium": 24, "focused": 16}
     
     # Save modified defaults
@@ -376,11 +376,11 @@ def test_youtube_presets_saving_and_loading(monkeypatch, tmp_path) -> None:
     
     updated_status = save_brief_defaults(settings, modified_defaults)
     assert updated_status["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
-    assert updated_status["podcast_presets"] == {"max": 10, "large": 7, "medium": 4, "focused": 2}
+    assert updated_status["podcast_presets"] == {"max": 5, "large": 5, "medium": 4, "focused": 2}
     assert updated_status["gmail_presets"] == {"max": 12, "large": 10, "medium": 8, "focused": 6}
     # Verify the YouTube preset limit is correctly saved
     assert updated_status["defaults"]["youtube_presets"] == {"max": 10, "large": 9, "medium": 6, "focused": 4}
-    assert updated_status["defaults"]["podcast_presets"] == {"max": 10, "large": 7, "medium": 4, "focused": 2}
+    assert updated_status["defaults"]["podcast_presets"] == {"max": 5, "large": 5, "medium": 4, "focused": 2}
     assert updated_status["defaults"]["gmail_presets"] == {"max": 12, "large": 10, "medium": 8, "focused": 6}
 
 

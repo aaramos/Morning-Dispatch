@@ -73,6 +73,10 @@ class TopicProfile:
     delivery_config: dict[str, Any] = field(default_factory=dict)
     content_limits: dict[str, Any] = field(default_factory=dict)
     pipeline_limits: dict[str, Any] = field(default_factory=dict)
+    direct_episode_queries: tuple[str, ...] = ()
+    related_episode_queries: tuple[str, ...] = ()
+    negative_constraints: tuple[str, ...] = ()
+    priority_terms: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> TopicProfile:
@@ -109,6 +113,10 @@ class TopicProfile:
             delivery_config=_dict(payload.get("delivery_config")),
             content_limits=_content_limits(payload.get("content_limits")),
             pipeline_limits=_dict(payload.get("pipeline_limits")),
+            direct_episode_queries=tuple(_string_list(payload.get("direct_episode_queries"))),
+            related_episode_queries=tuple(_string_list(payload.get("related_episode_queries"))),
+            negative_constraints=tuple(_string_list(payload.get("negative_constraints"))),
+            priority_terms=tuple(_string_list(payload.get("priority_terms"))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,6 +143,10 @@ class TopicProfile:
             "delivery_config": dict(self.delivery_config),
             "content_limits": dict(self.content_limits),
             "pipeline_limits": dict(self.pipeline_limits),
+            "direct_episode_queries": list(self.direct_episode_queries),
+            "related_episode_queries": list(self.related_episode_queries),
+            "negative_constraints": list(self.negative_constraints),
+            "priority_terms": list(self.priority_terms),
         }
 
     def search_text(self) -> str:

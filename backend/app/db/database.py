@@ -118,6 +118,9 @@ def init_database() -> None:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA_SQL)
         _ensure_explore_tables(connection)
+        _ensure_updated_feedback_table(connection)
+        _ensure_updated_exploration_feedback_table(connection)
+        _ensure_podcast_cache_tables(connection)
         _ensure_digest_run_metric_columns(connection)
         _ensure_digest_delivery_settings_table(connection)
         _ensure_podcast_metrics_table(connection)
@@ -519,13 +522,20 @@ def _ensure_explore_tables(connection: sqlite3.Connection) -> None:
         ) STRICT;
 
         CREATE TABLE IF NOT EXISTS exploration_feedback (
-          id              TEXT PRIMARY KEY,
-          exploration_id  TEXT NOT NULL REFERENCES explorations(exploration_id),
-          topic_id        TEXT NOT NULL REFERENCES topic_profiles(topic_id),
-          url             TEXT NOT NULL,
-          source_name     TEXT,
-          signal          TEXT NOT NULL CHECK(signal IN ('up','down')),
-          created_at      TEXT NOT NULL
+          id                  TEXT PRIMARY KEY,
+          exploration_id      TEXT NOT NULL REFERENCES explorations(exploration_id),
+          topic_id            TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          digest_id           TEXT REFERENCES digests(id),
+          digest_item_id      TEXT REFERENCES digest_items(id),
+          url                 TEXT NOT NULL,
+          stable_id           TEXT,
+          source_type         TEXT,
+          source_name         TEXT,
+          adapter             TEXT,
+          tags_json           TEXT,
+          query_metadata_json TEXT,
+          signal              TEXT NOT NULL CHECK(signal IN ('click', 'love', 'like', 'neutral', 'dislike', 'up', 'down')),
+          created_at          TEXT NOT NULL
         ) STRICT;
 
         CREATE INDEX IF NOT EXISTS idx_topic_profiles_updated_at ON topic_profiles(updated_at);
@@ -556,13 +566,20 @@ def _ensure_explore_tables(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS exploration_feedback (
-          id              TEXT PRIMARY KEY,
-          exploration_id  TEXT NOT NULL REFERENCES explorations(exploration_id),
-          topic_id        TEXT NOT NULL REFERENCES topic_profiles(topic_id),
-          url             TEXT NOT NULL,
-          source_name     TEXT,
-          signal          TEXT NOT NULL CHECK(signal IN ('up','down')),
-          created_at      TEXT NOT NULL
+          id                  TEXT PRIMARY KEY,
+          exploration_id      TEXT NOT NULL REFERENCES explorations(exploration_id),
+          topic_id            TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          digest_id           TEXT REFERENCES digests(id),
+          digest_item_id      TEXT REFERENCES digest_items(id),
+          url                 TEXT NOT NULL,
+          stable_id           TEXT,
+          source_type         TEXT,
+          source_name         TEXT,
+          adapter             TEXT,
+          tags_json           TEXT,
+          query_metadata_json TEXT,
+          signal              TEXT NOT NULL CHECK(signal IN ('click', 'love', 'like', 'neutral', 'dislike', 'up', 'down')),
+          created_at          TEXT NOT NULL
         ) STRICT
         """
     )
@@ -654,6 +671,255 @@ def _ensure_podcast_metrics_table(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_podcast_metrics_status ON podcast_metrics(status)"
     )
+
+
+def _ensure_podcast_cache_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS podcast_discovery_cache (
+          query_normalized TEXT NOT NULL,
+          provider         TEXT NOT NULL,
+          lookback_bucket  TEXT NOT NULL,
+          results_json     TEXT NOT NULL,
+          created_at       TEXT NOT NULL,
+          expires_at       TEXT NOT NULL,
+          PRIMARY KEY (query_normalized, provider, lookback_bucket)
+        ) STRICT
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS podcast_resolution_cache (
+          episode_url_normalized TEXT PRIMARY KEY,
+          feed_url               TEXT,
+          podcast_index_id       TEXT,
+          apple_url              TEXT,
+          resolved_at            TEXT NOT NULL,
+          expires_at             TEXT NOT NULL
+        ) STRICT
+        """
+    )
+
+
+def _ensure_updated_feedback_table(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'feedback'"
+    ).fetchone()
+    table_sql = str(row["sql"] or "") if row else ""
+    if "tags_json" in table_sql and "'click'" in table_sql:
+        return
+
+    connection.execute("ALTER TABLE feedback RENAME TO feedback_old")
+    connection.execute(
+        """
+        CREATE TABLE feedback (
+          id                  TEXT PRIMARY KEY,
+          digest_item_id      TEXT REFERENCES digest_items(id),
+          article_id          TEXT REFERENCES articles(id),
+          digest_id           TEXT NOT NULL REFERENCES digests(id),
+          exploration_id      TEXT REFERENCES explorations(exploration_id),
+          url                 TEXT,
+          source_type         TEXT,
+          source_name         TEXT,
+          adapter             TEXT,
+          tags_json           TEXT,
+          query_metadata_json TEXT,
+          signal              TEXT NOT NULL CHECK(signal IN ('click', 'love', 'like', 'neutral', 'dislike', 'up', 'down')),
+          created_at          TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO feedback (id, digest_item_id, article_id, digest_id, signal, created_at)
+        SELECT id, digest_item_id, article_id, digest_id,
+               CASE signal WHEN 'up' THEN 'like' WHEN 'down' THEN 'dislike' ELSE signal END,
+               created_at
+        FROM feedback_old
+        """
+    )
+    connection.execute("DROP TABLE feedback_old")
+
+
+def _ensure_updated_exploration_feedback_table(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'exploration_feedback'"
+    ).fetchone()
+    table_sql = str(row["sql"] or "") if row else ""
+    if "tags_json" in table_sql and "'click'" in table_sql:
+        return
+
+    connection.execute("ALTER TABLE exploration_feedback RENAME TO exploration_feedback_old")
+    connection.execute(
+        """
+        CREATE TABLE exploration_feedback (
+          id                  TEXT PRIMARY KEY,
+          exploration_id      TEXT NOT NULL REFERENCES explorations(exploration_id),
+          topic_id            TEXT NOT NULL REFERENCES topic_profiles(topic_id),
+          digest_id           TEXT REFERENCES digests(id),
+          digest_item_id      TEXT REFERENCES digest_items(id),
+          url                 TEXT NOT NULL,
+          stable_id           TEXT,
+          source_type         TEXT,
+          source_name         TEXT,
+          adapter             TEXT,
+          tags_json           TEXT,
+          query_metadata_json TEXT,
+          signal              TEXT NOT NULL CHECK(signal IN ('click', 'love', 'like', 'neutral', 'dislike', 'up', 'down')),
+          created_at          TEXT NOT NULL
+        ) STRICT
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO exploration_feedback (id, exploration_id, topic_id, url, source_name, signal, created_at)
+        SELECT id, exploration_id, topic_id, url, source_name,
+               CASE signal WHEN 'up' THEN 'like' WHEN 'down' THEN 'dislike' ELSE signal END,
+               created_at
+        FROM exploration_feedback_old
+        """
+    )
+    connection.execute("DROP TABLE exploration_feedback_old")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_exploration_feedback_topic_id ON exploration_feedback(topic_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_exploration_feedback_exploration_id ON exploration_feedback(exploration_id)")
+
+
+def get_cached_podcast_discovery(query_normalized: str, provider: str, lookback_bucket: str) -> list[dict[str, Any]] | None:
+    now = utc_now()
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT results_json FROM podcast_discovery_cache
+            WHERE query_normalized = ? AND provider = ? AND lookback_bucket = ? AND expires_at > ?
+            """,
+            (query_normalized, provider, lookback_bucket, now),
+        ).fetchone()
+        if row:
+            try:
+                return json.loads(row["results_json"])
+            except Exception:
+                return None
+    return None
+
+
+def set_cached_podcast_discovery(query_normalized: str, provider: str, lookback_bucket: str, results: list[dict[str, Any]], ttl_seconds: int) -> None:
+    now = datetime.now(UTC)
+    created_at = now.isoformat(timespec="seconds")
+    expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+    results_json = json.dumps(results, ensure_ascii=False)
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO podcast_discovery_cache
+            (query_normalized, provider, lookback_bucket, results_json, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (query_normalized, provider, lookback_bucket, results_json, created_at, expires_at),
+        )
+
+
+def get_cached_podcast_resolution(episode_url_normalized: str) -> dict[str, Any] | None:
+    now = utc_now()
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT feed_url, podcast_index_id, apple_url FROM podcast_resolution_cache
+            WHERE episode_url_normalized = ? AND expires_at > ?
+            """,
+            (episode_url_normalized, now),
+        ).fetchone()
+        if row:
+            return {
+                "feed_url": row["feed_url"],
+                "podcast_index_id": row["podcast_index_id"],
+                "apple_url": row["apple_url"],
+            }
+    return None
+
+
+def set_cached_podcast_resolution(episode_url_normalized: str, feed_url: str | None, podcast_index_id: str | None, apple_url: str | None, ttl_seconds: int) -> None:
+    now = datetime.now(UTC)
+    resolved_at = now.isoformat(timespec="seconds")
+    expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO podcast_resolution_cache
+            (episode_url_normalized, feed_url, podcast_index_id, apple_url, resolved_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (episode_url_normalized, feed_url, podcast_index_id, apple_url, resolved_at, expires_at),
+        )
+
+
+def get_feedback_profile(digest_id_or_topic_id: str) -> dict[str, Any]:
+    profile = {
+        "liked_domains": set(),
+        "disliked_domains": set(),
+        "liked_keywords": set(),
+        "disliked_keywords": set(),
+        "clicks": {}
+    }
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT f.signal, a.domain, a.keywords, f.url
+            FROM feedback f
+            LEFT JOIN articles a ON a.id = f.article_id
+            WHERE f.digest_id = ? OR f.exploration_id = ?
+            """,
+            (digest_id_or_topic_id, digest_id_or_topic_id),
+        ).fetchall()
+
+        exp_rows = connection.execute(
+            """
+            SELECT signal, source_name AS domain, tags_json AS keywords, url
+            FROM exploration_feedback
+            WHERE topic_id = ? OR exploration_id = ?
+            """,
+            (digest_id_or_topic_id, digest_id_or_topic_id),
+        ).fetchall()
+
+        for r in [*rows, *exp_rows]:
+            signal = r["signal"]
+            domain = r["domain"]
+            keywords_raw = r["keywords"]
+            url = r["url"]
+
+            keywords = []
+            if isinstance(keywords_raw, str) and keywords_raw:
+                if keywords_raw.startswith("["):
+                    try:
+                        keywords = json.loads(keywords_raw)
+                    except Exception:
+                        pass
+                else:
+                    keywords = [k.strip().lower() for k in keywords_raw.split(",") if k.strip()]
+            elif isinstance(keywords_raw, (list, tuple)):
+                keywords = [str(k).lower() for k in keywords_raw]
+
+            if signal == "click" and url:
+                profile["clicks"][url] = profile["clicks"].get(url, 0) + 1
+                continue
+
+            if signal in ("love", "like", "up"):
+                if domain:
+                    profile["liked_domains"].add(domain.lower())
+                for kw in keywords:
+                    profile["liked_keywords"].add(kw.lower())
+            elif signal in ("dislike", "down"):
+                if domain:
+                    profile["disliked_domains"].add(domain.lower())
+                for kw in keywords:
+                    profile["disliked_keywords"].add(kw.lower())
+
+    return {
+        "liked_domains": list(profile["liked_domains"]),
+        "disliked_domains": list(profile["disliked_domains"]),
+        "liked_keywords": list(profile["liked_keywords"]),
+        "disliked_keywords": list(profile["disliked_keywords"]),
+        "clicks": profile["clicks"]
+    }
 
 
 def _ensure_inference_metric_status_values(connection: sqlite3.Connection) -> None:
@@ -2729,7 +2995,7 @@ def render_ingested_issue(
     .feedback-controls button:hover {{ background: #efe3d1; }}
     .feedback-controls[data-feedback='sent'] button {{ opacity: .55; }}
     .feedback-state {{ color: var(--muted); font: 700 .72rem var(--mono); text-transform: uppercase; }}
-    .podcast-modal-link, .youtube-modal-link {{ color: inherit; }}
+    .podcast-modal-link, .youtube-modal-link, .newsletter-modal-link {{ color: inherit; }}
     .podcast-modal {{ position: fixed; inset: 0; z-index: 20; display: none; place-items: center; padding: 24px; background: rgba(34, 29, 24, .62); }}
     .podcast-modal:target {{ display: grid; }}
     .podcast-panel {{ width: min(920px, 100%); max-height: min(86vh, 980px); overflow: auto; background: var(--paper); border: 1px solid var(--ink); box-shadow: 0 24px 90px rgba(34, 29, 24, .34); padding: 24px; }}
@@ -2746,8 +3012,9 @@ def render_ingested_issue(
     .podcast-player {{ width: 100%; margin: 4px 0 20px; }}
     .youtube-panel {{ width: min(1040px, 100%); }}
     .youtube-player {{ width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--ink); background: var(--ink); margin: 8px 0 20px; }}
-    .youtube-summary, .podcast-summary, .podcast-transcript {{ border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }}
-    .youtube-summary h4, .podcast-summary h4, .podcast-transcript h4 {{ margin: 0 0 10px; font: 800 .78rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .youtube-summary, .podcast-summary, .podcast-transcript, .newsletter-body {{ border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }}
+    .youtube-summary h4, .podcast-summary h4, .podcast-transcript h4, .newsletter-body h4 {{ margin: 0 0 10px; font: 800 .78rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    .newsletter-body p {{ margin: 0 0 12px; font-size: 1rem; line-height: 1.62; color: #3f382f; }}
     .foreign-tabs {{ display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }}
     .foreign-tabs button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); padding: 8px 12px; font: 800 .74rem/1 var(--body); cursor: pointer; }}
     .foreign-tabs button.active {{ background: var(--ink); color: var(--paper); border-color: var(--ink); }}
@@ -3259,6 +3526,29 @@ def _result_url(result: ArticleFetchResult) -> str:
     return result.final_url or result.original_url or result.canonical_url or "#"
 
 
+def _reader_url(result: ArticleFetchResult) -> str:
+    for value in (result.canonical_url, result.final_url, result.original_url, result.payload.original_url):
+        url = _safe_web_url(value)
+        if url and not _is_gmail_message_url(url):
+            return url
+    for value in (result.canonical_url, result.final_url, result.original_url, result.payload.original_url):
+        url = _safe_web_url(value)
+        if url:
+            return url
+    return "#"
+
+
+def _is_embedded_newsletter_result(result: ArticleFetchResult) -> bool:
+    if result.payload.source_type != "gmail":
+        return False
+    return _is_gmail_message_url(_reader_url(result)) or _reader_url(result) == "#"
+
+
+def _is_gmail_message_url(value: str | None) -> bool:
+    parsed = urlparse(str(value or ""))
+    return parsed.netloc.lower() == "mail.google.com"
+
+
 def _result_image_url(result: ArticleFetchResult) -> str | None:
     metadata = _result_metadata(result)
     for key in ("image_url", "thumbnail_url"):
@@ -3451,9 +3741,14 @@ def _podcast_story_title(result: ArticleFetchResult) -> str:
 
 
 def _story_link_parts(result: ArticleFetchResult, *, issue_id: str | None) -> tuple[str, str, str, str, str]:
-    url = _result_url(result)
+    url = _reader_url(result)
+    if _is_embedded_newsletter_result(result):
+        modal_id = _newsletter_modal_id(result)
+        attributes = f' data-newsletter-modal-target="{escape(modal_id, quote=True)}"'
+        return f"#{modal_id}", "", ' class="newsletter-modal-link"', attributes, _render_newsletter_modal(result, modal_id)
     if not _supports_foreign_article_modal(result, issue_id=issue_id):
-        return url, "", "", "", ""
+        target = ' target="_blank" rel="noreferrer"' if _safe_web_url(url) else ""
+        return url, target, "", "", ""
     modal_id = _foreign_article_modal_id(result)
     attributes = _foreign_article_attributes(result, modal_id=modal_id)
     return f"#{modal_id}", "", ' class="foreign-article-link"', attributes, _render_foreign_article_modal(result, modal_id, issue_id)
@@ -3497,7 +3792,7 @@ def _render_image_strip(results: list[ArticleFetchResult]) -> str:
         image_url = _result_image_url(result)
         if not image_url:
             continue
-        link_url = _result_url(result)
+        link_url = _reader_url(result)
         image_html = f'<img src="{escape(image_url, quote=True)}" alt="{escape(_story_title(result), quote=True)}" loading="lazy" />'
         if link_url and link_url != "#":
             image_html = f'<a class="strip-link" href="{escape(link_url, quote=True)}">{image_html}</a>'
@@ -3655,7 +3950,7 @@ def _compact_company_name(company_name: str, ticker: str) -> str:
 
 
 def _render_lead_story(result: ArticleFetchResult, *, issue_id: str | None = None) -> str:
-    url = _result_url(result)
+    url = _reader_url(result)
     link_url, link_target, link_class, link_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
     feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
     return f"""
@@ -3680,7 +3975,7 @@ def _render_ranked_story(
     index: int,
     issue_id: str | None = None,
 ) -> str:
-    url = _result_url(result)
+    url = _reader_url(result)
     link_url, link_target, link_class, link_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
     feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
     return f"""
@@ -3706,7 +4001,7 @@ def _render_lower_confidence_story(
     index: int,
     issue_id: str | None = None,
 ) -> str:
-    url = _result_url(result)
+    url = _reader_url(result)
     link_url, link_target, link_class, link_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
     feedback_html = _render_feedback_controls(issue_id, url) if result.fetched else ""
     return f"""
@@ -3777,6 +4072,46 @@ def _render_media_card(result: ArticleFetchResult, *, issue_id: str | None = Non
 def _foreign_article_modal_id(result: ArticleFetchResult) -> str:
     raw_key = _result_url(result) or result.title or result.payload.id
     return f"foreign-{hashlib.sha1(raw_key.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _newsletter_modal_id(result: ArticleFetchResult) -> str:
+    raw_key = str(result.payload.id or result.original_url or result.title or result.payload.source_name)
+    return f"newsletter-{hashlib.sha1(raw_key.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _render_newsletter_modal(result: ArticleFetchResult, modal_id: str) -> str:
+    metadata = result.payload.metadata or {}
+    sender = str(metadata.get("sender_email") or result.payload.source_name or "Gmail newsletter").strip()
+    subject = str(metadata.get("subject") or result.title or "Newsletter item").strip()
+    published = _format_issue_date(result.payload.published_at or result.published_at)
+    body = _newsletter_body_html(result)
+    return f"""
+        <div class="podcast-modal newsletter-modal" id="{escape(modal_id, quote=True)}" role="dialog" aria-modal="true" aria-labelledby="{escape(modal_id, quote=True)}-title">
+          <div class="podcast-panel newsletter-panel">
+            <a href="#" class="podcast-close" data-newsletter-close>Close</a>
+            <div class="section-kicker">{escape(sender)} · {escape(published)}</div>
+            <h3 id="{escape(modal_id, quote=True)}-title">{escape(_clean_newsletter_text(subject))}</h3>
+            <section class="newsletter-body">
+              <h4>Newsletter content</h4>
+              {body}
+            </section>
+          </div>
+        </div>
+    """
+
+
+def _newsletter_body_html(result: ArticleFetchResult) -> str:
+    text = _clean_newsletter_text(result.text or result.payload.raw_text or result.excerpt or result.editor_summary)
+    if not text:
+        return "<p>No newsletter body text is available for this item.</p>"
+    paragraphs = [
+        part.strip()
+        for part in re.split(r"\n{2,}", text)
+        if part.strip()
+    ]
+    if not paragraphs:
+        paragraphs = [text]
+    return "\n".join(f"<p>{escape(part)}</p>" for part in paragraphs[:24])
 
 
 def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, issue_id: str) -> str:
@@ -4095,7 +4430,7 @@ def _render_article_card(
 ) -> str:
     if result is None:
         return ""
-    url = result.final_url or result.original_url
+    url = _reader_url(result)
     domain = result.domain or _domain(url) or "article"
     source = result.payload.source_name or "Gmail"
     published = _format_article_date(result.payload.published_at)
@@ -4132,6 +4467,8 @@ def _render_article_card(
         title_target = ""
         modal_html = _render_youtube_modal(result, youtube_modal_id)
     elif _supports_foreign_article_modal(result, issue_id=issue_id):
+        url, title_target, title_class, title_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
+    elif _is_embedded_newsletter_result(result):
         url, title_target, title_class, title_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
     return f"""
       <article class="{card_class}">
@@ -4596,9 +4933,9 @@ def _render_podcast_modal_script() -> str:
           return;
         }
 
-        const trigger = event.target.closest("[data-podcast-modal-target], [data-youtube-modal-target], [data-foreign-article-target]");
+        const trigger = event.target.closest("[data-podcast-modal-target], [data-youtube-modal-target], [data-foreign-article-target], [data-newsletter-modal-target]");
         if (trigger) {
-          const modalId = trigger.getAttribute("data-podcast-modal-target") || trigger.getAttribute("data-youtube-modal-target") || trigger.getAttribute("data-foreign-article-target");
+          const modalId = trigger.getAttribute("data-podcast-modal-target") || trigger.getAttribute("data-youtube-modal-target") || trigger.getAttribute("data-foreign-article-target") || trigger.getAttribute("data-newsletter-modal-target");
           if (modalId) {
             event.preventDefault();
             window.location.hash = modalId;
@@ -4609,7 +4946,7 @@ def _render_podcast_modal_script() -> str:
           return;
         }
 
-        const closeButton = event.target.closest("[data-podcast-close], [data-youtube-close], [data-foreign-close]");
+        const closeButton = event.target.closest("[data-podcast-close], [data-youtube-close], [data-foreign-close], [data-newsletter-close]");
         if (closeButton) {
           event.preventDefault();
           closeModal();
@@ -6039,34 +6376,70 @@ def apply_feedback_to_candidates(digest_id: str, article_results: list[ArticleFe
             (digest_id,),
         ).fetchall()
 
-    exact_signals: dict[str, int] = {}
-    domain_signals: dict[str, int] = {}
+    exact_signals: dict[str, float] = {}
+    domain_signals: dict[str, float] = {}
     for row in [*rows, *exploration_rows]:
         value = int(row["signal_count"] or 0)
-        delta = value if row["signal"] == "up" else -value
+        sig = row["signal"]
+
+        if sig in ("love", "up"):
+            delta = value * 1.5
+        elif sig == "like":
+            delta = float(value)
+        elif sig == "click":
+            delta = value * 0.3
+        elif sig in ("dislike", "down"):
+            delta = float(-value)
+        else:
+            delta = 0.0
+
         for url in (row["canonical_url"], row["original_url"]):
             key = _url_match_key(url)
             if key:
-                exact_signals[key] = exact_signals.get(key, 0) + delta
+                exact_signals[key] = exact_signals.get(key, 0.0) + delta
         domain = str(row["domain"] or "")
         if domain:
-            domain_signals[domain] = domain_signals.get(domain, 0) + delta
+            domain_signals[domain] = domain_signals.get(domain, 0.0) + delta
+
+    feedback_profile = get_feedback_profile(digest_id)
+    liked_keywords = {kw.lower() for kw in feedback_profile.get("liked_keywords", [])}
+    disliked_keywords = {kw.lower() for kw in feedback_profile.get("disliked_keywords", [])}
 
     adjusted: list[ArticleFetchResult] = []
     for result in article_results:
         url_key = _url_match_key(result.canonical_url or result.final_url or result.original_url)
         domain = result.domain or _domain(result.final_url or result.original_url) or result.payload.source_name
         source_weight = weights.get(domain, 1.0)
-        exact_delta = max(-0.25, min(0.25, exact_signals.get(url_key, 0) * 0.08)) if url_key else 0.0
-        domain_delta = max(-0.12, min(0.12, domain_signals.get(domain, 0) * 0.02)) if domain else 0.0
-        adjusted_score = max(0.0, min(1.0, (result.link_score * source_weight) + exact_delta + domain_delta))
+        exact_delta = max(-0.25, min(0.25, exact_signals.get(url_key, 0.0) * 0.08)) if url_key else 0.0
+        domain_delta = max(-0.12, min(0.12, domain_signals.get(domain, 0.0) * 0.02)) if domain else 0.0
+
+        # Keyword/tag biasing
+        kw_boost = 0.0
+        kw_suppress = 0.0
+        res_kws = {k.lower() for k in result.keywords}
+        title_words = set(re.findall(r"\w+", (result.title or "").lower()))
+
+        for kw in liked_keywords:
+            if kw in res_kws or kw in title_words:
+                kw_boost += 0.02
+        kw_boost = min(0.10, kw_boost)
+
+        for kw in disliked_keywords:
+            if kw in res_kws or kw in title_words:
+                kw_suppress += 0.04
+        kw_suppress = min(0.15, kw_suppress)
+
+        keyword_delta = kw_boost - kw_suppress
+
+        adjusted_score = max(0.0, min(1.0, (result.link_score * source_weight) + exact_delta + domain_delta + keyword_delta))
         adjusted.append(replace(result, link_score=round(adjusted_score, 3)))
     return adjusted
 
 
 def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] | None:
-    if signal not in {"up", "down"}:
-        raise ValueError("Feedback signal must be up or down")
+    valid_signals = {"up", "down", "click", "love", "like", "neutral", "dislike"}
+    if signal not in valid_signals:
+        raise ValueError(f"Feedback signal must be one of {valid_signals}")
 
     url_key = _url_match_key(url)
     if not url_key:
@@ -6077,6 +6450,37 @@ def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] |
             "SELECT id, run_id, digest_id FROM digest_issues WHERE id = ?",
             (issue_id,),
         ).fetchone()
+
+        article_row = connection.execute(
+            "SELECT id, keywords, content_type, domain FROM articles WHERE canonical_url = ? OR original_url = ?",
+            (url, url)
+        ).fetchone()
+
+        tags_json = None
+        source_type = None
+        domain = _domain(url)
+        if article_row:
+            source_type = article_row["content_type"]
+            if article_row["domain"]:
+                domain = article_row["domain"]
+            kw = article_row["keywords"]
+            if kw:
+                if kw.startswith("["):
+                    tags_json = kw
+                else:
+                    tags_json = json.dumps([k.strip().lower() for k in kw.split(",") if k.strip()], ensure_ascii=False)
+
+        adapter = None
+        if source_type:
+            adapter = {
+                "gmail": "gmail",
+                "podcast": "podcasts",
+                "video": "youtube",
+                "foreign_web": "foreign_media",
+                "market": "markets",
+                "collection": "collections",
+            }.get(source_type, "web_search")
+
         if issue is None:
             exploration = connection.execute(
                 "SELECT exploration_id, topic_id FROM explorations WHERE exploration_id = ?",
@@ -6085,37 +6489,40 @@ def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] |
             if exploration is None:
                 return None
             feedback_id = new_id()
-            source_name = _domain(url)
             connection.execute(
                 """
-                INSERT INTO exploration_feedback (id, exploration_id, topic_id, url, source_name, signal, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO exploration_feedback
+                (id, exploration_id, topic_id, url, source_name, signal, created_at, source_type, adapter, tags_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     feedback_id,
                     exploration["exploration_id"],
                     exploration["topic_id"],
                     url,
-                    source_name,
+                    domain,
                     signal,
                     now,
+                    source_type,
+                    adapter,
+                    tags_json,
                 ),
             )
-            if source_name:
-                _update_source_weight(connection, str(exploration["topic_id"]), source_name, signal, now)
+            if domain:
+                _update_source_weight(connection, str(exploration["topic_id"]), domain, signal, now)
             return {
                 "id": feedback_id,
                 "issue_id": issue_id,
                 "signal": signal,
                 "url": url,
-                "source_name": source_name,
+                "source_name": domain,
                 "created_at": now,
             }
 
         rows = connection.execute(
             """
             SELECT di.id AS digest_item_id, di.digest_id, a.id AS article_id,
-                   a.canonical_url, a.original_url, a.domain, a.publisher
+                   a.canonical_url, a.original_url, a.domain, a.publisher, a.keywords, a.content_type
             FROM digest_items di
             JOIN articles a ON a.id = di.article_id
             WHERE di.run_id = ? AND COALESCE(di.tier, '') != 'source'
@@ -6133,11 +6540,29 @@ def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] |
         if matched is None:
             return None
 
+        if matched["content_type"]:
+            source_type = matched["content_type"]
+            adapter = {
+                "gmail": "gmail",
+                "podcast": "podcasts",
+                "video": "youtube",
+                "foreign_web": "foreign_media",
+                "market": "markets",
+                "collection": "collections",
+            }.get(source_type, "web_search")
+        if matched["keywords"]:
+            kw = matched["keywords"]
+            if kw.startswith("["):
+                tags_json = kw
+            else:
+                tags_json = json.dumps([k.strip().lower() for k in kw.split(",") if k.strip()], ensure_ascii=False)
+
         feedback_id = new_id()
         connection.execute(
             """
-            INSERT INTO feedback (id, digest_item_id, article_id, digest_id, signal, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO feedback
+            (id, digest_item_id, article_id, digest_id, signal, created_at, url, source_type, source_name, adapter, tags_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 feedback_id,
@@ -6146,6 +6571,11 @@ def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] |
                 issue["digest_id"],
                 signal,
                 now,
+                url,
+                source_type,
+                matched["domain"] or matched["publisher"] or domain,
+                adapter,
+                tags_json,
             ),
         )
         source_name = str(matched["domain"] or matched["publisher"] or "")
@@ -6157,7 +6587,7 @@ def record_feedback(*, issue_id: str, url: str, signal: str) -> dict[str, Any] |
         "issue_id": issue_id,
         "signal": signal,
         "url": url,
-        "source_name": source_name,
+        "source_name": source_name or domain,
         "created_at": now,
     }
 
@@ -6358,7 +6788,16 @@ def _update_source_weight(
         (digest_id, source_name),
     ).fetchone()
     current = float(row["weight"]) if row else 1.0
-    delta = 0.04 if signal == "up" else -0.06
+    if signal == "love":
+        delta = 0.06
+    elif signal in ("like", "up"):
+        delta = 0.04
+    elif signal == "click":
+        delta = 0.01
+    elif signal in ("dislike", "down"):
+        delta = -0.06
+    else:
+        delta = 0.0
     updated = max(0.55, min(1.45, round(current + delta, 3)))
     connection.execute(
         """

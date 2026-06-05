@@ -7,7 +7,7 @@ import re
 import shlex
 import subprocess
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -49,6 +49,7 @@ class PodcastEpisode:
     duration_seconds: int | None = None
     apple_podcasts_url: str | None = None
     image_url: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 async def fetch_podcast_episodes(
@@ -354,6 +355,7 @@ async def _fetch_podcast_episodes(
                 "duration_seconds": episode.duration_seconds,
                 "episode_quality_score": score,
                 "transcript_source": transcript_source,
+                **(episode.metadata or {}),
             },
         )
         if pii_filter(payload):
@@ -1146,47 +1148,197 @@ async def _episode_first_search_and_resolve(
     diagnostics: dict[str, int],
     max_episodes: int = MAX_PODCAST_EPISODES,
 ) -> list[PodcastEpisode]:
-    from backend.agents.discovery.web_search import lookback_to_days, search_web
+    from backend.agents.discovery.web_search import lookback_to_days, search_web, SearchHit
     from backend.agents.discovery.types import TopicProfile
+    from backend.app.db.database import (
+        get_cached_podcast_discovery,
+        set_cached_podcast_discovery,
+        get_cached_podcast_resolution,
+        set_cached_podcast_resolution,
+    )
     days = lookback_to_days(lookback_hours)
 
-    queries = []
-    for source in search_sources:
-        q = str(source.get("query") or source.get("title") or "").strip()
-        if q:
-            queries.append(q)
-    if not queries:
-        queries = [digest_interest]
+    direct_queries = []
+    related_queries = []
+    negative_constraints = []
+    priority_terms = []
+    if profile:
+        direct_queries = list(profile.direct_episode_queries)
+        related_queries = list(profile.related_episode_queries)
+        negative_constraints = list(profile.negative_constraints)
+        priority_terms = list(profile.priority_terms)
+
+    if not direct_queries:
+        for source in search_sources:
+            q = str(source.get("query") or source.get("title") or "").strip()
+            if q:
+                direct_queries.append(q)
+        if not direct_queries:
+            direct_queries = [digest_interest]
 
     # Dynamically scale limits based on requested episodes (Issue 3)
-    queries_limit = max(2, max_episodes // 3)
+    queries_limit = max(6, min(12, max_episodes * 2))
     search_hits_limit = max(8, max_episodes * 2)
     resolution_attempts_limit = max(6, max_episodes + 2)
 
+    web_queries_provenance = {}
     web_queries = []
-    for q in queries[:queries_limit]:
-        web_queries.append(f"{q} podcast episode")
-        web_queries.append(f"{q} interview conversation podcast")
 
-    search_tasks = [search_web(wq, limit=search_hits_limit, days=days) for wq in web_queries]
-    search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+    # 1. Direct Queries
+    for dq in direct_queries:
+        wq1 = f'"{dq}" podcast episode'
+        web_queries.append(wq1)
+        web_queries_provenance[wq1.strip().lower()] = {
+            "discovery_query": dq,
+            "discovery_query_type": "direct"
+        }
 
+        wq2 = f'"{dq}" interview conversation podcast'
+        web_queries.append(wq2)
+        web_queries_provenance[wq2.strip().lower()] = {
+            "discovery_query": dq,
+            "discovery_query_type": "direct"
+        }
+
+        for pt in priority_terms[:2]:
+            wq3 = f'"{dq}" "{pt}" podcast'
+            web_queries.append(wq3)
+            web_queries_provenance[wq3.strip().lower()] = {
+                "discovery_query": dq,
+                "discovery_query_type": "direct",
+                "priority_term": pt
+            }
+
+    # 2. Related Queries
+    for rq in related_queries:
+        wq1 = f'"{rq}" podcast episode'
+        web_queries.append(wq1)
+        web_queries_provenance[wq1.strip().lower()] = {
+            "discovery_query": rq,
+            "discovery_query_type": "related"
+        }
+
+        wq2 = f'"{rq}" interview conversation podcast'
+        web_queries.append(wq2)
+        web_queries_provenance[wq2.strip().lower()] = {
+            "discovery_query": rq,
+            "discovery_query_type": "related"
+        }
+
+    # Deduplicate keeping order
+    unique_web_queries = []
+    seen_wq = set()
+    for wq in web_queries:
+        wq_norm = wq.strip().lower()
+        if wq_norm not in seen_wq:
+            seen_wq.add(wq_norm)
+            unique_web_queries.append(wq)
+
+    final_web_queries = unique_web_queries[:queries_limit]
+
+    # Caching / Execution for Web Searches
+    lookback_bucket = str(lookback_hours)
+    hits_by_query = {}
+    queries_to_fetch = []
+
+    for wq in final_web_queries:
+        wq_norm = wq.strip().lower()
+        cached = get_cached_podcast_discovery(wq_norm, "web_search", lookback_bucket)
+        if cached is not None:
+            hits_by_query[wq] = [
+                SearchHit(
+                    title=d.get("title", ""),
+                    url=d.get("url", ""),
+                    snippet=d.get("snippet", ""),
+                    score=d.get("score", 0.5),
+                    provider=d.get("provider", "web_search_cache"),
+                    published_at=d.get("published_at"),
+                )
+                for d in cached
+            ]
+        else:
+            queries_to_fetch.append(wq)
+
+    if queries_to_fetch:
+        search_tasks = [search_web(wq, limit=search_hits_limit, days=days) for wq in queries_to_fetch]
+        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+        for wq, res in zip(queries_to_fetch, search_results):
+            if isinstance(res, list):
+                hits_by_query[wq] = res
+                results_dict = [
+                    {
+                        "title": hit.title,
+                        "url": hit.url,
+                        "snippet": hit.snippet,
+                        "score": hit.score,
+                        "provider": hit.provider,
+                        "published_at": hit.published_at,
+                    }
+                    for hit in res
+                ]
+                set_cached_podcast_discovery(wq.strip().lower(), "web_search", lookback_bucket, results_dict, 7 * 24 * 3600)
+            else:
+                logger.info("Search failed for query '%s': %s", wq, res)
+                hits_by_query[wq] = []
+                set_cached_podcast_discovery(wq.strip().lower(), "web_search", lookback_bucket, [], 3600)
+
+    # Merge hits and assign provenance
     hits = []
     seen_urls = set()
-    for res in search_results:
-        if isinstance(res, list):
-            for hit in res:
-                url_normalized = _normalize_url_for_match(hit.url)
-                if url_normalized not in seen_urls:
-                    seen_urls.add(url_normalized)
-                    hits.append(hit)
+    provenance_by_url = {}
+
+    for wq in final_web_queries:
+        wq_hits = hits_by_query.get(wq, [])
+        wq_norm = wq.strip().lower()
+        prov = web_queries_provenance.get(wq_norm, {"discovery_query": wq, "discovery_query_type": "direct"})
+
+        for hit in wq_hits:
+            url_norm = _normalize_url_for_match(hit.url)
+            if url_norm not in seen_urls:
+                seen_urls.add(url_norm)
+                hits.append(hit)
+                provenance_by_url[url_norm] = prov
 
     diagnostics["episode_pages_found"] += len(hits)
     if not hits:
         return []
 
+    # Negative constraints filtering
+    non_blocked_hits = []
+    for hit in hits:
+        matched_constraint = None
+        title_lower = hit.title.lower() if hit.title else ""
+        snippet_lower = hit.snippet.lower() if hit.snippet else ""
+
+        for nc in negative_constraints:
+            nc_lower = nc.strip().lower()
+            if not nc_lower:
+                continue
+            if nc_lower in title_lower or nc_lower in snippet_lower:
+                matched_constraint = nc
+                break
+
+        if matched_constraint:
+            decisions.append(
+                _decision(
+                    target=hit.title,
+                    decision="drop",
+                    action="exclude_negative_constraint",
+                    confidence=1.0,
+                    reason=f"Filtered out because title or snippet matched negative constraint: '{matched_constraint}'",
+                    metadata={"rejected_constraints": [matched_constraint]},
+                )
+            )
+            logger.info("Filtered candidate '%s' due to negative constraint: '%s'", hit.title, matched_constraint)
+        else:
+            non_blocked_hits.append(hit)
+
+    if not non_blocked_hits:
+        return []
+
     kept = await _screen_episodes_with_agent(
-        hits=hits,
+        hits=non_blocked_hits,
         digest_interest=digest_interest,
         profile=profile,
         decisions=decisions,
@@ -1196,9 +1348,24 @@ async def _episode_first_search_and_resolve(
     resolved_episodes = []
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as http_client:
         for hit in kept[:resolution_attempts_limit]:
-            feed_url = await _resolve_feed_url(http_client, hit.url, hit.title, decisions)
+            url_norm = _normalize_url_for_match(hit.url)
+            cached_res = get_cached_podcast_resolution(url_norm)
+
+            if cached_res is not None:
+                feed_url = cached_res.get("feed_url")
+                resolution_method = "cache"
+            else:
+                feed_url = await _resolve_feed_url(http_client, hit.url, hit.title, decisions)
+                resolution_method = "network"
+
             if not feed_url:
+                # Cache failure for 1 hour (3600 seconds)
+                set_cached_podcast_resolution(url_norm, None, None, None, 3600)
                 continue
+
+            # Cache success for 7 days (604800 seconds)
+            if cached_res is None:
+                set_cached_podcast_resolution(url_norm, feed_url, None, None, 7 * 24 * 3600)
 
             diagnostics["feed_resolved"] += 1
 
@@ -1234,10 +1401,28 @@ async def _episode_first_search_and_resolve(
                 diagnostics["date_rejects"] += 1
                 continue
 
-            apple_url = await _lookup_apple_podcast_url(http_client, matched_ep, {"title": matched_ep.show_name})
+            # Check if apple_url is cached
+            apple_url = cached_res.get("apple_url") if cached_res else None
+            if not apple_url:
+                apple_url = await _lookup_apple_podcast_url(http_client, matched_ep, {"title": matched_ep.show_name})
+                if apple_url:
+                    # Update resolution cache with the apple_url
+                    set_cached_podcast_resolution(url_norm, feed_url, None, apple_url, 7 * 24 * 3600)
+
             if apple_url:
                 matched_ep = replace(matched_ep, apple_podcasts_url=apple_url)
 
+            # Inject provenance/query metadata
+            prov = provenance_by_url.get(url_norm, {})
+            meta = {
+                "discovery_query": prov.get("discovery_query"),
+                "discovery_query_type": prov.get("discovery_query_type"),
+                "resolution_method": resolution_method,
+            }
+            if prov.get("priority_term"):
+                meta["priority_term"] = prov["priority_term"]
+
+            matched_ep = replace(matched_ep, metadata=meta)
             resolved_episodes.append(matched_ep)
 
     return resolved_episodes
@@ -1559,4 +1744,3 @@ def _match_episode_in_feed(episodes: list[PodcastEpisode], hit: Any) -> PodcastE
                 return ep
 
     return None
-

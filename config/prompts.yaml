@@ -43,7 +43,11 @@ refinement_chat: |
       "source_selection": {"web_search": true},
       "foreign_language_plan": [
         {"code": "ko", "name": "Korean", "native_query": "idiomatic query", "native_entity_terms": ["native entity"], "reason": "why this language helps"}
-      ]
+      ],
+      "direct_episode_queries": ["exact topic episode search"],
+      "related_episode_queries": ["adjacent topics/interview targets"],
+      "negative_constraints": ["avoid these shows, hosts, or guests"],
+      "priority_terms": ["must-include terms"]
     },
     "ready_to_build": false
   }
@@ -53,7 +57,7 @@ refinement_chat: |
   When Gmail is in the selected sources AND no Gmail rules have been set yet (check already_inferred for gmail_rules), your single most important question for that turn is: ask the user what kind of newsletters or email content they want pulled from Gmail. Ask in plain language — e.g. "What kind of newsletters should I look for in Gmail? For example: AI research digests from the last two weeks." Do NOT ask any other question in the same turn. Once they answer, the system will automatically search Gmail, find matching senders, and show the user a list to approve. You do not need to produce gmail_source_queries — the system handles that.
 
   == SEARCH PLAN QUALITY ==
-  Every turn, keep the plan concrete and runnable. Write diverse, high-quality queries tailored to each selected source: native-language terms for foreign media, exchange ticker symbols only for markets, show/episode phrasing for podcasts, channel/video phrasing for youtube, precise web operators for web_search. Only add source_queries for sources the user has selected unless they explicitly name a new source type.
+  Every turn, keep the plan concrete and runnable. Write diverse, high-quality queries tailored to each selected source: native-language terms for foreign media, exchange ticker symbols only for markets, show/episode phrasing for podcasts, channel/video phrasing for youtube, precise web operators for web_search. Only add source_queries for sources the user has selected unless they explicitly name a new source type. When podcasts are selected, make semantic expansion explicit by populating: direct_episode_queries (direct topical queries), related_episode_queries (related topics, adjacent expert/interview terms), negative_constraints (shows, hosts, guests, or terms to reject), and priority_terms (highly relevant entities to boost).
 
   Set "ready_to_build": true as soon as the plan is strong enough to run; otherwise keep it false and your prose should carry the single most useful question. If asked to just build, set ready_to_build true and confirm briefly.
 
@@ -109,7 +113,11 @@ refinement_agent: |
           "native_entity_terms": ["native entity"],
           "reason": "why this language helps"
         }
-      ]
+      ],
+      "direct_episode_queries": ["exact topic episode search"],
+      "related_episode_queries": ["adjacent topics/interview targets"],
+      "negative_constraints": ["avoid these shows, hosts, or guests"],
+      "priority_terms": ["must-include terms"]
     },
     "ready_to_build": false,
     "next_question": "one concise, plain-language question, or null if ready",
@@ -155,7 +163,11 @@ strategy_refinement_chat: |
       "requested_sources": [{"adapter": "podcasts|youtube|web_search|foreign_media|gmail|collections|markets", "ref": "source name"}],
       "recency_weighting": "breaking|recent|last_year|all_available",
       "lookback_hours": 336,
-      "exclusions": ["thing to avoid"]
+      "exclusions": ["thing to avoid"],
+      "direct_episode_queries": ["exact topic episode search"],
+      "related_episode_queries": ["adjacent topics/interview targets"],
+      "negative_constraints": ["avoid these shows, hosts, or guests"],
+      "priority_terms": ["must-include terms"]
     },
     "reasoning_summary": "one sentence describing the proposed change",
     "assistant_response": "your prose reply (duplicate of what you already wrote above)"
@@ -163,7 +175,7 @@ strategy_refinement_chat: |
   ```
 
   == CONSTRAINTS ==
-  - Use source-shaped phrasing: ticker symbols for markets, native-language for foreign media, show/episode phrasing for podcasts.
+  - Use source-shaped phrasing: ticker symbols for markets, native-language for foreign media, show/episode phrasing for podcasts. For podcasts, populate direct_episode_queries, related_episode_queries, negative_constraints, and priority_terms to drive semantic expansion.
   - Honor the existing recency window. Never introduce stale year references.
   - Only change sources the user explicitly selected unless they ask for new ones.
   - Do not remove useful queries unless the instruction asks to narrow or exclude them.
@@ -237,7 +249,11 @@ strategy_refinement: |
       "requested_sources": [{"adapter": "podcasts|youtube|web_search|foreign_media|gmail|collections|markets", "ref": "specific source name"}],
       "recency_weighting": "breaking|recent|last_year|all_available",
       "lookback_hours": 336,
-      "exclusions": ["thing to avoid"]
+      "exclusions": ["thing to avoid"],
+      "direct_episode_queries": ["exact topic episode search"],
+      "related_episode_queries": ["adjacent topics/interview targets"],
+      "negative_constraints": ["avoid these shows, hosts, or guests"],
+      "priority_terms": ["must-include terms"]
     },
     "reasoning_summary": "one concise sentence describing the proposed change",
     "assistant_response": "plain-language response explaining what you propose and why"

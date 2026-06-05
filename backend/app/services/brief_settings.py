@@ -66,10 +66,10 @@ DEFAULT_YOUTUBE_PRESETS: dict[str, int] = {
 }
 
 DEFAULT_PODCAST_PRESETS: dict[str, int] = {
-    "max": 20,
-    "large": 16,
-    "medium": 12,
-    "focused": 8,
+    "max": 5,
+    "large": 4,
+    "medium": 3,
+    "focused": 2,
 }
 
 DEFAULT_GMAIL_PRESETS: dict[str, int] = {
@@ -156,10 +156,10 @@ def normalize_youtube_presets(value: Any) -> dict[str, int]:
 def normalize_podcast_presets(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
     return {
-        "max": _bounded_int(raw.get("max"), 1, 20) or 20,
-        "large": _bounded_int(raw.get("large"), 1, 20) or 16,
-        "medium": _bounded_int(raw.get("medium"), 1, 20) or 12,
-        "focused": _bounded_int(raw.get("focused"), 1, 20) or 8,
+        "max": _bounded_int(raw.get("max"), 1, 5) or 5,
+        "large": _bounded_int(raw.get("large"), 1, 5) or 4,
+        "medium": _bounded_int(raw.get("medium"), 1, 5) or 3,
+        "focused": _bounded_int(raw.get("focused"), 1, 5) or 2,
     }
 
 

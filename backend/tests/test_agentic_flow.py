@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 from backend.agents.critic import apply_critic_repairs
 from backend.agents.digestor.base import NormalizedPayload
@@ -303,6 +304,8 @@ def test_source_audit_uses_model_date_to_enforce_window_for_undated_items():
     model infers and enforces the recency window on it."""
     stale = result("Undated stale roadmap")  # no published_at on payload/metadata
     fresh = result("Undated fresh briefing")
+    stale_date = (datetime.now(UTC) - timedelta(days=60)).date().isoformat()
+    fresh_date = (datetime.now(UTC) - timedelta(days=1)).date().isoformat()
     model = FakeModelClient(
         {
             "decisions": [
@@ -311,7 +314,7 @@ def test_source_audit_uses_model_date_to_enforce_window_for_undated_items():
                     "decision": "include",
                     "confidence": 0.8,
                     "constraint_failures": [],
-                    "resolved_published_date": "2026-03-12",
+                    "resolved_published_date": stale_date,
                     "reason": "Looks relevant.",
                 },
                 {
@@ -319,7 +322,7 @@ def test_source_audit_uses_model_date_to_enforce_window_for_undated_items():
                     "decision": "include",
                     "confidence": 0.8,
                     "constraint_failures": [],
-                    "resolved_published_date": "2026-05-28",
+                    "resolved_published_date": fresh_date,
                     "reason": "Fresh and relevant.",
                 },
             ],
@@ -327,8 +330,8 @@ def test_source_audit_uses_model_date_to_enforce_window_for_undated_items():
         }
     )
 
-    # lookback covers anything on/after ~2026-05-22 (run relative to 'now'); the
-    # 2026-03-12 item must drop, the recent one must stay with its date applied.
+    # The stale inferred date must drop, while the recent inferred date stays with
+    # its date applied.
     updated, decisions, summary = asyncio.run(
         apply_source_audit(
             {"statement": "Track AI memory supply over the last 7 days", "interest": "memory"},
@@ -342,7 +345,7 @@ def test_source_audit_uses_model_date_to_enforce_window_for_undated_items():
     assert updated[0].tier == "dropped"
     assert "recency" in updated[0].metadata["source_audit"]["constraint_failures"]
     assert updated[1].tier != "dropped"
-    assert updated[1].payload.published_at == "2026-05-28"
+    assert updated[1].payload.published_at == fresh_date
     assert updated[1].metadata.get("date_source") == "model"
 
 

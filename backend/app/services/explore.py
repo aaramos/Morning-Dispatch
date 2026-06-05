@@ -1342,6 +1342,43 @@ def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchR
                 updated.append(r)
         else:
             updated.append(r)
+
+    # Podcast Quota Revival
+    podcasts_active = False
+    if profile.source_selection:
+        podcasts_active = profile.source_selection.get("podcasts") is True
+
+    if podcasts_active:
+        podcast_quota = 5
+        if isinstance(profile.content_limits, dict):
+            min_items = profile.content_limits.get("min_items", {})
+            if isinstance(min_items, dict):
+                podcast_quota = min_items.get("podcasts", 5)
+
+        active_podcast_count = sum(
+            1 for r in updated
+            if r.tier != "dropped" and _adapter_from_payload_type(r.payload.source_type, r.payload.metadata) == "podcasts"
+        )
+
+        # Get limit for podcasts to cap revival
+        max_allowed = 20
+        limit = per_source.get("podcasts", max_allowed) if isinstance(per_source, dict) else max_allowed
+        limit = min(limit, max_allowed)
+        target_quota = min(podcast_quota, limit)
+
+        if active_podcast_count < target_quota:
+            needed = target_quota - active_podcast_count
+            revival_candidates = []
+            for i, r in enumerate(updated):
+                adapter = _adapter_from_payload_type(r.payload.source_type, r.payload.metadata)
+                if adapter == "podcasts" and r.tier == "dropped":
+                    if r.link_score >= 0.22 and r.status != "error":
+                        revival_candidates.append((r.link_score, i))
+
+            revival_candidates.sort(key=lambda x: x[0], reverse=True)
+            for _, idx in revival_candidates[:needed]:
+                updated[idx] = replace(updated[idx], tier="main")
+
     return updated
 
 
