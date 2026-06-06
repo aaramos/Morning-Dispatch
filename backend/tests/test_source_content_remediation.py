@@ -1,0 +1,393 @@
+"""Regression tests for the source-content remediation work.
+
+Covers: locale-aware date parsing, recency demote-not-delete + per-source floor
+revival (P0), source-aware fetch budget (P1), origin-based brief labels + empty
+per-source real estate (P2), per-source broaden-on-empty (P3), reporting honesty
+for revived items (P4), podcast transcript-feed + transcription budget (P5), and
+the foreign-media English-gate exemption.
+"""
+from __future__ import annotations
+
+import asyncio
+
+from backend.agents.digestor import podcast
+from backend.agents.digestor.base import NormalizedPayload
+from backend.agents.discovery import runner
+from backend.agents.discovery.types import (
+    AdapterStatus,
+    Candidate,
+    DiscoveryResult,
+    TopicProfile,
+)
+from backend.agents.librarian.articles import ArticleFetchResult
+from backend.app.db import database
+from backend.app.services import explore, reporting
+
+
+def _profile(**overrides) -> TopicProfile:
+    payload = {
+        "topic_id": "t1",
+        "statement": "AI infrastructure pick and shovel companies",
+        "scope": "AI infrastructure",
+        "source_selection": {"web_search": True, "foreign_media": True, "gmail": True},
+        "content_limits": {"per_source": {"web_search": 25, "foreign_media": 25, "gmail": 25}},
+    }
+    payload.update(overrides)
+    return TopicProfile.from_dict(payload)
+
+
+def _result(
+    *,
+    source_type: str,
+    url: str,
+    title: str = "Story",
+    tier: str = "main",
+    link_score: float = 0.6,
+    status: str = "fetched",
+    metadata: dict | None = None,
+    payload_metadata: dict | None = None,
+) -> ArticleFetchResult:
+    payload = NormalizedPayload(
+        source_type=source_type,
+        source_name=title,
+        original_url=url,
+        metadata=payload_metadata or {},
+    )
+    return ArticleFetchResult(
+        payload=payload,
+        original_url=url,
+        final_url=url,
+        canonical_url=url,
+        title=title,
+        text="body text about AI infrastructure",
+        excerpt="excerpt",
+        domain="example.com",
+        status=status,
+        tier=tier,
+        link_score=link_score,
+        metadata=metadata or {},
+    )
+
+
+# ---------------------------------------------------------------------------
+# DATE: locale-aware parsing
+# ---------------------------------------------------------------------------
+
+
+def test_locale_dates_parse() -> None:
+    assert explore._date_from_text("2026年4月25日 発表").date().isoformat() == "2026-04-25"
+    assert explore._date_from_text("2026년 4월 25일 보도").date().isoformat() == "2026-04-25"
+    assert explore._date_from_text("등록 2026.04.25 09:30").date().isoformat() == "2026-04-25"
+    assert explore._date_from_text("Published April 25, 2026").date().isoformat() == "2026-04-25"
+    assert explore._date_from_text("no date here at all") is None
+
+
+# ---------------------------------------------------------------------------
+# P0: recency demote-not-delete + floor revival
+# ---------------------------------------------------------------------------
+
+
+def test_recency_filter_demotes_into_reserve() -> None:
+    profile = _profile()
+    stale = _result(
+        source_type="gmail_link",
+        url="https://ex.com/old/2020/01/01/x",
+        title="Old web story",
+        payload_metadata={"search_query": "ai"},
+    )
+    kept, issues, reserve = explore._apply_source_window_filter(
+        profile, [stale], lookback_hours=24
+    )
+    assert kept == []
+    assert len(issues) == 1
+    assert len(reserve) == 1
+    assert reserve[0].metadata.get("out_of_window") is True
+
+
+def test_floor_revives_reserve_only_when_source_empty() -> None:
+    profile = _profile()
+    reserve_item = _result(
+        source_type="foreign_web",
+        url="https://example.kr/n/1",
+        title="HBM 수요",
+        tier="dropped",
+        metadata={"out_of_window": True, "out_of_window_published_at": "2026-01-01T00:00:00+00:00"},
+    )
+    web_in = _result(source_type="gmail_link", url="https://ex.com/a", payload_metadata={"search_query": "ai"})
+
+    revived = explore._enforce_inclusion_limits(profile, [web_in], recency_reserve=[reserve_item])
+    foreign_active = [r for r in revived if explore._result_adapter(r) == "foreign_media" and r.tier != "dropped"]
+    assert len(foreign_active) == 1
+    assert foreign_active[0].metadata.get("served_once") is True
+
+    foreign_fresh = _result(source_type="foreign_web", url="https://example.kr/n/2", title="Fresh")
+    no_pad = explore._enforce_inclusion_limits(profile, [foreign_fresh], recency_reserve=[reserve_item])
+    foreign_active2 = [r for r in no_pad if explore._result_adapter(r) == "foreign_media" and r.tier != "dropped"]
+    assert len(foreign_active2) == 1  # reserve NOT added when in-window content exists
+
+    high_floor = _profile(content_limits={"min_items": {"foreign_media": 2}})
+    no_stale_padding = explore._enforce_inclusion_limits(
+        high_floor, [foreign_fresh], recency_reserve=[reserve_item]
+    )
+    foreign_active3 = [
+        r for r in no_stale_padding if explore._result_adapter(r) == "foreign_media" and r.tier != "dropped"
+    ]
+    assert len(foreign_active3) == 1  # stale reserve is not padding for a non-empty source
+
+
+# ---------------------------------------------------------------------------
+# P1: source-aware fetch budget
+# ---------------------------------------------------------------------------
+
+
+def _cand(adapter: str, source_type: str, i: int, meta: dict | None = None) -> Candidate:
+    return Candidate(
+        adapter=adapter,
+        score=0.5,
+        payload=NormalizedPayload(
+            source_type=source_type,
+            source_name=f"{adapter}{i}",
+            original_url=f"https://{adapter}.com/{i}",
+            metadata=meta or {},
+        ),
+    )
+
+
+def test_fetch_budget_reserves_web_foreign_under_newsletter_flood() -> None:
+    profile = _profile()
+    cands = []
+    cands += [_cand("gmail", "gmail", i) for i in range(40)]  # direct bodies
+    cands += [_cand("gmail", "gmail_link", i) for i in range(200)]  # newsletter links (HTTP)
+    cands += [_cand("web_search", "gmail_link", i, {"search_query": "q"}) for i in range(50)]
+    cands += [_cand("foreign_media", "foreign_web", i, {"source_language": "ko"}) for i in range(30)]
+
+    payloads, budgets = explore._select_fetch_payloads_for_budget(cands, profile=profile, max_articles=20)
+    assert budgets.get("web_search", 0) >= 5
+    assert budgets.get("foreign_media", 0) >= 5
+    # Direct gmail bodies bypass the HTTP budget (capped only by inclusion limit).
+    assert sum(1 for p in payloads if p.source_type == "gmail") == 25
+
+
+def test_fetch_budget_generous_gives_full_per_source() -> None:
+    profile = _profile()
+    cands = [_cand("web_search", "gmail_link", i, {"search_query": "q"}) for i in range(50)]
+    cands += [_cand("foreign_media", "foreign_web", i, {"source_language": "ko"}) for i in range(30)]
+    _payloads, budgets = explore._select_fetch_payloads_for_budget(cands, profile=profile, max_articles=250)
+    assert budgets["web_search"] == 25
+    assert budgets["foreign_media"] == 25
+
+
+# ---------------------------------------------------------------------------
+# P2: origin labels + empty per-source real estate
+# ---------------------------------------------------------------------------
+
+
+def test_origin_labels_separate_web_foreign_gmail() -> None:
+    web = _result(source_type="gmail_link", url="https://ex.com/w", payload_metadata={"search_query": "ai"})
+    newsletter = _result(source_type="gmail_link", url="https://ex.com/n", title="Newsletter link")
+    foreign = _result(source_type="foreign_web", url="https://ex.kr/f")
+    translated = _result(
+        source_type="gmail_link",
+        url="https://ex.com/t",
+        metadata={"translation": {"translated": True, "source_language": "th"}},
+    )
+    assert database._origin_source_label(web) == "Web"
+    assert database._origin_source_label(newsletter) == "Gmail"
+    assert database._origin_source_label(foreign) == "Foreign Media"
+    assert database._origin_source_label(translated) == "Web"
+
+
+def test_empty_source_note_only_with_selection() -> None:
+    web = _result(source_type="gmail_link", url="https://ex.com/w", payload_metadata={"search_query": "ai"})
+    selection = {"web_search": True, "foreign_media": True, "reddit": True}
+    html_with = database.render_ingested_issue(
+        "Brief", "snap", [], [web], lookback_hours=24, source_selection=selection
+    )
+    assert "source-section-empty" in html_with
+    assert "Foreign Media" in html_with  # the empty selected source gets a labeled block
+    # Without an explicit selection, no empty blocks are emitted (legacy behavior).
+    html_without = database.render_ingested_issue("Brief", "snap", [], [web], lookback_hours=24)
+    assert "source-section-empty" not in html_without
+
+
+# ---------------------------------------------------------------------------
+# P3: per-source broaden on empty
+# ---------------------------------------------------------------------------
+
+
+def _discovery(profile: TopicProfile, statuses: list[AdapterStatus], candidates=()) -> DiscoveryResult:
+    return DiscoveryResult(profile=profile, candidates=tuple(candidates), statuses=tuple(statuses))
+
+
+def test_missing_candidate_sources_detected() -> None:
+    profile = _profile()
+    discovery = _discovery(
+        profile,
+        [
+            AdapterStatus(name="foreign_media", status="completed", candidate_count=0),
+            AdapterStatus(name="web_search", status="completed", candidate_count=5),
+            AdapterStatus(name="podcasts", status="timed_out", candidate_count=0),
+        ],
+    )
+    missing = explore._selected_sources_missing_candidates(
+        discovery=discovery, source_selection=profile.source_selection
+    )
+    assert missing == ["foreign_media"]  # completed-with-nothing only; timeouts excluded
+
+
+def test_broaden_seeds_starved_lanes(monkeypatch) -> None:
+    class FakeClient:
+        async def complete_json(self, *, system, prompt, max_tokens):
+            return {"search_queries": ["AI infrastructure", "data center buildout"]}
+
+    class Res:
+        client = FakeClient()
+
+    monkeypatch.setattr(explore.model_routing, "client_for_agent", lambda *a, **k: Res())
+    profile = _profile(source_queries={"web_search": ["AI capex"]})
+    out = asyncio.run(
+        explore.broaden_queries_with_agent(profile, starved_sources=["foreign_media", "web_search"])
+    )
+    assert "AI infrastructure" in out.source_queries["foreign_media"]
+    assert "AI infrastructure" in out.source_queries["web_search"]
+    assert "AI capex" in out.source_queries["web_search"]  # existing preserved
+
+
+# ---------------------------------------------------------------------------
+# P4: reporting honesty for revived items
+# ---------------------------------------------------------------------------
+
+
+def test_revived_reserve_item_reports_included_not_recency() -> None:
+    profile = _profile()
+    url = "https://example.kr/n/1"
+    cand = Candidate(
+        adapter="foreign_media",
+        score=0.5,
+        payload=NormalizedPayload(source_type="foreign_web", source_name="Korea", original_url=url),
+    )
+    discovery = _discovery(profile, [AdapterStatus(name="foreign_media", status="completed", candidate_count=1)], [cand])
+    final = _result(source_type="foreign_web", url=url, title="Korea")
+    final = explore.replace(final, payload=cand.payload)  # share the candidate id
+    rows = reporting.compile_reporting_data(
+        exploration_id="e1",
+        discovery=discovery,
+        fetched_articles=[final],
+        source_window_issues=[{"item_url": url, "reason": "outside window", "source_name": "Korea"}],
+        enriched_articles=[final],
+        ranked_articles=[final],
+        after_audit=[final],
+        after_editorial=[final],
+        after_critic=[final],
+        final_results=[final],
+        progress={},
+    )
+    row = next(r for r in rows if r["id"] == cand.payload.id)
+    assert row["stages"]["recency"] is None  # included wins over recency
+    assert row["stages"]["fetch"] is None
+
+
+# ---------------------------------------------------------------------------
+# Podcast: transcript-feed preference + transcription budget
+# ---------------------------------------------------------------------------
+
+
+def test_feed_transcript_url_prefers_plain_text() -> None:
+    xml = (
+        '<?xml version="1.0"?>'
+        '<rss xmlns:podcast="https://podcastindex.org/namespace/1.0" version="2.0"><channel>'
+        "<title>Show</title><item><title>Ep</title><description>notes</description>"
+        '<enclosure url="https://cdn/ep.mp3" type="audio/mpeg" length="1"/>'
+        '<podcast:transcript url="https://x/ep.html" type="text/html"/>'
+        '<podcast:transcript url="https://x/ep.txt" type="text/plain"/>'
+        "</item></channel></rss>"
+    )
+    eps = podcast.parse_podcast_feed(xml, feed_url="https://x/feed")
+    assert eps[0].transcript_url == "https://x/ep.txt"
+
+
+def test_episode_text_uses_feed_transcript(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(podcast, "_transcript_path", lambda episode: tmp_path / f"{episode.episode_id}.txt")
+
+    async def fake_download(url: str) -> str:
+        return "This is a long publisher transcript " * 20
+
+    monkeypatch.setattr(podcast, "_download_transcript_text", fake_download)
+    episode = podcast.PodcastEpisode(
+        show_name="Show",
+        feed_url="https://x/feed",
+        episode_id="ep1",
+        title="Ep",
+        description="short notes",
+        published_at=None,
+        episode_url="https://x/ep",
+        audio_url="https://cdn/ep.mp3",
+        transcript_url="https://x/ep.txt",
+    )
+    text, source, _decisions, _metric = asyncio.run(podcast._episode_text(episode, {}, 0.9))
+    assert source == "transcript_feed"
+    assert "publisher transcript" in text
+
+
+def test_episode_text_budget_blocks_audio_transcription(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(podcast, "_transcript_path", lambda episode: tmp_path / f"{episode.episode_id}.txt")
+    monkeypatch.setattr(podcast, "_transcribe_command", lambda: "whisper {audio_path} {transcript_path}")
+
+    def explode(*args, **kwargs):  # transcription must NOT run when disallowed
+        raise AssertionError("transcription should be skipped under budget")
+
+    monkeypatch.setattr(podcast, "_run_transcription", explode)
+    episode = podcast.PodcastEpisode(
+        show_name="Show",
+        feed_url="https://x/feed",
+        episode_id="ep2",
+        title="Ep",
+        description="useful show notes about AI infrastructure and HBM memory demand",
+        published_at=None,
+        episode_url="https://x/ep",
+        audio_url="https://cdn/ep.mp3",
+    )
+    text, source, _decisions, _metric = asyncio.run(
+        podcast._episode_text(episode, {}, 0.9, allow_transcription=False)
+    )
+    assert source == "show_notes"
+    assert "show notes" in text
+
+
+# ---------------------------------------------------------------------------
+# Foreign media: English-gate exemption
+# ---------------------------------------------------------------------------
+
+
+def test_foreign_web_exempt_from_english_topic_gate() -> None:
+    profile = _profile(
+        statement="semiconductor memory HBM AI infrastructure capex",
+        scope="semiconductor memory HBM AI infrastructure capex",
+        keywords=["semiconductor", "memory", "hbm", "infrastructure", "capex"],
+    )
+    foreign = Candidate(
+        adapter="foreign_media",
+        score=0.6,
+        payload=NormalizedPayload(
+            source_type="foreign_web",
+            source_name="banana orange mango apple",
+            raw_text="banana orange mango apple",
+            original_url="https://ex.kr/f",
+            metadata={"source_language": "ko"},
+        ),
+    )
+    web = Candidate(
+        adapter="web_search",
+        score=0.6,
+        payload=NormalizedPayload(
+            source_type="gmail_link",
+            source_name="banana orange mango apple",
+            raw_text="banana orange mango apple",
+            original_url="https://ex.com/w",
+            metadata={"search_query": "q"},
+        ),
+    )
+    kept, _dropped = runner._apply_topic_relevance(profile, [foreign, web])
+    kept_ids = {c.payload.id for c in kept}
+    assert foreign.payload.id in kept_ids  # foreign exempt, kept despite no overlap
+    assert web.payload.id not in kept_ids  # non-foreign with no overlap is dropped

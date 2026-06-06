@@ -34,6 +34,15 @@ MAX_DISCOVERY_LANES = 8
 REQUEST_TIMEOUT_SECONDS = 20
 MIN_EPISODE_SCORE = 0.22
 USER_AGENT = "MorningDispatch/0.1 (+https://tailnet.local)"
+# Podcast namespace that carries <podcast:transcript> elements (Podcasting 2.0).
+PODCAST_NS = "https://podcastindex.org/namespace/1.0"
+# Hard ceiling for a single audio transcription so one slow episode cannot block
+# the whole discovery lane. The loop-level budget below is the primary guard.
+MAX_SINGLE_TRANSCRIPTION_SECONDS = 120
+# Minimum headroom required before STARTING another audio transcription; below
+# this we fall back to an existing transcript / show notes so the lane returns
+# partial results instead of timing out to zero.
+MIN_TRANSCRIPTION_HEADROOM_SECONDS = 20
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,7 @@ class PodcastEpisode:
     duration_seconds: int | None = None
     apple_podcasts_url: str | None = None
     image_url: str | None = None
+    transcript_url: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -65,6 +75,7 @@ async def fetch_podcast_episodes(
     seen_requires_published: bool = False,
     include_seen: bool = False,
     profile: TopicProfile | None = None,
+    transcription_budget_seconds: float | None = None,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     decisions: list[AgentDecision] = []
     try:
@@ -81,6 +92,7 @@ async def fetch_podcast_episodes(
             include_seen=include_seen,
             decisions=decisions,
             profile=profile,
+            transcription_budget_seconds=transcription_budget_seconds,
         )
     except Exception as exc:
         logger.info("Podcast ingestion failed: %s", exc)
@@ -111,10 +123,19 @@ async def _fetch_podcast_episodes(
     include_seen: bool,
     decisions: list[AgentDecision],
     profile: TopicProfile | None = None,
+    transcription_budget_seconds: float | None = None,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     podcast_sources = _podcast_sources(sources)
     if not podcast_sources:
         return [], decisions
+    # Stop attempting audio transcription once this deadline passes so the lane
+    # returns partial results (transcript-feed / show-notes) instead of timing out
+    # to zero (P5). None preserves the legacy "always transcribe" behavior.
+    transcription_deadline = (
+        time.monotonic() + max(0.0, float(transcription_budget_seconds))
+        if transcription_budget_seconds is not None
+        else None
+    )
 
     feed_sources = [source for source in podcast_sources if _source_feed_url(source)]
     search_sources = [source for source in podcast_sources if not _source_feed_url(source)]
@@ -308,8 +329,21 @@ async def _fetch_podcast_episodes(
         transcript_source = "unknown"
         transcript_decisions: list[AgentDecision] = []
         metric: dict[str, Any] = {}
+        if transcription_deadline is None:
+            allow_transcription = True
+            transcription_timeout: float | None = None
+        else:
+            remaining = transcription_deadline - time.monotonic()
+            allow_transcription = remaining >= MIN_TRANSCRIPTION_HEADROOM_SECONDS
+            transcription_timeout = remaining if allow_transcription else None
         try:
-            transcript, transcript_source, transcript_decisions, metric = await _episode_text(episode, source, score)
+            transcript, transcript_source, transcript_decisions, metric = await _episode_text(
+                episode,
+                source,
+                score,
+                allow_transcription=allow_transcription,
+                transcription_timeout=transcription_timeout,
+            )
         except Exception as exc:
             metric = _podcast_metric_base(
                 digest_id=digest_id,
@@ -649,15 +683,51 @@ def parse_podcast_feed(xml_text: str, *, feed_url: str, fallback_show_name: str 
                 audio_url=audio_url,
                 duration_seconds=_duration_seconds(_child_text(item, "duration")),
                 image_url=_image_url(item) or show_image_url,
+                transcript_url=_feed_transcript_url(item),
             )
         )
     return episodes
+
+
+def _feed_transcript_url(item: ElementTree.Element) -> str | None:
+    """Pick the cheapest usable <podcast:transcript> URL from a feed item.
+
+    Prefers plain text / SRT / VTT / JSON over HTML. Returning a transcript URL
+    lets the pipeline skip audio download + local transcription entirely (PC1).
+    """
+    preference = {
+        "text/plain": 0,
+        "application/srt": 1,
+        "text/srt": 1,
+        "application/x-subrip": 1,
+        "text/vtt": 2,
+        "application/json": 3,
+        "text/html": 4,
+    }
+    best_url: str | None = None
+    best_rank = 99
+    for element in item.iter():
+        tag = element.tag.split("}")[-1].lower()
+        if tag != "transcript":
+            continue
+        url = str(element.get("url") or "").strip()
+        if not url:
+            continue
+        mime = str(element.get("type") or "").strip().lower()
+        rank = preference.get(mime, 5)
+        if rank < best_rank:
+            best_rank = rank
+            best_url = url
+    return best_url
 
 
 async def _episode_text(
     episode: PodcastEpisode,
     source: dict[str, Any],
     score: float,
+    *,
+    allow_transcription: bool = True,
+    transcription_timeout: float | None = None,
 ) -> tuple[str, str, list[AgentDecision], dict[str, Any]]:
     started_at = time.monotonic()
     decisions: list[AgentDecision] = []
@@ -685,7 +755,37 @@ async def _episode_text(
         metric["transcript_words"] = _word_count(transcript)
         return transcript, "transcript_cache", decisions, metric
 
-    should_transcribe = _should_transcribe(episode, source, score)
+    # Prefer a publisher-provided transcript (Podcasting 2.0) — a cheap HTTP fetch
+    # that avoids audio download + local transcription entirely (PC1).
+    if episode.transcript_url:
+        transcript = await _download_transcript_text(episode.transcript_url)
+        if _word_count(transcript) >= 50:
+            try:
+                transcript_path.parent.mkdir(parents=True, exist_ok=True)
+                transcript_path.write_text(transcript, encoding="utf-8")
+            except OSError:
+                pass
+            decisions.append(
+                _decision(
+                    target=episode.title,
+                    decision="transcript_feed",
+                    action="use_feed_transcript",
+                    confidence=0.88,
+                    reason="Podcast Librarian used the publisher's transcript instead of transcribing audio.",
+                    metadata={"transcript_url": episode.transcript_url, "score": score},
+                )
+            )
+            metric = _podcast_metric_base(
+                episode=episode,
+                score=score,
+                transcript_source="transcript_feed",
+                status="success",
+                started_at=started_at,
+            )
+            metric["transcript_words"] = _word_count(transcript)
+            return transcript, "transcript_feed", decisions, metric
+
+    should_transcribe = allow_transcription and _should_transcribe(episode, source, score)
     if should_transcribe and episode.audio_url and _transcribe_command():
         try:
             download_started = time.monotonic()
@@ -693,7 +793,9 @@ async def _episode_text(
             download_ms = _elapsed_ms(download_started)
             audio_bytes = audio_path.stat().st_size if audio_path.exists() else None
             transcription_started = time.monotonic()
-            transcript = _run_transcription(audio_path, transcript_path)
+            transcript = _run_transcription(
+                audio_path, transcript_path, timeout_seconds=transcription_timeout
+            )
             transcription_ms = _elapsed_ms(transcription_started)
             decisions.append(
                 _decision(
@@ -843,16 +945,82 @@ async def _download_audio(episode: PodcastEpisode) -> Path:
     return path
 
 
-def _run_transcription(audio_path: Path, transcript_path: Path) -> str:
+def _run_transcription(
+    audio_path: Path,
+    transcript_path: Path,
+    *,
+    timeout_seconds: float | None = None,
+) -> str:
     command = _transcribe_command()
     if not command:
         raise RuntimeError("No transcription command configured")
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = command.format(audio_path=str(audio_path), transcript_path=str(transcript_path))
-    subprocess.run(shlex.split(rendered), check=True, timeout=7200)
+    # When a discovery-lane budget is supplied, bound a single transcription so one
+    # slow episode cannot exceed the lane timeout (falls back to show notes on
+    # timeout, caught by the caller). Legacy/offline callers (timeout_seconds=None)
+    # keep the generous ceiling so full transcriptions can complete.
+    if timeout_seconds is None:
+        timeout = 7200.0
+    else:
+        timeout = max(1.0, min(float(timeout_seconds), float(MAX_SINGLE_TRANSCRIPTION_SECONDS)))
+    subprocess.run(shlex.split(rendered), check=True, timeout=timeout)
     if not transcript_path.exists():
         raise RuntimeError("Transcription command did not create a transcript")
     return transcript_path.read_text(encoding="utf-8", errors="replace")
+
+
+async def _download_transcript_text(url: str) -> str:
+    """Fetch a publisher transcript URL and normalize it to plain text."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            body = response.text
+            content_type = str(response.headers.get("content-type", "")).lower()
+    except Exception as exc:
+        logger.info("Podcast transcript fetch failed for %s: %s", url, exc)
+        return ""
+    lowered = url.lower()
+    if "html" in content_type or lowered.endswith((".html", ".htm")):
+        return _clean_html(body)
+    if "json" in content_type or lowered.endswith(".json"):
+        try:
+            return _clean_text(_flatten_json_transcript(json.loads(body)))
+        except (ValueError, TypeError):
+            return ""
+    # SRT / VTT / plain text: drop cue indexes, timestamps, and WEBVTT headers.
+    lines: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.upper().startswith("WEBVTT"):
+            continue
+        if "-->" in stripped:
+            continue
+        if stripped.isdigit():
+            continue
+        lines.append(stripped)
+    return _clean_text(" ".join(lines))
+
+
+def _flatten_json_transcript(data: Any) -> str:
+    """Extract spoken text from common JSON transcript shapes (segments[].body/text)."""
+    segments = data.get("segments") if isinstance(data, dict) else data
+    if not isinstance(segments, list):
+        return ""
+    parts: list[str] = []
+    for segment in segments:
+        if isinstance(segment, dict):
+            text = segment.get("body") or segment.get("text") or segment.get("transcript")
+            if text:
+                parts.append(str(text))
+        elif isinstance(segment, str):
+            parts.append(segment)
+    return " ".join(parts)
 
 
 def _episode_payload_text(episode: PodcastEpisode, text: str, transcript_source: str) -> str:

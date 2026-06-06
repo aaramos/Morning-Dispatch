@@ -20,6 +20,7 @@ from backend.agents.critic import apply_critic_repairs
 from backend.agents.discovery import (
     DiscoveryRunner,
     DiscoveryResult,
+    Candidate,
     SourceAdapterContext,
     TopicProfile,
     default_source_registry,
@@ -47,6 +48,24 @@ _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 150
 _STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode"}
+# Source types that require an outbound HTTP article fetch (they compete for the
+# article-fetch budget). Everything else is "direct" — built straight from the
+# discovered payload text — so it must NOT consume the HTTP fetch budget (P1).
+_HTTP_FETCH_SOURCE_TYPES = {"gmail_link", "foreign_web"}
+_DIRECT_FETCH_SOURCE_TYPES = {
+    "gmail",
+    "reddit_thread",
+    "reddit_post",
+    "podcast_episode",
+    "youtube_video",
+    "collection_chunk",
+    "market_snapshot",
+    "sec_filing",
+    "fred_series",
+}
+# Minimum HTTP fetch slots reserved for fetch-heavy, recency-fragile lanes so a
+# flood of newsletter links can never starve them before they reach the brief.
+_RESERVED_FETCH_FLOOR = 10
 _DATE_METADATA_KEYS = (
     "published_at",
     "published",
@@ -66,6 +85,14 @@ _TEXT_DATE_RE = re.compile(
     r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?"
     r"\s+(?P<day>0?[1-9]|[12]\d|3[01]),?\s+(?P<year>20\d{2})\b",
     re.IGNORECASE,
+)
+# Locale numeric dates used by Korean/Japanese/Chinese outlets that never emit
+# English month text or ISO meta (e.g. 2026年4月25日, 2026년 4월 25일, 2026.04.25).
+_CJK_DATE_RE = re.compile(
+    r"(20\d{2})\s*[年년]\s*(1[0-2]|0?[1-9])\s*[月월]\s*(3[01]|[12]\d|0?[1-9])\s*[日일]?"
+)
+_DOTTED_DATE_RE = re.compile(
+    r"(?:^|[^\d])(20\d{2})\.(1[0-2]|0?[1-9])\.(3[01]|[12]\d|0?[1-9])(?:[^\d]|$)"
 )
 _MONTHS = {
     "january": 1,
@@ -616,6 +643,14 @@ async def _run_exploration(
             _set_candidate_count(progress, len(discovery.payloads()))
 
             payloads = discovery.payloads()
+            selected_fetch_payloads, source_fetch_budgets = _select_fetch_payloads_for_budget(
+                list(discovery.candidates),
+                profile=current_profile,
+                max_articles=brief_settings.pipeline_limits_for_profile(
+                    get_settings(),
+                    current_profile,
+                )["article_fetches"],
+            )
             stage_seconds = {"discovery": round(monotonic() - started_at, 3)}
             _set_pipeline_stage(progress, "fetch", "running")
             _persist_progress(exploration_id, progress)
@@ -624,12 +659,15 @@ async def _run_exploration(
             _raise_if_cancelled(exploration_id)
             pipeline_limits = brief_settings.pipeline_limits_for_profile(get_settings(), current_profile)
             fetched_articles = await fetch_articles_for_payloads(
-                payloads,
+                selected_fetch_payloads,
                 max_articles=pipeline_limits["article_fetches"],
                 concurrency=pipeline_limits["article_fetch_concurrency"],
             )
             _raise_if_cancelled(exploration_id)
             stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
+            if source_fetch_budgets:
+                progress["source_fetch_budgets"] = source_fetch_budgets
+                _persist_progress(exploration_id, progress)
 
             # 2. Run _adjudicate_dates_before_source_window_filter with inspect signature check
             adjudicate_kwargs = {
@@ -647,7 +685,7 @@ async def _run_exploration(
             if date_review_summary:
                 progress["source_date_review"] = date_review_summary
                 _persist_progress(exploration_id, progress)
-            fetched_articles, source_window_issues = _apply_source_window_filter(
+            fetched_articles, source_window_issues, recency_reserve = _apply_source_window_filter(
                 current_profile,
                 fetched_articles,
                 lookback_hours=lookback_hours,
@@ -682,6 +720,8 @@ async def _run_exploration(
                 digest_kwargs["threshold"] = threshold
             if _accepts_param(_run_digest_core, "low_yield"):
                 digest_kwargs["low_yield"] = low_yield_mode
+            if _accepts_param(_run_digest_core, "recency_reserve"):
+                digest_kwargs["recency_reserve"] = recency_reserve
 
             article_results = await _run_digest_core(**digest_kwargs)
             _raise_if_cancelled(exploration_id)
@@ -692,23 +732,52 @@ async def _run_exploration(
             target_yield = 3
             if isinstance(current_profile.content_limits, dict) and current_profile.content_limits.get("target_items") is not None:
                 target_yield = int(current_profile.content_limits["target_items"])
+            source_starved = _selected_source_starvation(
+                discovery=discovery,
+                source_selection=merged_selection,
+                article_results=article_results,
+            )
+            # A selected source that searched but found nothing at all (zero
+            # candidates) also deserves a query-modification retry (P3) — there is
+            # no reserve to fall back on, so broadening its queries is the only lever.
+            missing_sources = _selected_sources_missing_candidates(
+                discovery=discovery,
+                source_selection=merged_selection,
+            )
+            starved_sources = sorted(set(source_starved) | set(missing_sources))
 
-            if included_count < target_yield and attempt < max_attempts:
-                logger.info(
-                    "Attempt %d yielded only %d items (target: %d). Retrying with broadened queries and relaxed thresholds.",
-                    attempt,
-                    included_count,
-                    target_yield,
-                )
-                progress["queue"] = {
-                    "status": "running",
-                    "message": f"Initial run yielded low content ({included_count} item(s)). Retrying with broadened search strategy...",
-                    "action": queue_action or "build",
-                }
+            if (included_count < target_yield or starved_sources) and attempt < max_attempts:
+                if starved_sources:
+                    logger.info(
+                        "Attempt %d did not include final items for source(s): %s. Retrying with broadened per-source queries and relaxed thresholds.",
+                        attempt,
+                        ", ".join(starved_sources),
+                    )
+                    progress["queue"] = {
+                        "status": "running",
+                        "message": f"Initial run lacked final stories from {', '.join(starved_sources)}. Retrying with broadened search strategy...",
+                        "action": queue_action or "build",
+                    }
+                else:
+                    logger.info(
+                        "Attempt %d yielded only %d items (target: %d). Retrying with broadened queries and relaxed thresholds.",
+                        attempt,
+                        included_count,
+                        target_yield,
+                    )
+                    progress["queue"] = {
+                        "status": "running",
+                        "message": f"Initial run yielded low content ({included_count} item(s)). Retrying with broadened search strategy...",
+                        "action": queue_action or "build",
+                    }
                 _persist_progress(exploration_id, progress)
 
-                # 1. Broaden search queries using LLM-assisted helper
-                current_profile = await broaden_queries_with_agent(current_profile)
+                # 1. Broaden search queries using LLM-assisted helper. When specific
+                # sources came up empty, scope the broadening to those lanes (P3).
+                broaden_kwargs: dict[str, Any] = {}
+                if starved_sources and _accepts_param(broaden_queries_with_agent, "starved_sources"):
+                    broaden_kwargs["starved_sources"] = starved_sources
+                current_profile = await broaden_queries_with_agent(current_profile, **broaden_kwargs)
 
                 # 2. Relax filtering settings
                 low_yield_mode = True
@@ -782,6 +851,7 @@ async def _run_exploration(
             issue_id=exploration_id,
             digest_stats=digest_stats,
             newsletter_payloads=newsletter_source_notes,
+            source_selection=merged_selection,
         )
         brief_ref = _write_exploration_brief(exploration_id, html)
         stage_seconds["publishing"] = _elapsed_stage_seconds(stage_started)
@@ -799,6 +869,7 @@ async def _run_exploration(
             issue_id=exploration_id,
             digest_stats=digest_stats,
             newsletter_payloads=newsletter_source_notes,
+            source_selection=merged_selection,
         )
         brief_ref = _write_exploration_brief(exploration_id, html)
         database.record_served_undated_items(
@@ -938,6 +1009,170 @@ def _add_final_source_mix_issues(
             issues.append(issue)
         progress["requested_source_issues"] = issues
         progress["built_with_issues"] = True
+
+
+def _selected_source_starvation(
+    discovery: DiscoveryResult,
+    source_selection: dict[str, bool],
+    article_results: list[ArticleFetchResult],
+) -> list[str]:
+    candidate_counts = {status.name: status.candidate_count for status in discovery.statuses}
+    selected_sources = {
+        source
+        for source, enabled in source_selection.items()
+        if enabled and candidate_counts.get(source, 0) > 0
+    }
+    if not selected_sources:
+        return []
+
+    payload_adapters = {
+        candidate.payload.id: candidate.adapter for candidate in discovery.candidates
+    }
+    included_counts: dict[str, int] = {}
+    for result in article_results:
+        if not (result.fetched and result.tier != "dropped"):
+            continue
+        adapter = payload_adapters.get(
+            result.payload.id,
+            _adapter_from_payload_type(result.payload.source_type, result.payload.metadata),
+        )
+        if adapter:
+            included_counts[adapter] = included_counts.get(adapter, 0) + 1
+
+    return [
+        source
+        for source in sorted(selected_sources)
+        if included_counts.get(source, 0) <= 0
+    ]
+
+
+def _fetch_floor_for_adapter(adapter: str, profile: TopicProfile, *, cap: int) -> int:
+    """HTTP fetch slots guaranteed to a lane before lanes compete for the rest."""
+    base = brief_settings.source_min_items(adapter, profile.content_limits)
+    if adapter in {"web_search", "foreign_media"}:
+        return min(cap, max(base, _RESERVED_FETCH_FLOOR))
+    return min(cap, base)
+
+
+def _selected_sources_missing_candidates(
+    discovery: DiscoveryResult,
+    source_selection: dict[str, bool],
+) -> list[str]:
+    """Selected sources that completed discovery but returned zero candidates."""
+    statuses = {status.name: status for status in discovery.statuses}
+    missing: list[str] = []
+    for source, enabled in source_selection.items():
+        if not enabled or source == "collections":
+            continue
+        status = statuses.get(source)
+        if status is None:
+            continue
+        # Only "completed with nothing" is fixable by re-querying; timeouts/failures
+        # are not helped by broadening, so leave them to their own diagnostics.
+        if status.status == "completed" and status.candidate_count <= 0:
+            missing.append(source)
+    return sorted(missing)
+
+
+def _select_fetch_payloads_for_budget(
+    candidates: list[Candidate],
+    *,
+    profile: TopicProfile,
+    max_articles: int,
+) -> tuple[list[NormalizedPayload], dict[str, int]]:
+    source_selection = profile.source_selection or {}
+
+    # Direct sources need no outbound fetch, so they bypass the HTTP budget
+    # entirely (P1) — they are merely capped at their per-source inclusion limit
+    # so the candidate pool that flows into enrichment stays bounded.
+    direct_grouped: dict[str, list[Candidate]] = {}
+    fetch_grouped: dict[str, list[Candidate]] = {}
+    for candidate in candidates:
+        adapter = str(candidate.adapter or "").strip()
+        if not adapter or source_selection.get(adapter) is False:
+            continue
+        source_type = str(candidate.payload.source_type or "")
+        if source_type in _HTTP_FETCH_SOURCE_TYPES:
+            fetch_grouped.setdefault(adapter, []).append(candidate)
+        elif source_type in _DIRECT_FETCH_SOURCE_TYPES:
+            direct_grouped.setdefault(adapter, []).append(candidate)
+
+    direct_payloads: list[NormalizedPayload] = []
+    for adapter, cands in direct_grouped.items():
+        cands.sort(key=lambda item: item.score, reverse=True)
+        cap = _source_inclusion_limit(profile, adapter)
+        if cap <= 0:
+            continue
+        direct_payloads.extend(candidate.payload for candidate in cands[:cap])
+
+    budgets: dict[str, int] = {}
+    selected_fetch: list[tuple[float, NormalizedPayload]] = []
+    if max_articles > 0 and fetch_grouped:
+        for adapter in fetch_grouped:
+            fetch_grouped[adapter].sort(key=lambda item: item.score, reverse=True)
+        adapters = sorted(
+            fetch_grouped.keys(),
+            key=lambda adapter: fetch_grouped[adapter][0].score if fetch_grouped.get(adapter) else 0.0,
+            reverse=True,
+        )
+
+        max_budget: dict[str, int] = {}
+        floor_budget: dict[str, int] = {}
+        for adapter in adapters:
+            max_allowed = _source_inclusion_limit(profile, adapter)
+            available = len(fetch_grouped[adapter])
+            if max_allowed <= 0 or available <= 0:
+                continue
+            cap = min(max_allowed, available)
+            max_budget[adapter] = cap
+            floor_budget[adapter] = _fetch_floor_for_adapter(adapter, profile, cap=cap)
+
+        if max_budget:
+            remaining = max_articles
+            budgets = {adapter: 0 for adapter in max_budget}
+
+            # Floor pass: every fetch lane gets its reserved slots first.
+            while remaining > 0:
+                progressed = False
+                for adapter in adapters:
+                    floor = floor_budget.get(adapter, 0)
+                    if floor <= 0 or budgets[adapter] >= floor:
+                        continue
+                    budgets[adapter] += 1
+                    remaining -= 1
+                    progressed = True
+                    if remaining <= 0:
+                        break
+                if not progressed:
+                    break
+
+            # Fill pass: distribute the remainder up to each lane's max.
+            while remaining > 0:
+                progressed = False
+                for adapter in adapters:
+                    if budgets[adapter] >= max_budget.get(adapter, 0):
+                        continue
+                    budgets[adapter] += 1
+                    remaining -= 1
+                    progressed = True
+                    if remaining <= 0:
+                        break
+                if not progressed:
+                    break
+
+            for adapter in adapters:
+                take = budgets.get(adapter, 0)
+                if take <= 0:
+                    continue
+                selected_fetch.extend(
+                    (candidate.score, candidate.payload)
+                    for candidate in fetch_grouped[adapter][:take]
+                )
+
+    selected_fetch.sort(key=lambda item: item[0], reverse=True)
+    payloads = direct_payloads + [payload for _, payload in selected_fetch]
+    budgets = {adapter: count for adapter, count in budgets.items() if count > 0}
+    return payloads, budgets
 
 
 def _adapter_from_payload_type(source_type: str, metadata: dict[str, Any] | None = None) -> str:
@@ -1194,6 +1429,7 @@ async def _run_digest_core(
     persist: Callable[[], None],
     threshold: float = 0.45,
     low_yield: bool = False,
+    recency_reserve: list[ArticleFetchResult] | None = None,
 ) -> list[ArticleFetchResult]:
     digest = {
         "id": profile.topic_id,
@@ -1326,8 +1562,10 @@ async def _run_digest_core(
 
     if librarian_client is not None:
         database.cache_model_enrichments(article_results, model_name=_model_client_name(librarian_client, settings.librarian_model))
-    final_results = _enforce_inclusion_limits(profile, article_results)
-    
+    final_results = _enforce_inclusion_limits(
+        profile, article_results, recency_reserve=recency_reserve or []
+    )
+
     progress["_intermediates"] = {
         "enriched": enriched_articles,
         "ranked": ranked_articles,
@@ -1355,7 +1593,12 @@ def _source_inclusion_limit(profile: TopicProfile, adapter: str) -> int:
     return max_allowed
 
 
-def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchResult]) -> list[ArticleFetchResult]:
+def _enforce_inclusion_limits(
+    profile: TopicProfile,
+    results: list[ArticleFetchResult],
+    *,
+    recency_reserve: list[ArticleFetchResult] | None = None,
+) -> list[ArticleFetchResult]:
     counts: dict[str, int] = {}
     updated: list[ArticleFetchResult] = []
     for r in results:
@@ -1374,18 +1617,26 @@ def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchR
     # Generalized per-source floor (item 3): every active source that produced
     # candidates is guaranteed a minimum number of slots in the brief, reviving
     # its best dropped (loosely related) items when nothing survived review.
-    return _apply_source_floors(profile, updated)
+    return _apply_source_floors(profile, updated, recency_reserve=recency_reserve or [])
 
 
 def _apply_source_floors(
     profile: TopicProfile,
     results: list[ArticleFetchResult],
+    *,
+    recency_reserve: list[ArticleFetchResult] | None = None,
 ) -> list[ArticleFetchResult]:
     selection = profile.source_selection or {}
-    # Which adapters actually returned candidates this run (dropped or kept).
+    # Out-of-window items, grouped per adapter, available only as a last resort.
+    reserve_by_adapter: dict[str, list[ArticleFetchResult]] = {}
+    for r in recency_reserve or []:
+        reserve_by_adapter.setdefault(_result_adapter(r), []).append(r)
+    # Adapters that produced in-window candidates (dropped or kept) OR have an
+    # out-of-window reserve we could fall back to.
     present_adapters: set[str] = {_result_adapter(r) for r in results}
+    candidate_adapters = present_adapters | set(reserve_by_adapter)
     updated = list(results)
-    for adapter in sorted(present_adapters):
+    for adapter in sorted(candidate_adapters):
         if selection and selection.get(adapter) is not True:
             continue
         floor = brief_settings.source_min_items(adapter, profile.content_limits)
@@ -1400,17 +1651,35 @@ def _apply_source_floors(
         if active >= target:
             continue
         needed = target - active
+        # First, revive in-window dropped items (loosely related but on-topic and
+        # fresh) that clear the relevance bar — these are preferred over stale ones.
         revival: list[tuple[float, int]] = []
         for index, r in enumerate(updated):
             if _result_adapter(r) != adapter or r.tier != "dropped":
                 continue
             if r.status == "error":
                 continue
+            if (r.metadata or {}).get("out_of_window"):
+                continue
             if r.link_score >= brief_settings.SOURCE_FLOOR_SCORE_THRESHOLD:
                 revival.append((r.link_score, index))
         revival.sort(key=lambda item: item[0], reverse=True)
-        for _, index in revival[:needed]:
+        in_window_take = revival[:needed]
+        for _, index in in_window_take:
             updated[index] = replace(updated[index], tier="main")
+        remaining = needed - len(in_window_take)
+        # Only when a SELECTED source would otherwise be empty/short of its floor do
+        # we surface the freshest out-of-window reserve item(s), clearly labeled
+        # (P0). "No content means no content" stays rare: this fires only when the
+        # source genuinely returned nothing usable inside the window.
+        if remaining > 0 and active + len(in_window_take) == 0:
+            pool = sorted(
+                reserve_by_adapter.get(adapter, []),
+                key=_reserve_sort_key,
+                reverse=True,
+            )
+            for item in pool[:remaining]:
+                updated.append(_revive_out_of_window(item))
     return updated
 
 
@@ -1499,12 +1768,20 @@ def _apply_source_window_filter(
     article_results: list[ArticleFetchResult],
     *,
     lookback_hours: int | None,
-) -> tuple[list[ArticleFetchResult], list[dict[str, str]]]:
+) -> tuple[list[ArticleFetchResult], list[dict[str, str]], list[ArticleFetchResult]]:
+    """Split fetched items into in-window keepers and an out-of-window reserve.
+
+    Items that fail the recency window are NOT discarded (P0): they are demoted
+    into a reserve pool so a selected source that has zero in-window survivors can
+    still surface a minimal, clearly-labeled fallback item via _apply_source_floors,
+    rather than rendering an empty section.
+    """
     if lookback_hours is None:
-        return article_results, []
+        return article_results, [], []
     cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
     kept: list[ArticleFetchResult] = []
     issues: list[dict[str, str]] = []
+    reserve: list[ArticleFetchResult] = []
     for result in article_results:
         reason = _source_window_rejection_reason(profile, result, cutoff)
         if reason:
@@ -1517,9 +1794,42 @@ def _apply_source_window_filter(
                     "reason": reason,
                 }
             )
+            if result.fetched:
+                reserve.append(_mark_out_of_window(result, reason))
             continue
         kept.append(_mark_undated_once(result) if _is_strict_undated_result(result) else result)
-    return kept, issues
+    return kept, issues, reserve
+
+
+def _mark_out_of_window(result: ArticleFetchResult, reason: str) -> ArticleFetchResult:
+    """Tag a recency-rejected (but fetched) item for last-resort floor revival."""
+    metadata = {
+        **dict(result.metadata or {}),
+        "out_of_window": True,
+        "out_of_window_reason": reason,
+        "date_status": "out_of_window",
+    }
+    freshness = _article_published_at(result) or _article_text_or_url_date(result)
+    if freshness is not None:
+        metadata["out_of_window_published_at"] = freshness.isoformat()
+    return replace(result, tier="dropped", metadata=metadata)
+
+
+def _reserve_sort_key(result: ArticleFetchResult) -> tuple[str, float]:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    published = str(metadata.get("out_of_window_published_at") or "")
+    return (published, float(result.link_score or 0.0))
+
+
+def _revive_out_of_window(result: ArticleFetchResult) -> ArticleFetchResult:
+    """Promote a reserve item into the brief with an honest out-of-window note."""
+    metadata = {
+        **dict(result.metadata or {}),
+        "served_once": True,
+        "served_once_note": "Outside the requested window — shown as a fallback.",
+        "served_once_key": _undated_item_key(result),
+    }
+    return replace(result, tier="main", metadata=metadata)
 
 
 def _source_window_rejection_reason(profile: TopicProfile, result: ArticleFetchResult, cutoff: datetime) -> str:
@@ -1556,6 +1866,11 @@ def _source_window_rejection_reason(profile: TopicProfile, result: ArticleFetchR
 def _source_label_for_result(result: ArticleFetchResult) -> str:
     source_type = str(result.payload.source_type or "")
     if source_type == "gmail":
+        return "Gmail"
+    if source_type == "gmail_link":
+        metadata = result.payload.metadata or {}
+        if metadata.get("search_query") or metadata.get("search_provider"):
+            return "Web Search"
         return "Gmail"
     if source_type == "podcast_episode":
         return "Podcast"
@@ -1725,21 +2040,32 @@ def _date_from_url(value: str | None) -> datetime | None:
 def _date_from_text(value: str | None) -> datetime | None:
     text = str(value or "")
     match = _TEXT_DATE_RE.search(text)
-    if not match:
-        return None
-    month = _MONTHS.get(match.group("month").lower())
-    if month is None:
-        return None
-    with suppress(ValueError):
-        return datetime(
-            int(match.group("year")),
-            month,
-            int(match.group("day")),
-            23,
-            59,
-            59,
-            tzinfo=UTC,
-        )
+    if match:
+        month = _MONTHS.get(match.group("month").lower())
+        if month is not None:
+            with suppress(ValueError):
+                return datetime(
+                    int(match.group("year")),
+                    month,
+                    int(match.group("day")),
+                    23,
+                    59,
+                    59,
+                    tzinfo=UTC,
+                )
+    for pattern in (_CJK_DATE_RE, _DOTTED_DATE_RE):
+        locale_match = pattern.search(text)
+        if locale_match:
+            with suppress(ValueError):
+                return datetime(
+                    int(locale_match.group(1)),
+                    int(locale_match.group(2)),
+                    int(locale_match.group(3)),
+                    23,
+                    59,
+                    59,
+                    tzinfo=UTC,
+                )
     return None
 
 
@@ -1968,10 +2294,17 @@ def _requested_source_issues(
         if _requested_source_found(adapter=adapter, source_name=source_name, discovery=discovery):
             continue
         status = next((item for item in discovery.statuses if item.name == adapter), None)
+        limited_drop_count = _requested_source_limit_drops(
+            discovery=discovery,
+            adapter=adapter,
+            source_name=source_name,
+        )
         if status and status.message:
             reason = status.message
         elif adapter == "markets":
             reason = "Markets price data was requested, but no usable ticker or price items were returned for this run."
+        elif limited_drop_count > 0 and adapter == "gmail":
+            reason = "Gmail sender candidates were found during discovery, but they were removed by discovery lane/capacity limits."
         elif status and status.status in {"timed_out", "failed", "skipped"}:
             reason = f"{_adapter_label(adapter)} {status.status.replace('_', ' ')}."
         else:
@@ -1995,8 +2328,11 @@ def _build_source_issues(
             continue
         if status.candidate_count > 0:
             continue
-        if status.status == "failed" and status.message:
-            reason = status.message
+        if status.message or status.status in {"failed", "timed_out", "skipped"}:
+            if status.message:
+                reason = status.message
+            else:
+                reason = f"{_adapter_label(source)} {status.status.replace('_', ' ')}."
         elif source == "markets":
             reason = "Markets price data returned no usable ticker items."
 
@@ -2018,21 +2354,89 @@ def _build_source_issues(
     return issues
 
 
+def _requested_source_reference_matches(
+    source_name: str,
+    values: list[Any],
+) -> bool:
+    needle = source_name.strip().lower()
+    if not needle:
+        return False
+    parts: list[str] = []
+    for value in values:
+        if isinstance(value, dict):
+            parts.extend(
+                str(item)
+                for item in value.values()
+                if isinstance(item, (str, int, float)) and str(item).strip()
+            )
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                if isinstance(item, (str, int, float)) and str(item).strip():
+                    parts.append(str(item))
+        elif isinstance(value, (str, int, float)):
+            text = str(value)
+            if text:
+                parts.append(text)
+    haystack = " ".join(parts).lower()
+    return needle in haystack or (haystack and haystack in needle)
+
+
+def _requested_source_limit_drops(
+    *,
+    discovery: DiscoveryResult,
+    adapter: str,
+    source_name: str,
+) -> int:
+    drop_count = 0
+    for exclusion in discovery.exclusions:
+        if str(exclusion.get("adapter") or "").strip() != adapter:
+            continue
+        if not _is_discovery_limit_exclusion(exclusion):
+            continue
+        if _requested_source_reference_matches(
+            source_name,
+            [
+                exclusion.get("source_name"),
+                exclusion.get("subject"),
+                exclusion.get("parent_subject"),
+                exclusion.get("sender_email"),
+                exclusion.get("link_text"),
+                exclusion.get("original_url"),
+                exclusion.get("title"),
+                exclusion.get("metadata"),
+            ],
+        ):
+            drop_count += 1
+    return drop_count
+
+
+def _is_discovery_limit_exclusion(exclusion: dict[str, Any]) -> bool:
+    excluded_by = exclusion.get("excluded_by")
+    if isinstance(excluded_by, (list, tuple, set)):
+        for value in excluded_by:
+            if str(value).strip().lower() == "discovery_limits":
+                return True
+    reason = str(exclusion.get("reason") or "").lower()
+    return "duplicate" in reason and "capacity" in reason
+
+
 def _requested_source_found(*, adapter: str, source_name: str, discovery: DiscoveryResult) -> bool:
     needle = source_name.strip().lower()
     if not needle:
         return False
+    if adapter == "markets" and needle in {"market data", "market", "markets"}:
+        return any(candidate.adapter == "markets" for candidate in discovery.candidates)
     for candidate in discovery.candidates:
         if candidate.adapter != adapter:
             continue
-        payload = candidate.payload
-        haystack_parts = [
-            payload.source_name,
-            payload.original_url,
-            *[str(value) for value in payload.metadata.values() if isinstance(value, (str, int, float))],
-        ]
-        haystack = " ".join(str(value) for value in haystack_parts if value).lower()
-        if needle in haystack or haystack in needle:
+        if _requested_source_reference_matches(
+            source_name,
+            [
+                candidate.payload.source_name,
+                candidate.payload.original_url,
+                candidate.payload.metadata,
+            ],
+        ):
             return True
     return False
 
@@ -2065,8 +2469,18 @@ def _resolve_candidate_limit(profile: TopicProfile, candidate_limit: int | None)
     return 250
 
 
-async def broaden_queries_with_agent(profile: TopicProfile) -> TopicProfile:
-    """Uses LLM to broaden search queries by removing narrow qualifiers/terms."""
+async def broaden_queries_with_agent(
+    profile: TopicProfile,
+    *,
+    starved_sources: list[str] | None = None,
+) -> TopicProfile:
+    """Uses LLM to broaden search queries by removing narrow qualifiers/terms.
+
+    When `starved_sources` is provided (sources that returned no usable content),
+    the broadened queries are also folded into each starved source's per-source
+    queries (P3), so the retry's discovery for those lanes uses fresh angles even
+    if the model only returned a flat broadened list.
+    """
     settings = get_settings()
     try:
         resolution = model_routing.client_for_agent("refinement", settings=settings)
@@ -2082,6 +2496,9 @@ async def broaden_queries_with_agent(profile: TopicProfile) -> TopicProfile:
             "search_queries": list(profile.search_queries),
             "source_queries": {key: list(val) for key, val in profile.source_queries.items()},
         }
+        if starved_sources:
+            # Tell the model which lanes came up empty so it can target them.
+            prompt_data["starved_sources"] = list(starved_sources)
 
         system_prompt = load_prompt("query_broadening")
         prompt_str = json.dumps(prompt_data, ensure_ascii=False)
@@ -2096,21 +2513,39 @@ async def broaden_queries_with_agent(profile: TopicProfile) -> TopicProfile:
         broadened_search = payload.get("search_queries")
         broadened_source = payload.get("source_queries")
 
-        updates = {}
+        cleaned_search: list[str] = []
         if isinstance(broadened_search, list):
             cleaned_search = [str(q).strip() for q in broadened_search if str(q).strip()]
-            if cleaned_search:
-                updates["search_queries"] = tuple(cleaned_search)
 
+        cleaned_source: dict[str, tuple[str, ...]] = {}
         if isinstance(broadened_source, dict):
-            cleaned_source = {}
             for key, val in broadened_source.items():
                 if isinstance(val, list):
                     cleaned_val = [str(q).strip() for q in val if str(q).strip()]
                     if cleaned_val:
                         cleaned_source[key] = tuple(cleaned_val)
-            if cleaned_source:
-                updates["source_queries"] = cleaned_source
+
+        # Per-source targeting (P3): ensure each starved lane gets the broadened
+        # queries even when the model only returned a flat search list.
+        if starved_sources and cleaned_search:
+            for source in starved_sources:
+                existing = list(cleaned_source.get(source) or profile.source_queries.get(source, ()))
+                seen = {q.strip().lower() for q in existing}
+                for query in cleaned_search:
+                    key = query.strip().lower()
+                    if key and key not in seen:
+                        existing.append(query)
+                        seen.add(key)
+                if existing:
+                    cleaned_source[source] = tuple(existing)
+
+        updates: dict[str, Any] = {}
+        if cleaned_search:
+            updates["search_queries"] = tuple(cleaned_search)
+        if cleaned_source:
+            merged = {key: tuple(val) for key, val in profile.source_queries.items()}
+            merged.update(cleaned_source)
+            updates["source_queries"] = merged
 
         if updates:
             logger.info("Broadened queries: %s", updates)
@@ -2463,6 +2898,7 @@ async def re_enrich_deterministic_articles(exploration_id: str) -> dict[str, Any
             issue_id=exploration_id,
             digest_stats=digest_stats,
             newsletter_payloads=newsletter_source_notes,
+            source_selection=exploration.get("source_selection") if isinstance(exploration.get("source_selection"), dict) else None,
         )
         _write_exploration_brief(exploration_id, html)
 

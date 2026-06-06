@@ -2835,6 +2835,7 @@ def render_ingested_issue(
     issue_id: str | None = None,
     digest_stats: dict[str, Any] | None = None,
     newsletter_payloads: list[NormalizedPayload] | None = None,
+    source_selection: dict[str, bool] | None = None,
 ) -> str:
     article_results = article_results or []
     body_payloads = (
@@ -2903,6 +2904,14 @@ def render_ingested_issue(
 
     # Media gets dedicated per-source sections too (Watch for video, Listen for audio).
     media_sections_html = _render_media_sections(media_articles, issue_id=issue_id)
+
+    # Dedicated real estate for EVERY selected source (item: per-source honesty).
+    # A selected source that produced zero rendered items still gets a labeled block
+    # stating so, instead of silently vanishing from the brief.
+    empty_source_html = _render_empty_source_notes(
+        source_selection,
+        rendered_results=[*story_articles, *media_articles, *market_articles],
+    )
 
     lower_html = "\n".join(
         _render_lower_confidence_story(result, index=index, issue_id=issue_id)
@@ -3144,6 +3153,7 @@ def render_ingested_issue(
         </section>
         {per_source_sections_html}
         {media_section}
+        {empty_source_html}
         {lower_section}
       </div>
       {sidebar_html}
@@ -3659,6 +3669,14 @@ def _source_label(result: ArticleFetchResult) -> str:
         return "Podcast"
     if source_type == "reddit_thread":
         return "Legacy Discussion"
+    if source_type == "gmail_link":
+        metadata = result.payload.metadata or {}
+        if metadata.get("search_query") or metadata.get("search_provider"):
+            return "Web Search"
+        if _translation_metadata(result).get("translated"):
+            # A translated newsletter/web link is a web article, not a Gmail item.
+            return "Web"
+        return "Gmail"
     if source_type == "collection_chunk":
         return "Collection"
     if source_type == "market_snapshot":
@@ -4033,7 +4051,7 @@ _TOP_STORIES_TARGET = 5
 _SOURCE_SECTION_ORDER = (
     "Gmail",
     "Web",
-    "Foreign media",
+    "Foreign Media",
     "Reddit",
     "Collections",
     "Markets",
@@ -4055,7 +4073,7 @@ def _render_source_sections(
     """
     grouped: dict[str, list[ArticleFetchResult]] = {}
     for result in results:
-        label = _brief_source_count_label(result.payload.source_type)
+        label = _origin_source_label(result)
         grouped.setdefault(label, []).append(result)
 
     ordered_labels = [label for label in _SOURCE_SECTION_ORDER if label in grouped]
@@ -4079,6 +4097,50 @@ def _render_source_sections(
         """
         )
     return "\n".join(sections), index
+
+
+_SELECTED_SOURCE_LABELS: dict[str, str] = {
+    "gmail": "Gmail",
+    "web_search": "Web",
+    "foreign_media": "Foreign Media",
+    "reddit": "Reddit",
+    "youtube": "YouTube",
+    "podcasts": "Podcast",
+    "markets": "Markets",
+    "collections": "Collections",
+}
+
+
+def _render_empty_source_notes(
+    source_selection: dict[str, bool] | None,
+    *,
+    rendered_results: list[ArticleFetchResult],
+) -> str:
+    """One honest block per selected source that produced nothing this run.
+
+    Only emitted when the caller passes an explicit source_selection (the live
+    pipeline), so existing renders without it are unchanged.
+    """
+    if not source_selection:
+        return ""
+    rendered_labels = {_origin_source_label(result) for result in rendered_results}
+    notes: list[str] = []
+    for adapter, label in _SELECTED_SOURCE_LABELS.items():
+        if source_selection.get(adapter) is not True:
+            continue
+        if label in rendered_labels:
+            continue
+        slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "source"
+        notes.append(
+            f"""
+        <section class="source-section source-section-empty" aria-labelledby="source-{slug}-empty-heading">
+          <div class="section-kicker">Source</div>
+          <h2 id="source-{slug}-empty-heading">{escape(label)}</h2>
+          <p class="meta">No usable content found in this source for this run.</p>
+        </section>
+        """
+        )
+    return "\n".join(notes)
 
 
 def _media_section_bucket(result: ArticleFetchResult) -> str:
@@ -4426,14 +4488,14 @@ def _render_source_mix(results: list[ArticleFetchResult]) -> str:
     for result in results:
         if result.tier == "dropped":
             continue
-        label = _brief_source_count_label(result.payload.source_type)
+        label = _origin_source_label(result)
         counts[label] = counts.get(label, 0) + 1
     if not counts:
         return ""
     ordered_labels = [
         "Gmail",
         "Web",
-        "Foreign media",
+        "Foreign Media",
         "YouTube",
         "Podcast",
         "Markets",
@@ -4456,11 +4518,26 @@ def _render_source_mix(results: list[ArticleFetchResult]) -> str:
     """
 
 
-def _brief_source_count_label(source_type: str) -> str:
-    if source_type in {"gmail", "gmail_link"}:
+def _origin_source_label(result: ArticleFetchResult) -> str:
+    """Origin-based section/count label (item 8).
+
+    A Gmail newsletter link to a web article counts as Gmail; a web-search hit or a
+    translated foreign link counts as Web; a native-language result counts as
+    Foreign Media. This keeps the brief's section grouping and source-mix honest
+    about where content actually came from, independent of article type.
+    """
+    source_type = result.payload.source_type
+    metadata = result.payload.metadata or {}
+    if source_type == "gmail_link":
+        if metadata.get("search_query") or metadata.get("search_provider"):
+            return "Web"
+        if _translation_metadata(result).get("translated"):
+            return "Web"
+        return "Gmail"
+    if source_type == "gmail":
         return "Gmail"
     if source_type == "foreign_web":
-        return "Foreign media"
+        return "Foreign Media"
     if source_type == "youtube_video":
         return "YouTube"
     if source_type == "podcast_episode":
@@ -4469,7 +4546,7 @@ def _brief_source_count_label(source_type: str) -> str:
         return "Markets"
     if source_type == "collection_chunk":
         return "Collections"
-    if source_type == "reddit_post":
+    if source_type in {"reddit_post", "reddit_thread"}:
         return "Reddit"
     if source_type == "sec_filing":
         return "SEC filings"

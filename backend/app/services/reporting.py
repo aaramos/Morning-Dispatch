@@ -288,6 +288,13 @@ def compile_reporting_data(
     url_to_id = {cand["url"]: cand_id for cand_id, cand in candidates_by_id.items() if cand["url"]}
     title_to_id = {cand["title"].lower().strip(): cand_id for cand_id, cand in candidates_by_id.items() if cand["title"]}
 
+    # Items rejected by the recency window can still be revived from the reserve
+    # into the final brief (P0). When that happens, "included" must win over
+    # "recency" so the lifecycle log matches what actually rendered.
+    final_included_ids = {
+        result.payload.id for result in final_results if result.tier != "dropped"
+    }
+
     for issue in source_window_issues:
         url = issue.get("item_url") or issue.get("url")
         reason = issue.get("reason") or "Published outside the requested source window."
@@ -299,7 +306,7 @@ def compile_reporting_data(
         if not cand_id and issue.get("item"):
             cand_id = title_to_id.get(issue["item"].lower().strip())
 
-        if cand_id:
+        if cand_id and cand_id not in final_included_ids:
             set_reason_at_stage(cand_id, "recency", reason)
 
     # 4. Add candidates that never entered fetch/extract. Discovery can produce

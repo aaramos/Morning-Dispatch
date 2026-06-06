@@ -512,6 +512,12 @@ def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate], l
         if not _candidate_has_judgeable_topic_text(candidate):
             kept.append(candidate)
             continue
+        # Foreign-media results are native-language; the English keyword gate cannot
+        # judge them fairly and would silently drop on-topic coverage. Exempt them
+        # here and let the model-based audit judge them on translated text instead.
+        if candidate.adapter == "foreign_media" or candidate.payload.source_type == "foreign_web":
+            kept.append(candidate)
+            continue
         if _is_candidate_from_requested_source(candidate, profile):
             kept.append(candidate)
             continue

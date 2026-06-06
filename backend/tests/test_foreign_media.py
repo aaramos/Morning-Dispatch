@@ -111,7 +111,7 @@ def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path)
     )
 
     assert calls[0]["language"] == "ko"
-    assert calls[0]["limit"] == 15
+    assert calls[0]["limit"] == 20
     assert candidates[0].adapter == "foreign_media"
     assert candidates[0].payload.source_type == "foreign_web"
     assert candidates[0].payload.metadata["needs_translation"] is True

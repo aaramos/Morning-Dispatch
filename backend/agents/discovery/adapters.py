@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 
 from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes
+
+# Audio-transcription budget for the first podcast discovery pass. Kept well under
+# the adapter's 120s timeout so the lane returns partial results (transcript-feed /
+# show-notes) rather than timing out to zero. The refined pass does no audio
+# transcription (budget 0) so two passes stay within the adapter timeout.
+_PODCAST_TRANSCRIPTION_BUDGET_SECONDS = 75.0
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.text_utils import STOPWORDS
 from backend.agents.discovery.types import (
@@ -97,6 +103,7 @@ class PodcastSourceAdapter:
             seen_requires_published=True,
             include_seen=True,
             profile=profile,
+            transcription_budget_seconds=_PODCAST_TRANSCRIPTION_BUDGET_SECONDS,
         )
         if len(payloads) < 3:
             try:
@@ -132,6 +139,9 @@ class PodcastSourceAdapter:
                     seen_requires_published=True,
                     include_seen=True,
                     profile=profile,
+                    # Refined pass relies on transcript-feed / show-notes only so the
+                    # two passes together stay within the adapter's 120s timeout.
+                    transcription_budget_seconds=0.0,
                 )
                 seen_episode_ids = {p.metadata.get("episode_id") or p.original_url for p in payloads if p.metadata}
                 for rp in refined_payloads:

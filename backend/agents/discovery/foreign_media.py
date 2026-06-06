@@ -17,7 +17,7 @@ from backend.app.services import model_routing
 logger = logging.getLogger(__name__)
 
 MAX_FOREIGN_LANGUAGES = 10
-DEFAULT_RESULTS_PER_LANGUAGE = 15
+DEFAULT_RESULTS_PER_LANGUAGE = 20
 NON_FOREIGN_MEDIA_LANGUAGE_CODES = {"en"}
 SCRIPT_RE = {
     "ko": re.compile(r"[\uac00-\ud7af]"),

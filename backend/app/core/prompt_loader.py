@@ -191,6 +191,7 @@ CRITICAL:
 - Return a list of broadened queries in the "search_queries" field.
 - Optionally return a dictionary of broadened queries per source adapter (e.g. "web_search", "podcasts", "youtube") in the "source_queries" field.
 - For "podcasts", queries MUST be extremely short (1 to 2 words max, e.g. "AI", "semiconductor").
+- If a "starved_sources" list is provided, those source lanes returned NO usable content on the last run. Prioritize generating broader, simpler queries for those specific sources in "source_queries".
 
 Format your response as a strict JSON object with this shape:
 {

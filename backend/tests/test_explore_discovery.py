@@ -179,7 +179,7 @@ def test_source_window_filter_allows_undated_web_results(monkeypatch, tmp_path) 
         source_type="web_search",
     )
 
-    kept, issues = explore._apply_source_window_filter(
+    kept, issues, _reserve = explore._apply_source_window_filter(
         profile,
         [fresh, stale_url, undated],
         lookback_hours=72,
@@ -191,7 +191,7 @@ def test_source_window_filter_allows_undated_web_results(monkeypatch, tmp_path) 
     assert len(issues) == 1
     assert "outside the requested source window" in issues[0]["reason"]
 
-    kept_again, issues_again = explore._apply_source_window_filter(
+    kept_again, issues_again, _reserve_again = explore._apply_source_window_filter(
         profile,
         [undated],
         lookback_hours=72,
@@ -222,7 +222,7 @@ def test_source_window_filter_rejects_undated_strict_types_under_bounded_window(
         url="https://example.com/news/local-ai-story",
     )
 
-    kept, issues = explore._apply_source_window_filter(profile, [undated], lookback_hours=24)
+    kept, issues, _reserve = explore._apply_source_window_filter(profile, [undated], lookback_hours=24)
 
     assert kept == []
     assert len(issues) == 1
@@ -280,7 +280,7 @@ def test_pre_window_date_adjudication_rescues_fresh_strict_item(monkeypatch, tmp
             max_candidates=10,
         )
     )
-    kept, issues = explore._apply_source_window_filter(profile, reviewed, lookback_hours=24 * 7)
+    kept, issues, _reserve = explore._apply_source_window_filter(profile, reviewed, lookback_hours=24 * 7)
 
     assert summary["resolved_count"] == 1
     assert reviewed[0].payload.published_at == fresh_date
@@ -339,7 +339,7 @@ def test_pre_window_date_adjudication_still_rejects_stale_model_date(monkeypatch
             max_candidates=10,
         )
     )
-    kept, issues = explore._apply_source_window_filter(profile, reviewed, lookback_hours=24 * 7)
+    kept, issues, _reserve = explore._apply_source_window_filter(profile, reviewed, lookback_hours=24 * 7)
 
     assert summary["resolved_count"] == 1
     assert reviewed[0].payload.published_at == stale_date

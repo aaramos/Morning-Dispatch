@@ -590,6 +590,14 @@ def _normalize_date_text(value: str) -> str | None:
     slash = re.search(r"\b(20\d{2})/(\d{1,2})/(\d{1,2})\b", text)
     if slash:
         return _iso_or_none(slash.group(1), slash.group(2), slash.group(3))
+    # Locale numeric dates: CJK 年/月/日, Korean 년/월/일, and dotted (e.g. 2026.04.25)
+    # commonly used by Korean/Japanese/Chinese outlets that never emit ISO meta tags.
+    cjk = re.search(r"(20\d{2})\s*[年년]\s*(\d{1,2})\s*[月월]\s*(\d{1,2})\s*[日일]?", text)
+    if cjk:
+        return _iso_or_none(cjk.group(1), cjk.group(2), cjk.group(3))
+    dotted = re.search(r"\b(20\d{2})\.(\d{1,2})\.(\d{1,2})\.?", text)
+    if dotted:
+        return _iso_or_none(dotted.group(1), dotted.group(2), dotted.group(3))
     month_first = re.search(r"\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(20\d{2})\b", text)
     if month_first and month_first.group(1).lower() in _MONTHS:
         return _iso_or_none(month_first.group(3), _MONTHS[month_first.group(1).lower()], month_first.group(2))
