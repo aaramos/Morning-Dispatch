@@ -76,6 +76,7 @@ async def fetch_podcast_episodes(
     include_seen: bool = False,
     profile: TopicProfile | None = None,
     transcription_budget_seconds: float | None = None,
+    deadline: float | None = None,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     decisions: list[AgentDecision] = []
     try:
@@ -93,6 +94,7 @@ async def fetch_podcast_episodes(
             decisions=decisions,
             profile=profile,
             transcription_budget_seconds=transcription_budget_seconds,
+            deadline=deadline,
         )
     except Exception as exc:
         logger.info("Podcast ingestion failed: %s", exc)
@@ -124,6 +126,7 @@ async def _fetch_podcast_episodes(
     decisions: list[AgentDecision],
     profile: TopicProfile | None = None,
     transcription_budget_seconds: float | None = None,
+    deadline: float | None = None,
 ) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
     podcast_sources = _podcast_sources(sources)
     if not podcast_sources:
@@ -160,8 +163,11 @@ async def _fetch_podcast_episodes(
             decisions=decisions,
             diagnostics=diagnostics,
             max_episodes=max_episodes,
+            deadline=deadline,
         )
-        if not resolved_search_episodes:
+        # Skip the (unbounded) show-first fallback discovery when the lane is already
+        # out of time, so we return partial results instead of overrunning the wall.
+        if not resolved_search_episodes and (deadline is None or time.monotonic() < deadline):
             decisions.append(
                 _decision(
                     target="podcast discovery",
@@ -324,6 +330,12 @@ async def _fetch_podcast_episodes(
     ranked = sorted(candidates, key=lambda item: item[0], reverse=True)[:max(1, max_episodes)]
     payloads: list[NormalizedPayload] = []
     for score, episode, source in ranked:
+        # Honor the overall lane deadline: stop processing further episodes and
+        # return whatever has been gathered so far rather than risking a hard
+        # adapter timeout that discards everything.
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.info("Podcast lane hit its time budget; returning %d partial payload(s).", len(payloads))
+            break
         episode_started = time.monotonic()
         transcript = ""
         transcript_source = "unknown"
@@ -1315,6 +1327,7 @@ async def _episode_first_search_and_resolve(
     decisions: list[AgentDecision],
     diagnostics: dict[str, int],
     max_episodes: int = MAX_PODCAST_EPISODES,
+    deadline: float | None = None,
 ) -> list[PodcastEpisode]:
     from backend.agents.discovery.web_search import lookback_to_days, search_web, SearchHit
     from backend.agents.discovery.types import TopicProfile
@@ -1597,12 +1610,28 @@ async def _episode_first_search_and_resolve(
         return matched_ep
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as http_client:
-        tasks = [resolve_one(hit, http_client) for hit in kept[:resolution_attempts_limit]]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, Exception):
-                logger.warning("Failed to resolve candidate episode: %s", res)
-            elif res is not None:
+        tasks = [asyncio.ensure_future(resolve_one(hit, http_client)) for hit in kept[:resolution_attempts_limit]]
+        if not tasks:
+            return resolved_episodes
+        # Feed resolution is the slowest, most timeout-prone phase. Bound it by the
+        # overall lane deadline and keep whatever resolved in time, cancelling the
+        # rest, so the lane returns partial results instead of timing out to zero.
+        wait_timeout = None
+        if deadline is not None:
+            wait_timeout = max(0.0, deadline - time.monotonic())
+        done, pending = await asyncio.wait(tasks, timeout=wait_timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.info("Podcast resolution hit its time budget; %d resolution(s) cancelled.", len(pending))
+        for task in done:
+            try:
+                res = task.result()
+            except Exception as exc:
+                logger.warning("Failed to resolve candidate episode: %s", exc)
+                continue
+            if res is not None:
                 resolved_episodes.append(res)
 
     return resolved_episodes

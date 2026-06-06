@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import math
+import time
 import feedparser
 from datetime import datetime, UTC, timedelta
 from pathlib import Path
@@ -22,6 +23,12 @@ from backend.agents.digestor.podcast import fetch_podcast_episodes
 # show-notes) rather than timing out to zero. The refined pass does no audio
 # transcription (budget 0) so two passes stay within the adapter timeout.
 _PODCAST_TRANSCRIPTION_BUDGET_SECONDS = 75.0
+# Overall wall-clock budget for the podcast lane, kept under the adapter's 120s
+# timeout so discovery/resolution returns partial results instead of being killed
+# all-or-nothing by the runner's asyncio.wait_for.
+_PODCAST_OVERALL_BUDGET_SECONDS = 100.0
+# Minimum remaining time required to attempt the (expensive) refined second pass.
+_PODCAST_REFINED_PASS_MIN_SECONDS = 30.0
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.text_utils import STOPWORDS
 from backend.agents.discovery.types import (
@@ -84,6 +91,7 @@ class PodcastSourceAdapter:
     good_for = ("deep_context", "interviews", "expert_discussion")
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
+        deadline = time.monotonic() + _PODCAST_OVERALL_BUDGET_SECONDS
         sources = _approved_podcast_sources()
         for ref in _podcast_discovery_refs(profile):
             sources.append({
@@ -104,8 +112,11 @@ class PodcastSourceAdapter:
             include_seen=True,
             profile=profile,
             transcription_budget_seconds=_PODCAST_TRANSCRIPTION_BUDGET_SECONDS,
+            deadline=deadline,
         )
-        if len(payloads) < 3:
+        # Skip the expensive refined second pass when there is not enough time left;
+        # returning the first pass's partial results beats a hard adapter timeout.
+        if len(payloads) < 3 and (deadline - time.monotonic()) >= _PODCAST_REFINED_PASS_MIN_SECONDS:
             try:
                 from backend.agents.discovery.query_refiner import refine_queries_for_adapter
                 initial_queries = _podcast_discovery_refs(profile)
@@ -142,6 +153,7 @@ class PodcastSourceAdapter:
                     # Refined pass relies on transcript-feed / show-notes only so the
                     # two passes together stay within the adapter's 120s timeout.
                     transcription_budget_seconds=0.0,
+                    deadline=deadline,
                 )
                 seen_episode_ids = {p.metadata.get("episode_id") or p.original_url for p in payloads if p.metadata}
                 for rp in refined_payloads:

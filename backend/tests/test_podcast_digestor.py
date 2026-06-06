@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 
 from backend.agents.digestor import podcast
@@ -617,6 +618,49 @@ def test_podcast_relevance_drop_decision_is_rejected(monkeypatch):
     decision_actions = {d.action for d in decisions}
     assert "drop_episode_candidate" in decision_actions
     assert not any(d.decision == "keep_uncertain" for d in decisions)
+
+
+def test_fetch_podcast_episodes_returns_partial_when_deadline_passed(monkeypatch, tmp_path):
+    """An expired overall deadline returns partial results instead of timing out."""
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv("MORNING_DISPATCH_DB_PATH", str(runtime / "data" / "db" / "morning_dispatch.sqlite3"))
+    database.init_database()
+
+    episode = podcast.PodcastEpisode(
+        show_name="AI Daily Brief",
+        feed_url="https://podcasts.example.com/feed.xml",
+        episode_id="episode-1",
+        title="Agentic AI workflows",
+        description="A discussion of agentic AI and local LLM infrastructure.",
+        published_at=datetime.now(UTC).isoformat(timespec="seconds"),
+        episode_url="https://podcasts.example.com/agentic-ai",
+        audio_url="https://cdn.example.com/audio.mp3",
+        duration_seconds=1800,
+    )
+
+    async def fake_fetch_feed_episodes(_client, _source):
+        return [episode]
+
+    def explode(*_args, **_kwargs):  # episode processing must NOT run past the deadline
+        raise AssertionError("ranked loop should break before processing when the deadline passed")
+
+    monkeypatch.setattr(podcast, "_fetch_feed_episodes", fake_fetch_feed_episodes)
+    monkeypatch.setattr(podcast, "_episode_text", explode)
+
+    payloads, _decisions = asyncio.run(
+        podcast.fetch_podcast_episodes(
+            digest_id="digest-deadline",
+            digest_interest="agentic AI local LLM infrastructure",
+            sources=[{"type": "podcast_rss", "title": "AI Daily Brief", "feed_url": "https://podcasts.example.com/feed.xml"}],
+            lookback_hours=24,
+            deadline=time.monotonic() - 1,  # already expired
+        )
+    )
+    # The lane returns (empty) partial results instead of raising / hanging.
+    assert payloads == []
 
 
 
