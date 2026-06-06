@@ -31,6 +31,21 @@ GENERIC_TITLE_VALUES = {
     "web result from serpapi",
 }
 
+SOURCE_ISSUE_ADAPTERS = {
+    "collections": "collections",
+    "collection": "collections",
+    "foreign media": "foreign_media",
+    "gmail": "gmail",
+    "market data": "markets",
+    "markets": "markets",
+    "podcast": "podcasts",
+    "podcasts": "podcasts",
+    "reddit": "reddit",
+    "web": "web_search",
+    "web search": "web_search",
+    "youtube": "youtube",
+}
+
 
 def _clean_title_value(value: Any) -> str:
     title = str(value or "").strip()
@@ -112,6 +127,63 @@ def _article_title(result: ArticleFetchResult, *, fallback: str = "Source item")
     if title:
         return title
     return _candidate_title_from_payload(result.payload, fallback=fallback)
+
+
+def _source_issue_adapter(source_name: Any) -> str:
+    normalized = re.sub(r"\s+", " ", str(source_name or "").strip().lower())
+    return SOURCE_ISSUE_ADAPTERS.get(normalized, normalized.replace(" ", "_"))
+
+
+def _row_has_terminal_reason(row: Dict[str, Any]) -> bool:
+    stages = row.get("stages") if isinstance(row.get("stages"), dict) else {}
+    return any(bool(reason) for reason in stages.values())
+
+
+def _repair_unresolved_reporting_rows(
+    report_data: List[Dict[str, Any]],
+    progress: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Backfill terminal reasons into older reports with blank-pass rows.
+
+    Some saved reports predate explicit not-fetched reporting and can show
+    candidates as passing every lifecycle stage even when the run-level source
+    issue says the entire source failed to contribute final brief content.
+    """
+    issues = progress.get("requested_source_issues") if isinstance(progress, dict) else []
+    if not isinstance(issues, list):
+        return report_data
+
+    source_reasons: Dict[str, str] = {}
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        reason = str(issue.get("reason") or "").strip()
+        if "none survived" not in reason.lower():
+            continue
+        adapter = _source_issue_adapter(issue.get("source_name"))
+        if adapter:
+            source_reasons[adapter] = reason
+
+    if not source_reasons:
+        return report_data
+
+    repaired: List[Dict[str, Any]] = []
+    for row in report_data:
+        if not isinstance(row, dict):
+            repaired.append(row)
+            continue
+        source = str(row.get("source") or "").strip()
+        reason = source_reasons.get(source)
+        if not reason or _row_has_terminal_reason(row):
+            repaired.append(row)
+            continue
+        stages = row.get("stages") if isinstance(row.get("stages"), dict) else {}
+        next_row = dict(row)
+        next_stages = dict(stages)
+        next_stages["inclusion"] = reason
+        next_row["stages"] = next_stages
+        repaired.append(next_row)
+    return repaired
 
 
 def compile_reporting_data(
@@ -230,7 +302,33 @@ def compile_reporting_data(
         if cand_id:
             set_reason_at_stage(cand_id, "recency", reason)
 
-    # 4. Add fetch failures
+    # 4. Add candidates that never entered fetch/extract. Discovery can produce
+    # many more candidates than the article fetch budget; without an explicit
+    # reason these rows look like they passed every stage in the UI.
+    processed_ids = {
+        result.payload.id
+        for result in [
+            *fetched_articles,
+            *enriched_articles,
+            *ranked_articles,
+            *after_audit,
+            *after_editorial,
+            *after_critic,
+            *final_results,
+        ]
+    }
+    for cand_id, cand in candidates_by_id.items():
+        if any(cand["stages"].values()):
+            continue
+        if cand_id in processed_ids:
+            continue
+        set_reason_at_stage(
+            cand_id,
+            "fetch",
+            "Discovery candidate was not fetched or extracted before the article pipeline moved on, usually because the run produced more candidates than the fetch budget.",
+        )
+
+    # 5. Add fetch failures
     for result in fetched_articles:
         cand_id = result.payload.id
         if cand_id in candidates_by_id:
@@ -242,7 +340,7 @@ def compile_reporting_data(
                 reason = result.error or f"Failed to fetch content ({result.status})."
                 set_reason_at_stage(cand_id, "fetch", reason)
 
-    # 5. Add pre-ranking quality audit drops
+    # 6. Add pre-ranking quality audit drops
     enriched_ids = {r.payload.id for r in enriched_articles}
     ranked_ids = {r.payload.id for r in ranked_articles}
 
@@ -265,7 +363,7 @@ def compile_reporting_data(
                 f"Filtered out due to low relevance score ({result.relevance_score or 0.0:.2f} is below target threshold).",
             )
 
-    # 6. Add source audit drops
+    # 7. Add source audit drops
     after_audit_ids = {r.payload.id for r in after_audit if r.tier != "dropped"}
     audit_issues = progress.get("source_audit_issues") or []
     audit_reason = "Flagged by source audit (failed freshness, fit, or source quality checks)."
@@ -376,17 +474,20 @@ def save_reporting_log(exploration_id: str, data: List[Dict[str, Any]]) -> str:
 def get_or_build_reporting_log(exploration_id: str) -> List[Dict[str, Any]]:
     settings = get_settings()
     path = settings.data_dir / "digest-output" / f"exploration-{exploration_id}-reporting.json"
+    exploration = database.get_exploration(exploration_id)
+    progress = exploration.get("progress") if exploration else {}
+    if not isinstance(progress, dict):
+        progress = {}
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            report_data = json.loads(path.read_text(encoding="utf-8"))
+            return _repair_unresolved_reporting_rows(report_data, progress)
         except Exception as exc:
             logger.warning("Failed to read reporting json for exploration %s: %s", exploration_id, exc)
 
-    exploration = database.get_exploration(exploration_id)
     if exploration:
-        progress = exploration.get("progress") or {}
         if "candidate_reporting_data" in progress:
-            return progress["candidate_reporting_data"]
+            return _repair_unresolved_reporting_rows(progress["candidate_reporting_data"], progress)
 
     logger.info("Reconstructing reporting log on-demand for exploration %s", exploration_id)
     return reconstruct_reporting_data(exploration_id)

@@ -147,6 +147,48 @@ def test_compile_reporting_data(mock_candidate_and_fetch_results):
     assert cand_reports["cand_3"]["stages"]["inclusion"] == "Exceeded source-specific capacity limit (YouTube/Podcast capped at 20; Gmail/Markets/Web/Foreign capped at 40)."
 
 
+def test_compile_reporting_data_marks_discovered_unfetched_candidates(mock_candidate_and_fetch_results):
+    candidates, fetch_results = mock_candidate_and_fetch_results
+    payload4 = NormalizedPayload(
+        id="cand_4",
+        source_type="web_search",
+        source_name="Web Search",
+        original_url="https://example.com/not-fetched",
+        raw_text="This discovery candidate never entered fetch.",
+        published_at="2026-06-01T12:00:00Z",
+        fetched_at="2026-06-01T12:05:00Z",
+        metadata={"title": "Not fetched"},
+    )
+    c4 = Candidate(payload=payload4, score=0.6, reason="Extra web candidate", adapter="web_search")
+    discovery = DiscoveryResult(
+        profile=MagicMock(),
+        candidates=tuple([candidates[0], c4]),
+        statuses=tuple([]),
+        exclusions=tuple([]),
+    )
+
+    report = compile_reporting_data(
+        exploration_id="test_exp_unfetched",
+        discovery=discovery,
+        fetched_articles=[fetch_results[0]],
+        source_window_issues=[],
+        enriched_articles=[fetch_results[0]],
+        ranked_articles=[fetch_results[0]],
+        after_audit=[fetch_results[0]],
+        after_editorial=[fetch_results[0]],
+        after_critic=[fetch_results[0]],
+        final_results=[fetch_results[0]],
+        progress={},
+    )
+
+    cand_reports = {item["id"]: item for item in report}
+    assert all(val is None for val in cand_reports["cand_1"]["stages"].values())
+    assert cand_reports["cand_4"]["stages"]["fetch"].startswith(
+        "Discovery candidate was not fetched or extracted"
+    )
+    assert cand_reports["cand_4"]["stages"]["inclusion"] is None
+
+
 def test_save_and_retrieve_reporting_log(tmp_path):
     report_data = [{"id": "test_1", "title": "Test Title", "stages": {}}]
     
@@ -162,6 +204,71 @@ def test_save_and_retrieve_reporting_log(tmp_path):
         retrieved = get_or_build_reporting_log("test_id")
         assert len(retrieved) == 1
         assert retrieved[0]["id"] == "test_1"
+
+
+def test_retrieve_reporting_log_repairs_blank_pass_rows_from_source_issues(tmp_path):
+    report_data = [
+        {
+            "id": "web_1",
+            "title": "Web candidate",
+            "url": "https://example.com/web",
+            "source": "web_search",
+            "stages": {
+                "discovery": None,
+                "screening": None,
+                "recency": None,
+                "fetch": None,
+                "audit": None,
+                "editorial": None,
+                "critic": None,
+                "inclusion": None,
+            },
+        },
+        {
+            "id": "gmail_1",
+            "title": "Gmail candidate",
+            "url": "https://example.com/gmail",
+            "source": "gmail",
+            "stages": {
+                "discovery": None,
+                "screening": None,
+                "recency": None,
+                "fetch": None,
+                "audit": None,
+                "editorial": None,
+                "critic": None,
+                "inclusion": None,
+            },
+        },
+    ]
+    report_dir = tmp_path / "digest-output"
+    report_dir.mkdir()
+    (report_dir / "exploration-exp_1-reporting.json").write_text(
+        json.dumps(report_data),
+        encoding="utf-8",
+    )
+
+    progress = {
+        "requested_source_issues": [
+            {
+                "source_name": "Web Search",
+                "reason": "Web Search returned 250 candidate(s), but none survived fetch, audit, ranking, and review into the final brief.",
+            }
+        ]
+    }
+
+    with patch("backend.app.services.reporting.get_settings") as mock_settings:
+        mock_set = MagicMock()
+        mock_set.data_dir = tmp_path
+        mock_settings.return_value = mock_set
+        with patch("backend.app.services.reporting.database.get_exploration") as mock_get:
+            mock_get.return_value = {"progress": progress}
+
+            retrieved = get_or_build_reporting_log("exp_1")
+
+    by_id = {row["id"]: row for row in retrieved}
+    assert by_id["web_1"]["stages"]["inclusion"] == progress["requested_source_issues"][0]["reason"]
+    assert by_id["gmail_1"]["stages"]["inclusion"] is None
 
 
 def test_reconstruct_reporting_data_fallback(tmp_path):
