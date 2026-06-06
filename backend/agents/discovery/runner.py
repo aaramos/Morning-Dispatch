@@ -176,6 +176,11 @@ class DiscoveryRunner:
         low_yield: bool = False,
     ) -> DiscoveryResult:
         selection = source_selection or profile.source_selection
+        # Proactive query expansion (item 1): widen the search strategy for every
+        # selected source before any adapter runs. Folding the affiliated angles
+        # into per-source queries (not the global topic text) means adapters cast
+        # a wider net without loosening the downstream topic-relevance gate.
+        profile = await _expand_profile_queries(profile, selection, context, low_yield=low_yield)
         adapters = self.registry.selected(selection)
         all_names = set(self.registry.names())
         callback = on_adapter_status
@@ -205,76 +210,37 @@ class DiscoveryRunner:
                 boosted_candidates.append(candidate)
         candidates = boosted_candidates
 
-        # Dedicated source ranking lanes (sorted against each other before competing with
-        # other sources for pipeline capacity). These sources should be judged within
-        # their own lanes rather than crowded out by high-volume web results.
-        target_capacity = max(1, context.candidate_limit)
-        profile_total_limit = _explicit_total_limit(profile)
-        if profile_total_limit is not None:
-            target_capacity = min(target_capacity, profile_total_limit)
-        source_plan: tuple[tuple[str, int], ...] = (
-            ("markets", _lane_limit(profile, "markets", default=250, system_max=250)),
-            ("youtube", _lane_limit(profile, "youtube", default=250, system_max=250)),
-            ("podcasts", _lane_limit(profile, "podcasts", default=250, system_max=250)),
-            ("gmail", _lane_limit(profile, "gmail", default=250, system_max=250)),
-            ("foreign_media", _lane_limit(profile, "foreign_media", default=250, system_max=250)),
-            ("reddit", _lane_limit(profile, "reddit", default=250, system_max=250)),
-        )
-
+        # Dedicated source lanes (item 2): EVERY selected source is judged within
+        # its own lane and reserved its own slots, so no source is crowded out of
+        # the brief by another source's volume or higher scores. Each lane is
+        # bounded only by its own per-source limit, never by a shared global pool.
+        sort_key = lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or "")
+        lane_sources = sorted({candidate.adapter for candidate in candidates})
         lane_candidates: list[Candidate] = []
-        lane_adapters: set[str] = set()
-        for source, source_limit in source_plan:
-            if selection.get(source) is not True:
+        for source in lane_sources:
+            if selection.get(source) is False:
                 continue
+            source_limit = _lane_limit(profile, source, default=250, system_max=250)
             raw_candidates = [candidate for candidate in candidates if candidate.adapter == source]
-            lane_adapters.add(source)
 
             if source == "markets":
+                # Explicitly requested tickers are never trimmed by the lane limit.
                 explicit_candidates = [c for c in raw_candidates if (c.payload.metadata or {}).get("explicit_ticker") is True]
                 regular_candidates = [c for c in raw_candidates if (c.payload.metadata or {}).get("explicit_ticker") is not True]
-
-                deduped_explicit = _dedupe_candidates(
-                    sorted(explicit_candidates, key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True),
-                    limit=len(explicit_candidates),
+                lane_candidates.extend(
+                    _dedupe_candidates(sorted(explicit_candidates, key=sort_key, reverse=True), limit=len(explicit_candidates))
                 )
-
-                deduped_regular = _dedupe_candidates(
-                    sorted(regular_candidates, key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True),
-                    limit=source_limit,
+                lane_candidates.extend(
+                    _dedupe_candidates(sorted(regular_candidates, key=sort_key, reverse=True), limit=source_limit)
                 )
-
-                lane_candidates.extend(deduped_explicit)
-                lane_candidates.extend(deduped_regular)
             else:
                 lane_candidates.extend(
-                    _dedupe_candidates(
-                        sorted(raw_candidates, key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True),
-                        limit=source_limit,
-                    )
+                    _dedupe_candidates(sorted(raw_candidates, key=sort_key, reverse=True), limit=source_limit)
                 )
 
-        other_candidates = [candidate for candidate in candidates if candidate.adapter not in lane_adapters]
-
-        # Apply source limits to non-lane candidates first, then trim to the remaining
-        # capacity after reserved lane quotas.
-        other_candidates = _apply_source_limits(
-            profile,
-            other_candidates,
-            target_limit=_explicit_total_limit(profile),
-        )
-        is_constrained = (
-            (_explicit_total_limit(profile) is not None and _explicit_total_limit(profile) < 150) or
-            (context.candidate_limit < 150)
-        )
-        if is_constrained:
-            non_lane_capacity = max(0, target_capacity - len(lane_candidates))
-        else:
-            non_lane_capacity = _lane_limit(profile, "web_search", default=250, system_max=250)
-
-        deduped_other = _dedupe_candidates(other_candidates, limit=non_lane_capacity)
-
-        # Combine reserved lane results with the backfilled candidate stream.
-        candidates = sorted(list(lane_candidates) + list(deduped_other), key=lambda c: (c.score, c.payload.published_at or c.payload.fetched_at or ""), reverse=True)
+        # Combine every reserved lane into one ranked stream. Ordering by score is
+        # purely cosmetic for downstream stages; the slots themselves are reserved.
+        candidates = sorted(lane_candidates, key=sort_key, reverse=True)
 
         # Capture deduplication / lane limits drops
         final_ids = {c.payload.id for c in candidates}
@@ -358,6 +324,38 @@ class DiscoveryRunner:
         return candidates, status
 
 
+async def _expand_profile_queries(
+    profile: TopicProfile,
+    selection: dict[str, bool] | None,
+    context: SourceAdapterContext,
+    *,
+    low_yield: bool,
+) -> TopicProfile:
+    """Return a profile whose per-source queries include AI-suggested affiliated
+    angles for every selected source (item 1). Fails open to the original profile.
+    """
+    selected = {name for name, enabled in (selection or {}).items() if enabled}
+    if not selected:
+        return profile
+    from backend.agents.discovery.query_refiner import expand_search_strategy
+
+    expansions = await expand_search_strategy(profile, lookback_hours=context.lookback_hours)
+    if not expansions:
+        return profile
+
+    source_queries = {key: tuple(value) for key, value in profile.source_queries.items()}
+    for source in selected:
+        existing = list(source_queries.get(source, ()))
+        seen = {q.strip().lower() for q in existing}
+        for query in expansions:
+            key = query.strip().lower()
+            if key and key not in seen:
+                existing.append(query)
+                seen.add(key)
+        source_queries[source] = tuple(existing)
+    return replace(profile, source_queries=source_queries)
+
+
 def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candidate]:
     if limit <= 0:
         return []
@@ -373,51 +371,6 @@ def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candi
         if len(deduped) >= limit:
             break
     return deduped
-
-
-def _apply_source_limits(profile: TopicProfile, candidates: list[Candidate], *, target_limit: int | None = None) -> list[Candidate]:
-    per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else None
-    if not isinstance(per_source, dict) or not per_source:
-        return candidates
-
-    counts: dict[str, int] = {}
-    kept: list[Candidate] = []
-    ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
-    kept_ids: set[int] = set()
-    for candidate in ranked:
-        limit = _source_limit(per_source.get(candidate.adapter))
-        if limit is None:
-            kept.append(candidate)
-            kept_ids.add(id(candidate))
-            continue
-        current = counts.get(candidate.adapter, 0)
-        if current >= limit:
-            continue
-        counts[candidate.adapter] = current + 1
-        kept.append(candidate)
-        kept_ids.add(id(candidate))
-
-    if target_limit is not None and len(kept) < target_limit:
-        for candidate in ranked:
-            if id(candidate) in kept_ids:
-                continue
-            kept.append(candidate)
-            kept_ids.add(id(candidate))
-            if len(kept) >= target_limit:
-                break
-    return kept
-
-
-def _explicit_total_limit(profile: TopicProfile) -> int | None:
-    if not isinstance(profile.content_limits, dict) or "total_items" not in profile.content_limits:
-        return None
-    try:
-        total = int(profile.content_limits.get("total_items"))
-    except (TypeError, ValueError):
-        return None
-    if total < 1:
-        return None
-    return min(total, 250)
 
 
 def _lane_limit(profile: TopicProfile, adapter_name: str, *, default: int, system_max: int) -> int:

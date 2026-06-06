@@ -2853,16 +2853,23 @@ def render_ingested_issue(
     lead_article = next((result for result in story_articles if result.tier == "lead"), None)
     if lead_article is None and story_articles:
         lead_article = story_articles[0]
-    ranked_articles = [
+    # Non-lower-confidence story items, lead first. These feed both the cross-source
+    # Top Stories section (item 5) and the per-source sections (item 4).
+    main_story_articles = [
         result
         for result in story_articles
         if result is not lead_article and result.tier != "lower_confidence"
     ]
+    ordered_main = ([lead_article] if lead_article else []) + main_story_articles
     lower_confidence_articles = [
         result
         for result in story_articles
         if result is not lead_article and result.tier == "lower_confidence"
     ]
+
+    # Top Stories (item 5): the best items mixed across every story source.
+    top_stories = ordered_main[:_TOP_STORIES_TARGET]
+    per_source_remainder = ordered_main[_TOP_STORIES_TARGET:]
 
     newsletter_items = [_render_newsletter_item(payload) for payload in body_payloads]
     newsletter_html = "\n".join(item for item in newsletter_items if item)
@@ -2876,17 +2883,30 @@ def render_ingested_issue(
         inference_run_id=None,
         stage_seconds=None,
     )
-    lead_html = _render_lead_story(lead_article, issue_id=issue_id) if lead_article else ""
     market_html = _render_market_snapshot_section(market_articles)
-    image_strip_html = _render_image_strip([result for result in [lead_article, *ranked_articles, *media_articles] if result])
-    ranked_html = "\n".join(
-        _render_ranked_story(result, index=index, issue_id=issue_id)
-        for index, result in enumerate(ranked_articles, start=1)
+    image_strip_html = _render_image_strip([result for result in [*top_stories, *media_articles] if result])
+
+    # Top Stories: lead block for the single best item, story-rows for the rest.
+    lead_html = _render_lead_story(top_stories[0], issue_id=issue_id) if top_stories else ""
+    running_index = 1
+    top_rows_html = "\n".join(
+        _render_ranked_story(result, index=running_index + offset, issue_id=issue_id)
+        for offset, result in enumerate(top_stories[1:])
     )
-    media_html = "\n".join(_render_media_card(result, issue_id=issue_id) for result in media_articles)
+    running_index += max(0, len(top_stories) - 1)
+
+    # Per-source sections (item 4): each story source gets its own labeled section
+    # for the items beyond Top Stories, in a stable display order.
+    per_source_sections_html, running_index = _render_source_sections(
+        per_source_remainder, start_index=running_index, issue_id=issue_id
+    )
+
+    # Media gets dedicated per-source sections too (Watch for video, Listen for audio).
+    media_sections_html = _render_media_sections(media_articles, issue_id=issue_id)
+
     lower_html = "\n".join(
         _render_lower_confidence_story(result, index=index, issue_id=issue_id)
-        for index, result in enumerate(lower_confidence_articles, start=len(ranked_articles) + 1)
+        for index, result in enumerate(lower_confidence_articles, start=running_index)
     )
     sidebar_html = _render_brief_sidebar(
         stats=effective_stats,
@@ -2907,17 +2927,9 @@ def render_ingested_issue(
         </section>
         """
     ranked_empty = ""
-    if not lead_html and not ranked_html and not media_html:
+    if not lead_html and not top_rows_html and not per_source_sections_html and not media_sections_html:
         ranked_empty = '<p class="meta">No stories were ready for this brief.</p>'
-    media_section = ""
-    if media_html:
-        media_section = f"""
-        <section class="media-section" aria-labelledby="media-heading">
-          <div class="section-kicker">Media</div>
-          <h2 id="media-heading">Watch & listen</h2>
-          <div class="media-grid">{media_html}</div>
-        </section>
-        """
+    media_section = media_sections_html
     lower_section = ""
     if lower_html:
         lower_section = f"""
@@ -2999,7 +3011,7 @@ def render_ingested_issue(
     .translation-original p {{ margin: 8px 0 0; line-height: 1.45; }}
     .keywords {{ margin-top: 10px; font: 500 .72rem/1.5 var(--mono); color: var(--muted); }}
     .keywords span {{ border-bottom: 1px dotted var(--line); }}
-    .ranked-section, .media-section, .lower-confidence {{ border-top: 1px solid var(--line); padding-top: 20px; }}
+    .ranked-section, .top-stories-section, .source-section, .media-section, .lower-confidence {{ border-top: 1px solid var(--line); padding-top: 20px; }}
     .story-list {{ display: grid; gap: 0; }}
     .story-row {{ display: grid; grid-template-columns: 64px minmax(0, 1fr) 132px; gap: 18px; padding: 22px 0; border-bottom: 1px solid var(--line); align-items: start; }}
     .story-num {{ font-family: var(--display); font-size: 2.45rem; line-height: .9; color: var(--accent); font-weight: 900; }}
@@ -3125,11 +3137,12 @@ def render_ingested_issue(
       <div class="story-column">
         {image_strip_html}
         {lead_html}
-        <section class="ranked-section" aria-labelledby="ranked-heading">
-          <div class="section-kicker">Ranked</div>
-          <h2 id="ranked-heading">Top stories</h2>
-          <div class="story-list">{ranked_html or ranked_empty or '<p class="meta">No additional stories this run.</p>'}</div>
+        <section class="top-stories-section" aria-labelledby="top-stories-heading">
+          <div class="section-kicker">Across all sources</div>
+          <h2 id="top-stories-heading">Top stories</h2>
+          <div class="story-list">{top_rows_html or ranked_empty or '<p class="meta">No additional stories this run.</p>'}</div>
         </section>
+        {per_source_sections_html}
         {media_section}
         {lower_section}
       </div>
@@ -4012,6 +4025,101 @@ def _compact_company_name(company_name: str, ticker: str) -> str:
     return cleaned[:70] or ticker
 
 
+# Number of cross-source items featured in the Top Stories section (item 5).
+_TOP_STORIES_TARGET = 5
+
+# Stable display order for per-source brief sections (item 4). Labels not listed
+# fall back to alphabetical order after these.
+_SOURCE_SECTION_ORDER = (
+    "Gmail",
+    "Web",
+    "Foreign media",
+    "Reddit",
+    "Collections",
+    "Markets",
+    "SEC filings",
+    "Macro",
+)
+
+
+def _render_source_sections(
+    results: list[ArticleFetchResult],
+    *,
+    start_index: int,
+    issue_id: str | None = None,
+) -> tuple[str, int]:
+    """Render one dedicated section per source (item 4) for non-top-story items.
+
+    Returns the combined HTML and the next running story index so lower-confidence
+    numbering continues uninterrupted.
+    """
+    grouped: dict[str, list[ArticleFetchResult]] = {}
+    for result in results:
+        label = _brief_source_count_label(result.payload.source_type)
+        grouped.setdefault(label, []).append(result)
+
+    ordered_labels = [label for label in _SOURCE_SECTION_ORDER if label in grouped]
+    ordered_labels.extend(sorted(label for label in grouped if label not in _SOURCE_SECTION_ORDER))
+
+    sections: list[str] = []
+    index = start_index
+    for label in ordered_labels:
+        rows: list[str] = []
+        for result in grouped[label]:
+            rows.append(_render_ranked_story(result, index=index, issue_id=issue_id))
+            index += 1
+        slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "source"
+        sections.append(
+            f"""
+        <section class="source-section" aria-labelledby="source-{slug}-heading">
+          <div class="section-kicker">Source</div>
+          <h2 id="source-{slug}-heading">{escape(label)}</h2>
+          <div class="story-list">{''.join(rows)}</div>
+        </section>
+        """
+        )
+    return "\n".join(sections), index
+
+
+def _media_section_bucket(result: ArticleFetchResult) -> str:
+    if result.payload.source_type == "youtube_video" or result.content_type == "video":
+        return "Watch"
+    if result.payload.source_type == "podcast_episode" or result.content_type == "podcast":
+        return "Listen"
+    return "Watch & listen"
+
+
+def _render_media_sections(
+    media_articles: list[ArticleFetchResult],
+    *,
+    issue_id: str | None = None,
+) -> str:
+    """Dedicated per-source media sections (item 4): Watch for video, Listen for audio."""
+    if not media_articles:
+        return ""
+    grouped: dict[str, list[ArticleFetchResult]] = {}
+    for result in media_articles:
+        grouped.setdefault(_media_section_bucket(result), []).append(result)
+
+    sections: list[str] = []
+    for heading in ("Watch", "Listen", "Watch & listen"):
+        items = grouped.get(heading)
+        if not items:
+            continue
+        slug = re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-") or "media"
+        cards = "\n".join(_render_media_card(result, issue_id=issue_id) for result in items)
+        sections.append(
+            f"""
+        <section class="media-section" aria-labelledby="media-{slug}-heading">
+          <div class="section-kicker">Media</div>
+          <h2 id="media-{slug}-heading">{escape(heading)}</h2>
+          <div class="media-grid">{cards}</div>
+        </section>
+        """
+        )
+    return "\n".join(sections)
+
+
 def _render_lead_story(result: ArticleFetchResult, *, issue_id: str | None = None) -> str:
     url = _reader_url(result)
     link_url, link_target, link_class, link_attributes, modal_html = _story_link_parts(result, issue_id=issue_id)
@@ -4361,6 +4469,8 @@ def _brief_source_count_label(source_type: str) -> str:
         return "Markets"
     if source_type == "collection_chunk":
         return "Collections"
+    if source_type == "reddit_post":
+        return "Reddit"
     if source_type == "sec_filing":
         return "SEC filings"
     if source_type == "fred_series":
@@ -6122,7 +6232,19 @@ def agent_decisions_summary(*, limit: int = 500) -> dict[str, Any]:
     }
 
 
-def record_podcast_metric(metric: dict[str, Any]) -> str:
+def record_podcast_metric(metric: dict[str, Any]) -> str | None:
+    digest_id = str(metric.get("digest_id") or "")
+    if digest_id:
+        with connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM digests WHERE id = ?", (digest_id,)
+            ).fetchone()
+            if not exists:
+                logger.info(
+                    "Skipping record_podcast_metric: digest_id %s not in digests table (exploration run)",
+                    digest_id,
+                )
+                return None
     metric_id = str(metric.get("id") or new_id())
     record = {
         "id": metric_id,

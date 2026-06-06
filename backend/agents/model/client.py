@@ -52,7 +52,7 @@ async def aclose_shared_model_clients() -> None:
     clients = list(_SHARED_HTTP_CLIENTS.values())
     _SHARED_HTTP_CLIENTS.clear()
     for _loop, client in clients:
-        if not client.is_closed:
+        if hasattr(client, "is_closed") and not client.is_closed:
             try:
                 await client.aclose()
             except Exception:  # pragma: no cover - best-effort shutdown

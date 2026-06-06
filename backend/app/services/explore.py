@@ -269,6 +269,13 @@ async def source_status() -> dict[str, Any]:
                 "max_core_companies": settings.markets_max_core_companies,
                 "max_related_companies": settings.markets_max_related_companies,
             },
+            "reddit": {
+                "label": "Reddit",
+                "enabled": True,
+                "setup_required": False,
+                "reason": None,
+                "mode": "public-json-rss",
+            },
         }
     }
 
@@ -736,8 +743,10 @@ async def _run_exploration(
         except Exception as exc:
             logger.exception("Failed to compile or save reporting log for exploration %s: %s", exploration_id, exc)
         _add_final_source_mix_issues(progress, discovery, article_results, merged_selection)
-        if mode == "scheduled":
-            _promote_explore_sources(topic_id=topic_id, discovery=discovery, article_results=article_results)
+        # Feedback loop (item 6): learn promoted sources from whatever produced
+        # included content on every run mode, not just scheduled ones, so the loop
+        # is active for all sources and shapes future discovery queries.
+        _promote_explore_sources(topic_id=topic_id, discovery=discovery, article_results=article_results)
         _set_pipeline_stage(progress, "done", "running")
         _set_candidate_count(progress, len(payloads))
 
@@ -1329,19 +1338,29 @@ async def _run_digest_core(
     return final_results
 
 
-def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchResult]) -> list[ArticleFetchResult]:
+def _result_adapter(result: ArticleFetchResult) -> str:
+    adapter = _adapter_from_payload_type(result.payload.source_type, result.payload.metadata)
+    return adapter or result.payload.source_type or "web_search"
+
+
+def _source_inclusion_limit(profile: TopicProfile, adapter: str) -> int:
+    """Per-source inclusion cap, clamped to the unified system ceiling (item 7)."""
     per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else {}
+    max_allowed = brief_settings.source_inclusion_max(adapter)
+    if isinstance(per_source, dict) and adapter in per_source:
+        try:
+            return min(int(per_source[adapter]), max_allowed)
+        except (TypeError, ValueError):
+            return max_allowed
+    return max_allowed
+
+
+def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchResult]) -> list[ArticleFetchResult]:
     counts: dict[str, int] = {}
     updated: list[ArticleFetchResult] = []
     for r in results:
-        adapter = _adapter_from_payload_type(r.payload.source_type, r.payload.metadata)
-        if not adapter:
-            adapter = r.payload.source_type or "web_search"
-
-        max_allowed = 20 if adapter in ("youtube", "podcasts", "reddit") else (40 if adapter in ("markets", "web_search", "gmail", "foreign_media") else 25)
-        limit = per_source.get(adapter, max_allowed) if isinstance(per_source, dict) else max_allowed
-        limit = min(limit, max_allowed)
-
+        adapter = _result_adapter(r)
+        limit = _source_inclusion_limit(profile, adapter)
         if r.tier != "dropped":
             current = counts.get(adapter, 0)
             if current >= limit:
@@ -1352,42 +1371,46 @@ def _enforce_inclusion_limits(profile: TopicProfile, results: list[ArticleFetchR
         else:
             updated.append(r)
 
-    # Podcast Quota Revival
-    podcasts_active = False
-    if profile.source_selection:
-        podcasts_active = profile.source_selection.get("podcasts") is True
+    # Generalized per-source floor (item 3): every active source that produced
+    # candidates is guaranteed a minimum number of slots in the brief, reviving
+    # its best dropped (loosely related) items when nothing survived review.
+    return _apply_source_floors(profile, updated)
 
-    if podcasts_active:
-        podcast_quota = 5
-        if isinstance(profile.content_limits, dict):
-            min_items = profile.content_limits.get("min_items", {})
-            if isinstance(min_items, dict):
-                podcast_quota = min_items.get("podcasts", 5)
 
-        active_podcast_count = sum(
+def _apply_source_floors(
+    profile: TopicProfile,
+    results: list[ArticleFetchResult],
+) -> list[ArticleFetchResult]:
+    selection = profile.source_selection or {}
+    # Which adapters actually returned candidates this run (dropped or kept).
+    present_adapters: set[str] = {_result_adapter(r) for r in results}
+    updated = list(results)
+    for adapter in sorted(present_adapters):
+        if selection and selection.get(adapter) is not True:
+            continue
+        floor = brief_settings.source_min_items(adapter, profile.content_limits)
+        if floor <= 0:
+            continue
+        limit = _source_inclusion_limit(profile, adapter)
+        target = min(floor, limit)
+        active = sum(
             1 for r in updated
-            if r.tier != "dropped" and _adapter_from_payload_type(r.payload.source_type, r.payload.metadata) == "podcasts"
+            if r.tier != "dropped" and _result_adapter(r) == adapter
         )
-
-        # Get limit for podcasts to cap revival
-        max_allowed = 20
-        limit = per_source.get("podcasts", max_allowed) if isinstance(per_source, dict) else max_allowed
-        limit = min(limit, max_allowed)
-        target_quota = min(podcast_quota, limit)
-
-        if active_podcast_count < target_quota:
-            needed = target_quota - active_podcast_count
-            revival_candidates = []
-            for i, r in enumerate(updated):
-                adapter = _adapter_from_payload_type(r.payload.source_type, r.payload.metadata)
-                if adapter == "podcasts" and r.tier == "dropped":
-                    if r.link_score >= 0.22 and r.status != "error":
-                        revival_candidates.append((r.link_score, i))
-
-            revival_candidates.sort(key=lambda x: x[0], reverse=True)
-            for _, idx in revival_candidates[:needed]:
-                updated[idx] = replace(updated[idx], tier="main")
-
+        if active >= target:
+            continue
+        needed = target - active
+        revival: list[tuple[float, int]] = []
+        for index, r in enumerate(updated):
+            if _result_adapter(r) != adapter or r.tier != "dropped":
+                continue
+            if r.status == "error":
+                continue
+            if r.link_score >= brief_settings.SOURCE_FLOOR_SCORE_THRESHOLD:
+                revival.append((r.link_score, index))
+        revival.sort(key=lambda item: item[0], reverse=True)
+        for _, index in revival[:needed]:
+            updated[index] = replace(updated[index], tier="main")
     return updated
 
 

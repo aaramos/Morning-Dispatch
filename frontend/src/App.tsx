@@ -705,6 +705,10 @@ type StrategyStreamEvent =
   | { type: "done"; session: RefinementSession; has_proposal: boolean }
   | { type: "error"; message: string };
 
+type QueryEditTarget =
+  | { kind: "general"; index: number }
+  | { kind: "source"; sourceKey: string; index: number };
+
 type RefinementStreamBody = {
   session_id?: string | null;
   statement?: string;
@@ -1083,6 +1087,84 @@ function DispatchApp() {
     }
   }
 
+  function updateSearchQuery(target: QueryEditTarget, nextValue: string | null) {
+    const applyEdit = (profile: TopicProfile): TopicProfile => {
+      const nextProfile: TopicProfile = {
+        ...profile,
+        search_queries: [...(profile.search_queries ?? [])],
+        source_queries: { ...(profile.source_queries ?? {}) },
+      };
+      if (target.kind === "general") {
+        const queries = [...(nextProfile.search_queries ?? [])];
+        if (nextValue === null) {
+          queries.splice(target.index, 1);
+        } else {
+          queries[target.index] = nextValue;
+        }
+        nextProfile.search_queries = queries;
+      } else {
+        const sourceQueries = [...(nextProfile.source_queries?.[target.sourceKey] ?? [])];
+        if (nextValue === null) {
+          sourceQueries.splice(target.index, 1);
+        } else {
+          sourceQueries[target.index] = nextValue;
+        }
+        nextProfile.source_queries = {
+          ...(nextProfile.source_queries ?? {}),
+          [target.sourceKey]: sourceQueries,
+        };
+      }
+      return nextProfile;
+    };
+
+    const applyPreviewEdit = (preview: StrategyPreview | undefined): StrategyPreview | undefined => {
+      if (!preview) return preview;
+      if (target.kind === "general") {
+        const queries = [...preview.search_queries];
+        if (nextValue === null) {
+          queries.splice(target.index, 1);
+        } else {
+          queries[target.index] = nextValue;
+        }
+        return { ...preview, search_queries: queries };
+      }
+      return {
+        ...preview,
+        per_source: preview.per_source.map((source) => {
+          if (source.key !== target.sourceKey) return source;
+          const queries = [...source.queries];
+          if (nextValue === null) {
+            queries.splice(target.index, 1);
+          } else {
+            queries[target.index] = nextValue;
+          }
+          return { ...source, queries };
+        }),
+      };
+    };
+
+    setSession((current) => {
+      if (!current) return current;
+      const nextProfile = applyEdit(current.profile);
+      const pending = current.pending_strategy_refinement
+        ? {
+          ...current.pending_strategy_refinement,
+          proposed_profile: applyEdit(current.pending_strategy_refinement.proposed_profile),
+          strategy_preview: applyPreviewEdit(current.pending_strategy_refinement.strategy_preview),
+        }
+        : current.pending_strategy_refinement;
+      return {
+        ...current,
+        profile: nextProfile,
+        pending_strategy_refinement: pending,
+        strategy_preview: applyPreviewEdit(current.strategy_preview),
+      };
+    });
+    setTopicProfile((current) => (
+      current ? { ...current, profile: applyEdit(current.profile) } : current
+    ));
+  }
+
   // Drives one AI-led streaming turn: streams prose into the live bubble, applies the
   // plan snapshot, and advances the flow. Returns the final session (or null on error).
   async function runRefinementStream(
@@ -1359,8 +1441,8 @@ function DispatchApp() {
       requested_sources: baseProfile?.requested_sources ?? [],
       subtopics: baseProfile?.subtopics ?? [],
       keywords: baseProfile?.keywords ?? [],
-      search_queries: baseProfile?.search_queries ?? [],
-      source_queries: baseProfile?.source_queries ?? {},
+      search_queries: uniqueCleanList(baseProfile?.search_queries ?? []),
+      source_queries: cleanSourceQueryRecord(baseProfile?.source_queries),
       gmail_rules: baseProfile?.gmail_rules ?? {},
       models: {},
       schedule: baseProfile?.schedule ?? null,
@@ -2183,6 +2265,7 @@ function DispatchApp() {
               sourceStatus={sourceStatus}
               sourceLocked={sourceLocked}
               onSourceToggle={updateSource}
+              onSearchQueryEdit={updateSearchQuery}
               onBuild={() => void buildBrief()}
               canSubmitInterest={canSubmitInterest}
               onSubmitInterest={(event) => {
@@ -2427,6 +2510,7 @@ function RefinementPanel(props: {
   sourceStatus: SourceStatusResponse | null;
   sourceLocked: boolean;
   onSourceToggle: (source: SourceKey) => void;
+  onSearchQueryEdit: (target: QueryEditTarget, nextValue: string | null) => void;
   onBuild: () => void;
   canSubmitInterest: boolean;
   onSubmitInterest: (event?: React.FormEvent) => void;
@@ -2440,7 +2524,12 @@ function RefinementPanel(props: {
   const tickers = marketSource?.tickers ?? [];
   const sourceQueries = (preview?.per_source ?? [])
     .filter((source) => source.key !== "markets")
-    .flatMap((source) => source.queries.map((query) => ({ source: source.source, query })));
+    .flatMap((source) => source.queries.map((query, index) => ({
+      source: source.source,
+      sourceKey: source.key,
+      query,
+      index,
+    })));
   const recencyLabel = recencyText(preview?.recency_weighting, preview?.lookback_hours);
   const scopeText = preview?.scope || props.profile?.scope || "";
   const progressState = props.refinementProgress
@@ -2727,8 +2816,14 @@ function RefinementPanel(props: {
             <div className="plan-group">
               <div className="plan-label">Live queries</div>
               <ul className="plan-qlist">
-                {generalQueries.slice(0, 8).map((query, index) => (
-                  <li key={`gq-${index}`}>{query}</li>
+                {generalQueries.map((query, index) => (
+                  <EditablePlanQuery
+                    key={`gq-${index}`}
+                    value={query}
+                    label="General query"
+                    onChange={(value) => props.onSearchQueryEdit({ kind: "general", index }, value)}
+                    onDelete={() => props.onSearchQueryEdit({ kind: "general", index }, null)}
+                  />
                 ))}
               </ul>
             </div>
@@ -2737,11 +2832,15 @@ function RefinementPanel(props: {
             <div className="plan-group">
               <div className="plan-label">Source queries</div>
               <ul className="plan-qlist">
-                {sourceQueries.slice(0, 8).map((item, index) => (
-                  <li key={`sq-${index}`}>
-                    <span className="plan-qsource">{item.source}</span>
-                    {item.query}
-                  </li>
+                {sourceQueries.map((item, index) => (
+                  <EditablePlanQuery
+                    key={`sq-${item.sourceKey}-${item.index}-${index}`}
+                    value={item.query}
+                    label={item.source}
+                    sourceLabel={item.source}
+                    onChange={(value) => props.onSearchQueryEdit({ kind: "source", sourceKey: item.sourceKey, index: item.index }, value)}
+                    onDelete={() => props.onSearchQueryEdit({ kind: "source", sourceKey: item.sourceKey, index: item.index }, null)}
+                  />
                 ))}
               </ul>
             </div>
@@ -2758,6 +2857,35 @@ function RefinementPanel(props: {
         </div>
       </aside>
     </section>
+  );
+}
+
+function EditablePlanQuery(props: {
+  value: string;
+  label: string;
+  sourceLabel?: string;
+  onChange: (value: string) => void;
+  onDelete: () => void;
+}) {
+  return (
+    <li className="plan-query-row">
+      {props.sourceLabel ? <span className="plan-qsource">{props.sourceLabel}</span> : null}
+      <input
+        className="plan-query-input"
+        aria-label={`Edit ${props.label}`}
+        value={props.value}
+        onChange={(event) => props.onChange(event.target.value)}
+      />
+      <button
+        type="button"
+        className="plan-query-delete"
+        onClick={props.onDelete}
+        aria-label={`Delete ${props.label}`}
+        title="Delete query"
+      >
+        ×
+      </button>
+    </li>
   );
 }
 
@@ -6838,6 +6966,15 @@ function uniqueCleanList(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
+function cleanSourceQueryRecord(value: Record<string, string[]> | undefined): Record<string, string[]> {
+  const cleaned: Record<string, string[]> = {};
+  for (const [source, queries] of Object.entries(value ?? {})) {
+    const nextQueries = uniqueCleanList(Array.isArray(queries) ? queries : []);
+    if (nextQueries.length) cleaned[source] = nextQueries;
+  }
+  return cleaned;
+}
+
 function emptySourcePlanLabel(source: SourceKey): string {
   if (source === "markets") return "No ticker resolved yet";
   if (source === "foreign_media") return "No native-language query set yet";
@@ -7105,9 +7242,9 @@ function formatStage(value: string): string {
 }
 
 function mergeChatMessages(serverMessages: ChatMessage[], localMessages: ChatMessage[]): ChatMessage[] {
-  const merged = [...serverMessages];
+  const merged = [...localMessages];
   const seen = new Set(merged.map((message) => `${message.role}\u0000${message.content}`));
-  for (const message of localMessages) {
+  for (const message of serverMessages) {
     const key = `${message.role}\u0000${message.content}`;
     if (!seen.has(key)) {
       merged.push(message);

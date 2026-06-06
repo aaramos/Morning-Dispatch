@@ -594,14 +594,16 @@ def test_youtube_capacity_protection_and_lane_sorting() -> None:
     )
     
     candidates = result.candidates
-    assert len(candidates) == 12
-    
+    # Both sources keep their own reserved lanes (item 2): youtube is not crowded
+    # out by web, and web is not crowded out by youtube's higher volume.
+    assert len(candidates) == 17
+
     yt_results = [c for c in candidates if c.adapter == "youtube"]
     web_results = [c for c in candidates if c.adapter == "web_search"]
-    
+
     assert len(yt_results) == 12
-    assert len(web_results) == 0
-    
+    assert len(web_results) == 5
+
     # Verify that the youtube candidates selected are the ones with highest scores
     yt_urls = {c.payload.original_url for c in yt_results}
     assert "https://youtube.com/watch?v=yt-11" in yt_urls
@@ -656,9 +658,11 @@ def test_podcast_lane_isolation_from_web_candidates(monkeypatch, tmp_path) -> No
     podcast_results = [c for c in candidates if c.adapter == "podcasts"]
     web_results = [c for c in candidates if c.adapter == "web_search"]
 
-    assert len(candidates) == 12
+    # Each lane is isolated: podcasts keep all their slots and web keeps all of
+    # its own — neither source displaces the other (item 2).
+    assert len(candidates) == 20
     assert len(podcast_results) == 12
-    assert len(web_results) == 0
+    assert len(web_results) == 8
 
     # podcast items should come from highest scoring podcast candidates up to the lane limit.
     assert "https://podcast.example.com/episode-11" in {c.payload.original_url for c in podcast_results}

@@ -98,6 +98,80 @@ async def refine_queries_for_adapter(
         return []
 
 
+async def expand_search_strategy(
+    profile: TopicProfile,
+    *,
+    lookback_hours: int | None = None,
+    max_expansions: int = 4,
+) -> list[str]:
+    """Proactively widen the search strategy for ALL sources (item 1).
+
+    Asks the refinement agent for affiliated, adjacent, or synonymous angles that
+    surface related items the original queries would miss — even loosely-related
+    ones that will rate lower. Returns only the NEW expansion queries (callers
+    fold them into per-source queries). Fails open to an empty list so a missing
+    model client or any error simply leaves the original strategy untouched.
+    """
+    settings = get_settings()
+    try:
+        resolution = model_routing.client_for_agent("refinement", settings=settings)
+        client = resolution.client
+        if client is None:
+            return []
+
+        base_queries = [q for q in list(profile.search_queries) if str(q or "").strip()]
+        if not base_queries:
+            seed = profile.discovery_text().strip()
+            if seed:
+                base_queries = [seed]
+
+        prompt_data = {
+            "statement": profile.statement,
+            "scope": profile.scope,
+            "keywords": list(profile.keywords),
+            "subtopics": list(profile.subtopics),
+            "original_queries": base_queries,
+            "current_date": datetime.now(UTC).date().isoformat(),
+            "lookback_hours": lookback_hours,
+            "mode": "proactive_expansion",
+            "instructions": (
+                "Proactively broaden the search strategy. Suggest up to "
+                f"{max_expansions} affiliated, adjacent, or synonymous search angles "
+                "that surface related items the original queries would miss — even if "
+                "they are only loosely tied to the interest and would rate lower. "
+                "Do not repeat the original queries. Keep them within the same broad "
+                "interest. Provide them in the 'refined_queries' list."
+            ),
+        }
+        system_prompt = load_prompt("query_refinement")
+
+        payload = await client.complete_json(
+            system=system_prompt,
+            prompt=json.dumps(prompt_data, ensure_ascii=False),
+            max_tokens=600,
+        )
+        refined = payload.get("refined_queries")
+        if not isinstance(refined, list):
+            return []
+
+        existing = {q.strip().lower() for q in base_queries}
+        cleaned: list[str] = []
+        for q in refined:
+            value = str(q or "").strip()
+            key = value.lower()
+            if not value or key in existing or key in {c.lower() for c in cleaned}:
+                continue
+            cleaned.append(value)
+            if len(cleaned) >= max_expansions:
+                break
+        if cleaned:
+            logger.info("Proactive search-strategy expansion added queries: %s", cleaned)
+        return cleaned
+    except Exception as exc:
+        logger.warning("Proactive search-strategy expansion failed: %s", exc)
+        return []
+
+
 async def screen_candidates(
     profile: TopicProfile,
     candidates: list[Any],

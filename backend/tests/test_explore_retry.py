@@ -267,9 +267,10 @@ async def test_screen_candidates_is_bounded_and_fails_open(monkeypatch) -> None:
     class FakeResolution:
         client = SlowClient()
 
+    from types import SimpleNamespace
     from backend.app.services import model_routing
-
     monkeypatch.setattr(model_routing, "client_for_agent", lambda *args, **kwargs: FakeResolution())
+    monkeypatch.setattr(query_refiner, "get_settings", lambda: SimpleNamespace(model_timeout_seconds=0.0))
     monkeypatch.setattr(query_refiner, "_SCREENING_MAX_CANDIDATES_PER_SOURCE", 2)
     monkeypatch.setattr(query_refiner, "_SCREENING_BATCH_SIZE", 1)
     monkeypatch.setattr(query_refiner, "_SCREENING_MAX_CONCURRENCY", 1)

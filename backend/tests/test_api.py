@@ -20,6 +20,26 @@ from backend.app.services.brief_title import tight_brief_title
 from backend.db.queries import get_watermark
 
 
+def test_source_status_exposes_reddit(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        response = client.get("/api/explore/source-status")
+
+    assert response.status_code == 200
+    reddit = response.json()["sources"]["reddit"]
+    assert reddit["enabled"] is True
+    assert reddit["setup_required"] is False
+    assert reddit["reason"] is None
+
+
 def test_health_and_digest_lifecycle(monkeypatch, tmp_path):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
@@ -935,7 +955,7 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
         assert "https://podcasts.example.com/agentic-ai-workflows" in html.text
         assert "via AI Daily Brief" in html.text
         assert "05/22/2026" in html.text
-        assert "Watch & listen" in html.text
+        # Podcast episodes render in their own dedicated "Listen" section (item 4).
         assert "Listen" in html.text
         assert "media-card" in html.text
         assert "podcast-modal" in html.text

@@ -18,6 +18,7 @@ dependencies = [
     "yfinance>=0.2.66",
     "youtube-transcript-api>=1.2.0",
     "feedparser>=6.0.0",
+    "h2>=4.1.0",
 ]
 
 [dependency-groups]

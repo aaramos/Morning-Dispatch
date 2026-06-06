@@ -26,21 +26,63 @@ MAX_TARGET_ITEMS = 250
 MODEL_REFINEMENT_LIMIT = 150
 MAX_ARTICLE_FETCH_CONCURRENCY = 20
 
+# Single source of truth for per-source ceilings. For each source the configured
+# value is BOTH the system maximum AND the default cap a brief gets unless a
+# preset scales it down. Adding a source here automatically gives it a discovery
+# lane limit, an inclusion cap, and a generated set of presets.
+PER_SOURCE_MAX: dict[str, int] = {
+    "web_search": 40,
+    "foreign_media": 40,
+    "gmail": 40,
+    "markets": 40,
+    "reddit": 30,
+    "collections": 25,
+    "podcasts": 20,
+    "youtube": 20,
+}
+# Sources not listed above fall back to this cap.
+DEFAULT_PER_SOURCE_MAX = 25
+
+# Cross-source "Top Stories" lead section (item 5). The lead count is the number
+# of best-of items pulled from every source into the top section of the brief.
+TOP_STORIES_MAX = MAX_LEAD_ITEMS
+TOP_STORIES_DEFAULT = 5
+
+# Preset tiers expressed as a fraction of each source's max. "max" == the system
+# ceiling; the rest are percentage-scaled. Brief defaults use the "medium" (0.6)
+# tier, matching the historical _scaled_content_limits(0.6) baseline.
+PRESET_SCALE: dict[str, float] = {
+    "max": 1.0,
+    "large": 0.8,
+    "medium": 0.6,
+    "focused": 0.4,
+}
+
 SYSTEM_CONTENT_LIMITS: dict[str, Any] = {
     "total_items": MAX_CANDIDATE_BUDGET,
     "target_items": 25,
-    "lead_items": 5,
+    "lead_items": TOP_STORIES_DEFAULT,
     "quality_floor": "standard",
-    "per_source": {
-        "web_search": 40,
-        "foreign_media": 40,
-        "gmail": 40,
-        "podcasts": 20,
-        "youtube": 20,
-        "collections": 25,
-        "markets": 40,
-    },
+    "per_source": dict(PER_SOURCE_MAX),
 }
+
+
+def _percent_presets(max_value: int) -> dict[str, int]:
+    """Generate focused/medium/large/max presets as percentages of a ceiling."""
+    return {
+        tier: max(1, round(max_value * scale))
+        for tier, scale in PRESET_SCALE.items()
+    }
+
+
+def _normalize_scaled_presets(value: Any, *, bound: int) -> dict[str, int]:
+    """Clamp each preset tier to [1, bound], falling back to the % default."""
+    raw = value if isinstance(value, dict) else {}
+    fallback = _percent_presets(bound)
+    return {
+        tier: _bounded_int(raw.get(tier), 1, bound) or fallback[tier]
+        for tier in ("max", "large", "medium", "focused")
+    }
 
 
 def _scaled_content_limits(scale: float) -> dict[str, Any]:
@@ -57,27 +99,6 @@ def _scaled_content_limits(scale: float) -> dict[str, Any]:
             for key, value in SYSTEM_CONTENT_LIMITS["per_source"].items()
         },
     }
-
-DEFAULT_YOUTUBE_PRESETS: dict[str, int] = {
-    "max": 20,
-    "large": 16,
-    "medium": 12,
-    "focused": 8,
-}
-
-DEFAULT_PODCAST_PRESETS: dict[str, int] = {
-    "max": 5,
-    "large": 4,
-    "medium": 3,
-    "focused": 2,
-}
-
-DEFAULT_GMAIL_PRESETS: dict[str, int] = {
-    "max": 40,
-    "large": 32,
-    "medium": 24,
-    "focused": 16,
-}
 
 DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
     "lookback_hours": 336,
@@ -143,34 +164,22 @@ def save_brief_defaults(settings: Settings, defaults: dict[str, Any]) -> dict[st
     return brief_settings_status(settings)
 
 
+# YouTube and Gmail presets derive their ceiling from the unified per-source map.
+# Podcast presets are a distinct UI control (episodes shown) bounded at 5, which
+# is intentionally lower than the podcasts inclusion cap in PER_SOURCE_MAX.
+PODCAST_PRESET_MAX = 5
+
+
 def normalize_youtube_presets(value: Any) -> dict[str, int]:
-    raw = value if isinstance(value, dict) else {}
-    return {
-        "max": _bounded_int(raw.get("max"), 1, 20) or 20,
-        "large": _bounded_int(raw.get("large"), 1, 20) or 16,
-        "medium": _bounded_int(raw.get("medium"), 1, 20) or 12,
-        "focused": _bounded_int(raw.get("focused"), 1, 20) or 8,
-    }
+    return _normalize_scaled_presets(value, bound=_source_max_limit("youtube"))
 
 
 def normalize_podcast_presets(value: Any) -> dict[str, int]:
-    raw = value if isinstance(value, dict) else {}
-    return {
-        "max": _bounded_int(raw.get("max"), 1, 5) or 5,
-        "large": _bounded_int(raw.get("large"), 1, 5) or 4,
-        "medium": _bounded_int(raw.get("medium"), 1, 5) or 3,
-        "focused": _bounded_int(raw.get("focused"), 1, 5) or 2,
-    }
+    return _normalize_scaled_presets(value, bound=PODCAST_PRESET_MAX)
 
 
 def normalize_gmail_presets(value: Any) -> dict[str, int]:
-    raw = value if isinstance(value, dict) else {}
-    return {
-        "max": _bounded_int(raw.get("max"), 1, 40) or 40,
-        "large": _bounded_int(raw.get("large"), 1, 40) or 32,
-        "medium": _bounded_int(raw.get("medium"), 1, 40) or 24,
-        "focused": _bounded_int(raw.get("focused"), 1, 40) or 16,
-    }
+    return _normalize_scaled_presets(value, bound=_source_max_limit("gmail"))
 
 
 def load_pipeline_limits(settings: Settings) -> dict[str, int]:
@@ -291,11 +300,38 @@ def _write_settings_file(settings: Settings, payload: dict[str, Any]) -> None:
 
 
 def _source_max_limit(source_name: str) -> int:
-    if source_name in ("youtube", "podcasts"):
-        return 20
-    if source_name in ("markets", "web_search", "gmail", "foreign_media"):
-        return 40
-    return 25
+    return PER_SOURCE_MAX.get(source_name, DEFAULT_PER_SOURCE_MAX)
+
+
+def source_inclusion_max(source_name: str) -> int:
+    """Public per-source inclusion ceiling (single source of truth, item 7)."""
+    return _source_max_limit(source_name)
+
+
+# Default minimum number of items each active source may inject into a brief even
+# when its candidates are only loosely tied to the interest (item 3). Sources not
+# listed fall back to DEFAULT_SOURCE_FLOOR. A profile can override any of these
+# through content_limits["min_items"].
+DEFAULT_MIN_ITEMS: dict[str, int] = {
+    "podcasts": 5,
+}
+DEFAULT_SOURCE_FLOOR = 1
+# Items revived to satisfy a floor must clear this relevance bar so a floor never
+# injects outright junk (mirrors the historical podcast revival threshold).
+SOURCE_FLOOR_SCORE_THRESHOLD = 0.22
+
+
+def source_min_items(source_name: str, content_limits: Any) -> int:
+    """Resolve the inclusion floor for a source, honoring profile overrides."""
+    floor = DEFAULT_MIN_ITEMS.get(source_name, DEFAULT_SOURCE_FLOOR)
+    if isinstance(content_limits, dict):
+        overrides = content_limits.get("min_items")
+        if isinstance(overrides, dict) and source_name in overrides:
+            try:
+                floor = int(overrides[source_name])
+            except (TypeError, ValueError):
+                pass
+    return max(0, min(floor, source_inclusion_max(source_name)))
 
 
 def _per_source_limits(value: Any) -> dict[str, int]:

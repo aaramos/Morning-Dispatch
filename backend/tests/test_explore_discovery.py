@@ -803,6 +803,7 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                 "gmail": 24,
                 "markets": 24,
                 "podcasts": 12,
+                "reddit": 18,
                 "web_search": 5,
                 "youtube": 2,
             },
@@ -1362,7 +1363,7 @@ def test_discovery_runner_applies_per_source_content_limits(monkeypatch, tmp_pat
     ]
 
 
-def test_discovery_runner_reserves_each_dedicated_lane_before_global_backfill(monkeypatch, tmp_path) -> None:
+def test_discovery_runner_reserves_a_dedicated_lane_for_every_source(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     profile = TopicProfile.from_dict(
         {
@@ -1393,11 +1394,13 @@ def test_discovery_runner_reserves_each_dedicated_lane_before_global_backfill(mo
     )
 
     adapters = [candidate.adapter for candidate in result.candidates]
+    # Every selected source keeps its own reserved slots; the small total_items /
+    # candidate_limit no longer lets high-volume sources crowd web_search out.
     assert adapters.count("markets") == 2
     assert adapters.count("youtube") == 2
     assert adapters.count("podcasts") == 2
     assert adapters.count("gmail") == 1
-    assert "web_search" not in adapters
+    assert adapters.count("web_search") == 1
 
 
 def test_discovery_runner_backfills_unused_source_limit_capacity() -> None:

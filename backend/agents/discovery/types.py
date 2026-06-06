@@ -331,6 +331,18 @@ def _content_limits(value: Any) -> dict[str, Any]:
                 per_source[key] = source_limit
     if per_source:
         limits["per_source"] = per_source
+    # Per-source inclusion floors (item 3): minimum items a source may inject into
+    # the brief even when only loosely related. Validated like per_source caps.
+    min_items: dict[str, int] = {}
+    raw_min_items = value.get("min_items")
+    if isinstance(raw_min_items, dict):
+        for raw_key, raw_floor in raw_min_items.items():
+            key = _clean_text(raw_key)
+            floor = _positive_int(raw_floor, maximum=50, allow_zero=True)
+            if key in VALID_SOURCE_ADAPTERS and floor is not None:
+                min_items[key] = floor
+    if min_items:
+        limits["min_items"] = min_items
     return limits
 
 

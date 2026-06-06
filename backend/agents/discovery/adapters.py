@@ -74,7 +74,7 @@ class GmailSourceAdapter:
 
 class PodcastSourceAdapter:
     name = "podcasts"
-    cost_profile = CostProfile(label="slow", timeout_seconds=75.0)
+    cost_profile = CostProfile(label="slow", timeout_seconds=120.0)
     good_for = ("deep_context", "interviews", "expert_discussion")
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
@@ -503,7 +503,14 @@ def _podcast_diagnostic_summary(decisions: list[Any]) -> str:
 def _source_plan_refs(profile: TopicProfile, adapter: str) -> list[str]:
     refs: list[str] = []
     seen: set[str] = set()
-    for value in [*_requested_refs(profile, adapter), *profile.source_queries.get(adapter, ())]:
+    # Promoted refs (item 6): sources/terms that previously produced included
+    # content are folded back into query construction so the feedback loop is
+    # acted on when picking new content — not just used as a late scoring boost.
+    for value in [
+        *_requested_refs(profile, adapter),
+        *profile.source_queries.get(adapter, ()),
+        *_promoted_refs(profile, adapter),
+    ]:
         ref = _trim_query(str(value or ""), limit=180)
         key = ref.casefold()
         if ref and key not in seen:
@@ -524,6 +531,28 @@ def _requested_refs(profile: TopicProfile, adapter: str) -> list[str]:
     refs: list[str] = []
     seen: set[str] = set()
     for source in profile.requested_sources:
+        if str(source.get("adapter") or "").strip() != adapter:
+            continue
+        ref = str(source.get("ref") or source.get("source_name") or "").strip()
+        key = ref.lower()
+        if ref and key not in seen:
+            refs.append(ref)
+            seen.add(key)
+    return refs
+
+
+def _promoted_refs(profile: TopicProfile, adapter: str) -> list[str]:
+    """Refs from sources promoted by the feedback loop (item 6).
+
+    These are shows/domains/subreddits/senders that previously contributed
+    included content. Feeding them back into discovery queries lets every source
+    learn from what performed, mirroring the original podcast-only behavior.
+    """
+    refs: list[str] = []
+    seen: set[str] = set()
+    for source in getattr(profile, "promoted_sources", ()) or ():
+        if not isinstance(source, dict):
+            continue
         if str(source.get("adapter") or "").strip() != adapter:
             continue
         ref = str(source.get("ref") or source.get("source_name") or "").strip()
@@ -888,17 +917,7 @@ class RedditSourceAdapter:
         if context.lookback_hours is not None:
             cutoff = datetime.now(UTC) - timedelta(hours=max(1, context.lookback_hours))
 
-        # Time filter mapping for Reddit Search API
-        t_filter = "all"
-        if context.lookback_hours is not None:
-            if context.lookback_hours <= 24:
-                t_filter = "day"
-            elif context.lookback_hours <= 168:
-                t_filter = "week"
-            elif context.lookback_hours <= 720:
-                t_filter = "month"
-            elif context.lookback_hours <= 8760:
-                t_filter = "year"
+        days = lookback_to_days(context.lookback_hours)
 
         # Requested subreddits for scoring boost
         requested_subs = {
@@ -914,270 +933,155 @@ class RedditSourceAdapter:
         # Comment fetching semaphore (max 2 concurrent)
         comments_semaphore = asyncio.Semaphore(2)
 
+        ua = "MorningDispatchScout/1.0 (contact: scout@morningdispatch.com)"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-        }
-
-        rss_headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": ua,
             "Accept": "application/xml, application/rss+xml, text/xml, */*",
         }
 
         import httpx
 
-        async def fetch_subreddit_json_or_rss(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
-            url = f"https://www.reddit.com/r/{sub}/hot.json"
-            params = {"limit": limit_per_source, "raw_json": 1}
-
+        async def fetch_subreddit_rss(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
+            rss_url = f"https://www.reddit.com/r/{sub}/hot/.rss"
             async with fetch_semaphore:
                 try:
-                    logger.info("Fetching subreddit hot posts: r/%s", sub)
-                    response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
-
-                    if response.status_code == 429:
-                        retry_after = response.headers.get("Retry-After")
-                        sleep_time = 5.0
-                        if retry_after:
-                            try:
-                                sleep_time = min(10.0, float(retry_after))
-                            except ValueError:
-                                pass
-                        logger.warning("Reddit API 429 for r/%s. Sleeping %.1fs before retry", sub, sleep_time)
-                        await asyncio.sleep(sleep_time)
-                        response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
-
-                    if response.status_code == 403:
-                        logger.info("Reddit JSON returned 403 for r/%s. Falling back to RSS.", sub)
-                        return await fetch_subreddit_rss(client, sub)
-
+                    logger.info("Fetching subreddit hot RSS: r/%s", sub)
+                    response = await client.get(rss_url, headers=headers, timeout=request_timeout)
                     if response.status_code != 200:
-                        logger.warning("Reddit JSON returned status %d for r/%s", response.status_code, sub)
+                        logger.warning("Reddit RSS returned status %d for r/%s", response.status_code, sub)
                         return []
 
-                    data = response.json()
-                    children = data.get("data", {}).get("children", [])
+                    feed = feedparser.parse(response.text)
                     posts = []
-                    for child in children:
-                        cdata = child.get("data", {})
-                        post_id = cdata.get("id")
-                        title = cdata.get("title")
-                        permalink = cdata.get("permalink")
-                        if not post_id or not title or not permalink:
-                            continue
+                    for entry in feed.entries:
+                        link = entry.get("link", "")
+                        match = re.search(r"/comments/([a-z0-9]+)/", link)
+                        post_id = match.group(1) if match else str(hash(link))
+                        title = entry.get("title", "Reddit Post")
 
-                        created_utc = cdata.get("created_utc")
                         published_at = None
-                        if created_utc:
-                            published_at = datetime.fromtimestamp(created_utc, UTC).isoformat(timespec="seconds")
+                        if entry.get("published_parsed"):
+                            try:
+                                published_at = datetime(*entry.published_parsed[:6], tzinfo=UTC).isoformat(timespec="seconds")
+                            except Exception:
+                                pass
 
                         posts.append({
                             "id": post_id,
                             "title": title,
-                            "selftext": cdata.get("selftext", ""),
-                            "url": cdata.get("url"),
-                            "permalink": permalink,
-                            "score": cdata.get("score", 0),
-                            "upvote_ratio": cdata.get("upvote_ratio", 1.0),
-                            "num_comments": cdata.get("num_comments", 0),
-                            "flair": cdata.get("link_flair_text"),
-                            "subreddit": cdata.get("subreddit", sub),
+                            "selftext": entry.get("content", [{"value": entry.get("summary", "")}])[0].get("value", ""),
+                            "url": link,
+                            "permalink": link,
+                            "score": 10,  # fallback score
+                            "upvote_ratio": 1.0,
+                            "num_comments": 0,
+                            "flair": None,
+                            "subreddit": sub,
                             "published_at": published_at,
-                            "is_self": cdata.get("is_self", True),
+                            "is_self": True,
                             "fetch_mode": "subreddit",
                         })
                     return posts
                 except Exception as exc:
-                    logger.warning("Exception fetching hot JSON for r/%s: %s. Falling back to RSS.", sub, exc)
-                    return await fetch_subreddit_rss(client, sub)
-
-        async def fetch_subreddit_rss(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
-            rss_url = f"https://www.reddit.com/r/{sub}/hot/.rss"
-            try:
-                response = await client.get(rss_url, headers=rss_headers, timeout=request_timeout)
-                if response.status_code != 200:
-                    logger.warning("Reddit RSS returned status %d for r/%s", response.status_code, sub)
+                    logger.warning("Exception fetching hot RSS for r/%s: %s", sub, exc)
                     return []
 
-                feed = feedparser.parse(response.text)
+        async def fetch_search_via_web(q: str) -> list[dict[str, Any]]:
+            try:
+                logger.info("Searching Reddit via web search: %s", q)
+                query = f"site:reddit.com {q}"
+                hits = await search_web(query, limit=10, days=days)
+                
                 posts = []
-                for entry in feed.entries:
-                    link = entry.get("link", "")
-                    # Extract post ID from link
-                    match = re.search(r"/comments/([a-z0-9]+)/", link)
-                    post_id = match.group(1) if match else str(hash(link))
-                    title = entry.get("title", "Reddit Post")
-
-                    published_at = None
-                    if entry.get("published_parsed"):
-                        try:
-                            published_at = datetime(*entry.published_parsed[:6], tzinfo=UTC).isoformat(timespec="seconds")
-                        except Exception:
-                            pass
-
-                    # RSS does not contain score, upvote ratio, flairs or comments details
+                for hit in hits:
+                    url = hit.url
+                    match = re.search(r"/r/([a-zA-Z0-9_]+)/comments/([a-z0-9]+)/", url)
+                    if match:
+                        sub = match.group(1)
+                        post_id = match.group(2)
+                    else:
+                        match_short = re.search(r"/comments/([a-z0-9]+)/", url)
+                        if match_short:
+                            sub = "reddit"
+                            post_id = match_short.group(1)
+                        else:
+                            continue
+                            
                     posts.append({
                         "id": post_id,
-                        "title": title,
-                        "selftext": entry.get("content", [{"value": entry.get("summary", "")}])[0].get("value", ""),
-                        "url": link,
-                        "permalink": link,
-                        "score": 10,  # fallback score
+                        "title": hit.title,
+                        "selftext": hit.snippet,
+                        "url": url,
+                        "permalink": url,
+                        "score": int(hit.score * 100) if hit.score else 10,
                         "upvote_ratio": 1.0,
                         "num_comments": 0,
                         "flair": None,
                         "subreddit": sub,
-                        "published_at": published_at,
+                        "published_at": hit.published_at,
                         "is_self": True,
-                        "fetch_mode": "subreddit",
+                        "fetch_mode": "search",
                     })
                 return posts
             except Exception as exc:
-                logger.warning("Exception fetching hot RSS for r/%s: %s", sub, exc)
+                logger.warning("Exception searching Reddit via web for query %s: %s", q, exc)
                 return []
 
-        async def fetch_search_json(client: httpx.AsyncClient, q: str) -> list[dict[str, Any]]:
-            url = "https://www.reddit.com/search.json"
-            params = {"q": q, "sort": "relevance", "limit": 10, "t": t_filter}
-
-            async with fetch_semaphore:
-                try:
-                    logger.info("Searching Reddit: %s", q)
-                    response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
-
-                    if response.status_code == 429:
-                        retry_after = response.headers.get("Retry-After")
-                        sleep_time = 5.0
-                        if retry_after:
-                            try:
-                                sleep_time = min(10.0, float(retry_after))
-                            except ValueError:
-                                pass
-                        logger.warning("Reddit API 429 for search query: %s. Sleeping %.1fs before retry", q, sleep_time)
-                        await asyncio.sleep(sleep_time)
-                        response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
-
-                    if response.status_code != 200:
-                        logger.warning("Reddit Search returned status %d for query %s", response.status_code, q)
-                        return []
-
-                    data = response.json()
-                    children = data.get("data", {}).get("children", [])
-                    posts = []
-                    for child in children:
-                        cdata = child.get("data", {})
-                        post_id = cdata.get("id")
-                        title = cdata.get("title")
-                        permalink = cdata.get("permalink")
-                        if not post_id or not title or not permalink:
-                            continue
-
-                        created_utc = cdata.get("created_utc")
-                        published_at = None
-                        if created_utc:
-                            published_at = datetime.fromtimestamp(created_utc, UTC).isoformat(timespec="seconds")
-
-                        posts.append({
-                            "id": post_id,
-                            "title": title,
-                            "selftext": cdata.get("selftext", ""),
-                            "url": cdata.get("url"),
-                            "permalink": permalink,
-                            "score": cdata.get("score", 0),
-                            "upvote_ratio": cdata.get("upvote_ratio", 1.0),
-                            "num_comments": cdata.get("num_comments", 0),
-                            "flair": cdata.get("link_flair_text"),
-                            "subreddit": cdata.get("subreddit"),
-                            "published_at": published_at,
-                            "is_self": cdata.get("is_self", True),
-                            "fetch_mode": "search",
-                        })
-                    return posts
-                except Exception as exc:
-                    logger.warning("Exception searching Reddit for query %s: %s", q, exc)
-                    return []
-
         async def fetch_comments_for_post(client: httpx.AsyncClient, sub: str, post_id: str) -> str:
-            url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.json"
-            params = {"limit": comments_limit, "depth": 2, "sort": "top", "raw_json": 1}
-
+            url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.rss"
             async with comments_semaphore:
                 try:
-                    response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
-
-                    if response.status_code == 429:
-                        retry_after = response.headers.get("Retry-After")
-                        sleep_time = 5.0
-                        if retry_after:
-                            try:
-                                sleep_time = min(10.0, float(retry_after))
-                            except ValueError:
-                                pass
-                        await asyncio.sleep(sleep_time)
-                        response = await client.get(url, params=params, headers=headers, timeout=request_timeout)
-
-                    if response.status_code == 403:
-                        logger.warning("Comments returned 403 for post %s, continuing without comments", post_id)
-                        return ""
-
+                    response = await client.get(url, headers=headers, timeout=request_timeout)
                     if response.status_code != 200:
+                        logger.warning("Comments RSS returned status %d for post %s, continuing without comments", response.status_code, post_id)
                         return ""
 
-                    list_data = response.json()
-                    if not isinstance(list_data, list) or len(list_data) < 2:
-                        return ""
-
-                    comments_listing = list_data[1]
-                    extracted = _extract_comments_tree(comments_listing.get("data", {}).get("children", []), current_depth=1)
-                    if not extracted:
-                        return ""
-
+                    feed = feedparser.parse(response.text)
                     lines = ["--- Top Comments ---"]
-                    for c in extracted[:comments_limit]:
-                        author = c["author"]
-                        body = c["body"]
-                        score = c["score"]
-                        indent = "  " * (c["depth"] - 1)
-                        lines.append(f"{indent}[{author} ({score} pts)]: {body}")
-                    return "\n".join(lines)
+                    count = 0
+                    for entry in feed.entries:
+                        author = entry.get("author") or "anonymous"
+                        if author.startswith("/u/"):
+                            author = author[3:]
+                        elif author.startswith("u/"):
+                            author = author[2:]
+                        
+                        if author.lower() in {"automoderator", "moderator"}:
+                            continue
+                            
+                        html_content = ""
+                        if "content" in entry and entry.content:
+                            html_content = entry.content[0].value
+                        else:
+                            html_content = entry.get("summary") or ""
+                            
+                        if not html_content:
+                            continue
+                            
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html_content, "html.parser")
+                        body = soup.get_text().strip()
+                        body = " ".join(body.split())
+                        
+                        if not body:
+                            continue
+
+                        lines.append(f"[{author}]: {body}")
+                        count += 1
+                        if count >= comments_limit:
+                            break
+                    
+                    if len(lines) > 1:
+                        return "\n".join(lines)
+                    return ""
                 except Exception as exc:
-                    logger.warning("Exception fetching comments for post %s: %s", post_id, exc)
+                    logger.warning("Exception fetching comments RSS for post %s: %s", post_id, exc)
                     return ""
 
-        def _extract_comments_tree(children: list[dict[str, Any]], current_depth: int) -> list[dict[str, Any]]:
-            extracted = []
-            for child in children:
-                if child.get("kind") != "t1":
-                    continue
-                cdata = child.get("data", {})
-                author = cdata.get("author")
-                body = cdata.get("body")
-                score = cdata.get("score", 0)
-                distinguished = cdata.get("distinguished")
-
-                if not author or not body:
-                    continue
-                if author.lower() == "automoderator" or distinguished == "moderator":
-                    continue
-
-                extracted.append({
-                    "author": author,
-                    "body": " ".join(body.strip().split()),  # clean spacing/newlines
-                    "score": score,
-                    "depth": current_depth,
-                })
-
-                replies_val = cdata.get("replies")
-                if isinstance(replies_val, dict) and current_depth < 2:
-                    rdata = replies_val.get("data", {})
-                    rchildren = rdata.get("children", [])
-                    extracted.extend(_extract_comments_tree(rchildren, current_depth + 1))
-            return extracted
-
         # Run initial fetch
-        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
-            subreddit_tasks = [fetch_subreddit_json_or_rss(client, sub) for sub in targets.subreddits]
-            search_tasks = [fetch_search_json(client, q) for q in targets.search_queries]
+        async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=None) as client:
+            subreddit_tasks = [fetch_subreddit_rss(client, sub) for sub in targets.subreddits]
+            search_tasks = [fetch_search_via_web(q) for q in targets.search_queries]
 
             results = await asyncio.gather(*(subreddit_tasks + search_tasks), return_exceptions=True)
 
@@ -1302,8 +1206,8 @@ class RedditSourceAdapter:
 
             if refined_queries:
                 refined_queries = refined_queries[:3]
-                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
-                    ref_search_tasks = [fetch_search_json(client, q) for q in refined_queries]
+                async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=None) as client:
+                    ref_search_tasks = [fetch_search_via_web(q) for q in refined_queries]
                     ref_results = await asyncio.gather(*ref_search_tasks, return_exceptions=True)
 
                     ref_raw_candidates = []
