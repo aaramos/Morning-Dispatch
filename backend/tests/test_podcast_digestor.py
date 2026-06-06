@@ -620,6 +620,96 @@ def test_podcast_relevance_drop_decision_is_rejected(monkeypatch):
     assert not any(d.decision == "keep_uncertain" for d in decisions)
 
 
+def test_podcast_relevance_screening_falls_back_at_deadline(monkeypatch):
+    from backend.agents.discovery.web_search import SearchHit
+
+    mock_hits = [
+        SearchHit(
+            title="Agentic AI workflows for local LLMs",
+            url="https://example.com/podcast/agentic-ai",
+            snippet="A podcast conversation about agentic AI workflows and local LLM infrastructure.",
+            score=0.9,
+            provider="brave",
+        )
+    ]
+
+    class SlowRelevanceClient:
+        async def complete_json(self, **kwargs):
+            await asyncio.sleep(60)
+            return {"decisions": []}
+
+    monkeypatch.setattr(
+        "backend.app.services.model_routing.client_for_agent",
+        lambda *_args, **_kwargs: type("Res", (), {"client": SlowRelevanceClient()})(),
+    )
+
+    decisions = []
+    diagnostics = {
+        "episode_pages_found": 0,
+        "low_relevance_rejects": 0,
+        "feed_resolved": 0,
+        "episode_matched": 0,
+        "no_audio_rejects": 0,
+        "date_rejects": 0,
+    }
+
+    started = time.monotonic()
+    kept = asyncio.run(
+        podcast._screen_episodes_with_agent(
+            hits=mock_hits,
+            digest_interest="agentic AI local LLM infrastructure",
+            profile=None,
+            decisions=decisions,
+            diagnostics=diagnostics,
+            deadline=time.monotonic() + 0.01,
+        )
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert kept == mock_hits
+
+
+def test_episode_first_search_respects_deadline(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv("MORNING_DISPATCH_DB_PATH", str(runtime / "data" / "db" / "morning_dispatch.sqlite3"))
+    database.init_database()
+
+    async def slow_search_web(*args, **kwargs):
+        await asyncio.sleep(60)
+        return []
+
+    monkeypatch.setattr("backend.agents.discovery.web_search.search_web", slow_search_web)
+
+    decisions = []
+    diagnostics = {
+        "episode_pages_found": 0,
+        "low_relevance_rejects": 0,
+        "feed_resolved": 0,
+        "episode_matched": 0,
+        "no_audio_rejects": 0,
+        "date_rejects": 0,
+    }
+
+    started = time.monotonic()
+    episodes = asyncio.run(
+        podcast._episode_first_search_and_resolve(
+            digest_interest="agentic AI local LLM infrastructure",
+            lookback_hours=24,
+            search_sources=[{"type": "podcast_search", "title": "Agentic AI", "query": "Agentic AI"}],
+            profile=None,
+            decisions=decisions,
+            diagnostics=diagnostics,
+            deadline=time.monotonic() + 0.01,
+        )
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert episodes == []
+
+
 def test_fetch_podcast_episodes_returns_partial_when_deadline_passed(monkeypatch, tmp_path):
     """An expired overall deadline returns partial results instead of timing out."""
     runtime = tmp_path / "runtime"
@@ -661,7 +751,6 @@ def test_fetch_podcast_episodes_returns_partial_when_deadline_passed(monkeypatch
     )
     # The lane returns (empty) partial results instead of raising / hanging.
     assert payloads == []
-
 
 
 

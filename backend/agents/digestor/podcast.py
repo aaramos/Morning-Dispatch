@@ -45,6 +45,58 @@ MAX_SINGLE_TRANSCRIPTION_SECONDS = 120
 MIN_TRANSCRIPTION_HEADROOM_SECONDS = 20
 
 
+def _deadline_remaining(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _deadline_expired(deadline: float | None, *, min_remaining: float = 0.0) -> bool:
+    remaining = _deadline_remaining(deadline)
+    return remaining is not None and remaining <= min_remaining
+
+
+async def _await_with_deadline(awaitable: Any, deadline: float | None) -> Any:
+    remaining = _deadline_remaining(deadline)
+    if remaining is None:
+        return await awaitable
+    if remaining <= 0:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        raise asyncio.TimeoutError("podcast lane deadline expired")
+    return await asyncio.wait_for(awaitable, timeout=remaining)
+
+
+async def _gather_with_deadline(awaitables: Iterable[Any], deadline: float | None) -> list[Any]:
+    tasks = [asyncio.create_task(awaitable) for awaitable in awaitables]
+    if not tasks:
+        return []
+    if deadline is None:
+        return list(await asyncio.gather(*tasks, return_exceptions=True))
+
+    remaining = _deadline_remaining(deadline)
+    if remaining is None:
+        return list(await asyncio.gather(*tasks, return_exceptions=True))
+
+    done, pending = await asyncio.wait(tasks, timeout=remaining)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    results: list[Any] = []
+    for task in tasks:
+        if task in pending:
+            results.append(asyncio.TimeoutError("podcast lane deadline expired"))
+            continue
+        try:
+            results.append(task.result())
+        except Exception as exc:
+            results.append(exc)
+    return results
+
+
 @dataclass(frozen=True)
 class PodcastEpisode:
     show_name: str
@@ -167,7 +219,7 @@ async def _fetch_podcast_episodes(
         )
         # Skip the (unbounded) show-first fallback discovery when the lane is already
         # out of time, so we return partial results instead of overrunning the wall.
-        if not resolved_search_episodes and (deadline is None or time.monotonic() < deadline):
+        if not resolved_search_episodes and not _deadline_expired(deadline):
             decisions.append(
                 _decision(
                     target="podcast discovery",
@@ -177,7 +229,14 @@ async def _fetch_podcast_episodes(
                     reason="Episode-first search yielded no candidate episodes, falling back to show-first discovery.",
                 )
             )
-            discovered = await _discover_sources(search_sources, digest_interest)
+            try:
+                discovered = await _await_with_deadline(
+                    _discover_sources(search_sources, digest_interest),
+                    deadline,
+                )
+            except asyncio.TimeoutError:
+                logger.info("Podcast show-first fallback skipped because the lane deadline was reached.")
+                discovered = []
             for source in discovered:
                 decisions.append(
                     _decision(
@@ -193,11 +252,11 @@ async def _fetch_podcast_episodes(
     feed_sources.extend(discovered)
     
     batches = []
-    if feed_sources:
+    if feed_sources and not _deadline_expired(deadline):
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-            batches = await asyncio.gather(
-                *[_timed_fetch_feed_episodes(client, source) for source in feed_sources],
-                return_exceptions=True,
+            batches = await _gather_with_deadline(
+                (_timed_fetch_feed_episodes(client, source) for source in feed_sources),
+                deadline,
             )
 
     candidates: list[tuple[float, PodcastEpisode, dict[str, Any]]] = []
@@ -1440,9 +1499,11 @@ async def _episode_first_search_and_resolve(
         else:
             queries_to_fetch.append(wq)
 
-    if queries_to_fetch:
-        search_tasks = [search_web(wq, limit=search_hits_limit, days=days) for wq in queries_to_fetch]
-        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+    if queries_to_fetch and not _deadline_expired(deadline):
+        search_results = await _gather_with_deadline(
+            (search_web(wq, limit=search_hits_limit, days=days) for wq in queries_to_fetch),
+            deadline,
+        )
 
         for wq, res in zip(queries_to_fetch, search_results):
             if isinstance(res, list):
@@ -1463,6 +1524,9 @@ async def _episode_first_search_and_resolve(
                 logger.info("Search failed for query '%s': %s", wq, res)
                 hits_by_query[wq] = []
                 set_cached_podcast_discovery(wq.strip().lower(), "web_search", lookback_bucket, [], 3600)
+    elif queries_to_fetch:
+        for wq in queries_to_fetch:
+            hits_by_query[wq] = []
 
     # Merge hits and assign provenance
     hits = []
@@ -1524,6 +1588,7 @@ async def _episode_first_search_and_resolve(
         profile=profile,
         decisions=decisions,
         diagnostics=diagnostics,
+        deadline=deadline,
     )
 
     resolved_episodes = []
@@ -1616,9 +1681,7 @@ async def _episode_first_search_and_resolve(
         # Feed resolution is the slowest, most timeout-prone phase. Bound it by the
         # overall lane deadline and keep whatever resolved in time, cancelling the
         # rest, so the lane returns partial results instead of timing out to zero.
-        wait_timeout = None
-        if deadline is not None:
-            wait_timeout = max(0.0, deadline - time.monotonic())
+        wait_timeout = _deadline_remaining(deadline)
         done, pending = await asyncio.wait(tasks, timeout=wait_timeout)
         for task in pending:
             task.cancel()
@@ -1643,6 +1706,7 @@ async def _screen_episodes_with_agent(
     profile: TopicProfile | None,
     decisions: list[AgentDecision],
     diagnostics: dict[str, int],
+    deadline: float | None = None,
 ) -> list[Any]:
     from backend.app.services import model_routing
     from backend.agents.discovery.types import TopicProfile
@@ -1655,7 +1719,7 @@ async def _screen_episodes_with_agent(
         logger.warning("Failed to obtain client for podcast relevance agent: %s", exc)
         client = None
 
-    if client is None:
+    if client is None or _deadline_expired(deadline, min_remaining=1.0):
         kept = []
         for hit in hits:
             score = _feed_fit_score(f"{hit.title} {hit.snippet}", digest_interest)
@@ -1684,10 +1748,13 @@ async def _screen_episodes_with_agent(
     system_prompt = system_prompt.replace("{{exclusions}}", exclusions)
 
     try:
-        payload = await client.complete_json(
-            system=system_prompt,
-            prompt=json.dumps(cand_list, ensure_ascii=False),
-            max_tokens=2000,
+        payload = await _await_with_deadline(
+            client.complete_json(
+                system=system_prompt,
+                prompt=json.dumps(cand_list, ensure_ascii=False),
+                max_tokens=2000,
+            ),
+            deadline,
         )
         decisions_list = payload.get("decisions", [])
         decisions_map = {}
