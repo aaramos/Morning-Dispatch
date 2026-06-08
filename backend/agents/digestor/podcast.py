@@ -566,12 +566,249 @@ async def discover_podcasts(query: str, *, limit: int = 8) -> list[dict[str, Any
                 "feed_url": feed_url,
                 "site_url": feed.get("link"),
                 "author": feed.get("author"),
+                "description": _clean_html(str(feed.get("description") or ""))[:600],
                 "aggregator": "podcastindex",
                 "itunes_id": _nullable_str(feed.get("itunesId") or feed.get("itunes_id")),
                 "apple_podcasts_url": _apple_url_from_itunes_id(feed.get("itunesId") or feed.get("itunes_id")),
             }
         )
     return results
+
+
+def _within_staleness(published_at: str | None, staleness_days: int) -> bool:
+    """True only when a parseable publish date falls within the staleness window.
+
+    Unlike _inside_lookback, an undated/unparseable episode is treated as STALE
+    (returns False) so a confirmed show with no datable recent episode is
+    suppressed rather than surfacing audio of unknown age.
+    """
+    if not published_at:
+        return False
+    try:
+        parsed = datetime.fromisoformat(published_at)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed >= datetime.now(UTC) - timedelta(days=max(1, staleness_days))
+
+
+def _latest_episode_with_audio(episodes: list[PodcastEpisode]) -> PodcastEpisode | None:
+    playable = [ep for ep in episodes if ep.audio_url]
+    if not playable:
+        return None
+    return max(playable, key=lambda ep: ep.published_at or "")
+
+
+async def fetch_subscribed_show_latest(
+    shows: list[dict[str, Any]],
+    *,
+    digest_id: str,
+    staleness_days: int = 60,
+    inference_run_id: str | None = None,
+    transcription_budget_seconds: float | None = None,
+    deadline: float | None = None,
+) -> tuple[list[NormalizedPayload], list[AgentDecision]]:
+    """Curated-subscription inclusion (the show-subscription model).
+
+    For each confirmed show, fetch its feed and take the most recent episode with
+    playable audio. The latest episode is always summarized REGARDLESS of topic fit
+    or the brief's interest lookback; the only gate is a show-level staleness cutoff
+    (default 60 days) so dead shows are suppressed with an honest note rather than
+    surfacing very old audio.
+    """
+    decisions: list[AgentDecision] = []
+    payloads: list[NormalizedPayload] = []
+    if not shows:
+        return payloads, decisions
+
+    transcription_deadline = (
+        time.monotonic() + max(0.0, float(transcription_budget_seconds))
+        if transcription_budget_seconds is not None
+        else None
+    )
+
+    feed_sources = [
+        {"type": "podcast_rss", "feed_url": str(s.get("feed_url") or "").strip(), "title": str(s.get("title") or "Podcast").strip()}
+        for s in shows
+        if str(s.get("feed_url") or "").strip()
+    ]
+    if not feed_sources:
+        return payloads, decisions
+
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}
+    ) as client:
+        batches = await asyncio.gather(
+            *[_timed_fetch_feed_episodes(client, source) for source in feed_sources],
+            return_exceptions=True,
+        )
+
+        for source, batch in zip(feed_sources, batches, strict=False):
+            show_title = source["title"]
+            if isinstance(batch, BaseException):
+                decisions.append(
+                    _decision(
+                        target=show_title,
+                        decision="feed_error",
+                        action="skip_show",
+                        confidence=0.8,
+                        reason="Subscribed show feed could not be read this run.",
+                        metadata={"feed_url": source["feed_url"], "error": str(batch)[:200]},
+                    )
+                )
+                continue
+            episodes, feed_fetch_ms = batch
+            latest = _latest_episode_with_audio(episodes)
+            if latest is None:
+                decisions.append(
+                    _decision(
+                        target=show_title,
+                        decision="skip",
+                        action="exclude_no_audio",
+                        confidence=0.85,
+                        reason="Subscribed show had no episode with playable audio.",
+                        metadata={"feed_url": source["feed_url"]},
+                    )
+                )
+                continue
+            if not _within_staleness(latest.published_at, staleness_days):
+                decisions.append(
+                    _decision(
+                        target=show_title,
+                        decision="stale_show",
+                        action="suppress_stale_show",
+                        confidence=0.8,
+                        reason=f"Subscribed show's latest episode is older than the {staleness_days}-day staleness cutoff.",
+                        metadata={"feed_url": source["feed_url"], "published_at": latest.published_at},
+                    )
+                )
+                continue
+
+            episode_started = time.monotonic()
+            if transcription_deadline is None:
+                allow_transcription = True
+                transcription_timeout: float | None = None
+            else:
+                remaining = transcription_deadline - time.monotonic()
+                allow_transcription = remaining >= MIN_TRANSCRIPTION_HEADROOM_SECONDS
+                transcription_timeout = remaining if allow_transcription else None
+
+            try:
+                transcript, transcript_source, transcript_decisions, metric = await _episode_text(
+                    latest,
+                    {"transcription": "auto", "title": show_title},
+                    0.8,
+                    allow_transcription=allow_transcription,
+                    transcription_timeout=transcription_timeout,
+                )
+            except Exception as exc:
+                logger.info("Subscribed show episode processing failed for %s: %s", show_title, exc)
+                continue
+            decisions.extend(transcript_decisions)
+            metric.update(
+                {
+                    "digest_id": digest_id,
+                    "inference_run_id": inference_run_id,
+                    "feed_fetch_ms": feed_fetch_ms,
+                    "total_ms": _elapsed_ms(episode_started),
+                    "transcript_words": _word_count(transcript),
+                }
+            )
+            raw_text = _episode_payload_text(latest, transcript, transcript_source)
+            preferred_url = latest.apple_podcasts_url or latest.episode_url or latest.audio_url
+            payload = NormalizedPayload(
+                source_type="podcast_episode",
+                source_name=latest.show_name or show_title,
+                raw_text=raw_text,
+                original_url=preferred_url,
+                published_at=latest.published_at,
+                metadata={
+                    "podcast_episode_id": latest.episode_id,
+                    "podcast_title": latest.show_name or show_title,
+                    "title": latest.title,
+                    "feed_url": latest.feed_url or source["feed_url"],
+                    "apple_podcasts_url": latest.apple_podcasts_url,
+                    "audio_url": latest.audio_url,
+                    "episode_url": latest.episode_url,
+                    "image_url": latest.image_url,
+                    "duration_seconds": latest.duration_seconds,
+                    "episode_quality_score": 0.8,
+                    "transcript_source": transcript_source,
+                    "subscribed_show": True,
+                    **(latest.metadata or {}),
+                },
+            )
+            if pii_filter(payload):
+                payloads.append(payload)
+                metric["status"] = "success"
+            else:
+                metric["status"] = "pii_filtered"
+            database.record_podcast_metric(metric)
+
+    return payloads, decisions
+
+
+async def discover_candidate_shows(
+    queries: list[str],
+    *,
+    limit: int = 12,
+    staleness_days: int = 60,
+    enrich: bool = True,
+) -> list[dict[str, Any]]:
+    """Show-first discovery for the picker: shows whose content matches the interest.
+
+    Returns shows with a 'usual content' summary plus latest-episode metadata and a
+    staleness flag, deduped by feed_url. Discovery is NOT bounded by the interest
+    lookback — it finds relevant shows regardless of when they last matched.
+    """
+    discovered: dict[str, dict[str, Any]] = {}
+    for query in [q for q in queries if str(q or "").strip()][:6]:
+        try:
+            for show in await discover_podcasts(query, limit=8):
+                feed_url = str(show.get("feed_url") or "").strip()
+                if feed_url:
+                    discovered.setdefault(feed_url, show)
+        except Exception as exc:
+            logger.info("Candidate show discovery failed for %s: %s", query, exc)
+        if len(discovered) >= limit:
+            break
+
+    candidates = [
+        {
+            "feed_url": show["feed_url"],
+            "title": show.get("title") or "Podcast",
+            "description": show.get("description") or "",
+            "author": show.get("author"),
+            "site_url": show.get("site_url"),
+            "apple_podcasts_url": show.get("apple_podcasts_url"),
+            "latest_episode_title": None,
+            "latest_published_at": None,
+            "stale": None,
+        }
+        for show in list(discovered.values())[:limit]
+    ]
+
+    if enrich and candidates:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers={"User-Agent": USER_AGENT}
+        ) as client:
+            batches = await asyncio.gather(
+                *[_timed_fetch_feed_episodes(client, {"type": "podcast_rss", "feed_url": c["feed_url"], "title": c["title"]}) for c in candidates],
+                return_exceptions=True,
+            )
+        for cand, batch in zip(candidates, batches, strict=False):
+            if isinstance(batch, BaseException):
+                continue
+            episodes, _ms = batch
+            latest = _latest_episode_with_audio(episodes) or (episodes[0] if episodes else None)
+            if latest is not None:
+                cand["latest_episode_title"] = latest.title
+                cand["latest_published_at"] = latest.published_at
+                cand["stale"] = not _within_staleness(latest.published_at, staleness_days)
+                if not cand["description"]:
+                    cand["description"] = (latest.description or "")[:600]
+    return candidates
 
 
 def _podcast_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -38,6 +38,9 @@ class Settings:
     podcastindex_api_secret: str | None = None
     fred_api_key: str | None = None
     podcast_transcribe_command: str | None = None
+    # Subscribed podcast shows whose latest episode is older than this are
+    # suppressed from the brief (with an honest note) instead of surfacing stale audio.
+    podcast_staleness_days: int = 60
     model_base_url: str | None = None
     model_api_key: str | None = None
     librarian_model: str | None = DEFAULT_LIBRARIAN_MODEL
@@ -316,6 +319,7 @@ def get_settings() -> Settings:
         podcastindex_api_secret=podcastindex_api_secret,
         fred_api_key=fred_api_key,
         podcast_transcribe_command=os.environ.get("MORNING_DISPATCH_PODCAST_TRANSCRIBE_COMMAND"),
+        podcast_staleness_days=_int_from_env("MORNING_DISPATCH_PODCAST_STALENESS_DAYS", 60),
         model_base_url=os.environ.get("MORNING_DISPATCH_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"),
         model_api_key=model_api_key,
         librarian_model=librarian_model,

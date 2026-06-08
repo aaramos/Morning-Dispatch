@@ -955,8 +955,10 @@ def test_digest_run_can_publish_podcast_episodes(monkeypatch, tmp_path):
         assert "https://podcasts.example.com/agentic-ai-workflows" in html.text
         assert "via AI Daily Brief" in html.text
         assert "05/22/2026" in html.text
-        # Podcast episodes render in their own dedicated "Listen" section (item 4).
-        assert "Listen" in html.text
+        # A compelling podcast (quality 0.76) is promoted into Top Stories and rendered
+        # as a media card (item 9), keeping its player/transcript; non-compelling
+        # episodes would remain in the dedicated "Listen" lane. Either way it publishes
+        # with its media presentation.
         assert "media-card" in html.text
         assert "podcast-modal" in html.text
         assert "https://cdn.example.com/audio.mp3" in html.text

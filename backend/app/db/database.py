@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -12,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from html import escape, unescape
 from pathlib import Path
 from typing import Any, Iterator
+
+logger = logging.getLogger(__name__)
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2861,7 +2864,26 @@ def render_ingested_issue(
         for result in story_articles
         if result is not lead_article and result.tier != "lower_confidence"
     ]
-    ordered_main = ([lead_article] if lead_article else []) + main_story_articles
+
+    def _top_story_score(result: ArticleFetchResult) -> float:
+        return result.relevance_score if result.relevance_score is not None else result.link_score
+
+    # Podcast episodes (subscription model) are eligible for Top Stories when
+    # compelling, while otherwise remaining in the Listen lane (item 9).
+    compelling_podcasts = sorted(
+        [
+            result
+            for result in media_articles
+            if result.payload.source_type == "podcast_episode"
+            and (result.tier == "lead" or _top_story_score(result) >= _PODCAST_TOP_STORY_THRESHOLD)
+        ],
+        key=_top_story_score,
+        reverse=True,
+    )[:_MAX_PODCAST_TOP_STORIES]
+
+    mixable = main_story_articles + compelling_podcasts
+    mixable.sort(key=_top_story_score, reverse=True)
+    ordered_main = ([lead_article] if lead_article else []) + mixable
     lower_confidence_articles = [
         result
         for result in story_articles
@@ -2870,7 +2892,20 @@ def render_ingested_issue(
 
     # Top Stories (item 5): the best items mixed across every story source.
     top_stories = ordered_main[:_TOP_STORIES_TARGET]
-    per_source_remainder = ordered_main[_TOP_STORIES_TARGET:]
+    # A podcast promoted into Top Stories must not also render in the Listen lane.
+    promoted_podcast_ids = {
+        result.payload.id for result in top_stories if result.payload.source_type == "podcast_episode"
+    }
+    if promoted_podcast_ids:
+        media_articles = [
+            result for result in media_articles if result.payload.id not in promoted_podcast_ids
+        ]
+    # Per-source sections are story-only; podcasts beyond Top Stories stay in Listen.
+    per_source_remainder = [
+        result
+        for result in ordered_main[_TOP_STORIES_TARGET:]
+        if not _is_media_result(result)
+    ]
 
     newsletter_items = [_render_newsletter_item(payload) for payload in body_payloads]
     newsletter_html = "\n".join(item for item in newsletter_items if item)
@@ -2888,10 +2923,21 @@ def render_ingested_issue(
     image_strip_html = _render_image_strip([result for result in [*top_stories, *media_articles] if result])
 
     # Top Stories: lead block for the single best item, story-rows for the rest.
-    lead_html = _render_lead_story(top_stories[0], issue_id=issue_id) if top_stories else ""
+    # Media items promoted into Top Stories (e.g. a compelling podcast, item 9) keep
+    # their media-card presentation (player + transcript) instead of a text row.
+    def _render_top_story(result: ArticleFetchResult, *, index: int, lead: bool) -> str:
+        if _is_media_result(result):
+            return _render_media_card(result, issue_id=issue_id)
+        return (
+            _render_lead_story(result, issue_id=issue_id)
+            if lead
+            else _render_ranked_story(result, index=index, issue_id=issue_id)
+        )
+
+    lead_html = _render_top_story(top_stories[0], index=0, lead=True) if top_stories else ""
     running_index = 1
     top_rows_html = "\n".join(
-        _render_ranked_story(result, index=running_index + offset, issue_id=issue_id)
+        _render_top_story(result, index=running_index + offset, lead=False)
         for offset, result in enumerate(top_stories[1:])
     )
     running_index += max(0, len(top_stories) - 1)
@@ -4045,6 +4091,10 @@ def _compact_company_name(company_name: str, ticker: str) -> str:
 
 # Number of cross-source items featured in the Top Stories section (item 5).
 _TOP_STORIES_TARGET = 5
+# A subscribed podcast episode may be promoted into Top Stories when compelling
+# (relevance/link score at or above this), capped so podcasts never dominate.
+_PODCAST_TOP_STORY_THRESHOLD = 0.7
+_MAX_PODCAST_TOP_STORIES = 2
 
 # Stable display order for per-source brief sections (item 4). Labels not listed
 # fall back to alphabetical order after these.

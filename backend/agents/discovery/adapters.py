@@ -16,7 +16,7 @@ from backend.agents.discovery.reddit_expander import expand_reddit_targets, clea
 logger = logging.getLogger(__name__)
 
 from backend.agents.digestor.gmail import fetch_newsletters
-from backend.agents.digestor.podcast import fetch_podcast_episodes
+from backend.agents.digestor.podcast import fetch_podcast_episodes, fetch_subscribed_show_latest
 
 # Audio-transcription budget for the first podcast discovery pass. Kept well under
 # the adapter's 120s timeout so the lane returns partial results (transcript-feed /
@@ -92,6 +92,38 @@ class PodcastSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         deadline = time.monotonic() + _PODCAST_OVERALL_BUDGET_SECONDS
+
+        # Curated subscription model: when the user has confirmed shows, the brief
+        # includes each subscribed show's LATEST episode (topic/recency gates do not
+        # apply; only a show-level staleness cutoff), instead of episode-first search.
+        subscribed = _subscribed_podcast_shows(profile)
+        if subscribed:
+            settings = get_settings()
+            payloads, decisions = await fetch_subscribed_show_latest(
+                subscribed,
+                digest_id=context.exploration_id,
+                staleness_days=int(getattr(settings, "podcast_staleness_days", 60) or 60),
+                inference_run_id=context.exploration_id,
+                transcription_budget_seconds=_PODCAST_TRANSCRIPTION_BUDGET_SECONDS,
+                deadline=deadline,
+            )
+            if not payloads:
+                stale_count = sum(1 for d in decisions if getattr(d, "decision", "") == "stale_show")
+                raise AdapterUnavailable(
+                    "Subscribed podcast shows had no episode within the staleness window."
+                    if stale_count
+                    else "Subscribed podcast shows returned no usable recent episodes with playable audio."
+                )
+            return [
+                Candidate(
+                    adapter=self.name,
+                    payload=payload,
+                    score=_payload_score(payload.metadata),
+                    reason="Latest episode from a confirmed podcast subscription.",
+                )
+                for payload in payloads
+            ]
+
         sources = _approved_podcast_sources()
         for ref in _podcast_discovery_refs(profile):
             sources.append({
@@ -462,6 +494,33 @@ def _approved_gmail_senders() -> list[str]:
 
 
 
+
+
+def _subscribed_podcast_shows(profile: TopicProfile) -> list[dict[str, Any]]:
+    """Confirmed podcast shows (with a feed URL) the user subscribed to.
+
+    Drawn from requested_sources (explicit picker confirmations) and promoted_sources
+    (feedback loop), deduped by feed URL. Only shows with a feed URL are usable for
+    the latest-episode subscription model.
+    """
+    shows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in [*profile.requested_sources, *(getattr(profile, "promoted_sources", ()) or ())]:
+        if not isinstance(source, dict):
+            continue
+        if str(source.get("adapter") or "").strip() != "podcasts":
+            continue
+        feed_url = str(source.get("feed_url") or "").strip()
+        if not feed_url or feed_url.lower() in seen:
+            continue
+        seen.add(feed_url.lower())
+        shows.append(
+            {
+                "feed_url": feed_url,
+                "title": str(source.get("ref") or source.get("source_name") or "Podcast").strip(),
+            }
+        )
+    return shows
 
 
 def _approved_podcast_sources() -> list[dict[str, Any]]:

@@ -676,6 +676,154 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+type PodcastShowCandidate = {
+  feed_url: string;
+  title: string;
+  description?: string;
+  author?: string | null;
+  site_url?: string | null;
+  latest_episode_title?: string | null;
+  latest_published_at?: string | null;
+  stale?: boolean | null;
+  subscribed?: boolean;
+};
+
+type PodcastShowsResponse = {
+  topic_id: string;
+  staleness_days: number;
+  candidates: PodcastShowCandidate[];
+};
+
+async function fetchPodcastShows(topicId: string): Promise<PodcastShowsResponse> {
+  return api<PodcastShowsResponse>(`/api/explore/topic-profiles/${topicId}/podcast-shows`);
+}
+
+async function savePodcastShows(
+  topicId: string,
+  shows: Array<{ feed_url: string; title: string }>,
+): Promise<unknown> {
+  return api(`/api/explore/topic-profiles/${topicId}/podcast-shows`, {
+    method: "POST",
+    body: JSON.stringify({ shows }),
+  });
+}
+
+function PodcastShowPicker(props: { ensureTopicId: () => Promise<string | null> }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [savedNote, setSavedNote] = useState("");
+  const [candidates, setCandidates] = useState<PodcastShowCandidate[]>([]);
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [stalenessDays, setStalenessDays] = useState(60);
+
+  async function loadShows() {
+    setLoading(true);
+    setError("");
+    setSavedNote("");
+    try {
+      const topicId = await props.ensureTopicId();
+      if (!topicId) {
+        setError("Save or build this topic once, then choose shows.");
+        return;
+      }
+      const data = await fetchPodcastShows(topicId);
+      setStalenessDays(data.staleness_days);
+      setCandidates(data.candidates);
+      const initial: Record<string, boolean> = {};
+      for (const candidate of data.candidates) {
+        initial[candidate.feed_url] = Boolean(candidate.subscribed);
+      }
+      setSelected(initial);
+      setOpen(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load podcast shows");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveShows() {
+    setSaving(true);
+    setError("");
+    setSavedNote("");
+    try {
+      const topicId = await props.ensureTopicId();
+      if (!topicId) {
+        setError("Save or build this topic once, then choose shows.");
+        return;
+      }
+      const shows = candidates
+        .filter((candidate) => selected[candidate.feed_url])
+        .map((candidate) => ({ feed_url: candidate.feed_url, title: candidate.title }));
+      await savePodcastShows(topicId, shows);
+      setSavedNote(`Saved ${shows.length} show${shows.length === 1 ? "" : "s"}. The brief will summarize each show's latest episode.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save podcast shows");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const selectedCount = candidates.filter((candidate) => selected[candidate.feed_url]).length;
+
+  return (
+    <div className="podcast-show-picker">
+      <div className="podcast-show-picker-head">
+        <strong>Podcast shows</strong>
+        <button type="button" onClick={() => void loadShows()} disabled={loading || saving}>
+          {loading ? "Finding shows…" : open ? "Refresh shows" : "Find & choose shows"}
+        </button>
+      </div>
+      {error ? <p className="meta error">{error}</p> : null}
+      {open ? (
+        <div className="podcast-show-body">
+          <p className="meta">
+            Pick the shows to follow. Each build summarizes the latest episode of every show you keep
+            (regardless of topic match); shows with no episode in the last {stalenessDays} days are skipped.
+          </p>
+          <div className="podcast-show-list">
+            {candidates.length === 0 ? (
+              <p className="meta">No candidate shows found yet. Try broadening the interest.</p>
+            ) : (
+              candidates.map((candidate) => (
+                <label className="podcast-show-row" key={candidate.feed_url}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(selected[candidate.feed_url])}
+                    onChange={(event) =>
+                      setSelected((prev) => ({ ...prev, [candidate.feed_url]: event.target.checked }))
+                    }
+                  />
+                  <span className="podcast-show-copy">
+                    <span className="podcast-show-title">
+                      {candidate.title}
+                      {candidate.stale ? <span className="podcast-show-stale"> · stale</span> : null}
+                    </span>
+                    {candidate.description ? (
+                      <span className="podcast-show-desc">{candidate.description}</span>
+                    ) : null}
+                    {candidate.latest_episode_title ? (
+                      <span className="podcast-show-latest">Latest: {candidate.latest_episode_title}</span>
+                    ) : null}
+                  </span>
+                </label>
+              ))
+            )}
+          </div>
+          <div className="podcast-show-actions">
+            <button type="button" className="secondary-action" onClick={() => void saveShows()} disabled={saving}>
+              {saving ? "Saving…" : `Save ${selectedCount} show${selectedCount === 1 ? "" : "s"}`}
+            </button>
+            {savedNote ? <span className="meta success">{savedNote}</span> : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 type GmailCandidatePayload = {
   candidates: Array<{
     sender: string;
@@ -1451,6 +1599,26 @@ function DispatchApp() {
       candidate_limit: draftOverride.content_limits.total_items,
       content_limits: draftOverride.content_limits,
     };
+  }
+
+  // Persist the confirmed profile so podcast show-discovery can run against the
+  // latest queries + selection, returning a topic_id for the show picker.
+  async function ensurePodcastTopicId(): Promise<string | null> {
+    const existing = topicProfile?.topic_id ?? session?.topic_id ?? null;
+    try {
+      const payload = { ...confirmedProfilePayload(draft), source_selection: selectedEnabledSources };
+      const saved = await api<TopicProfileResponse>("/api/explore/topic-profiles", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (saved?.topic_id) {
+        setTopicProfile(saved);
+        return saved.topic_id;
+      }
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not save the topic for show discovery"));
+    }
+    return existing;
   }
 
   async function reviewSearchStrategyBeforeBuild(profilePayload: ConfirmedProfilePayload): Promise<boolean> {
@@ -2267,6 +2435,7 @@ function DispatchApp() {
               onSourceToggle={updateSource}
               onSearchQueryEdit={updateSearchQuery}
               onBuild={() => void buildBrief()}
+              onEnsurePodcastTopicId={ensurePodcastTopicId}
               canSubmitInterest={canSubmitInterest}
               onSubmitInterest={(event) => {
                 if (event) event.preventDefault();
@@ -2514,6 +2683,7 @@ function RefinementPanel(props: {
   onBuild: () => void;
   canSubmitInterest: boolean;
   onSubmitInterest: (event?: React.FormEvent) => void;
+  onEnsurePodcastTopicId?: () => Promise<string | null>;
 }) {
   const threadRef = useRef<HTMLDivElement | null>(null);
   const messages = props.session?.messages ?? [];
@@ -2708,6 +2878,9 @@ function RefinementPanel(props: {
                   locked={props.sourceLocked}
                   onToggle={props.onSourceToggle}
                 />
+                {props.sourceSelection.podcasts && props.onEnsurePodcastTopicId ? (
+                  <PodcastShowPicker ensureTopicId={props.onEnsurePodcastTopicId} />
+                ) : null}
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", width: "100%" }}>
                   <span className="muted-hint">Or type further adjustments above</span>
                   <button

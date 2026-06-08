@@ -163,6 +163,15 @@ class TopicProfileContentLimitsUpdate(BaseModel):
     pipeline_limits: dict[str, Any] = Field(default_factory=dict)
 
 
+class PodcastShowRef(BaseModel):
+    feed_url: str = Field(min_length=1, max_length=2000)
+    title: str = Field(default="Podcast", max_length=400)
+
+
+class PodcastSubscriptionUpdate(BaseModel):
+    shows: list[PodcastShowRef] = Field(default_factory=list)
+
+
 class SourceSetupPayload(BaseModel):
     provider: Literal["tavily", "brave", "serpapi"] = "tavily"
     api_key: str = Field(min_length=1, max_length=1000)
@@ -468,6 +477,24 @@ def update_topic_profile_content_limits(topic_id: str, payload: TopicProfileCont
         return explore.save_topic_profile(profile)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/explore/topic-profiles/{topic_id}/podcast-shows")
+async def list_podcast_shows(topic_id: str) -> dict[str, Any]:
+    result = await explore.podcast_show_candidates(topic_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Topic profile not found")
+    return result
+
+
+@router.post("/explore/topic-profiles/{topic_id}/podcast-shows")
+def save_podcast_shows(topic_id: str, payload: PodcastSubscriptionUpdate) -> dict[str, Any]:
+    result = explore.save_podcast_subscriptions(
+        topic_id, [show.model_dump() for show in payload.shows]
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Topic profile not found")
+    return result
 
 
 @router.post("/explore/topic-profiles/{topic_id}/pause")

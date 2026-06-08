@@ -202,6 +202,88 @@ def save_topic_profile(payload: dict[str, Any]) -> dict[str, Any]:
     return database.upsert_topic_profile(profile.to_dict())
 
 
+async def podcast_show_candidates(topic_id: str) -> dict[str, Any] | None:
+    """Discover candidate podcast SHOWS for the picker (show-subscription model).
+
+    Returns shows whose content matches the interest (any time), each with a
+    usual-content summary, latest-episode metadata, a staleness flag, and whether
+    the user has already subscribed. Subscribed shows not surfaced by discovery are
+    appended so the user always sees their full current list.
+    """
+    record = database.get_topic_profile(topic_id)
+    if record is None:
+        return None
+    from backend.agents.digestor.podcast import discover_candidate_shows
+    from backend.agents.discovery.adapters import _podcast_discovery_refs, _subscribed_podcast_shows
+
+    profile = TopicProfile.from_dict(record["profile"])
+    staleness = int(getattr(get_settings(), "podcast_staleness_days", 60) or 60)
+    queries = _podcast_discovery_refs(profile)
+    candidates = await discover_candidate_shows(queries, staleness_days=staleness)
+
+    subscribed = _subscribed_podcast_shows(profile)
+    subscribed_feeds = {s["feed_url"].strip().lower() for s in subscribed}
+    discovered_feeds: set[str] = set()
+    for candidate in candidates:
+        feed_key = str(candidate.get("feed_url") or "").strip().lower()
+        discovered_feeds.add(feed_key)
+        candidate["subscribed"] = feed_key in subscribed_feeds
+    for show in subscribed:
+        if show["feed_url"].strip().lower() not in discovered_feeds:
+            candidates.append(
+                {
+                    "feed_url": show["feed_url"],
+                    "title": show["title"],
+                    "description": "",
+                    "subscribed": True,
+                    "latest_episode_title": None,
+                    "latest_published_at": None,
+                    "stale": None,
+                }
+            )
+    return {"topic_id": topic_id, "staleness_days": staleness, "candidates": candidates}
+
+
+def save_podcast_subscriptions(topic_id: str, shows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Persist the user's confirmed podcast shows onto the topic profile.
+
+    Stored as requested_sources entries (adapter=podcasts, with feed_url) so the
+    discovery adapter's subscription path picks them up on every build.
+    """
+    record = database.get_topic_profile(topic_id)
+    if record is None:
+        return None
+    profile = dict(record["profile"])
+    profile["topic_id"] = topic_id
+    profile["statement"] = record["statement"]
+
+    existing = [s for s in profile.get("requested_sources", []) if isinstance(s, dict)]
+    # Keep every non-podcast-feed requested source; replace the podcast feed set.
+    kept = [
+        s
+        for s in existing
+        if not (str(s.get("adapter") or "").strip() == "podcasts" and str(s.get("feed_url") or "").strip())
+    ]
+    seen: set[str] = set()
+    for show in shows:
+        feed_url = str(show.get("feed_url") or "").strip()
+        if not feed_url or feed_url.lower() in seen:
+            continue
+        seen.add(feed_url.lower())
+        title = str(show.get("title") or show.get("ref") or "Podcast").strip()
+        kept.append(
+            {
+                "adapter": "podcasts",
+                "ref": title,
+                "source_name": title,
+                "feed_url": feed_url,
+                "has_feed": True,
+            }
+        )
+    profile["requested_sources"] = kept
+    return save_topic_profile(profile)
+
+
 async def source_status() -> dict[str, Any]:
     settings = get_settings()
     try:
