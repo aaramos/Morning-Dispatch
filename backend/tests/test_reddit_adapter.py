@@ -128,14 +128,15 @@ def test_reddit_adapter_query_rss_success(monkeypatch, tmp_path) -> None:
         def text(self) -> str:
             return self._text
 
-    hot_rss = """<?xml version="1.0" encoding="UTF-8"?>
+    recent_published = datetime.now(UTC).isoformat(timespec="seconds")
+    hot_rss = f"""<?xml version="1.0" encoding="UTF-8"?>
     <feed xmlns="http://www.w3.org/2005/Atom">
       <title>hot posts in r/python</title>
       <entry>
         <title>LLM Coding Assistant</title>
         <link href="https://www.reddit.com/r/python/comments/post1/llm_coding_assistant/"/>
         <content type="html">&lt;p&gt;Check out this coding assistant built locally.&lt;/p></content>
-        <published>2026-06-05T20:50:00+00:00</published>
+        <published>{recent_published}</published>
         <author><name>/u/user_a</name></author>
       </entry>
     </feed>"""

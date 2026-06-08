@@ -391,3 +391,54 @@ def test_foreign_web_exempt_from_english_topic_gate() -> None:
     kept_ids = {c.payload.id for c in kept}
     assert foreign.payload.id in kept_ids  # foreign exempt, kept despite no overlap
     assert web.payload.id not in kept_ids  # non-foreign with no overlap is dropped
+
+
+# ---------------------------------------------------------------------------
+# Reddit recency: undated/old posts no longer bypass the window
+# ---------------------------------------------------------------------------
+
+
+def test_reddit_post_is_strict_window_type() -> None:
+    assert "reddit_post" in explore._STRICT_SOURCE_WINDOW_TYPES
+
+
+def test_undated_reddit_post_excluded_by_window() -> None:
+    profile = _profile(source_selection={"reddit": True})
+    undated = _result(source_type="reddit_post", url="https://www.reddit.com/r/ai/comments/abc/")
+    kept, issues, _reserve = explore._apply_source_window_filter(profile, [undated], lookback_hours=24)
+    assert kept == []  # undated reddit no longer slips through the recency gate
+    assert len(issues) == 1
+
+
+# ---------------------------------------------------------------------------
+# Podcast: freshest-in-window fallback when exact episode match fails
+# ---------------------------------------------------------------------------
+
+
+def test_latest_in_window_episode_picks_freshest_with_audio() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+
+    def ep(eid: str, hours_ago: int, audio: str | None):
+        return podcast.PodcastEpisode(
+            show_name="Show",
+            feed_url="https://x/feed",
+            episode_id=eid,
+            title=eid,
+            description="d",
+            published_at=(now - timedelta(hours=hours_ago)).isoformat(timespec="seconds"),
+            episode_url=f"https://x/{eid}",
+            audio_url=audio,
+        )
+
+    episodes = [
+        ep("old", 400, "https://a/old.mp3"),
+        ep("fresh", 5, "https://a/fresh.mp3"),
+        ep("noaudio", 1, None),  # newest but unplayable -> skipped
+    ]
+    chosen = podcast._latest_in_window_episode(episodes, 168)
+    assert chosen is not None and chosen.episode_id == "fresh"
+
+    # Nothing inside the window -> None.
+    assert podcast._latest_in_window_episode([ep("stale", 999, "https://a/s.mp3")], 24) is None

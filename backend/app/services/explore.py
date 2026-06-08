@@ -47,7 +47,7 @@ _BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
 _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 150
-_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode"}
+_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode", "reddit_post"}
 # Source types that require an outbound HTTP article fetch (they compete for the
 # article-fetch budget). Everything else is "direct" — built straight from the
 # discovered payload text — so it must NOT consume the HTTP fetch budget (P1).

@@ -1626,28 +1626,45 @@ async def _episode_first_search_and_resolve(
             return None
 
         matched_ep = _match_episode_in_feed(episodes, hit)
-        if not matched_ep:
-            return None
+        if matched_ep is not None:
+            diagnostics["episode_matched"] += 1
+            if not matched_ep.audio_url:
+                diagnostics["no_audio_rejects"] += 1
+                decisions.append(
+                    _decision(
+                        target=matched_ep.title,
+                        decision="skip",
+                        action="exclude_no_audio",
+                        confidence=0.9,
+                        reason="Excluded because the resolved episode has no playable audio URL.",
+                        metadata={"feed_url": feed_url},
+                    )
+                )
+                matched_ep = None
+            elif not _inside_lookback(matched_ep.published_at, lookback_hours):
+                diagnostics["date_rejects"] += 1
+                matched_ep = None
 
-        diagnostics["episode_matched"] += 1
-
-        if not matched_ep.audio_url:
-            diagnostics["no_audio_rejects"] += 1
+        if matched_ep is None:
+            # The show's feed resolved but the specific episode could not be matched
+            # (or was stale / had no audio). Fall back to the show's freshest in-window
+            # episode with playable audio so a relevant show still contributes instead
+            # of the lane yielding nothing.
+            fallback_ep = _latest_in_window_episode(episodes, lookback_hours)
+            if fallback_ep is None:
+                return None
+            diagnostics["episode_matched"] += 1
             decisions.append(
                 _decision(
-                    target=matched_ep.title,
-                    decision="skip",
-                    action="exclude_no_audio",
-                    confidence=0.9,
-                    reason="Excluded because the resolved episode has no playable audio URL.",
-                    metadata={"feed_url": feed_url},
+                    target=fallback_ep.title,
+                    decision="fallback",
+                    action="use_latest_show_episode",
+                    confidence=0.6,
+                    reason="Exact episode match failed; used the show's most recent in-window episode.",
+                    metadata={"feed_url": feed_url, "hit": getattr(hit, "title", "")},
                 )
             )
-            return None
-
-        if not _inside_lookback(matched_ep.published_at, lookback_hours):
-            diagnostics["date_rejects"] += 1
-            return None
+            matched_ep = fallback_ep
 
         # Check if apple_url is cached
         apple_url = cached_res.get("apple_url") if cached_res else None
@@ -1688,14 +1705,20 @@ async def _episode_first_search_and_resolve(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
             logger.info("Podcast resolution hit its time budget; %d resolution(s) cancelled.", len(pending))
+        seen_episode_ids: set[str] = set()
         for task in done:
             try:
                 res = task.result()
             except Exception as exc:
                 logger.warning("Failed to resolve candidate episode: %s", exc)
                 continue
-            if res is not None:
-                resolved_episodes.append(res)
+            if res is None:
+                continue
+            # Multiple hits can fall back to the same show's latest episode; keep one.
+            if res.episode_id in seen_episode_ids:
+                continue
+            seen_episode_ids.add(res.episode_id)
+            resolved_episodes.append(res)
 
     return resolved_episodes
 
@@ -1962,6 +1985,20 @@ def _extract_show_name_from_hit_title(title: str) -> str:
                 if "episode" not in p.lower() and "interview" not in p.lower() and len(p.split()) <= 5 and len(p) > 2:
                     return p
     return cleaned
+
+
+def _latest_in_window_episode(
+    episodes: list[PodcastEpisode], lookback_hours: int
+) -> PodcastEpisode | None:
+    """Most recent episode with playable audio that falls inside the lookback window."""
+    in_window = [
+        ep
+        for ep in episodes
+        if ep.audio_url and _inside_lookback(ep.published_at, lookback_hours)
+    ]
+    if not in_window:
+        return None
+    return max(in_window, key=lambda ep: ep.published_at or "")
 
 
 def _match_episode_in_feed(episodes: list[PodcastEpisode], hit: Any) -> PodcastEpisode | None:

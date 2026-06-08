@@ -982,9 +982,13 @@ class RedditSourceAdapter:
                         title = entry.get("title", "Reddit Post")
 
                         published_at = None
-                        if entry.get("published_parsed"):
+                        # Reddit's Atom feed usually exposes <updated> (updated_parsed)
+                        # and not always <published>; fall back so hot posts carry a
+                        # date and the recency gate can actually filter them.
+                        date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+                        if date_struct:
                             try:
-                                published_at = datetime(*entry.published_parsed[:6], tzinfo=UTC).isoformat(timespec="seconds")
+                                published_at = datetime(*date_struct[:6], tzinfo=UTC).isoformat(timespec="seconds")
                             except Exception:
                                 pass
 
