@@ -3,15 +3,29 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from backend.agents.discovery.types import AdapterUnavailable, TopicProfile
+
+logger = logging.getLogger(__name__)
+
+# Per-ticker wall-clock cap for the (blocking) yfinance call.
+_MARKET_FETCH_TIMEOUT_SECONDS = 15.0
+# Dedicated, bounded thread pool for blocking yfinance calls. Isolating them here
+# means a yfinance request that wedges on Yahoo (no library-level HTTP timeout)
+# can NEVER exhaust the default asyncio thread pool that the rest of the pipeline
+# — notably the post-review report compilation (asyncio.to_thread) — depends on.
+# Without this, leaked hung yfinance threads accumulate across builds and
+# eventually deadlock the brief between the `review` and `done` stages.
+_MARKETS_EXECUTOR = ThreadPoolExecutor(max_workers=6, thread_name_prefix="markets-yf")
 
 MARKETS_WINDOW_DAYS = 90
 YAHOO_QUOTE_URL = "https://finance.yahoo.com/quote/{ticker}"
@@ -152,13 +166,26 @@ def select_market_companies(
 async def fetch_market_snapshots(companies: list[MarketCompany]) -> list[MarketSnapshot]:
     if not markets_available():
         raise AdapterUnavailable("Markets requires the yfinance package.")
-    tasks = [asyncio.to_thread(_fetch_market_snapshot, company) for company in companies]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    snapshots: list[MarketSnapshot] = []
-    for result in results:
-        if isinstance(result, MarketSnapshot):
-            snapshots.append(result)
-    return snapshots
+    loop = asyncio.get_running_loop()
+
+    async def _one(company: MarketCompany) -> MarketSnapshot | None:
+        # Run on the dedicated markets pool (not the default thread pool) with a hard
+        # per-ticker deadline. If yfinance wedges, the lane degrades gracefully and the
+        # stuck thread is isolated to this pool — it cannot starve the rest of asyncio.
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(_MARKETS_EXECUTOR, _fetch_market_snapshot, company),
+                timeout=_MARKET_FETCH_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.info("Market snapshot for %s timed out after %.0fs", company.ticker, _MARKET_FETCH_TIMEOUT_SECONDS)
+            return None
+        except Exception as exc:
+            logger.info("Market snapshot for %s failed: %s", company.ticker, exc)
+            return None
+
+    results = await asyncio.gather(*[_one(company) for company in companies], return_exceptions=True)
+    return [result for result in results if isinstance(result, MarketSnapshot)]
 
 
 def _fetch_market_snapshot(company: MarketCompany) -> MarketSnapshot | None:

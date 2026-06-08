@@ -377,3 +377,39 @@ def test_fred_series_parsing(monkeypatch, tmp_path) -> None:
     assert len(fred_data) == 4
     assert fred_data[0]["current_value"] == 5.33
     assert fred_data[0]["current_date"] == "2026-05-01"
+
+
+def test_fetch_market_snapshots_isolates_hung_yfinance(monkeypatch):
+    """A wedged yfinance call must time out per-ticker and never block the gather
+    (and runs on the dedicated markets pool, not the default thread pool)."""
+    import time
+
+    monkeypatch.setattr(markets, "markets_available", lambda: True)
+    monkeypatch.setattr(markets, "_MARKET_FETCH_TIMEOUT_SECONDS", 0.3)
+
+    good = MarketCompany(ticker="GOOD", company_name="Good Co", tier="core", rationale="r")
+    hung = MarketCompany(ticker="HUNG", company_name="Hung Co", tier="core", rationale="r")
+
+    def fake_fetch(company: MarketCompany):
+        if company.ticker == "HUNG":
+            time.sleep(5)  # simulate a yfinance call wedged on Yahoo
+            return None
+        return MarketSnapshot(
+            ticker="GOOD", company_name="Good Co", tier="core", rationale="r",
+            current_price=100.0, market_cap=1, currency="USD",
+            change_1d_pct=0.0, change_7d_pct=0.0, change_30d_pct=0.0,
+            change_3m_pct=0.0, price_history=(),
+            analyst_rating=None, sector=None, industry=None, recent_news=(),
+            fetched_at="2026-06-08T00:00:00+00:00", source_url="https://example.com",
+        )
+
+    monkeypatch.setattr(markets, "_fetch_market_snapshot", fake_fetch)
+
+    started = time.monotonic()
+    snapshots = asyncio.run(markets.fetch_market_snapshots([good, hung]))
+    elapsed = time.monotonic() - started
+
+    # Returns promptly (well under the 5s hang) with the good ticker; the hung one
+    # is dropped rather than wedging the whole call.
+    assert elapsed < 3.0
+    assert [s.ticker for s in snapshots] == ["GOOD"]
