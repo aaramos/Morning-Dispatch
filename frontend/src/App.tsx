@@ -38,6 +38,10 @@ type TopicProfile = {
   search_queries?: string[];
   source_queries?: Record<string, string[]>;
   foreign_language_plan?: Array<{ code: string; name: string; native_query: string; reason?: string }>;
+  direct_episode_queries?: string[];
+  related_episode_queries?: string[];
+  negative_constraints?: string[];
+  priority_terms?: string[];
   depth?: string;
   recency_weighting?: string;
   lookback_hours?: number | null;
@@ -84,6 +88,10 @@ type StrategyPreview = {
     queries: string[];
     approved_senders?: string[];
     tickers?: string[];
+    direct_episode_queries?: string[];
+    related_episode_queries?: string[];
+    negative_constraints?: string[];
+    priority_terms?: string[];
     note?: string;
   }>;
   lookback_hours: number | null;
@@ -144,6 +152,10 @@ type ConfirmedProfilePayload = {
   keywords: string[];
   search_queries: string[];
   source_queries: Record<string, string[]>;
+  direct_episode_queries?: string[];
+  related_episode_queries?: string[];
+  negative_constraints?: string[];
+  priority_terms?: string[];
   gmail_rules?: TopicProfile["gmail_rules"];
   models: Record<string, never>;
   schedule?: string | null;
@@ -1591,6 +1603,10 @@ function DispatchApp() {
       keywords: baseProfile?.keywords ?? [],
       search_queries: uniqueCleanList(baseProfile?.search_queries ?? []),
       source_queries: cleanSourceQueryRecord(baseProfile?.source_queries),
+      direct_episode_queries: uniqueCleanList(baseProfile?.direct_episode_queries ?? []),
+      related_episode_queries: uniqueCleanList(baseProfile?.related_episode_queries ?? []),
+      negative_constraints: uniqueCleanList(baseProfile?.negative_constraints ?? []),
+      priority_terms: uniqueCleanList(baseProfile?.priority_terms ?? []),
       gmail_rules: baseProfile?.gmail_rules ?? {},
       models: {},
       schedule: baseProfile?.schedule ?? null,
@@ -2691,7 +2707,24 @@ function RefinementPanel(props: {
   const finalized = props.flow === "confirm" || props.session?.status === "finalized";
   const generalQueries = preview?.search_queries ?? props.profile?.search_queries ?? [];
   const marketSource = (preview?.per_source ?? []).find((source) => source.key === "markets");
+  const podcastSource = (preview?.per_source ?? []).find((source) => source.key === "podcasts");
   const tickers = marketSource?.tickers ?? [];
+  const podcastDirectQueries = uniqueCleanList([
+    ...(podcastSource?.direct_episode_queries ?? []),
+    ...(props.profile?.direct_episode_queries ?? []),
+  ]);
+  const podcastRelatedQueries = uniqueCleanList([
+    ...(podcastSource?.related_episode_queries ?? []),
+    ...(props.profile?.related_episode_queries ?? []),
+  ]);
+  const podcastPriorityTerms = uniqueCleanList([
+    ...(podcastSource?.priority_terms ?? []),
+    ...(props.profile?.priority_terms ?? []),
+  ]);
+  const podcastNegativeTerms = uniqueCleanList([
+    ...(podcastSource?.negative_constraints ?? []),
+    ...(props.profile?.negative_constraints ?? []),
+  ]);
   const sourceQueries = (preview?.per_source ?? [])
     .filter((source) => source.key !== "markets")
     .flatMap((source) => source.queries.map((query, index) => ({
@@ -3014,6 +3047,18 @@ function RefinementPanel(props: {
                   />
                 ))}
               </ul>
+            </div>
+          ) : null}
+          {podcastDirectQueries.length || podcastRelatedQueries.length || podcastPriorityTerms.length || podcastNegativeTerms.length ? (
+            <div className="plan-group">
+              <div className="plan-label">Podcast strategy</div>
+              <div className="plan-value">
+                {podcastDirectQueries.length ? `Direct: ${podcastDirectQueries.join(" · ")}` : null}
+                {podcastRelatedQueries.length ? `${podcastDirectQueries.length ? " | " : ""}Related: ${podcastRelatedQueries.join(" · ")}` : null}
+                {podcastPriorityTerms.length ? `${podcastDirectQueries.length || podcastRelatedQueries.length ? " | " : ""}Boost: ${podcastPriorityTerms.join(" · ")}` : null}
+                {podcastNegativeTerms.length ? `${podcastDirectQueries.length || podcastRelatedQueries.length || podcastPriorityTerms.length ? " | " : ""}Avoid: ${podcastNegativeTerms.join(" · ")}` : null}
+              </div>
+              <div className="plan-ready-note">Approved shows contribute their latest eligible episode; these terms discover additional related podcast content.</div>
             </div>
           ) : null}
           {(preview?.exclusions?.length ?? 0) > 0 ? (
@@ -7081,7 +7126,14 @@ function sourceReadinessItems(
         return { key: source.key, label: source.label, ready: false, message: sourceStatus?.reason || "not configured" };
       }
       if (source.key === "podcasts" && !queries.length && !sourceStatus.configured_source_count) {
-        return { key: source.key, label: source.label, ready: false, message: "no show or search targets yet" };
+        const semanticCount = uniqueCleanList([
+          ...(profile?.direct_episode_queries ?? []),
+          ...(profile?.related_episode_queries ?? []),
+          ...(profile?.priority_terms ?? []),
+        ]).length;
+        if (!semanticCount) {
+          return { key: source.key, label: source.label, ready: false, message: "no show or search targets yet" };
+        }
       }
       if (source.key === "youtube" && sourceStatus.quota_units_used && sourceStatus.quota_units_used >= 8000) {
         return { key: source.key, label: source.label, ready: false, message: "quota is high today" };
@@ -7118,6 +7170,16 @@ function sourceSearchPlanGroups(profile: TopicProfile | null): SearchPlanGroup[]
       label: source.label,
       queries: queries.length ? queries : [emptySourcePlanLabel(source.key)],
     });
+    if (source.key === "podcasts") {
+      const direct = uniqueCleanList(profile.direct_episode_queries ?? []);
+      const related = uniqueCleanList(profile.related_episode_queries ?? []);
+      const boosted = uniqueCleanList(profile.priority_terms ?? []);
+      const avoided = uniqueCleanList(profile.negative_constraints ?? []);
+      if (direct.length) groups.push({ key: "podcast-direct", label: "Podcast direct", queries: direct });
+      if (related.length) groups.push({ key: "podcast-related", label: "Podcast related", queries: related });
+      if (boosted.length) groups.push({ key: "podcast-boost", label: "Podcast boost", queries: boosted });
+      if (avoided.length) groups.push({ key: "podcast-avoid", label: "Podcast avoid", queries: avoided });
+    }
   }
 
   for (const item of profile.foreign_language_plan ?? []) {

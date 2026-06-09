@@ -231,7 +231,9 @@ def _apply_editorial_payload(
         section = _safe_section(raw.get("section"))
         action = "none"
 
-        if decision == "exclude" and confidence >= 0.55 and result.payload.source_type != "market_snapshot":
+        if decision == "exclude" and confidence >= 0.55 and _is_protected_from_editorial_exclusion(result):
+            action = "preserve_approved_source"
+        elif decision == "exclude" and confidence >= 0.55 and result.payload.source_type != "market_snapshot":
             updated[index] = replace(result, tier="dropped")
             action = "drop"
         elif decision == "demote":
@@ -288,6 +290,15 @@ def _normalize_lead(results: list[ArticleFetchResult]) -> list[ArticleFetchResul
         elif result.tier == "lead":
             normalized[index] = replace(result, tier="main")
     return normalized
+
+
+def _is_protected_from_editorial_exclusion(result: ArticleFetchResult) -> bool:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    payload_metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    return (
+        result.payload.source_type == "podcast_episode"
+        and bool(metadata.get("subscribed_show") or payload_metadata.get("subscribed_show"))
+    )
 
 
 def _safe_int(value: Any) -> int | None:

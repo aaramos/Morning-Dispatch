@@ -87,7 +87,10 @@ def _prepare_result(
     if topic_signal and result.payload.source_type == "gmail_link":
         relevance = min(1.0, relevance + 0.18)
 
-    if _matches_exclusion(result, source_text, exclusion_phrases):
+    if _is_approved_podcast_latest(result):
+        tier = "main"
+        relevance = max(relevance, 0.55)
+    elif _matches_exclusion(result, source_text, exclusion_phrases):
         tier = "dropped"
     elif _translation_unavailable(result):
         tier = "dropped"
@@ -135,6 +138,15 @@ def _prepare_result(
         relevance_score=round(relevance, 3),
         tier=tier,
         section=section,
+    )
+
+
+def _is_approved_podcast_latest(result: ArticleFetchResult) -> bool:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    payload_metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    return (
+        result.payload.source_type == "podcast_episode"
+        and bool(metadata.get("subscribed_show") or payload_metadata.get("subscribed_show"))
     )
 
 

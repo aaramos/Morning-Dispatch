@@ -379,7 +379,8 @@ query_broadening: |
   - Do NOT change or broaden the recency filtering or time window. Focus only on the topical words of the query.
   - Return a list of broadened queries in the "search_queries" field.
   - Optionally return a dictionary of broadened queries per source adapter (e.g. "web_search", "podcasts", "youtube") in the "source_queries" field.
-  - For "podcasts", queries MUST be extremely short (1 to 2 words max, e.g. "AI", "semiconductor").
+  - For "podcasts", source_queries MUST be extremely short (1 to 2 words max, e.g. "AI", "semiconductor"). You may also update direct_episode_queries, related_episode_queries, negative_constraints, and priority_terms to broaden podcast discovery without suppressing approved latest episodes.
+  - Use source-specific repair behavior: web_search should broaden restrictive terms and add aliases; foreign_media should add native-language variants; gmail should stay inside approved sender/query boundaries; podcasts should add adjacent show/episode/guest terms; youtube should use video/channel/interview phrasing; markets should stay ticker-only; reddit should add subreddit-native terms.
 
   Format your response as a strict JSON object with this shape:
   {
@@ -388,6 +389,10 @@ query_broadening: |
       "web_search": ["query 1"],
       "podcasts": ["podcast query"]
     },
+    "direct_episode_queries": ["direct podcast episode topic"],
+    "related_episode_queries": ["adjacent podcast topic"],
+    "negative_constraints": ["thing to avoid"],
+    "priority_terms": ["entity to boost"],
     "explanation": "concise explanation of how the queries were broadened"
   }
 

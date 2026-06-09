@@ -88,6 +88,40 @@ def result(title: str, *, score: float = 0.5, tier: str = "main") -> ArticleFetc
     )
 
 
+def approved_podcast_result(title: str = "Approved show latest") -> ArticleFetchResult:
+    payload = NormalizedPayload(
+        source_type="podcast_episode",
+        source_name="Approved Show",
+        raw_text="A detailed conversation about urban planning and restaurant economics.",
+        original_url=f"https://podcasts.example.com/{title.lower().replace(' ', '-')}",
+        published_at="2026-05-20T12:00:00+00:00",
+        metadata={
+            "title": title,
+            "podcast_title": "Approved Show",
+            "subscribed_show": True,
+            "approved_podcast_latest": True,
+        },
+    )
+    return ArticleFetchResult(
+        payload=payload,
+        original_url=str(payload.original_url),
+        final_url=str(payload.original_url),
+        canonical_url=str(payload.original_url),
+        title=title,
+        text=payload.raw_text,
+        excerpt=payload.raw_text,
+        domain="podcasts.example.com",
+        status="fetched",
+        link_score=0.2,
+        relevance_score=0.1,
+        tier="main",
+        section="Podcast Signals",
+        editor_summary=payload.raw_text,
+        content_type="podcast",
+        metadata=dict(payload.metadata),
+    )
+
+
 def test_editorial_agent_can_drop_and_replace_lead():
     articles = [
         result("Weak promo story", score=0.7, tier="lead"),
@@ -121,6 +155,35 @@ def test_editorial_agent_can_drop_and_replace_lead():
     assert updated[1].tier == "lead"
     assert updated[1].section == "AI Infrastructure"
     assert any(decision.agent == "editorial" and decision.action == "drop" for decision in decisions)
+
+
+def test_editorial_agent_preserves_approved_podcast_latest():
+    articles = [
+        approved_podcast_result("Approved show latest"),
+        result("Strong AI infrastructure story", score=0.7),
+    ]
+    model = FakeModelClient(
+        {
+            "decisions": [
+                {
+                    "index": 0,
+                    "decision": "exclude",
+                    "confidence": 0.95,
+                    "reason": "Not directly about the requested AI infrastructure interest.",
+                }
+            ]
+        }
+    )
+
+    updated, decisions = asyncio.run(
+        apply_editorial_decisions({"name": "AI Brief", "interest": "AI infrastructure"}, articles, model_client=model)
+    )
+
+    assert updated[0].tier != "dropped"
+    assert any(
+        decision.agent == "editorial" and decision.action == "preserve_approved_source"
+        for decision in decisions
+    )
 
 
 def test_editorial_agent_streams_reasoning_to_callback():
@@ -297,6 +360,42 @@ def test_source_audit_agent_can_exclude_stale_or_low_fit_sources():
     assert updated[1].tier == "dropped"
     assert summary["excluded_count"] == 1
     assert any(decision.agent == "source_audit" and decision.action == "drop_article" for decision in decisions)
+
+
+def test_source_audit_preserves_approved_podcast_latest():
+    article = approved_podcast_result("Approved show latest")
+    model = FakeModelClient(
+        {
+            "decisions": [
+                {
+                    "index": 0,
+                    "decision": "exclude",
+                    "confidence": 0.9,
+                    "constraint_failures": ["topic_fit"],
+                    "reason": "Adjacent but not directly attributable to the requested interest.",
+                }
+            ],
+            "summary": "Protected approved podcast latest episode.",
+        }
+    )
+
+    updated, decisions, summary = asyncio.run(
+        apply_source_audit(
+            {"statement": "Track AI infrastructure", "interest": "GPU markets"},
+            [article],
+            lookback_hours=72,
+            model_client=model,
+            inference_run_id="audit-approved-podcast",
+        )
+    )
+
+    assert updated[0].tier != "dropped"
+    assert summary["included_count"] == 1
+    assert summary["excluded_count"] == 0
+    assert any(
+        decision.agent == "source_audit" and decision.action == "preserve_approved_source"
+        for decision in decisions
+    )
 
 
 def test_source_audit_uses_model_date_to_enforce_window_for_undated_items():

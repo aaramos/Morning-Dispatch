@@ -829,6 +829,12 @@ async def _run_exploration(
                 source_selection=merged_selection,
             )
             starved_sources = sorted(set(source_starved) | set(missing_sources))
+            _update_strategy_repair_result(
+                progress,
+                attempt=attempt,
+                included_count=included_count,
+                starved_sources=starved_sources,
+            )
 
             if (included_count < target_yield or starved_sources) and attempt < max_attempts:
                 if starved_sources:
@@ -861,7 +867,19 @@ async def _run_exploration(
                 broaden_kwargs: dict[str, Any] = {}
                 if starved_sources and _accepts_param(broaden_queries_with_agent, "starved_sources"):
                     broaden_kwargs["starved_sources"] = starved_sources
+                before_repair = current_profile
                 current_profile = await broaden_queries_with_agent(current_profile, **broaden_kwargs)
+                _record_strategy_repair(
+                    progress,
+                    before=before_repair,
+                    after=current_profile,
+                    attempt=attempt,
+                    retry_attempt=attempt + 1,
+                    included_count=included_count,
+                    target_yield=target_yield,
+                    starved_sources=starved_sources,
+                )
+                _persist_progress(exploration_id, progress)
 
                 # 2. Relax filtering settings
                 low_yield_mode = True
@@ -1223,6 +1241,106 @@ def _selected_sources_missing_candidates(
         if status.status == "completed" and status.candidate_count <= 0:
             missing.append(source)
     return sorted(missing)
+
+
+def _record_strategy_repair(
+    progress: dict[str, Any],
+    *,
+    before: TopicProfile,
+    after: TopicProfile,
+    attempt: int,
+    retry_attempt: int,
+    included_count: int,
+    target_yield: int,
+    starved_sources: list[str],
+) -> None:
+    before_sources = _compact_source_queries(before)
+    after_sources = _compact_source_queries(after)
+    changed_sources = sorted(
+        source
+        for source in set(before_sources) | set(after_sources)
+        if before_sources.get(source, []) != after_sources.get(source, [])
+    )
+    before_podcast = _compact_podcast_strategy(before)
+    after_podcast = _compact_podcast_strategy(after)
+    podcast_changed = before_podcast != after_podcast
+    trigger = "source_starvation" if starved_sources else "low_yield"
+    repairs = list(progress.get("strategy_repairs") or [])
+    repairs.append(
+        {
+            "status": "retrying",
+            "trigger": trigger,
+            "attempt": attempt,
+            "retry_attempt": retry_attempt,
+            "reason": (
+                f"Selected source lane(s) produced no final content: {', '.join(starved_sources)}."
+                if starved_sources
+                else f"Only {included_count} visible item(s) survived; target is {target_yield}."
+            ),
+            "starved_sources": list(starved_sources),
+            "included_count_before_retry": included_count,
+            "target_yield": target_yield,
+            "before_search_queries": list(before.search_queries),
+            "after_search_queries": list(after.search_queries),
+            "before_source_queries": before_sources,
+            "after_source_queries": after_sources,
+            "changed_sources": changed_sources,
+            "before_podcast_strategy": before_podcast,
+            "after_podcast_strategy": after_podcast,
+            "podcast_strategy_changed": podcast_changed,
+            "changed": (
+                list(before.search_queries) != list(after.search_queries)
+                or bool(changed_sources)
+                or podcast_changed
+            ),
+            "persisted_to_topic_profile": False,
+        }
+    )
+    progress["strategy_repairs"] = repairs
+
+
+def _update_strategy_repair_result(
+    progress: dict[str, Any],
+    *,
+    attempt: int,
+    included_count: int,
+    starved_sources: list[str],
+) -> None:
+    repairs = progress.get("strategy_repairs")
+    if not isinstance(repairs, list):
+        return
+    for entry in reversed(repairs):
+        if not isinstance(entry, dict):
+            continue
+        if int(entry.get("retry_attempt") or 0) != attempt:
+            continue
+        if isinstance(entry.get("retry_result"), dict):
+            return
+        target_yield = int(entry.get("target_yield") or 0)
+        entry["retry_result"] = {
+            "included_count": included_count,
+            "remaining_starved_sources": list(starved_sources),
+            "status": "improved" if included_count >= target_yield and not starved_sources else "still_weak",
+        }
+        entry["status"] = "completed"
+        return
+
+
+def _compact_source_queries(profile: TopicProfile) -> dict[str, list[str]]:
+    return {
+        source: list(queries)[:8]
+        for source, queries in profile.source_queries.items()
+        if queries
+    }
+
+
+def _compact_podcast_strategy(profile: TopicProfile) -> dict[str, list[str]]:
+    return {
+        "direct_episode_queries": list(profile.direct_episode_queries)[:8],
+        "related_episode_queries": list(profile.related_episode_queries)[:8],
+        "negative_constraints": list(profile.negative_constraints)[:8],
+        "priority_terms": list(profile.priority_terms)[:8],
+    }
 
 
 def _select_fetch_payloads_for_budget(
@@ -2646,6 +2764,10 @@ async def broaden_queries_with_agent(
             "exclusions": list(profile.exclusions),
             "search_queries": list(profile.search_queries),
             "source_queries": {key: list(val) for key, val in profile.source_queries.items()},
+            "direct_episode_queries": list(profile.direct_episode_queries),
+            "related_episode_queries": list(profile.related_episode_queries),
+            "negative_constraints": list(profile.negative_constraints),
+            "priority_terms": list(profile.priority_terms),
         }
         if starved_sources:
             # Tell the model which lanes came up empty so it can target them.
@@ -2663,6 +2785,12 @@ async def broaden_queries_with_agent(
 
         broadened_search = payload.get("search_queries")
         broadened_source = payload.get("source_queries")
+        broadened_podcast_fields = {
+            "direct_episode_queries": payload.get("direct_episode_queries"),
+            "related_episode_queries": payload.get("related_episode_queries"),
+            "negative_constraints": payload.get("negative_constraints"),
+            "priority_terms": payload.get("priority_terms"),
+        }
 
         cleaned_search: list[str] = []
         if isinstance(broadened_search, list):
@@ -2697,6 +2825,35 @@ async def broaden_queries_with_agent(
             merged = {key: tuple(val) for key, val in profile.source_queries.items()}
             merged.update(cleaned_source)
             updates["source_queries"] = merged
+        for field, raw_values in broadened_podcast_fields.items():
+            if not isinstance(raw_values, list):
+                continue
+            existing_values = [str(q).strip() for q in getattr(profile, field, ()) if str(q).strip()]
+            merged_values = list(existing_values)
+            seen_values = {query.lower() for query in merged_values}
+            limit = max(16, len(existing_values))
+            for query in (str(q).strip() for q in raw_values if str(q).strip()):
+                key = query.lower()
+                if key and key not in seen_values:
+                    merged_values.append(query)
+                    seen_values.add(key)
+                if len(merged_values) >= limit:
+                    break
+            if merged_values != existing_values:
+                updates[field] = tuple(merged_values)
+
+        if starved_sources and "podcasts" in starved_sources and cleaned_search and "related_episode_queries" not in updates:
+            existing_related = list(profile.related_episode_queries)
+            seen_related = {query.strip().lower() for query in existing_related}
+            for query in cleaned_search:
+                key = query.strip().lower()
+                if key and key not in seen_related:
+                    existing_related.append(query)
+                    seen_related.add(key)
+                if len(existing_related) >= 8:
+                    break
+            if existing_related:
+                updates["related_episode_queries"] = tuple(existing_related)
 
         if updates:
             logger.info("Broadened queries: %s", updates)

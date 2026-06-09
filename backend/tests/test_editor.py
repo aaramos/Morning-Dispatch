@@ -120,6 +120,47 @@ def test_prepare_issue_articles_keeps_reddit_community_signals():
     assert prepared[0].tier == "lead"
 
 
+def test_prepare_issue_articles_keeps_approved_podcast_latest_even_when_off_topic():
+    payload = NormalizedPayload(
+        source_type="podcast_episode",
+        source_name="Approved Show",
+        raw_text="A conversation about urban planning, restaurant economics, and neighborhood zoning.",
+        original_url="https://podcasts.example.com/latest",
+        published_at="2026-05-20T12:00:00+00:00",
+        metadata={
+            "title": "City zoning and restaurant economics",
+            "podcast_title": "Approved Show",
+            "subscribed_show": True,
+            "approved_podcast_latest": True,
+            "episode_quality_score": 0.8,
+        },
+    )
+    podcast_result = ArticleFetchResult(
+        payload=payload,
+        original_url=str(payload.original_url),
+        final_url=str(payload.original_url),
+        canonical_url=str(payload.original_url),
+        title="City zoning and restaurant economics",
+        text=payload.raw_text,
+        excerpt=payload.raw_text,
+        domain="podcasts.example.com",
+        status="fetched",
+        link_score=0.2,
+        content_type="podcast",
+        metadata=dict(payload.metadata),
+    )
+
+    prepared = prepare_issue_articles(
+        {"interest": "AI infrastructure and GPU markets", "threshold": 0.45},
+        [podcast_result],
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0].section == "Podcast Signals"
+    assert prepared[0].tier == "lead"
+    assert prepared[0].relevance_score >= 0.55
+
+
 def test_prepare_issue_articles_uses_avoid_terms_as_exclusions():
     prepared = prepare_issue_articles(
         {"interest": "Mexico City food, museums, and walking tours Avoid: fine dining, luxury shopping", "threshold": 0.45},

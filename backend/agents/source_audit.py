@@ -715,7 +715,11 @@ def _apply_audit_payload(
             "resolved_published_date": model_date or "",
         }}
 
-        if decision == "exclude" and confidence >= 0.5 and result.payload.source_type != "market_snapshot":
+        if decision == "exclude" and confidence >= 0.5 and _is_protected_from_audit_exclusion(result):
+            updated[index] = replace(result, metadata=metadata)
+            included_count += 1
+            action = "preserve_approved_source"
+        elif decision == "exclude" and confidence >= 0.5 and result.payload.source_type != "market_snapshot":
             updated[index] = replace(result, tier="dropped", metadata=metadata)
             excluded_count += 1
             action = "drop_article"
@@ -895,6 +899,15 @@ def _client_model_name(client: ModelClient | None, fallback: str | None) -> str 
         return fallback
     config = getattr(client, "config", None)
     return str(getattr(config, "model", None) or fallback or "")
+
+
+def _is_protected_from_audit_exclusion(result: ArticleFetchResult) -> bool:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    payload_metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    return (
+        result.payload.source_type == "podcast_episode"
+        and bool(metadata.get("subscribed_show") or payload_metadata.get("subscribed_show"))
+    )
 
 
 def _safe_int(value: Any) -> int | None:

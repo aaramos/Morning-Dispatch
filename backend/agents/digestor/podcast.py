@@ -736,6 +736,7 @@ async def fetch_subscribed_show_latest(
                     "episode_quality_score": 0.8,
                     "transcript_source": transcript_source,
                     "subscribed_show": True,
+                    "approved_podcast_latest": True,
                     **(latest.metadata or {}),
                 },
             )

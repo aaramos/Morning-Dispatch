@@ -134,6 +134,48 @@ def test_strategy_preview_exposes_diagnostics():
     assert preview["diagnostics"]["readiness_reason"] == "defaults_filled"
 
 
+def test_podcast_semantic_fields_survive_patch_coercion_review_and_preview():
+    profile = refinement._coerce_profile(
+        _profile(source_selection={"web_search": True, "podcasts": True})
+    )
+    patched = refinement._merge_agent_profile_patch(
+        profile,
+        {
+            "direct_episode_queries": ["AI agents"],
+            "related_episode_queries": ["developer tools"],
+            "negative_constraints": ["crypto"],
+            "priority_terms": ["OpenAI"],
+            "source_queries": {"podcasts": ["AI agents"]},
+        },
+        user_text="track AI agents in podcasts",
+    )
+
+    assert patched["direct_episode_queries"] == ["AI agents"]
+    assert patched["related_episode_queries"] == ["developer tools"]
+    assert patched["negative_constraints"] == ["crypto"]
+    assert patched["priority_terms"] == ["OpenAI"]
+
+    reviewed = refinement._profile_for_strategy_review(
+        profile,
+        {
+            **patched,
+            "direct_episode_queries": ["AI agents", "coding agents"],
+            "priority_terms": ["OpenAI", "Anthropic"],
+        },
+        models={},
+    )
+    assert reviewed["direct_episode_queries"] == ["AI agents", "coding agents"]
+    assert reviewed["priority_terms"] == ["OpenAI", "Anthropic"]
+    assert refinement._strategy_fingerprint(profile) != refinement._strategy_fingerprint(reviewed)
+
+    preview = refinement._strategy_preview(reviewed)
+    podcast_plan = next(entry for entry in preview["per_source"] if entry["key"] == "podcasts")
+    assert podcast_plan["direct_episode_queries"] == ["AI agents", "coding agents"]
+    assert podcast_plan["related_episode_queries"] == ["developer tools"]
+    assert podcast_plan["negative_constraints"] == ["crypto"]
+    assert podcast_plan["priority_terms"] == ["OpenAI", "Anthropic"]
+
+
 def test_apply_agent_update_ignores_model_ready_without_user_confirmation(monkeypatch):
     # Keep the second model pass inert so the test never touches the network.
     monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)

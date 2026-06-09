@@ -62,6 +62,12 @@ QUESTIONS = {
 }
 
 VALID_SOURCE_ADAPTERS = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit"}
+PODCAST_STRATEGY_FIELDS = (
+    "direct_episode_queries",
+    "related_episode_queries",
+    "negative_constraints",
+    "priority_terms",
+)
 
 
 
@@ -1285,6 +1291,10 @@ def _build_refinement_chat_prompt(
         "search_queries": _string_list(profile.get("search_queries")),
         "source_queries": _clean_source_queries(profile.get("source_queries")),
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
+        "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
+        "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
+        "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
         "depth": _normalize_depth(profile.get("depth")),
         "recency_weighting": _normalize_recency(profile.get("recency_weighting")),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -1673,6 +1683,7 @@ def _profile_for_strategy_review(base_profile: dict[str, Any], payload_profile: 
             "source_queries",
             "foreign_language_plan",
             "requested_sources",
+            *PODCAST_STRATEGY_FIELDS,
             "depth",
             "recency_weighting",
             "lookback_hours",
@@ -1711,6 +1722,10 @@ def _strategy_fingerprint(profile: dict[str, Any]) -> str:
         "source_queries": _clean_source_queries(profile.get("source_queries")),
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
         "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
+        "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
+        "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
+        "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
+        "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
         "depth": str(profile.get("depth") or ""),
         "recency_weighting": str(profile.get("recency_weighting") or ""),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -1806,6 +1821,10 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
                 "search_queries": _string_list(profile.get("search_queries"), limit=20),
                 "source_queries": _clean_source_queries(profile.get("source_queries")),
                 "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+                "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
+                "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
+                "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
+                "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
                 "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
                 "source_selection": _source_selection_dict(profile.get("source_selection")),
                 "selected_sources": selected_sources,
@@ -2191,6 +2210,10 @@ def _build_refinement_agent_prompt(
         "search_queries": _string_list(profile.get("search_queries")),
         "source_queries": _clean_source_queries(profile.get("source_queries")),
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
+        "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
+        "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
+        "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
         "depth": _normalize_depth(profile.get("depth")),
         "recency_weighting": _normalize_recency(profile.get("recency_weighting")),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -2323,7 +2346,7 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
         if value:
             updated[key] = value
 
-    for key in ("subtopics", "search_queries", "exclusions"):
+    for key in ("subtopics", "search_queries", "exclusions", *PODCAST_STRATEGY_FIELDS):
         if key not in patch:
             continue
         if key == "search_queries" and bool(patch.get("replace_search_queries")):
@@ -3373,6 +3396,10 @@ def _baseline_diagnostics(profile: dict[str, Any]) -> dict[str, Any]:
             "source_availability": availability,
             "final_source_queries": {src: list(qs) for src, qs in source_queries.items()},
             "final_search_queries": _string_list(profile.get("search_queries"), limit=20),
+            "final_podcast_strategy": {
+                field: _string_list(profile.get(field), limit=16)
+                for field in PODCAST_STRATEGY_FIELDS
+            },
         }
     )
     diagnostics.setdefault("readiness_reason", "defaults_filled")
@@ -3393,6 +3420,10 @@ def _diagnostics_query_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
     return {
         "search_queries": _string_list(profile.get("search_queries"), limit=20),
         "source_queries": _clean_source_queries(profile.get("source_queries")),
+        "podcast_strategy": {
+            field: _string_list(profile.get(field), limit=16)
+            for field in PODCAST_STRATEGY_FIELDS
+        },
     }
 
 
@@ -3423,6 +3454,11 @@ def _enrich_diagnostics(
     pre_search = pre_critique.get("search_queries") if isinstance(pre_critique, dict) else []
     post_source = _clean_source_queries(profile.get("source_queries"))
     post_search = _string_list(profile.get("search_queries"), limit=20)
+    pre_podcast = pre_critique.get("podcast_strategy") if isinstance(pre_critique, dict) else {}
+    post_podcast = {
+        field: _string_list(profile.get(field), limit=16)
+        for field in PODCAST_STRATEGY_FIELDS
+    }
     source_added: dict[str, int] = {}
     for src, queries in post_source.items():
         added = max(0, len(queries) - len((pre_source or {}).get(src, [])))
@@ -3431,6 +3467,7 @@ def _enrich_diagnostics(
     diagnostics["critique_changes"] = {
         "search_queries_added": max(0, len(post_search) - len(pre_search or [])),
         "source_queries_added": source_added,
+        "podcast_strategy_changed": pre_podcast != post_podcast,
     }
     return diagnostics
 
@@ -3850,6 +3887,10 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "search_queries": _string_list(profile.get("search_queries"), limit=20),
         "source_queries": source_queries,
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
+        "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
+        "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
+        "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
         "depth": str(profile.get("depth") or ""),
         "recency_weighting": str(profile.get("recency_weighting") or ""),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -4069,6 +4110,14 @@ def _strategy_preview(profile: dict[str, Any]) -> dict[str, Any]:
             if source == "gmail":
                 entry["approved_senders"] = database.approved_gmail_senders()
                 entry["note"] = "Only approved newsletters are read; their linked articles become primary content."
+            if source == "podcasts":
+                entry["direct_episode_queries"] = _string_list(profile.get("direct_episode_queries"), limit=8)
+                entry["related_episode_queries"] = _string_list(profile.get("related_episode_queries"), limit=8)
+                entry["negative_constraints"] = _string_list(profile.get("negative_constraints"), limit=8)
+                entry["priority_terms"] = _string_list(profile.get("priority_terms"), limit=8)
+                entry["note"] = (
+                    "Approved shows contribute their latest eligible episode; semantic queries discover related shows and episodes."
+                )
             if source == "markets":
                 # Resolve the actual tickers that will be fetched so the user can
                 # see and verify them in the confirmation card.

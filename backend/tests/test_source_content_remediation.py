@@ -253,6 +253,84 @@ def test_broaden_seeds_starved_lanes(monkeypatch) -> None:
     assert "AI capex" in out.source_queries["web_search"]  # existing preserved
 
 
+def test_broaden_updates_podcast_strategy_for_starved_podcast(monkeypatch) -> None:
+    class FakeClient:
+        async def complete_json(self, *, system, prompt, max_tokens):
+            return {
+                "search_queries": ["AI agents", "developer tools"],
+                "source_queries": {"podcasts": ["AI"]},
+                "direct_episode_queries": ["coding agents"],
+                "related_episode_queries": ["developer tools"],
+                "priority_terms": ["OpenAI"],
+                "negative_constraints": ["crypto"],
+            }
+
+    class Res:
+        client = FakeClient()
+
+    monkeypatch.setattr(explore.model_routing, "client_for_agent", lambda *a, **k: Res())
+    profile = _profile(
+        source_selection={"podcasts": True},
+        source_queries={"podcasts": ["agent interviews"]},
+        direct_episode_queries=["AI agents"],
+    )
+    out = asyncio.run(explore.broaden_queries_with_agent(profile, starved_sources=["podcasts"]))
+
+    assert "AI" in out.source_queries["podcasts"]
+    assert "AI agents" in out.direct_episode_queries
+    assert "coding agents" in out.direct_episode_queries
+    assert "developer tools" in out.related_episode_queries
+    assert "OpenAI" in out.priority_terms
+    assert "crypto" in out.negative_constraints
+
+
+def test_strategy_repair_audit_records_changes_and_retry_result() -> None:
+    before = _profile(
+        source_selection={"podcasts": True},
+        source_queries={"podcasts": ["agent interviews"]},
+        related_episode_queries=["legacy tooling"],
+    )
+    after = _profile(
+        source_selection={"podcasts": True},
+        search_queries=["AI agents", "developer tools"],
+        source_queries={"podcasts": ["agent interviews", "AI"]},
+        direct_episode_queries=["coding agents"],
+        related_episode_queries=["legacy tooling", "developer tools"],
+        priority_terms=["OpenAI"],
+    )
+    progress: dict = {}
+
+    explore._record_strategy_repair(
+        progress,
+        before=before,
+        after=after,
+        attempt=1,
+        retry_attempt=2,
+        included_count=0,
+        target_yield=3,
+        starved_sources=["podcasts"],
+    )
+
+    repair = progress["strategy_repairs"][0]
+    assert repair["status"] == "retrying"
+    assert repair["trigger"] == "source_starvation"
+    assert repair["changed"] is True
+    assert repair["changed_sources"] == ["podcasts"]
+    assert repair["podcast_strategy_changed"] is True
+    assert repair["persisted_to_topic_profile"] is False
+    assert repair["after_podcast_strategy"]["direct_episode_queries"] == ["coding agents"]
+
+    explore._update_strategy_repair_result(
+        progress,
+        attempt=2,
+        included_count=4,
+        starved_sources=[],
+    )
+    assert repair["status"] == "completed"
+    assert repair["retry_result"]["status"] == "improved"
+    assert repair["retry_result"]["included_count"] == 4
+
+
 # ---------------------------------------------------------------------------
 # P4: reporting honesty for revived items
 # ---------------------------------------------------------------------------
