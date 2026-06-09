@@ -285,44 +285,77 @@ async def screen_candidates(
             decisions_map.update(res)
 
     screened_candidates = []
+    dropped_candidates: list[Any] = []
     dropped_count = 0
     for c in candidates:
         if c.adapter in {"gmail", "podcasts"}:
             decision = decisions_map.get(str(c.payload.id))
             if decision == "drop":
                 dropped_count += 1
-                if exclusions is not None:
-                    metadata = c.payload.metadata or {}
-                    title = (
-                        metadata.get("title")
-                        or metadata.get("link_text")
-                        or metadata.get("subject")
-                        or metadata.get("parent_subject")
-                        or metadata.get("youtube_title")
-                        or metadata.get("podcast_title")
-                        or c.payload.source_name
-                        or c.reason
-                    )
-                    exclusions.append({
-                        "adapter": c.adapter,
-                        "candidate_id": str(c.payload.id),
-                        "original_url": c.payload.original_url,
-                        "source_type": c.payload.source_type,
-                        "source_name": c.payload.source_name,
-                        "title": title,
-                        "subject": metadata.get("subject") or metadata.get("parent_subject"),
-                        "link_text": metadata.get("link_text"),
-                        "metadata": dict(metadata),
-                        "excluded_by": ["agentic_screening"],
-                        "reason": "Filtered by agentic screening (spam, promotion, or off-topic).",
-                    })
+                dropped_candidates.append(c)
                 continue
         screened_candidates.append(c)
 
+    preserved_ids: set[str] = set()
+    for adapter in ("gmail", "podcasts"):
+        source_selected = bool(profile.source_selection.get(adapter))
+        if not source_selected:
+            continue
+        had_candidates = any(c.adapter == adapter for c in candidates)
+        kept_candidates = [c for c in screened_candidates if c.adapter == adapter]
+        if not had_candidates or kept_candidates:
+            continue
+        restoration_limit = 3 if adapter == "gmail" else 2
+        restorable = sorted(
+            (c for c in dropped_candidates if c.adapter == adapter),
+            key=lambda c: (
+                getattr(c, "score", 0.0),
+                getattr(c.payload, "published_at", None) or getattr(c.payload, "fetched_at", None) or "",
+            ),
+            reverse=True,
+        )[:restoration_limit]
+        for candidate in restorable:
+            candidate.payload.metadata = {
+                **dict(candidate.payload.metadata or {}),
+                "screening_preserved_low_yield": True,
+            }
+            screened_candidates.append(candidate)
+            preserved_ids.add(str(candidate.payload.id))
+
+    if exclusions is not None:
+        for c in dropped_candidates:
+            if str(c.payload.id) in preserved_ids:
+                continue
+            metadata = c.payload.metadata or {}
+            title = (
+                metadata.get("title")
+                or metadata.get("link_text")
+                or metadata.get("subject")
+                or metadata.get("parent_subject")
+                or metadata.get("youtube_title")
+                or metadata.get("podcast_title")
+                or c.payload.source_name
+                or c.reason
+            )
+            exclusions.append({
+                "adapter": c.adapter,
+                "candidate_id": str(c.payload.id),
+                "original_url": c.payload.original_url,
+                "source_type": c.payload.source_type,
+                "source_name": c.payload.source_name,
+                "title": title,
+                "subject": metadata.get("subject") or metadata.get("parent_subject"),
+                "link_text": metadata.get("link_text"),
+                "metadata": dict(metadata),
+                "excluded_by": ["agentic_screening"],
+                "reason": "Filtered by agentic screening (spam, promotion, or off-topic).",
+            })
+
     logger.info(
-        "Agentic screening pass complete. Dropped %d candidates of %d screened; kept %d unscreened overflow candidates.",
+        "Agentic screening pass complete. Dropped %d candidates of %d screened; preserved %d selected-source fallback(s); kept %d unscreened overflow candidates.",
         dropped_count,
         len(to_screen),
+        len(preserved_ids),
         max(0, skipped_count),
     )
     return screened_candidates

@@ -67,6 +67,12 @@ _DIRECT_FETCH_SOURCE_TYPES = {
 # Minimum HTTP fetch slots reserved for fetch-heavy, recency-fragile lanes so a
 # flood of newsletter links can never starve them before they reach the brief.
 _RESERVED_FETCH_FLOOR = 10
+# Fetch/enrich oversample factor: how many candidates per source enter the
+# fetch+enrichment funnel relative to that source's final *inclusion* cap. The
+# inclusion cap is enforced later in `_enforce_inclusion_limits`, so the brief
+# stays bounded; this headroom exists purely so recency/audit/editorial attrition
+# can't reduce a source to a single item. Bump this if sources still come up thin.
+_FETCH_OVERSAMPLE = 2
 _DATE_METADATA_KEYS = (
     "published_at",
     "published",
@@ -1369,9 +1375,12 @@ def _select_fetch_payloads_for_budget(
     direct_payloads: list[NormalizedPayload] = []
     for adapter, cands in direct_grouped.items():
         cands.sort(key=lambda item: item.score, reverse=True)
-        cap = _source_inclusion_limit(profile, adapter)
-        if cap <= 0:
+        inclusion_cap = _source_inclusion_limit(profile, adapter)
+        if inclusion_cap <= 0:
             continue
+        # Oversample into enrichment so recency/audit attrition can't strip the
+        # source down to one item; the inclusion cap is re-applied downstream.
+        cap = min(len(cands), inclusion_cap * _FETCH_OVERSAMPLE)
         direct_payloads.extend(candidate.payload for candidate in cands[:cap])
 
     budgets: dict[str, int] = {}
@@ -1392,7 +1401,10 @@ def _select_fetch_payloads_for_budget(
             available = len(fetch_grouped[adapter])
             if max_allowed <= 0 or available <= 0:
                 continue
-            cap = min(max_allowed, available)
+            # Fetch headroom beyond the inclusion cap (bounded by what's available
+            # and, collectively, by the global article-fetch budget below) so a lane
+            # survives recency/audit attrition. Inclusion is re-capped downstream.
+            cap = min(available, max(max_allowed * _FETCH_OVERSAMPLE, _RESERVED_FETCH_FLOOR))
             max_budget[adapter] = cap
             floor_budget[adapter] = _fetch_floor_for_adapter(adapter, profile, cap=cap)
 

@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from backend.agents.discovery.language_support import trusted_language_options
-from backend.agents.discovery.markets import resolve_tickers_from_text
+from backend.agents.discovery.markets import normalize_market_query_tickers, resolve_tickers_from_text
 from backend.agents.discovery.types import DEFAULT_EXPLORE_SOURCE_SELECTION
 from backend.agents.digestor.gmail import NewsletterCandidate, discover_newsletter_candidates
 from backend.agents.librarian.text_utils import keyword_set
@@ -525,7 +525,6 @@ async def astream_refinement(
 
     task = asyncio.create_task(_run())
     full_text = ""
-    emitted = 0
     error_message: str | None = None
     while True:
         kind, value = await queue.get()
@@ -535,11 +534,6 @@ async def astream_refinement(
         if kind == "end":
             break
         full_text += value or ""
-        visible, _ = _visible_prose(full_text)
-        new = visible[emitted:]
-        if new:
-            emitted += len(new)
-            yield {"type": "token", "text": new}
     await task
 
     if error_message is not None:
@@ -548,10 +542,6 @@ async def astream_refinement(
         return
 
     final_visible, _ = _visible_prose(full_text, final=True)
-    if len(final_visible) > emitted:
-        tail = final_visible[emitted:]
-        if tail.strip():
-            yield {"type": "token", "text": tail}
 
     assistant_text = final_visible.strip()
     patch, ready_flag = _parse_chat_payload(full_text)
@@ -561,9 +551,18 @@ async def astream_refinement(
     patched = _seed_profile_with_hints(patched)
     if not str(patched.get("scope") or "").strip():
         patched["scope"] = str(profile.get("statement") or "").strip()
+    if clean_answer and not just_go_now:
+        patched = _ensure_reply_updates_strategy(profile, patched, clean_answer)
     if assistant_text:
+        assistant_text = _refinement_reply_with_required_question(
+            assistant_text,
+            profile=patched,
+            messages=messages,
+            just_go_now=just_go_now,
+        )
         patched["reasoning_summary"] = assistant_text[:600]
         messages.append({"role": "assistant", "content": assistant_text})
+        yield {"type": "token", "text": assistant_text}
 
     topic_id = session.get("topic_id")
 
@@ -2346,10 +2345,12 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
         if value:
             updated[key] = value
 
+    cleanup_requested = _requests_strategy_cleanup(user_text)
+
     for key in ("subtopics", "search_queries", "exclusions", *PODCAST_STRATEGY_FIELDS):
         if key not in patch:
             continue
-        if key == "search_queries" and bool(patch.get("replace_search_queries")):
+        if key == "search_queries" and (bool(patch.get("replace_search_queries")) or cleanup_requested):
             updated[key] = _string_list(patch.get(key), limit=20)
         else:
             updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
@@ -2372,6 +2373,12 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
     if "source_queries" in patch:
         if bool(patch.get("replace_source_queries")):
             updated["source_queries"] = _clean_source_queries(patch.get("source_queries"))
+        elif cleanup_requested:
+            existing = _clean_source_queries(updated.get("source_queries"))
+            incoming = _clean_source_queries(patch.get("source_queries"))
+            for source, queries in incoming.items():
+                existing[source] = queries
+            updated["source_queries"] = existing
         else:
             updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), patch.get("source_queries"))
     if "foreign_language_plan" in patch:
@@ -2393,20 +2400,35 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
         updated["requested_sources_answered"] = True
 
     source_feedback = _extract_requested_sources(user_text)
+    source_query_hints: dict[str, list[str]] = {}
     if source_feedback:
         updated["requested_sources"] = _merge_requested_source_lists(
             _normalize_requested_sources(updated.get("requested_sources")),
             source_feedback,
         )
         updated["requested_sources_answered"] = True
-        source_query_hints: dict[str, list[str]] = {}
         for source in source_feedback:
             adapter = str(source.get("adapter") or "").strip()
             ref = str(source.get("ref") or "").strip()
             if adapter and ref:
                 source_query_hints.setdefault(adapter, []).append(ref)
-        if source_query_hints:
-            updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), source_query_hints)
+    if source_query_hints:
+        updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), source_query_hints)
+
+    additions = _extract_user_strategy_additions(user_text)
+    if additions:
+        updated["keywords"] = _merge_string_lists(updated.get("keywords"), _keywords(" ".join(additions)), limit=24)
+        updated["search_queries"] = _merge_string_lists(updated.get("search_queries"), additions, limit=20)
+        selected = _source_selection_dict(updated.get("source_selection"))
+        source_additions: dict[str, list[str]] = {}
+        for source in ("web_search", "youtube", "podcasts", "reddit", "collections"):
+            if selected.get(source):
+                source_additions[source] = list(additions)
+        if source_additions:
+            updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), source_additions)
+        if selected.get("podcasts"):
+            updated["direct_episode_queries"] = _merge_string_lists(updated.get("direct_episode_queries"), additions, limit=16)
+            updated["priority_terms"] = _merge_string_lists(updated.get("priority_terms"), _keywords(" ".join(additions)), limit=16)
 
     if updated.get("subtopics"):
         updated["related_interests_answered"] = True
@@ -2424,13 +2446,249 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
     return _coerce_profile(updated)
 
 
+def _requests_strategy_cleanup(user_text: str) -> bool:
+    lowered = str(user_text or "").casefold()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "no mention of 2024",
+            "not mention of 2024",
+            "not referencing 2024",
+            "stop looking",
+            "stale",
+            "old references",
+            "old queries",
+            "last 7 days",
+            "last seven days",
+            "did not elicit",
+            "fails to update",
+            "failed to update",
+        )
+    )
+
+
+def _extract_user_strategy_additions(user_text: str) -> list[str]:
+    text = " ".join(str(user_text or "").split()).strip()
+    if not text:
+        return []
+    lowered = text.casefold()
+    if not any(phrase in lowered for phrase in ("add this", "add it", "include this", "include it", "add to", "include in")):
+        return []
+    candidates: list[str] = []
+    for match in re.finditer(r"\*\*(.+?)\*\*", text):
+        candidates.append(match.group(1))
+    tail_match = re.search(r"(?:add|include)(?:\s+this)?(?:\s+to\s+(?:it|the\s+strategy))?\s*:\s*(.+)$", text, flags=re.IGNORECASE)
+    if tail_match:
+        candidates.append(tail_match.group(1))
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = re.sub(r"\([^)]*\)", "", candidate)
+        value = re.sub(r"\bor\b.*$", "", value, flags=re.IGNORECASE)
+        value = " ".join(value.replace("*", "").split()).strip(" .?;:")
+        if not value:
+            continue
+        key = value.casefold()
+        if key not in seen:
+            cleaned.append(value[:180])
+            seen.add(key)
+    return cleaned[:4]
+
+
+def _ensure_reply_updates_strategy(
+    before: dict[str, Any],
+    patched: dict[str, Any],
+    user_text: str,
+) -> dict[str, Any]:
+    """Guarantee that a substantive user reply moves the search strategy (spec step 6).
+
+    The model usually emits a profile_patch that changes the plan. When it doesn't —
+    or the change was a no-op — we deterministically fold the user's own words into the
+    executable plan (a narrow query from their phrasing + broad keywords + the selected
+    source lanes) so the side panel can never claim an update that didn't happen.
+    Skipped for empty/negative answers and for meta requests like "show me the strategy".
+    """
+    text = " ".join(str(user_text or "").split()).strip()
+    if not text:
+        return patched
+    if _negative_answer(text) or _user_requested_strategy_snapshot([{"role": "user", "content": text}]):
+        return patched
+    if _strategy_fingerprint(before) != _strategy_fingerprint(patched):
+        return patched  # the model already advanced the plan this turn
+
+    updated = dict(patched)
+    phrase = text[:180]
+    updated["search_queries"] = _merge_string_lists(updated.get("search_queries"), [phrase], limit=20)
+    keywords = _keywords(text)
+    if keywords:
+        updated["keywords"] = _merge_string_lists(updated.get("keywords"), keywords, limit=24)
+    selected = _source_selection_dict(updated.get("source_selection"))
+    source_additions: dict[str, list[str]] = {}
+    for source in ("web_search", "youtube", "podcasts", "reddit", "collections"):
+        if selected.get(source):
+            source_additions[source] = [phrase]
+    if source_additions:
+        updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), source_additions)
+    if selected.get("podcasts"):
+        updated["direct_episode_queries"] = _merge_string_lists(updated.get("direct_episode_queries"), [phrase], limit=16)
+        if keywords:
+            updated["priority_terms"] = _merge_string_lists(updated.get("priority_terms"), keywords, limit=16)
+    return _coerce_profile(updated)
+
+
 def _clean_next_question(value: Any) -> str | None:
     question = " ".join(str(value or "").split()).strip()
     if not question:
         return None
     if not question.endswith("?"):
         question = f"{question}?"
+    if _is_refinement_closing_language(question):
+        return None
     return question[:260]
+
+
+def _refinement_reply_with_required_question(
+    text: str,
+    *,
+    profile: dict[str, Any],
+    messages: list[dict[str, str]],
+    just_go_now: bool,
+) -> str:
+    cleaned = _sanitize_recent_visible_text_years(_strip_refinement_closing_language(text), profile)
+    if just_go_now:
+        return cleaned or "Confirmed. I’ll build using the current search strategy."
+    strategy_snapshot = _format_strategy_snapshot(profile) if _user_requested_strategy_snapshot(messages) else ""
+    if _ends_with_question(cleaned):
+        if strategy_snapshot:
+            return f"{cleaned}\n\n{strategy_snapshot}"
+        return cleaned
+    question = _strategy_deepening_question(profile, messages) or _search_strategy_question(profile)
+    if strategy_snapshot:
+        if cleaned:
+            return f"{cleaned}\n\n{strategy_snapshot}\n\n{question}"
+        return f"{strategy_snapshot}\n\n{question}"
+    if cleaned:
+        return f"{cleaned} {question}"
+    return question
+
+
+def _user_requested_strategy_snapshot(messages: list[dict[str, str]]) -> bool:
+    last = _last_user_message(messages).casefold()
+    return any(
+        phrase in last
+        for phrase in (
+            "show me the strategy",
+            "show the strategy",
+            "see the strategy",
+            "output the strategy",
+            "print the strategy",
+            "what is the strategy",
+            "show me",
+        )
+    )
+
+
+def _last_user_message(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _format_strategy_snapshot(profile: dict[str, Any]) -> str:
+    selection = _source_selection_dict(profile.get("source_selection"))
+    source_queries = _clean_source_queries(profile.get("source_queries"))
+    lines = [
+        "Current strategy:",
+        f"- Scope: {str(profile.get('scope') or profile.get('statement') or '').strip()}",
+        f"- Recency: {_strategy_recency_label(profile)}",
+        "- Sources: " + ", ".join(_SOURCE_DISPLAY.get(source, source) for source, selected in selection.items() if selected),
+    ]
+    search_queries = _string_list(profile.get("search_queries"), limit=8)
+    if search_queries:
+        lines.append("- General queries: " + "; ".join(search_queries))
+    for source, label in _SOURCE_DISPLAY.items():
+        if not selection.get(source):
+            continue
+        queries = source_queries.get(source, [])
+        if queries:
+            lines.append(f"- {label}: " + "; ".join(queries[:8]))
+    podcast_bits = _string_list(profile.get("direct_episode_queries"), limit=6)
+    if podcast_bits:
+        lines.append("- Podcast direct: " + "; ".join(podcast_bits))
+    related = _string_list(profile.get("related_episode_queries"), limit=6)
+    if related:
+        lines.append("- Podcast related: " + "; ".join(related))
+    priority = _string_list(profile.get("priority_terms"), limit=8)
+    if priority:
+        lines.append("- Priority terms: " + "; ".join(priority))
+    foreign = _normalize_foreign_language_plan(profile.get("foreign_language_plan"))
+    for item in foreign[:4]:
+        lines.append(f"- {item['name']}: {item['native_query']}")
+    return "\n".join(line for line in lines if line.strip())
+
+
+def _strategy_recency_label(profile: dict[str, Any]) -> str:
+    lookback_hours = _coerce_lookback_hours(profile.get("lookback_hours"))
+    if lookback_hours:
+        if lookback_hours <= 48:
+            return f"last {lookback_hours} hours"
+        days = max(1, round(lookback_hours / 24))
+        return f"last {days} days"
+    return str(profile.get("recency_weighting") or "recent")
+
+
+def _sanitize_recent_visible_text_years(text: str, profile: dict[str, Any]) -> str:
+    lookback_hours = _coerce_lookback_hours(profile.get("lookback_hours"))
+    recency = _normalize_recency(profile.get("recency_weighting"))
+    if lookback_hours is None and recency not in {"breaking", "recent"}:
+        return text
+    if lookback_hours is not None and lookback_hours > 24 * 90:
+        return text
+    current_year = datetime.now(UTC).year
+
+    def replace_year(match: re.Match[str]) -> str:
+        year = int(match.group(1))
+        return str(current_year) if year < current_year else match.group(1)
+
+    # Preserve the model's paragraph/line structure; only the stale year tokens change.
+    return _QUERY_YEAR_RE.sub(replace_year, str(text or "")).strip()
+
+
+def _ends_with_question(text: str) -> bool:
+    return str(text or "").rstrip().endswith("?")
+
+
+def _strip_refinement_closing_language(text: str) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    # Drop sentences that announce completion ("ready to build", etc.) while preserving
+    # the model's paragraph structure so the chat reply keeps its formatting.
+    kept_blocks: list[str] = []
+    for block in re.split(r"\n{2,}", raw):
+        sentences = re.split(r"(?<=[.!?])\s+", block.strip())
+        kept = [sentence for sentence in sentences if sentence.strip() and not _is_refinement_closing_language(sentence)]
+        if kept:
+            kept_blocks.append(" ".join(kept))
+    return "\n\n".join(kept_blocks).strip()
+
+
+def _is_refinement_closing_language(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    closing_patterns = (
+        r"\bi(?:'|’)m ready to build\b",
+        r"\bready to build\b",
+        r"\bready for (?:the )?brief\b",
+        r"\bready to run\b",
+        r"\bi have (?:everything|all) (?:i|we) need\b",
+        r"\b(?:we|i) have (?:everything|all) (?:we|i) need\b",
+        r"\bthe plan is (?:complete|done|locked)\b",
+        r"\bi(?:'|’)ve locked in\b",
+        r"\bi have locked in\b",
+        r"\bsearch strategy confirmed\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in closing_patterns)
 
 
 def _is_generic_actionable_question(question: str) -> bool:
@@ -2498,6 +2756,10 @@ def _clean_source_queries(value: Any) -> dict[str, list[str]]:
         if source_key not in VALID_SOURCE_ADAPTERS:
             continue
         query_list = _string_list(queries, limit=20)
+        if source_key == "markets":
+            # The markets lane is the explicit ticker lane: validate each entry as a
+            # ticker (company names/cashtags resolved, acronyms/junk dropped).
+            query_list = normalize_market_query_tickers(query_list)[:20]
         if query_list:
             cleaned[source_key] = query_list
     return cleaned
@@ -3878,7 +4140,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         for source, queries in _clean_source_queries(profile.get("source_queries")).items()
         if selected_sources.get(source, False)
     }
-    return {
+    coerced = {
         "topic_id": str(profile.get("topic_id") or database.new_id()),
         "statement": str(profile.get("statement") or ""),
         "scope": str(profile.get("scope") or ""),
@@ -3923,6 +4185,52 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "content_limits": _stable_jsonable(profile.get("content_limits")) if isinstance(profile.get("content_limits"), dict) else {},
         "pipeline_limits": _stable_jsonable(profile.get("pipeline_limits")) if isinstance(profile.get("pipeline_limits"), dict) else {},
     }
+    return _sanitize_bounded_recency_query_years(coerced)
+
+
+_QUERY_YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2}|2100)\b")
+
+
+def _sanitize_bounded_recency_query_years(profile: dict[str, Any]) -> dict[str, Any]:
+    lookback_hours = _coerce_lookback_hours(profile.get("lookback_hours"))
+    recency = _normalize_recency(profile.get("recency_weighting"))
+    if lookback_hours is None and recency not in {"breaking", "recent"}:
+        return profile
+    if lookback_hours is not None and lookback_hours > 24 * 90:
+        return profile
+    current_year = datetime.now(UTC).year
+
+    def clean(value: str) -> str:
+        def replace_year(match: re.Match[str]) -> str:
+            year = int(match.group(1))
+            return str(current_year) if year < current_year else match.group(1)
+
+        return " ".join(_QUERY_YEAR_RE.sub(replace_year, str(value or "")).split()).strip()
+
+    def clean_list(values: Any, *, limit: int = 20) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in _string_list(values, limit=limit):
+            query = clean(value)
+            key = query.casefold()
+            if query and key not in seen:
+                cleaned.append(query)
+                seen.add(key)
+        return cleaned
+
+    updated = dict(profile)
+    updated["scope"] = clean(str(profile.get("scope") or ""))
+    updated["subtopics"] = clean_list(profile.get("subtopics"), limit=24)
+    updated["keywords"] = clean_list(profile.get("keywords"), limit=24)
+    updated["search_queries"] = clean_list(profile.get("search_queries"), limit=20)
+    updated["direct_episode_queries"] = clean_list(profile.get("direct_episode_queries"), limit=16)
+    updated["related_episode_queries"] = clean_list(profile.get("related_episode_queries"), limit=16)
+    updated["priority_terms"] = clean_list(profile.get("priority_terms"), limit=16)
+    source_queries = {}
+    for source, queries in _clean_source_queries(profile.get("source_queries")).items():
+        source_queries[source] = clean_list(queries, limit=20)
+    updated["source_queries"] = source_queries
+    return updated
 
 
 def _coerce_schedule(value: Any) -> str | None:
@@ -4120,15 +4428,23 @@ def _strategy_preview(profile: dict[str, Any]) -> dict[str, Any]:
                 )
             if source == "markets":
                 # Resolve the actual tickers that will be fetched so the user can
-                # see and verify them in the confirmation card.
+                # see and verify them in the confirmation card. Prose (statement/scope/
+                # keywords) only yields known-company and cashtag/exchange symbols; bare
+                # acronyms never become tickers. The model's markets query lane is the
+                # explicit ticker lane and is validated separately.
                 profile_text = " ".join(filter(None, [
                     str(profile.get("statement") or ""),
                     str(profile.get("scope") or ""),
                     *_string_list(profile.get("keywords")),
                     *_string_list(profile.get("subtopics")),
-                    *entry["queries"],
                 ]))
+                seen_tickers: set[str] = set()
                 resolved = resolve_tickers_from_text(profile_text)
+                seen_tickers.update(resolved)
+                resolved = resolved + normalize_market_query_tickers(entry["queries"], seen_tickers)
+                # Keep the visible markets lane consistent with the resolved tickers so the
+                # confirmation card, the snapshot, and the executable plan all agree.
+                entry["queries"] = resolved
                 if resolved:
                     entry["tickers"] = resolved
                     entry["note"] = "Tracks price, recent news, and key metrics for each ticker."

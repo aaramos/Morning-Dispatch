@@ -176,6 +176,181 @@ def test_podcast_semantic_fields_survive_patch_coercion_review_and_preview():
     assert podcast_plan["priority_terms"] == ["OpenAI", "Anthropic"]
 
 
+def test_coerce_profile_rewrites_stale_year_queries_for_recent_strategy():
+    current_year = refinement.datetime.now(refinement.UTC).year
+    profile = refinement._coerce_profile(
+        _profile(
+            lookback_hours=168,
+            recency_weighting="recent",
+            scope="Evolution from WWDC 2024 announcements to current workflows",
+            subtopics=["WWDC 2024 Apple Intelligence"],
+            keywords=["2024 GUI"],
+            search_queries=["Apple WWDC 2024 AI announcements summary"],
+            source_queries={
+                "web_search": ["best AI productivity apps for Mac 2024"],
+                "podcasts": ["consumer AI trends 2024"],
+            },
+            direct_episode_queries=["WWDC 2024 Apple AI"],
+            related_episode_queries=["consumer AI trends 2024"],
+            source_selection={"web_search": True, "podcasts": True},
+        )
+    )
+
+    joined = " ".join([
+        profile["scope"],
+        *profile["subtopics"],
+        *profile["keywords"],
+        *profile["search_queries"],
+        *profile["source_queries"]["web_search"],
+        *profile["source_queries"]["podcasts"],
+        *profile["direct_episode_queries"],
+        *profile["related_episode_queries"],
+    ])
+    assert "2024" not in joined
+    assert str(current_year) in joined
+
+
+def test_refinement_visible_reply_never_ends_conversation_without_confirmation():
+    profile = refinement._coerce_profile(
+        _profile(
+            lookback_hours=168,
+            recency_weighting="recent",
+            search_queries=["Apple Intelligence Mac tools"],
+        )
+    )
+    reply = refinement._refinement_reply_with_required_question(
+        "You're absolutely right. I have everything I need and I'm ready to build this now.",
+        profile=profile,
+        messages=[{"role": "user", "content": "Keep it to the last 7 days."}],
+        just_go_now=False,
+    )
+
+    lowered = reply.lower()
+    assert "ready to build" not in lowered
+    assert "everything i need" not in lowered
+    assert reply.endswith("?")
+
+
+def test_refinement_visible_reply_sanitizes_stale_year_for_recent_window():
+    current_year = refinement.datetime.now(refinement.UTC).year
+    profile = refinement._coerce_profile(
+        _profile(
+            lookback_hours=168,
+            recency_weighting="recent",
+            search_queries=["Apple Intelligence Mac tools"],
+        )
+    )
+    reply = refinement._refinement_reply_with_required_question(
+        "I will not use WWDC 2024 as the anchor.",
+        profile=profile,
+        messages=[{"role": "user", "content": "There was no mention of 2024."}],
+        just_go_now=False,
+    )
+
+    assert "2024" not in reply
+    assert str(current_year) in reply
+    assert reply.endswith("?")
+
+
+def test_strategy_cleanup_replaces_stale_query_lanes_on_user_correction():
+    profile = refinement._coerce_profile(
+        _profile(
+            lookback_hours=168,
+            recency_weighting="recent",
+            search_queries=["Apple WWDC 2024 AI announcements summary"],
+            source_queries={
+                "web_search": ["Apple WWDC 2024 AI announcements summary"],
+                "youtube": ["Apple Intelligence 2024 demos"],
+            },
+            source_selection={"web_search": True, "youtube": True},
+        )
+    )
+
+    patched = refinement._merge_agent_profile_patch(
+        profile,
+        {
+            "search_queries": ["Apple Intelligence Mac software June 2026"],
+            "source_queries": {
+                "web_search": ["Apple Intelligence Mac software June 2026"],
+                "youtube": ["Apple Intelligence Mac software demo 2026"],
+            },
+        },
+        user_text="Your last response did not elicit a requirement and there was no mention of 2024 ever. Keep it to last 7 days.",
+    )
+
+    assert patched["search_queries"] == ["Apple Intelligence Mac software June 2026"]
+    assert patched["source_queries"]["web_search"] == ["Apple Intelligence Mac software June 2026"]
+    assert patched["source_queries"]["youtube"] == ["Apple Intelligence Mac software demo 2026"]
+    assert "2024" not in " ".join([
+        *patched["search_queries"],
+        *patched["source_queries"]["web_search"],
+        *patched["source_queries"]["youtube"],
+    ])
+
+
+def test_coerce_profile_normalizes_market_queries_to_real_tickers_only():
+    profile = refinement._coerce_profile(
+        _profile(
+            source_selection={"web_search": True, "markets": True},
+            source_queries={"markets": ["I", "WWDC", "256", "GB", "RAM", "2024", "Apple"]},
+        )
+    )
+
+    assert profile["source_queries"]["markets"] == ["AAPL"]
+
+
+def test_user_can_request_strategy_snapshot_in_chat_reply():
+    profile = refinement._coerce_profile(
+        _profile(
+            scope="Mac Studio local AI workflows",
+            lookback_hours=168,
+            recency_weighting="recent",
+            search_queries=["Apple Intelligence Mac Studio 2026"],
+            source_queries={"web_search": ["Apple Intelligence Mac Studio 2026"]},
+            source_selection={"web_search": True, "podcasts": True},
+            direct_episode_queries=["local AI Mac Studio"],
+        )
+    )
+    reply = refinement._refinement_reply_with_required_question(
+        "I updated it.",
+        profile=profile,
+        messages=[{"role": "user", "content": "I want to see the strategy and add this to it."}],
+        just_go_now=False,
+    )
+
+    assert "Current strategy:" in reply
+    assert "- Scope: Mac Studio local AI workflows" in reply
+    assert "- General queries: Apple Intelligence Mac Studio 2026" in reply
+    assert "- Web search: Apple Intelligence Mac Studio 2026" in reply
+    assert reply.endswith("?")
+
+
+def test_add_this_to_strategy_updates_executable_queries_deterministically():
+    profile = refinement._coerce_profile(
+        _profile(
+            source_selection={"web_search": True, "youtube": True, "podcasts": True, "markets": True},
+            search_queries=["Apple Intelligence Mac Studio 2026"],
+            source_queries={
+                "web_search": ["Apple Intelligence Mac Studio 2026"],
+                "markets": ["Apple"],
+            },
+        )
+    )
+
+    patched = refinement._merge_agent_profile_patch(
+        profile,
+        {"profile_patch": {}},
+        user_text="I want to see the strategy and add this to it: knowledge/reasoning workflows (like massive context window research and long-document analysis).",
+    )
+
+    assert "knowledge/reasoning workflows" in patched["search_queries"]
+    assert "knowledge/reasoning workflows" in patched["source_queries"]["web_search"]
+    assert "knowledge/reasoning workflows" in patched["source_queries"]["youtube"]
+    assert "knowledge/reasoning workflows" in patched["source_queries"]["podcasts"]
+    assert patched["source_queries"]["markets"] == ["AAPL"]
+    assert "knowledge/reasoning workflows" in patched["direct_episode_queries"]
+
+
 def test_apply_agent_update_ignores_model_ready_without_user_confirmation(monkeypatch):
     # Keep the second model pass inert so the test never touches the network.
     monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)
@@ -237,3 +412,71 @@ def test_queries_from_statement_no_hardcoded_year_suffix():
     queries = refinement._queries_from_statement("optimizing AI inference chips and memory architecture")
     assert "2025" not in " ".join(queries)
     assert len(queries) > 0
+
+
+def test_strategy_preview_markets_never_invents_tickers_from_prose_acronyms():
+    # Acronyms in scope/keywords (WWDC, RAM, GB, UI, UX) must NOT become tickers, but a
+    # named company (Apple) and a cashtag should resolve to real symbols.
+    profile = refinement._coerce_profile(
+        _profile(
+            statement="Apple WWDC keynote, RAM and GB specs, UI/UX changes, watching $TSLA",
+            scope="Apple developer ecosystem WWDC RAM GB UI UX",
+            keywords=["WWDC", "RAM", "GB", "UI", "UX"],
+            search_queries=["Apple WWDC announcements"],
+            source_selection={"web_search": True, "markets": True},
+            source_queries={"markets": []},
+        )
+    )
+    preview = refinement._strategy_preview(profile)
+    markets = next(source for source in preview["per_source"] if source["key"] == "markets")
+    tickers = markets.get("tickers", [])
+    assert "AAPL" in tickers
+    assert "TSLA" in tickers
+    for junk in ("WWDC", "RAM", "GB", "UI", "UX"):
+        assert junk not in tickers
+
+
+def test_substantive_reply_always_updates_strategy_even_with_empty_model_patch():
+    before = refinement._coerce_profile(
+        _profile(
+            scope="Local AI workflows on Mac Studio",
+            search_queries=["Mac Studio local inference"],
+            source_selection={"web_search": True, "podcasts": True},
+            source_queries={"web_search": ["Mac Studio local inference"]},
+        )
+    )
+    # Model returned nothing useful this turn, but the user gave real topical direction.
+    patched = refinement._merge_agent_profile_patch(before, {}, user_text="")
+    patched = refinement._ensure_reply_updates_strategy(
+        before, patched, "focus on running quantized 70B models with MLX"
+    )
+    assert refinement._strategy_fingerprint(before) != refinement._strategy_fingerprint(patched)
+    blob = " ".join(patched["search_queries"]).lower()
+    assert "quantized" in blob or "mlx" in blob
+    assert patched["source_queries"]["web_search"] != before["source_queries"]["web_search"]
+    assert patched["source_queries"].get("podcasts")
+
+
+def test_meta_and_negative_replies_do_not_pollute_strategy():
+    before = refinement._coerce_profile(
+        _profile(
+            scope="Local AI workflows on Mac Studio",
+            search_queries=["Mac Studio local inference"],
+            source_selection={"web_search": True},
+            source_queries={"web_search": ["Mac Studio local inference"]},
+        )
+    )
+    for meta in ("show me the strategy", "what is the strategy", "no", "nothing else"):
+        patched = refinement._ensure_reply_updates_strategy(before, dict(before), meta)
+        assert refinement._strategy_fingerprint(before) == refinement._strategy_fingerprint(patched), meta
+
+
+def test_strip_refinement_closing_language_preserves_paragraphs():
+    text = (
+        "I refined the scope to focus on quantized local models.\n\n"
+        "Should we prioritize MLX tooling or llama.cpp builds?"
+    )
+    cleaned = refinement._strip_refinement_closing_language(text)
+    assert "\n\n" in cleaned
+    assert "quantized local models" in cleaned
+    assert cleaned.strip().endswith("?")

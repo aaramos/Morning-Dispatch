@@ -623,53 +623,121 @@ def _published_at(item: dict[str, Any]) -> datetime | None:
     return None
 
 
-def resolve_tickers_from_text(text: str) -> list[str]:
-    """Return ticker symbols found in *text* using known company patterns and bare-ticker regex.
+# A bare run of capital letters in prose ("WWDC", "RAM", "GB", "UI") is NOT a ticker.
+# We only accept a token as a ticker when it carries an unambiguous market signal:
+#   - a $CASHTAG ("$NVDA")
+#   - an exchange-suffixed symbol ("000660.KS", "285A.T")
+# Anything else must be resolved through the curated company->ticker map. This is an
+# allowlist, replacing the old denylist that played whack-a-mole with acronyms.
+_CASHTAG_RE = re.compile(r"\$([A-Za-z]{1,5})\b")
+_EXCHANGE_SUFFIX_RE = re.compile(r"\b([A-Z]{1,5}|[0-9]{3,6}[A-Z]?)\.([A-Z]{1,4})\b")
+# A market-lane query entry the model produced is intended to be a ticker, so we accept
+# a bare uppercase token there — but still reject obvious non-tickers and digits.
+_BARE_TICKER_RE = re.compile(r"^(?:[A-Z]{1,5}|[0-9]{3,6}[A-Z]?)(?:\.[A-Z]{1,4})?$")
 
-    Used by the refinement layer to populate markets source_queries and strategy previews
-    before the discovery adapter runs. Mirrors the logic inside _explicit_tickers.
-    """
-    tickers: list[str] = []
-    seen: set[str] = set()
+
+def _company_tickers(text: str, seen: set[str]) -> list[str]:
+    out: list[str] = []
     for pattern, ticker in _KNOWN_COMPANY_TICKERS:
         if re.search(pattern, text, flags=re.IGNORECASE):
             normalized = ticker.upper()
             if normalized not in seen:
-                tickers.append(normalized)
+                out.append(normalized)
                 seen.add(normalized)
-    for match in re.findall(r"\b(?:[A-Z]{1,5}|[0-9]{3,6}[A-Z]?)(?:\.[A-Z]{1,3})?\b", text):
+    return out
+
+
+def _signalled_tickers(text: str, seen: set[str]) -> list[str]:
+    """Cashtags and exchange-suffixed symbols only — safe to scan over free prose."""
+    out: list[str] = []
+    for match in _CASHTAG_RE.findall(text):
         normalized = match.upper()
-        if normalized in _TICKER_STOPWORDS or normalized in seen:
+        if normalized.isdigit() or normalized in _TICKER_STOPWORDS or normalized in seen:
             continue
-        tickers.append(normalized)
+        out.append(normalized)
         seen.add(normalized)
+    for symbol, suffix in _EXCHANGE_SUFFIX_RE.findall(text):
+        normalized = f"{symbol.upper()}.{suffix.upper()}"
+        if normalized in seen:
+            continue
+        out.append(normalized)
+        seen.add(normalized)
+    return out
+
+
+def normalize_market_query_tickers(queries: Any, seen: set[str] | None = None) -> list[str]:
+    """Validate the model's markets query lane, where each entry should already be a ticker.
+
+    Bare uppercase tokens are accepted here (the lane is explicitly tickers) but obvious
+    acronyms/digits are rejected. Company names and cashtags are still resolved.
+    """
+    seen = seen if seen is not None else set()
+    out: list[str] = []
+    items: list[str]
+    if isinstance(queries, (list, tuple)):
+        items = [str(item) for item in queries]
+    elif queries:
+        items = [str(queries)]
+    else:
+        items = []
+    for raw in items:
+        token = raw.strip()
+        if not token:
+            continue
+        # Resolve any embedded company names / signalled symbols first. If the token
+        # already resolved that way (e.g. "APPLE" -> AAPL), don't also keep it as a bare
+        # token — otherwise the company name leaks in alongside its ticker.
+        resolved = _company_tickers(token, seen)
+        resolved.extend(_signalled_tickers(token, seen))
+        if resolved:
+            out.extend(resolved)
+            continue
+        candidate = token.lstrip("$").upper()
+        if (
+            _BARE_TICKER_RE.match(candidate)
+            and not candidate.isdigit()
+            and candidate not in _TICKER_STOPWORDS
+            and candidate not in seen
+        ):
+            out.append(candidate)
+            seen.add(candidate)
+    return out
+
+
+def resolve_tickers_from_text(text: str) -> list[str]:
+    """Return ticker symbols found in *text* — known companies plus signalled symbols only.
+
+    Used by the refinement layer to populate strategy previews. It deliberately does NOT
+    treat bare uppercase prose tokens as tickers, so acronyms like WWDC/RAM/GB/UI never
+    leak into the markets plan.
+    """
+    seen: set[str] = set()
+    tickers = _company_tickers(text, seen)
+    tickers.extend(_signalled_tickers(text, seen))
     return tickers
 
 
 def _explicit_tickers(profile: TopicProfile) -> list[str]:
-    raw = " ".join(
+    prose = " ".join(
         [
             profile.statement,
             profile.scope,
             *profile.keywords,
             *profile.subtopics,
-            *[str(source.get("ref") or "") for source in profile.requested_sources if str(source.get("adapter") or "") == "markets"],
         ]
     )
-    tickers: list[str] = []
     seen: set[str] = set()
-    for pattern, ticker in _KNOWN_COMPANY_TICKERS:
-        if re.search(pattern, raw, flags=re.IGNORECASE):
-            normalized = ticker.upper()
-            if normalized not in seen:
-                tickers.append(normalized)
-                seen.add(normalized)
-    for match in re.findall(r"\b(?:[A-Z]{1,5}|[0-9]{3,6}[A-Z]?)(?:\.[A-Z]{1,3})?\b", raw):
-        normalized = match.upper()
-        if normalized in _TICKER_STOPWORDS or normalized in seen:
-            continue
-        tickers.append(normalized)
-        seen.add(normalized)
+    tickers = _company_tickers(prose, seen)
+    tickers.extend(_signalled_tickers(prose, seen))
+    # Explicit market lanes: requested_sources refs + the markets source_queries lane are
+    # intended to name tickers directly, so accept validated bare tokens there.
+    market_refs = [
+        str(source.get("ref") or "")
+        for source in profile.requested_sources
+        if str(source.get("adapter") or "") == "markets"
+    ]
+    tickers.extend(normalize_market_query_tickers(market_refs, seen))
+    tickers.extend(normalize_market_query_tickers(profile.source_queries.get("markets"), seen))
     return tickers
 
 
@@ -737,14 +805,24 @@ _TICKER_STOPWORDS = {
     "DRAM",
     "GPU",
     "HBM",
+    "GB",
+    "GUI",
+    "I",
     "LLM",
+    "MLX",
     "MCP",
     "NAND",
+    "OS",
+    "RAM",
     "SEC",
     "SK",
+    "UI",
     "USA",
+    "UX",
+    "WWDC",
 }
 _KNOWN_COMPANY_TICKERS = (
+    (r"\bapple\b|\bapple inc\.?\b", "AAPL"),
     (r"\bmicron\b|\bmicron technology\b", "MU"),
     (r"\b(?:sk\s+)?hynix\b", "000660.KS"),
     (r"\bsamsung(?: electronics)?\b", "005930.KS"),

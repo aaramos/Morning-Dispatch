@@ -59,7 +59,7 @@ class GmailSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         # Strict allowlist: only senders explicitly approved in the managed store are ever fetched.
-        senders = _approved_gmail_senders()
+        senders = _profile_gmail_senders(profile) or _approved_gmail_senders()
         if not senders:
             return []
         payloads = await fetch_newsletters(
@@ -491,6 +491,22 @@ class MarketsSourceAdapter:
 
 def _approved_gmail_senders() -> list[str]:
     return database.approved_gmail_senders()
+
+
+def _profile_gmail_senders(profile: TopicProfile) -> list[str]:
+    rules = profile.gmail_rules if isinstance(profile.gmail_rules, dict) else {}
+    raw = rules.get("include_senders")
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    senders: list[str] = []
+    seen: set[str] = set()
+    for sender in raw:
+        value = str(sender or "").strip().lower()
+        if "@" not in value or value in seen:
+            continue
+        senders.append(value)
+        seen.add(value)
+    return senders
 
 
 

@@ -1375,11 +1375,12 @@ function DispatchApp() {
       throw new Error(streamError || "Refinement stream ended unexpectedly");
     }
     const resolved: RefinementSession = finalSession;
-    setSession((prev) => (
-      prev && prev.session_id === resolved.session_id
-        ? { ...resolved, messages: mergeChatMessages(resolved.messages, prev.messages) }
-        : resolved
-    ));
+    // The backend is the single source of truth for the ordered chat transcript. The
+    // optimistic user bubble we showed during streaming is discarded here in favor of
+    // the server's persisted messages, which already include this turn's user + AI
+    // messages in order. Merging the two produced out-of-order / duplicated turns
+    // (notably for "Build brief", where the optimistic and persisted text differ).
+    setSession(resolved);
     setDraft(draftFromProfile(resolved.profile, defaultControls.content_limits));
     setSourceSelection(sourceSelectionFromRecord(resolved.profile.source_selection));
     if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
@@ -1432,6 +1433,7 @@ function DispatchApp() {
   }
 
   async function answerRefinement(justGoNow = false, answerOverride?: string) {
+    if (busy || streaming || activeRefinementTurns.current > 0) return;
     if (!activeInterest) return;
     const effectiveAnswer = (answerOverride ?? answer).trim();
     if (!session && !justGoNow && !effectiveAnswer) return;
@@ -1450,7 +1452,7 @@ function DispatchApp() {
           just_go_now: justGoNow,
           models: {},
         },
-        justGoNow ? "Search strategy confirmed." : pendingAnswer,
+        justGoNow ? "Build brief requested." : pendingAnswer,
       );
     } catch (error) {
       if (!justGoNow && pendingAnswer) setAnswer(pendingAnswer);
@@ -2430,7 +2432,6 @@ function DispatchApp() {
               gmailCandidates={gmailCandidates}
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
-              onJustGo={() => void answerRefinement(true)}
 	              onGmailApprove={(approvedSenders, instructions) => {
 	                let reply = "none";
 	                if (!approvedSenders.length) {
@@ -2687,7 +2688,6 @@ function RefinementPanel(props: {
   gmailCandidates: GmailCandidatePayload | null;
   onAnswerChange: (value: string) => void;
   onSend: () => void;
-  onJustGo: () => void;
   onGmailApprove: (approvedSenders: string[], instructions: string) => void;
   // Starting Flow props
   statement: string;
@@ -2890,10 +2890,11 @@ function RefinementPanel(props: {
                   onChange={(event) => props.onAnswerChange(event.target.value)}
                   placeholder="Add anything else to adjust..."
                   rows={1}
+                  disabled={props.busy || props.streaming}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
-                      props.onSend();
+                      if (!props.busy && !props.streaming && props.answer.trim()) props.onSend();
                     }
                   }}
                 />
@@ -2901,7 +2902,7 @@ function RefinementPanel(props: {
                   type="button"
                   className="chat-send"
                   onClick={props.onSend}
-                  disabled={!props.answer.trim()}
+                  disabled={props.busy || props.streaming || !props.answer.trim()}
                   aria-label="Send"
                 >
                   →
@@ -2938,10 +2939,11 @@ function RefinementPanel(props: {
                   onChange={(event) => props.onAnswerChange(event.target.value)}
                   placeholder={props.gmailCandidates ? "Reply with numbers, names, all, none, or click senders above…" : finalized ? "Add anything else…" : "Answer the next question or refine the strategy…"}
                   rows={1}
+                  disabled={props.busy || props.streaming}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
-                      props.onSend();
+                      if (!props.busy && !props.streaming && props.answer.trim()) props.onSend();
                     }
                   }}
                 />
@@ -2949,7 +2951,7 @@ function RefinementPanel(props: {
                   type="button"
                   className="chat-send"
                   onClick={props.onSend}
-                  disabled={!props.answer.trim()}
+                  disabled={props.busy || props.streaming || !props.answer.trim()}
                   aria-label="Send"
                 >
                   →
@@ -2967,8 +2969,8 @@ function RefinementPanel(props: {
                     {props.streaming ? "" : "Enter to send · Shift+Enter for a new line"}
                   </span>
                   <span style={{ flex: 1 }} />
-                  <button type="button" className="primary-action strategy-confirm-action" onClick={props.onJustGo} disabled={props.busy}>
-                    Confirm Search Strategy
+                  <button type="button" className="primary-action strategy-confirm-action" onClick={props.onBuild} disabled={props.busy}>
+                    Build brief
                   </button>
                 </div>
               </div>
@@ -3068,7 +3070,7 @@ function RefinementPanel(props: {
             </div>
           ) : null}
           {finalized ? (
-            <div className="plan-ready-note">Search strategy confirmed. Build the brief when you are ready.</div>
+            <div className="plan-ready-note">Strategy is ready for the build step.</div>
           ) : null}
         </div>
       </aside>
@@ -3136,7 +3138,16 @@ function ChatMessageContent(props: { content: string }) {
       </div>
     );
   }
-  return <>{props.content}</>;
+  return (
+    <>
+      {props.content.split("\n").map((line, index) => (
+        <Fragment key={`${index}-${line.slice(0, 16)}`}>
+          {index > 0 ? <br /> : null}
+          {line}
+        </Fragment>
+      ))}
+    </>
+  );
 }
 
 function parseGmailCandidateMessage(content: string): { intro: string; candidates: GmailCandidateLine[]; prompt: string } | null {
@@ -7474,18 +7485,6 @@ function formatStage(value: string): string {
   return value.split("_").filter(Boolean).map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(" ");
 }
 
-function mergeChatMessages(serverMessages: ChatMessage[], localMessages: ChatMessage[]): ChatMessage[] {
-  const merged = [...localMessages];
-  const seen = new Set(merged.map((message) => `${message.role}\u0000${message.content}`));
-  for (const message of serverMessages) {
-    const key = `${message.role}\u0000${message.content}`;
-    if (!seen.has(key)) {
-      merged.push(message);
-      seen.add(key);
-    }
-  }
-  return merged;
-}
 
 function formatDateTime(value: string | null | undefined): string {
   if (!value) return "Never";

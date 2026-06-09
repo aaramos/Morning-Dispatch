@@ -3008,171 +3008,175 @@ def render_ingested_issue(
   <title>{escape(title)}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700;800&family=Playfair+Display:wght@700;800;900&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Playfair+Display:ital,wght@0,700;0,800;0,900;1,700&display=swap" rel="stylesheet" />
   <style>
     :root {{
-      color: #221d18;
-      background: #f4efe6;
-      --paper: #fffaf1;
-      --paper-deep: #f4efe6;
-      --ink: #221d18;
-      --muted: #796f65;
-      --line: #d8cbbc;
-      --accent: #b53a32;
-      --accent-dark: #84251f;
-      --sidebar: #ebe3d5;
-      --shadow: 0 24px 80px rgba(48, 35, 24, .13);
-      --display: 'Playfair Display', Georgia, 'Times New Roman', serif;
-      --body: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      --mono: 'DM Mono', 'SFMono-Regular', Consolas, monospace;
+      color: #1a1a1a;
+      background: #fafaf9;
+      --paper: #ffffff;
+      --paper-deep: #fafaf9;
+      --ink: #1a1a1a;
+      --muted: #6b6b66;
+      --line: #eaeae5;
+      --accent: #1e3a8a;
+      --accent-dark: #172554;
+      --sidebar: #f5f5f0;
+      --shadow: 0 12px 40px rgba(0, 0, 0, .04);
+      --display: 'Playfair Display', Georgia, serif;
+      --body: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --mono: 'JetBrains Mono', monospace;
     }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ width: 100%; max-width: 100%; overflow-x: hidden; }}
-    body {{ margin: 0; font-family: var(--body); color: var(--ink); background: radial-gradient(circle at top left, #fffaf1 0, #f4efe6 38%, #eee4d5 100%); }}
-    .brief-shell {{ width: min(1180px, 100%); margin: 0 auto; padding: 34px 24px 64px; }}
-    .brief-masthead {{ display: flex; justify-content: space-between; gap: 18px; align-items: center; border-bottom: 1px solid var(--ink); padding-bottom: 16px; margin-bottom: 28px; }}
-    .masthead-brand {{ font-family: var(--display); font-size: clamp(2rem, 5vw, 4.2rem); font-weight: 900; line-height: .9; letter-spacing: 0; }}
-    .masthead-meta, .dateline, .section-kicker, .meta {{ font: 700 .74rem/1.35 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
+    body {{ margin: 0; font-family: var(--body); color: var(--ink); background: var(--paper-deep); -webkit-font-smoothing: antialiased; }}
+    .brief-shell {{ width: min(1180px, 100%); margin: 0 auto; padding: 40px 24px 80px; }}
+    .brief-masthead {{ display: flex; justify-content: space-between; gap: 18px; align-items: center; border-bottom: 2px solid var(--ink); padding-bottom: 20px; margin-bottom: 36px; }}
+    .masthead-brand {{ font-family: var(--display); font-size: clamp(1.8rem, 4.5vw, 3.2rem); font-weight: 800; line-height: 1; letter-spacing: -0.02em; }}
+    .masthead-meta, .dateline, .section-kicker, .meta {{ font: 700 .7rem/1.4 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
     .masthead-meta {{ max-width: 48ch; text-align: right; }}
-    .brief-header {{ display: grid; gap: 14px; max-width: 920px; margin-bottom: 30px; }}
-    h1 {{ font-family: var(--display); font-size: 2.85rem; font-weight: 900; line-height: .98; margin: 0; letter-spacing: 0; }}
-    .brief-header h1 {{ display: -webkit-box; max-height: 11.18rem; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: break-word; word-break: normal; hyphens: auto; }}
-    h2 {{ font-family: var(--display); font-size: clamp(2rem, 4vw, 3.2rem); line-height: .95; margin: 0 0 18px; letter-spacing: 0; }}
-    h3 {{ font-family: var(--display); font-size: clamp(1.35rem, 3vw, 2.05rem); line-height: 1.05; margin: 0; letter-spacing: 0; }}
+    .brief-header {{ display: grid; gap: 12px; max-width: 920px; margin-bottom: 36px; }}
+    h1 {{ font-family: var(--display); font-size: 3rem; font-weight: 850; line-height: 1.05; margin: 0; letter-spacing: -0.01em; }}
+    .brief-header h1 {{ display: -webkit-box; max-height: 12rem; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: break-word; word-break: normal; hyphens: auto; }}
+    h2 {{ font-family: var(--display); font-size: clamp(1.6rem, 3.2vw, 2.4rem); line-height: 1.1; margin: 0 0 20px; letter-spacing: -0.01em; }}
+    h3 {{ font-family: var(--display); font-size: clamp(1.25rem, 2.5vw, 1.75rem); line-height: 1.15; margin: 0; letter-spacing: -0.01em; }}
     h1, h2, h3, h4, p, a, .meta, .story-title, .side-value {{ overflow-wrap: anywhere; }}
-    a {{ color: inherit; text-decoration-thickness: 1px; text-underline-offset: 4px; }}
+    a {{ color: inherit; text-decoration-thickness: 1px; text-underline-offset: 4px; transition: color 0.15s ease; }}
+    a:hover {{ color: var(--accent); }}
     img, video, iframe, table {{ max-width: 100%; }}
-    .brief-body {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); gap: 34px; align-items: start; }}
+    .brief-body {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(290px, 340px); gap: 40px; align-items: start; }}
     .story-column, .brief-sidebar, .lead-block, .story-row, .media-card, .low-conf-row, .newsletter {{ min-width: 0; }}
-    .story-column {{ display: grid; gap: 30px; }}
+    .story-column {{ display: grid; gap: 36px; }}
     .img-strip {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
-    .strip-frame, .story-thumb, .media-thumb {{ position: relative; overflow: hidden; background: #e5dacb; border: 1px solid var(--line); }}
+    .strip-frame, .story-thumb, .media-thumb {{ position: relative; overflow: hidden; background: #eaeae0; border: 1px solid var(--line); border-radius: 8px; }}
     .strip-frame {{ aspect-ratio: 4 / 3; }}
     .strip-link {{ display: block; width: 100%; height: 100%; }}
     .strip-frame img, .story-thumb img, .media-thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
-    .fallback-art {{ display: grid; place-items: center; min-height: 100%; color: var(--accent); background: linear-gradient(135deg, #fbf3e5, #e9ddcb); }}
-    .fallback-art svg {{ width: 34px; height: 34px; }}
-    .lead-block {{ display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 18px; padding: 24px 0 28px; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }}
-    .lead-bar {{ background: var(--accent); border-radius: 999px; }}
-    .lead-content {{ display: grid; gap: 13px; }}
-    .lead-title {{ font-family: var(--display); font-size: clamp(2.25rem, 5vw, 4.4rem); line-height: .9; font-weight: 900; }}
-    .lead-summary {{ font-size: 1.14rem; line-height: 1.55; margin: 0; color: #3f382f; }}
+    .fallback-art {{ display: grid; place-items: center; min-height: 100%; color: var(--accent); background: linear-gradient(135deg, #f5f5f0, #eaeae0); }}
+    .fallback-art svg {{ width: 30px; height: 30px; }}
+    .lead-block {{ display: grid; grid-template-columns: 6px minmax(0, 1fr); gap: 20px; padding: 28px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }}
+    .lead-bar {{ background: var(--accent); border-radius: 3px; }}
+    .lead-content {{ display: grid; gap: 14px; }}
+    .lead-title {{ font-family: var(--display); font-size: clamp(2rem, 4.5vw, 2.8rem); line-height: 1.1; font-weight: 800; letter-spacing: -0.015em; }}
+    .lead-summary {{ font-size: 1.02rem; line-height: 1.6; margin: 0; color: #333330; }}
     .story-meta, .chip-row, .keywords, .feedback-controls {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
-    .source-type, .score {{ display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; font: 700 .68rem/1 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .04em; background: rgba(255, 250, 241, .72); }}
-    .source-type.youtube, .source-type.podcast, .source-type.foreign-media, .translation-badge {{ color: var(--accent-dark); border-color: rgba(181, 58, 50, .34); background: rgba(181, 58, 50, .08); }}
-    .translation-badge.low, .translation-badge.unavailable {{ color: #7a4c10; border-color: rgba(156, 97, 18, .34); background: rgba(156, 97, 18, .10); }}
-    .translation-original {{ margin-top: 10px; color: var(--muted); font-size: .88rem; }}
-    .translation-original summary {{ cursor: pointer; font-weight: 800; color: var(--accent-dark); }}
-    .translation-original p {{ margin: 8px 0 0; line-height: 1.45; }}
-    .keywords {{ margin-top: 10px; font: 500 .72rem/1.5 var(--mono); color: var(--muted); }}
+    .source-type, .score {{ display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font: 700 .62rem/1 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; background: rgba(255, 255, 255, 0.8); }}
+    .source-type.youtube, .source-type.podcast, .source-type.foreign-media, .translation-badge {{ color: var(--accent); border-color: rgba(30, 58, 138, .15); background: rgba(30, 58, 138, .04); }}
+    .translation-badge.low, .translation-badge.unavailable {{ color: #b45309; border-color: rgba(180, 83, 9, .15); background: rgba(180, 83, 9, .04); }}
+    .translation-original {{ margin-top: 10px; color: var(--muted); font-size: .84rem; }}
+    .translation-original summary {{ cursor: pointer; font-weight: 700; color: var(--accent); }}
+    .translation-original p {{ margin: 8px 0 0; line-height: 1.5; }}
+    .keywords {{ margin-top: 10px; font: 500 .68rem/1.5 var(--mono); color: var(--muted); }}
     .keywords span {{ border-bottom: 1px dotted var(--line); }}
-    .ranked-section, .top-stories-section, .source-section, .media-section, .lower-confidence {{ border-top: 1px solid var(--line); padding-top: 20px; }}
+    .ranked-section, .top-stories-section, .source-section, .media-section, .lower-confidence {{ border-top: 1px solid var(--line); padding-top: 24px; }}
     .story-list {{ display: grid; gap: 0; }}
-    .story-row {{ display: grid; grid-template-columns: 64px minmax(0, 1fr) 132px; gap: 18px; padding: 22px 0; border-bottom: 1px solid var(--line); align-items: start; }}
-    .story-num {{ font-family: var(--display); font-size: 2.45rem; line-height: .9; color: var(--accent); font-weight: 900; }}
-    .story-copy {{ display: grid; gap: 9px; }}
-    .story-title {{ font-family: var(--display); font-size: clamp(1.42rem, 2.5vw, 2.05rem); line-height: 1.02; font-weight: 800; }}
-    .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-summary p, .podcast-transcript p {{ font-size: .98rem; line-height: 1.58; margin: 0; color: #4a4138; }}
-    .market-snapshot {{ background: var(--sidebar); border: 1px solid var(--line); padding: 16px; box-shadow: var(--shadow); }}
-    .market-snapshot h2 {{ font-size: 1.55rem; margin-bottom: 12px; }}
+    .story-row {{ display: grid; grid-template-columns: 48px minmax(0, 1fr) 112px; gap: 20px; padding: 24px 0; border-bottom: 1px solid var(--line); align-items: start; }}
+    .story-num {{ font-family: var(--mono); font-size: 0.9rem; line-height: 1; color: var(--accent); font-weight: 700; background: var(--sidebar); width: 32px; height: 32px; display: inline-grid; place-items: center; border-radius: 6px; border: 1px solid var(--line); }}
+    .story-copy {{ display: grid; gap: 8px; }}
+    .story-title {{ font-family: var(--display); font-size: clamp(1.3rem, 2.2vw, 1.7rem); line-height: 1.15; font-weight: 800; letter-spacing: -0.01em; }}
+    .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-summary p, .podcast-transcript p {{ font-size: .95rem; line-height: 1.6; margin: 0; color: #40403d; }}
+    .market-snapshot {{ background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 20px; box-shadow: var(--shadow); }}
+    .market-snapshot h2 {{ font-size: 1.25rem; margin-bottom: 14px; letter-spacing: -0.01em; }}
     .market-grid {{ display: grid; gap: 0; }}
-    .market-card {{ display: grid; grid-template-columns: minmax(64px, .55fr) minmax(0, 1fr); gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid rgba(34, 29, 24, .18); }}
+    .market-card {{ display: grid; grid-template-columns: minmax(64px, .55fr) minmax(0, 1fr); gap: 10px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }}
     .market-symbol {{ display: grid; gap: 3px; }}
-    .market-symbol strong {{ font: 900 1.05rem/1 var(--mono); color: var(--ink); }}
-    .market-symbol span {{ color: var(--muted); font: 700 .58rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: .04em; }}
+    .market-symbol strong {{ font: 700 0.95rem/1 var(--mono); color: var(--ink); }}
+    .market-symbol span {{ color: var(--muted); font: 700 .54rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: .06em; }}
     .market-performance {{ display: grid; gap: 5px; min-width: 0; }}
     .market-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }}
-    .market-price {{ font: 900 .92rem/1 var(--body); }}
-    .market-change {{ font: 800 .68rem/1 var(--mono); }}
-    .market-change.up {{ color: #17633a; }}
-    .market-change.down {{ color: #9f2820; }}
+    .market-price {{ font: 700 .88rem/1 var(--body); }}
+    .market-change {{ font: 700 .65rem/1 var(--mono); }}
+    .market-change.up {{ color: #166534; }}
+    .market-change.down {{ color: #991b1b; }}
     .market-change.flat {{ color: var(--muted); }}
-    .sparkline {{ width: 100%; height: 30px; display: block; overflow: visible; }}
-    .sparkline path {{ fill: none; stroke: var(--accent); stroke-width: 2.25; stroke-linecap: round; stroke-linejoin: round; }}
-    .sparkline .baseline {{ stroke: rgba(34, 29, 24, .18); stroke-width: 1; }}
-    .story-thumb {{ aspect-ratio: 1; border-radius: 2px; }}
-    .media-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
-    .media-card {{ display: grid; gap: 12px; padding: 14px; background: rgba(255, 250, 241, .68); border: 1px solid var(--line); box-shadow: 0 10px 34px rgba(48, 35, 24, .06); }}
-    .media-thumb {{ aspect-ratio: 16 / 9; }}
-    .media-title {{ font-family: var(--display); font-size: 1.42rem; line-height: 1.04; font-weight: 800; }}
-    .media-cta {{ justify-self: start; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--accent); border-radius: 999px; color: var(--accent-dark); padding: 8px 12px; font: 800 .76rem/1 var(--body); text-decoration: none; }}
+    .sparkline {{ width: 100%; height: 26px; display: block; overflow: visible; }}
+    .sparkline path {{ fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }}
+    .sparkline .baseline {{ stroke: var(--line); stroke-width: 1; }}
+    .story-thumb {{ aspect-ratio: 1; border-radius: 6px; }}
+    .media-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }}
+    .media-card {{ display: grid; gap: 14px; padding: 20px; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }}
+    .media-thumb {{ aspect-ratio: 16 / 9; border-radius: 6px; }}
+    .media-title {{ font-family: var(--display); font-size: 1.35rem; line-height: 1.15; font-weight: 800; letter-spacing: -0.01em; }}
+    .media-cta {{ justify-self: start; display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--accent); border-radius: 8px; color: var(--accent); padding: 8px 14px; font: 700 .74rem/1 var(--body); text-decoration: none; transition: all 0.15s ease; }}
+    .media-cta:hover {{ background: var(--accent); color: #ffffff; }}
     .low-conf-list {{ display: grid; gap: 0; }}
-    .low-conf-row {{ display: grid; grid-template-columns: 50px minmax(0, 1fr); gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--line); opacity: .78; }}
-    .low-conf-row .story-num {{ font-size: 1.7rem; color: var(--muted); }}
-    .brief-sidebar {{ position: sticky; top: 22px; display: grid; gap: 16px; }}
-    .side-panel {{ background: var(--sidebar); border: 1px solid var(--line); padding: 18px; box-shadow: var(--shadow); }}
-    .side-panel h2 {{ font-size: 1.55rem; margin-bottom: 14px; }}
-    .side-stats {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
-    .side-stat {{ border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 9px; }}
-    .side-stat span {{ display: block; font: 700 .66rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
-    .side-stat strong {{ display: block; margin-top: 3px; font-family: var(--display); font-size: 1.45rem; line-height: 1; }}
-    .source-mix {{ margin-top: 16px; border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 13px; }}
-    .source-mix h3 {{ margin: 0 0 9px; font: 800 .74rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
-    .source-mix-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid rgba(34, 29, 24, .12); }}
+    .low-conf-row {{ display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--line); opacity: .85; }}
+    .low-conf-row .story-num {{ font-size: 0.85rem; color: var(--muted); background: var(--paper-deep); }}
+    .brief-sidebar {{ position: sticky; top: 24px; display: grid; gap: 20px; }}
+    .side-panel {{ background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 20px; box-shadow: var(--shadow); }}
+    .side-panel h2 {{ font-size: 1.25rem; margin-bottom: 16px; letter-spacing: -0.01em; }}
+    .side-stats {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
+    .side-stat {{ border-top: 1px solid var(--line); padding-top: 10px; }}
+    .side-stat span {{ display: block; font: 700 .62rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
+    .side-stat strong {{ display: block; margin-top: 4px; font-family: var(--display); font-size: 1.35rem; line-height: 1; font-weight: 800; }}
+    .source-mix {{ margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }}
+    .source-mix h3 {{ margin: 0 0 10px; font: 700 .68rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
+    .source-mix-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--line); }}
     .source-mix-row:first-of-type {{ border-top: 0; }}
-    .source-mix-label {{ color: #4f463d; font: 700 .82rem/1.25 var(--body); }}
-    .source-mix-count {{ font: 800 .82rem/1 var(--mono); color: var(--ink); }}
-    .side-note {{ margin-top: 16px; border-top: 1px solid rgba(34, 29, 24, .22); padding-top: 13px; }}
-    .side-note h3 {{ margin: 0 0 7px; font: 800 .74rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
-    .side-note p {{ margin: 0; color: #4f463d; font-size: .86rem; line-height: 1.45; }}
-    .stage-list {{ margin: 10px 0 0; padding-left: 18px; color: var(--muted); font: 600 .78rem/1.6 var(--body); }}
-    details.source-notes {{ margin-top: 18px; border-top: 1px solid rgba(34, 29, 24, .26); padding-top: 14px; }}
-    details.source-notes summary {{ cursor: pointer; font: 800 .74rem/1.25 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
-    .newsletter {{ padding: 14px 0; border-bottom: 1px solid rgba(34, 29, 24, .18); }}
-    .newsletter h3 {{ font-size: 1.1rem; line-height: 1.1; margin-top: 6px; }}
-    .feedback-controls {{ margin-top: 12px; }}
-    .feedback-controls button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); color: var(--accent-dark); padding: 7px 11px; font: 800 .72rem/1 var(--body); cursor: pointer; }}
-    .feedback-controls button:hover {{ background: #efe3d1; }}
+    .source-mix-label {{ color: #40403d; font: 600 .78rem/1.3 var(--body); }}
+    .source-mix-count {{ font: 700 .78rem/1 var(--mono); color: var(--ink); }}
+    .side-note {{ margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }}
+    .side-note h3 {{ margin: 0 0 8px; font: 700 .68rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
+    .side-note p {{ margin: 0; color: #40403d; font-size: .84rem; line-height: 1.5; }}
+    .stage-list {{ margin: 10px 0 0; padding-left: 18px; color: var(--muted); font: 600 .74rem/1.6 var(--body); }}
+    details.source-notes {{ margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; }}
+    details.source-notes summary {{ cursor: pointer; font: 700 .68rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; outline: none; }}
+    .newsletter {{ padding: 16px 0; border-bottom: 1px solid var(--line); }}
+    .newsletter h3 {{ font-size: 1.05rem; line-height: 1.2; margin-top: 6px; font-weight: 700; }}
+    .feedback-controls {{ margin-top: 14px; }}
+    .feedback-controls button {{ border: 1px solid var(--line); border-radius: 8px; background: var(--paper); color: var(--accent); padding: 6px 12px; font: 700 .72rem/1 var(--body); cursor: pointer; transition: all 0.15s ease; }}
+    .feedback-controls button:hover {{ background: var(--sidebar); }}
     .feedback-controls[data-feedback='sent'] button {{ opacity: .55; }}
-    .feedback-state {{ color: var(--muted); font: 700 .72rem var(--mono); text-transform: uppercase; }}
-    .podcast-modal-link, .youtube-modal-link, .newsletter-modal-link {{ color: inherit; }}
-    .podcast-modal {{ position: fixed; inset: 0; z-index: 20; display: none; place-items: center; padding: 24px; background: rgba(34, 29, 24, .62); }}
+    .feedback-state {{ color: var(--muted); font: 700 .68rem var(--mono); text-transform: uppercase; }}
+    .podcast-modal-link, .youtube-modal-link, .newsletter-modal-link {{ color: inherit; text-decoration: none; }}
+    .podcast-modal-link:hover, .youtube-modal-link:hover, .newsletter-modal-link:hover {{ text-decoration: underline; }}
+    .podcast-modal {{ position: fixed; inset: 0; z-index: 20; display: none; place-items: center; padding: 24px; background: rgba(0, 0, 0, .4); backdrop-filter: blur(4px); }}
     .podcast-modal:target {{ display: grid; }}
-    .podcast-panel {{ width: min(920px, 100%); max-height: min(86vh, 980px); overflow: auto; background: var(--paper); border: 1px solid var(--ink); box-shadow: 0 24px 90px rgba(34, 29, 24, .34); padding: 24px; }}
-    .podcast-close {{ float: right; border: 1px solid var(--ink); border-radius: 999px; background: var(--ink); color: var(--paper); padding: 9px 13px; font: 800 .72rem/1 var(--body); cursor: pointer; text-decoration: none; }}
-    .podcast-brand {{ display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 18px; align-items: center; margin: 14px 0 20px; }}
-    .podcast-art {{ width: 132px; aspect-ratio: 1; object-fit: cover; border: 1px solid var(--line); background: #e5dacb; }}
-    .podcast-art.fallback {{ display: grid; place-items: center; font-family: var(--display); font-weight: 900; font-size: 2rem; color: var(--accent); }}
-    .podcast-panel h3 {{ font-size: clamp(1.8rem, 4vw, 3.1rem); line-height: .95; margin: 0 0 10px; }}
-    .podcast-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 18px; font: 800 .75rem var(--body); text-transform: uppercase; }}
-    .podcast-actions a {{ color: var(--accent-dark); }}
-    .podcast-speed-controls {{ display: flex; gap: 8px; margin: 0 0 16px; align-items: center; flex-wrap: wrap; }}
-    .podcast-speed-controls button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); padding: 6px 10px; font: 700 .72rem var(--body); cursor: pointer; }}
-    .podcast-speed-controls button.active {{ border-color: var(--ink); background: var(--ink); color: var(--paper); }}
-    .podcast-player {{ width: 100%; margin: 4px 0 20px; }}
+    .podcast-panel {{ width: min(920px, 100%); max-height: min(86vh, 980px); overflow: auto; background: var(--paper); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 20px 80px rgba(0,0,0,0.12); padding: 32px; }}
+    .podcast-close {{ float: right; border: 1px solid var(--line); border-radius: 8px; background: var(--ink); color: #ffffff; padding: 8px 14px; font: 700 .72rem/1 var(--body); cursor: pointer; text-decoration: none; transition: opacity 0.15s ease; }}
+    .podcast-close:hover {{ opacity: 0.9; }}
+    .podcast-brand {{ display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 20px; align-items: center; margin: 14px 0 24px; }}
+    .podcast-art {{ width: 120px; aspect-ratio: 1; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); background: #eaeae0; }}
+    .podcast-art.fallback {{ display: grid; place-items: center; font-family: var(--display); font-weight: 800; font-size: 1.8rem; color: var(--accent); }}
+    .podcast-panel h3 {{ font-size: clamp(1.6rem, 3.5vw, 2.6rem); line-height: 1.1; margin: 0 0 10px; }}
+    .podcast-actions {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0 20px; font: 700 .72rem var(--body); text-transform: uppercase; letter-spacing: 0.04em; }}
+    .podcast-actions a {{ color: var(--accent); }}
+    .podcast-speed-controls {{ display: flex; gap: 8px; margin: 0 0 20px; align-items: center; flex-wrap: wrap; }}
+    .podcast-speed-controls button {{ border: 1px solid var(--line); border-radius: 6px; background: var(--paper); padding: 6px 10px; font: 700 .7rem var(--body); cursor: pointer; }}
+    .podcast-speed-controls button.active {{ border-color: var(--accent); background: var(--accent); color: #ffffff; }}
+    .podcast-player {{ width: 100%; margin: 4px 0 20px; border-radius: 8px; }}
     .youtube-panel {{ width: min(1040px, 100%); }}
-    .youtube-player {{ width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--ink); background: var(--ink); margin: 8px 0 20px; }}
-    .youtube-summary, .podcast-summary, .podcast-transcript, .newsletter-body {{ border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }}
-    .youtube-summary h4, .podcast-summary h4, .podcast-transcript h4, .newsletter-body h4 {{ margin: 0 0 10px; font: 800 .78rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
-    .newsletter-body p {{ margin: 0 0 12px; font-size: 1rem; line-height: 1.62; color: #3f382f; }}
-    .foreign-tabs {{ display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }}
-    .foreign-tabs button {{ border: 1px solid var(--line); border-radius: 999px; background: var(--paper); padding: 8px 12px; font: 800 .74rem/1 var(--body); cursor: pointer; }}
-    .foreign-tabs button.active {{ background: var(--ink); color: var(--paper); border-color: var(--ink); }}
+    .youtube-player {{ width: 100%; aspect-ratio: 16 / 9; border-radius: 12px; border: 1px solid var(--line); background: #000000; margin: 8px 0 24px; overflow: hidden; }}
+    .youtube-summary, .podcast-summary, .podcast-transcript, .newsletter-body {{ border-top: 1px solid var(--line); padding-top: 20px; margin-top: 20px; }}
+    .youtube-summary h4, .podcast-summary h4, .podcast-transcript h4, .newsletter-body h4 {{ margin: 0 0 12px; font: 700 .72rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
+    .newsletter-body p {{ margin: 0 0 14px; font-size: .98rem; line-height: 1.65; color: #333330; }}
+    .foreign-tabs {{ display: flex; gap: 8px; margin: 16px 0; flex-wrap: wrap; }}
+    .foreign-tabs button {{ border: 1px solid var(--line); border-radius: 8px; background: var(--paper); padding: 8px 12px; font: 700 .72rem/1 var(--body); cursor: pointer; }}
+    .foreign-tabs button.active {{ background: var(--accent); color: #ffffff; border-color: var(--accent); }}
     .foreign-view[hidden] {{ display: none; }}
-    .foreign-view {{ border-top: 1px solid var(--line); padding-top: 16px; }}
-    .foreign-status, .foreign-notice, .foreign-provenance {{ color: var(--muted); font: 700 .82rem/1.45 var(--body); }}
+    .foreign-view {{ border-top: 1px solid var(--line); padding-top: 20px; }}
+    .foreign-status, .foreign-notice, .foreign-provenance {{ color: var(--muted); font: 600 .8rem/1.5 var(--body); }}
     .foreign-provenance {{ margin: 8px 0 0; }}
-    .foreign-body p {{ margin: 0 0 12px; font-size: 1rem; line-height: 1.62; color: #3f382f; }}
+    .foreign-body p {{ margin: 0 0 14px; font-size: .98rem; line-height: 1.65; color: #333330; }}
     body.modal-open {{ overflow: hidden; }}
-    .empty {{ margin-top: 32px; padding: 24px; border: 1px dashed #b9ae9d; font: 1rem var(--body); background: var(--paper); }}
-    @media (max-width: 860px) {{
-      .brief-shell {{ padding: 26px 16px 48px; }}
-      .brief-header h1 {{ font-size: 2.35rem; line-height: 1; max-height: 9.4rem; }}
+    .empty {{ margin-top: 36px; padding: 24px; border: 1px dashed var(--line); border-radius: 12px; font: 1rem var(--body); background: var(--paper); }}
+    @media (max-width: 900px) {{
+      .brief-shell {{ padding: 32px 16px 60px; }}
+      .brief-header h1 {{ font-size: 2.4rem; line-height: 1.1; max-height: 9.6rem; }}
       .brief-masthead {{ align-items: flex-start; flex-direction: column; }}
       .masthead-meta {{ max-width: none; text-align: left; }}
       .brief-body, .media-grid, .podcast-brand {{ grid-template-columns: 1fr; }}
       .brief-sidebar {{ position: static; }}
       .market-card {{ grid-template-columns: 1fr; }}
-      .story-row {{ grid-template-columns: 48px minmax(0, 1fr); }}
+      .story-row {{ grid-template-columns: 40px minmax(0, 1fr); }}
       .story-thumb {{ display: none; }}
       .img-strip {{ grid-template-columns: 1fr; }}
       .strip-frame {{ aspect-ratio: 16 / 9; }}
-      .podcast-panel {{ max-height: 90vh; }}
+      .podcast-panel {{ max-height: 90vh; padding: 24px; }}
     }}
     @media (max-width: 480px) {{
       .brief-shell {{ padding-inline: 12px; }}
-      .brief-header h1 {{ font-size: 1.9rem; line-height: 1; max-height: 7.6rem; }}
-      .lead-block {{ grid-template-columns: 7px minmax(0, 1fr); gap: 12px; }}
+      .brief-header h1 {{ font-size: 1.85rem; line-height: 1.1; max-height: 7.4rem; }}
+      .lead-block {{ grid-template-columns: 5px minmax(0, 1fr); gap: 16px; }}
       .side-stats {{ grid-template-columns: 1fr; }}
     }}
   </style>
@@ -3218,19 +3222,20 @@ def render_placeholder_issue(title: str, snapshot: str, generated_at: str | None
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{title}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ width: 100%; max-width: 100%; overflow-x: hidden; }}
-    body {{ margin: 0; font-family: Georgia, 'Times New Roman', serif; color: #171717; background: #f7f3eb; }}
-    main {{ width: min(900px, 100%); margin: 0 auto; padding: 48px 24px; }}
-    header {{ border-bottom: 2px solid #171717; padding-bottom: 18px; margin-bottom: 28px; }}
-    h1 {{ font-size: 2.6rem; line-height: 1; margin: 0; letter-spacing: 0; display: -webkit-box; max-height: 10.4rem; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: break-word; word-break: normal; hyphens: auto; }}
+    body {{ margin: 0; font-family: 'Plus Jakarta Sans', sans-serif; color: #1a1a1a; background: #fafaf9; -webkit-font-smoothing: antialiased; }}
+    main {{ width: min(800px, 100%); margin: 0 auto; padding: 48px 24px; }}
+    header {{ border-bottom: 2px solid #1a1a1a; padding-bottom: 18px; margin-bottom: 28px; }}
+    h1 {{ font-family: 'Playfair Display', serif; font-size: 2.6rem; line-height: 1.1; margin: 0; letter-spacing: -0.01em; display: -webkit-box; max-height: 10.4rem; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: break-word; word-break: normal; hyphens: auto; }}
     h1, p {{ overflow-wrap: anywhere; }}
-    .date {{ margin-top: 12px; font: 600 0.8rem Arial, sans-serif; text-transform: uppercase; }}
-    .snapshot {{ font-size: 1.3rem; line-height: 1.5; max-width: 720px; }}
-    .empty {{ margin-top: 32px; padding-top: 24px; border-top: 1px solid #c8bfae; font: 1rem Arial, sans-serif; }}
+    .date {{ margin-top: 12px; font: 700 0.72rem 'Plus Jakarta Sans', sans-serif; text-transform: uppercase; color: #6b6b66; letter-spacing: 0.08em; }}
+    .snapshot {{ font-size: 1.25rem; line-height: 1.55; max-width: 720px; color: #333330; }}
+    .empty {{ margin-top: 32px; padding-top: 24px; border-top: 1px solid #eaeae5; font: 0.95rem 'Plus Jakarta Sans', sans-serif; }}
     @media (max-width: 640px) {{
-      h1 {{ font-size: 1.9rem; line-height: 1; max-height: 7.6rem; }}
+      h1 {{ font-size: 1.95rem; line-height: 1.1; max-height: 7.8rem; }}
     }}
   </style>
 </head>

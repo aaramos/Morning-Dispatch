@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import replace
 from collections.abc import Callable
 from time import perf_counter
@@ -176,6 +177,7 @@ class DiscoveryRunner:
         low_yield: bool = False,
     ) -> DiscoveryResult:
         selection = source_selection or profile.source_selection
+        profile = _sanitize_bounded_recency_queries(profile, context.lookback_hours)
         # Proactive query expansion (item 1): widen the search strategy for every
         # selected source before any adapter runs. Folding the affiliated angles
         # into per-source queries (not the global topic text) means adapters cast
@@ -353,7 +355,57 @@ async def _expand_profile_queries(
                 existing.append(query)
                 seen.add(key)
         source_queries[source] = tuple(existing)
-    return replace(profile, source_queries=source_queries)
+    return _sanitize_bounded_recency_queries(
+        replace(profile, source_queries=source_queries),
+        context.lookback_hours,
+    )
+
+
+_YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2}|2100)\b")
+
+
+def _sanitize_bounded_recency_queries(profile: TopicProfile, lookback_hours: int | None) -> TopicProfile:
+    if lookback_hours is None or int(lookback_hours or 0) > 24 * 90:
+        return profile
+    current_year = datetime_now_year()
+
+    def clean_text(value: str) -> str:
+        def replace_year(match: re.Match[str]) -> str:
+            year = int(match.group(1))
+            return str(current_year) if year < current_year else match.group(1)
+
+        return " ".join(_YEAR_RE.sub(replace_year, str(value or "")).split()).strip()
+
+    def clean_tuple(values: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            query = clean_text(value)
+            key = query.casefold()
+            if query and key not in seen:
+                cleaned.append(query)
+                seen.add(key)
+        return tuple(cleaned)
+
+    source_queries = {
+        source: clean_tuple(tuple(values))
+        for source, values in profile.source_queries.items()
+    }
+    updated = replace(
+        profile,
+        search_queries=clean_tuple(profile.search_queries),
+        source_queries=source_queries,
+        direct_episode_queries=clean_tuple(profile.direct_episode_queries),
+        related_episode_queries=clean_tuple(profile.related_episode_queries),
+        priority_terms=clean_tuple(profile.priority_terms),
+    )
+    return updated
+
+
+def datetime_now_year() -> int:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).year
 
 
 def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candidate]:

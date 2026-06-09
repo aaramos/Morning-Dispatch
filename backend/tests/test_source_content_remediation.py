@@ -12,11 +12,13 @@ import asyncio
 
 from backend.agents.digestor import podcast
 from backend.agents.digestor.base import NormalizedPayload
-from backend.agents.discovery import runner
+from backend.agents.discovery import adapters, query_refiner, runner
+from backend.agents.discovery.markets import resolve_tickers_from_text
 from backend.agents.discovery.types import (
     AdapterStatus,
     Candidate,
     DiscoveryResult,
+    SourceAdapterContext,
     TopicProfile,
 )
 from backend.agents.librarian.articles import ArticleFetchResult
@@ -164,17 +166,33 @@ def test_fetch_budget_reserves_web_foreign_under_newsletter_flood() -> None:
     payloads, budgets = explore._select_fetch_payloads_for_budget(cands, profile=profile, max_articles=20)
     assert budgets.get("web_search", 0) >= 5
     assert budgets.get("foreign_media", 0) >= 5
-    # Direct gmail bodies bypass the HTTP budget (capped only by inclusion limit).
-    assert sum(1 for p in payloads if p.source_type == "gmail") == 25
+    # Direct gmail bodies bypass the HTTP budget. They oversample to 2x the inclusion
+    # cap (25 -> 50) but are bounded by what's available (40), so all 40 enter
+    # enrichment; the inclusion cap is re-applied downstream.
+    assert sum(1 for p in payloads if p.source_type == "gmail") == 40
 
 
-def test_fetch_budget_generous_gives_full_per_source() -> None:
+def test_fetch_budget_oversamples_beyond_inclusion_cap_when_budget_allows() -> None:
+    # With ample global budget, each HTTP lane fetches up to 2x its inclusion cap
+    # (bounded by availability) so recency/audit attrition can't starve it. The
+    # final brief is still capped at the inclusion limit by _enforce_inclusion_limits.
     profile = _profile()
     cands = [_cand("web_search", "gmail_link", i, {"search_query": "q"}) for i in range(50)]
     cands += [_cand("foreign_media", "foreign_web", i, {"source_language": "ko"}) for i in range(30)]
     _payloads, budgets = explore._select_fetch_payloads_for_budget(cands, profile=profile, max_articles=250)
-    assert budgets["web_search"] == 25
-    assert budgets["foreign_media"] == 25
+    # web: oversample 2x25=50, bounded by 50 available -> 50 (was capped at 25 before).
+    assert budgets["web_search"] == 50
+    # foreign: oversample cap 50 but only 30 available -> 30.
+    assert budgets["foreign_media"] == 30
+
+
+def test_fetch_oversample_still_bounded_by_global_budget() -> None:
+    # The oversample headroom never exceeds the global article-fetch budget.
+    profile = _profile()
+    cands = [_cand("web_search", "gmail_link", i, {"search_query": "q"}) for i in range(80)]
+    cands += [_cand("foreign_media", "foreign_web", i, {"source_language": "ko"}) for i in range(80)]
+    _payloads, budgets = explore._select_fetch_payloads_for_budget(cands, profile=profile, max_articles=30)
+    assert sum(budgets.values()) <= 30
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +269,95 @@ def test_broaden_seeds_starved_lanes(monkeypatch) -> None:
     assert "AI infrastructure" in out.source_queries["foreign_media"]
     assert "AI infrastructure" in out.source_queries["web_search"]
     assert "AI capex" in out.source_queries["web_search"]  # existing preserved
+
+
+def test_gmail_adapter_uses_profile_approved_senders(monkeypatch) -> None:
+    captured: dict[str, list[str]] = {}
+
+    async def fake_fetch_newsletters(*, digest_id, sender_allowlist, lookback_hours, db_path):
+        captured["senders"] = list(sender_allowlist)
+        return [
+            NormalizedPayload(
+                source_type="gmail",
+                source_name="The Deep View",
+                raw_text="Newsletter body about Apple Intelligence.",
+                metadata={"sender_email": sender_allowlist[0]},
+            )
+        ]
+
+    monkeypatch.setattr(adapters.database, "approved_gmail_senders", lambda: [])
+    monkeypatch.setattr(adapters, "fetch_newsletters", fake_fetch_newsletters)
+    profile = _profile(
+        gmail_rules={"include_senders": ["Newsletter@TheDeepView.co", "bad-value"]},
+        source_selection={"gmail": True},
+    )
+
+    candidates = asyncio.run(
+        adapters.GmailSourceAdapter().query(
+            profile,
+            SourceAdapterContext(exploration_id="gmail-profile-test", lookback_hours=168, candidate_limit=10),
+        )
+    )
+
+    assert captured["senders"] == ["newsletter@thedeepview.co"]
+    assert len(candidates) == 1
+
+
+def test_bounded_recency_sanitizes_stale_years_before_discovery() -> None:
+    profile = _profile(
+        search_queries=["Apple WWDC 2024 AI announcements summary"],
+        source_queries={
+            "web_search": ["best AI productivity apps for Mac 2024"],
+            "podcasts": ["consumer AI trends 2024"],
+        },
+        direct_episode_queries=["WWDC 2024 Apple AI"],
+        related_episode_queries=["consumer AI trends 2024"],
+    )
+
+    sanitized = runner._sanitize_bounded_recency_queries(profile, 168)
+    joined = " ".join([
+        *sanitized.search_queries,
+        *sanitized.source_queries["web_search"],
+        *sanitized.source_queries["podcasts"],
+        *sanitized.direct_episode_queries,
+        *sanitized.related_episode_queries,
+    ])
+
+    assert "2024" not in joined
+    assert str(runner.datetime_now_year()) in joined
+
+
+def test_market_ticker_resolution_ignores_plain_words_and_years() -> None:
+    assert resolve_tickers_from_text("I WWDC 2024 256 GB RAM OS MLX UI UX GUI") == []
+    assert resolve_tickers_from_text("Apple Intelligence on Mac") == ["AAPL"]
+
+
+def test_screening_preserves_selected_podcast_when_model_drops_all(monkeypatch) -> None:
+    payload = NormalizedPayload(
+        source_type="podcast_episode",
+        source_name="AI & I",
+        raw_text="Adjacent conversation about Apple Intelligence and product strategy.",
+        original_url="https://podcasts.example.com/episode",
+        metadata={"title": "Adjacent AI conversation", "podcast_title": "AI & I"},
+    )
+    candidate = Candidate(adapter="podcasts", payload=payload, score=0.2)
+
+    class FakeClient:
+        async def complete_json(self, **_kwargs):
+            return {"decisions": [{"id": payload.id, "decision": "drop"}]}
+
+    class Res:
+        client = FakeClient()
+
+    monkeypatch.setattr(query_refiner.model_routing, "client_for_agent", lambda *a, **k: Res())
+    exclusions: list[dict] = []
+    profile = _profile(source_selection={"podcasts": True})
+
+    screened = asyncio.run(query_refiner.screen_candidates(profile, [candidate], exclusions=exclusions))
+
+    assert screened == [candidate]
+    assert screened[0].payload.metadata["screening_preserved_low_yield"] is True
+    assert exclusions == []
 
 
 def test_broaden_updates_podcast_strategy_for_starved_podcast(monkeypatch) -> None:
