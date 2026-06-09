@@ -195,6 +195,50 @@ def test_fetch_oversample_still_bounded_by_global_budget() -> None:
     assert sum(budgets.values()) <= 30
 
 
+def test_recency_prescreen_drops_known_stale_before_budget() -> None:
+    # Known-stale candidates (provider date older than the cutoff) are removed
+    # before the fetch budget, so the budget targets the in-window pool instead
+    # of being spent on items recency would drop right after fetching them.
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(hours=168)
+    fresh = now - timedelta(hours=2)
+    stale = now - timedelta(days=30)
+    profile = _profile()
+    cands = []
+    cands += [
+        _cand("web_search", "gmail_link", i, {"search_query": "q", "published_at": stale.isoformat()})
+        for i in range(40)
+    ]
+    cands += [
+        _cand("web_search", "gmail_link", 100 + i, {"search_query": "q", "published_at": fresh.isoformat()})
+        for i in range(10)
+    ]
+    # Undated candidates must survive the pre-screen (date resolved post-fetch).
+    cands += [_cand("web_search", "gmail_link", 200 + i, {"search_query": "q"}) for i in range(5)]
+
+    payloads, _budgets = explore._select_fetch_payloads_for_budget(
+        cands, profile=profile, max_articles=250, cutoff=cutoff
+    )
+    selected_dates = {p.metadata.get("published_at") for p in payloads}
+    assert stale.isoformat() not in selected_dates  # known-stale pre-dropped
+    assert fresh.isoformat() in selected_dates  # in-window kept
+    # 10 fresh + 5 undated survive the screen; none of the 40 stale do.
+    assert len(payloads) == 15
+
+
+def test_recency_prescreen_skipped_when_no_cutoff() -> None:
+    # With no bounded window (all-available), nothing is pre-dropped on date.
+    from datetime import UTC, datetime, timedelta
+
+    stale = (datetime.now(UTC) - timedelta(days=400)).isoformat()
+    profile = _profile()
+    cands = [_cand("web_search", "gmail_link", i, {"search_query": "q", "published_at": stale}) for i in range(5)]
+    payloads, _ = explore._select_fetch_payloads_for_budget(cands, profile=profile, max_articles=250, cutoff=None)
+    assert len(payloads) == 5
+
+
 # ---------------------------------------------------------------------------
 # P2: origin labels + empty per-source real estate
 # ---------------------------------------------------------------------------

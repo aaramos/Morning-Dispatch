@@ -739,6 +739,7 @@ async def _run_exploration(
                     get_settings(),
                     current_profile,
                 )["article_fetches"],
+                cutoff=(datetime.now(UTC) - timedelta(hours=int(lookback_hours))) if lookback_hours else None,
             )
             stage_seconds = {"discovery": round(monotonic() - started_at, 3)}
             _set_pipeline_stage(progress, "fetch", "running")
@@ -1349,13 +1350,46 @@ def _compact_podcast_strategy(profile: TopicProfile) -> dict[str, list[str]]:
     }
 
 
+def _candidate_known_stale(candidate: Candidate, cutoff: datetime) -> bool:
+    """True only when a candidate's *already-known* date is confidently before the cutoff.
+
+    Mirrors the URL-date and published_at rejection paths in
+    `_source_window_rejection_reason`, so pre-dropping these before the fetch
+    budget changes no final outcome — it just stops the budget being spent on
+    candidates that recency would drop anyway. Undated candidates return False
+    (kept) so their date can still be resolved after fetch; the strict-undated
+    decision stays in the post-fetch window filter.
+    """
+    payload = candidate.payload
+    url_date = _date_from_url(getattr(payload, "original_url", None))
+    if url_date is not None and url_date < cutoff:
+        return True
+    values: list[Any] = [getattr(payload, "published_at", None)]
+    metadata = payload.metadata if isinstance(getattr(payload, "metadata", None), dict) else {}
+    for key in _DATE_METADATA_KEYS:
+        values.append(metadata.get(key))
+    for value in values:
+        parsed = _parse_datetime_hint(value)
+        if parsed is not None:
+            return parsed < cutoff
+    return False
+
+
 def _select_fetch_payloads_for_budget(
     candidates: list[Candidate],
     *,
     profile: TopicProfile,
     max_articles: int,
+    cutoff: datetime | None = None,
 ) -> tuple[list[NormalizedPayload], dict[str, int]]:
     source_selection = profile.source_selection or {}
+
+    # Recency pre-screen (P0): when a bounded window is active, drop candidates we
+    # already know are stale BEFORE allocating the fetch budget, so the budget
+    # targets the in-window (or not-yet-dated) pool instead of being spent on
+    # items recency would discard right after fetching them.
+    if cutoff is not None:
+        candidates = [c for c in candidates if not _candidate_known_stale(c, cutoff)]
 
     # Direct sources need no outbound fetch, so they bypass the HTTP budget
     # entirely (P1) — they are merely capped at their per-source inclusion limit

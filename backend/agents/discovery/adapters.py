@@ -1128,16 +1128,34 @@ class RedditSourceAdapter:
                 logger.warning("Exception searching Reddit via web for query %s: %s", q, exc)
                 return []
 
-        async def fetch_comments_for_post(client: httpx.AsyncClient, sub: str, post_id: str) -> str:
+        async def fetch_comments_for_post(client: httpx.AsyncClient, sub: str, post_id: str) -> tuple[str, str | None]:
+            """Fetch a post's comment thread and derive a recency date for it.
+
+            Returns (comments_text, thread_date_iso). Reddit's authoritative JSON
+            (created_utc) is 403-blocked for unauthenticated requests, but the comment
+            thread's Atom feed (already fetched here) is allowed and carries the thread's
+            most-recent-activity timestamp. We use that as the post's recency date for
+            search-path posts that arrived without one, so a recently-discussed thread is
+            no longer dropped as "undated". Fails open to (text, None).
+            """
             url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.rss"
             async with comments_semaphore:
                 try:
                     response = await client.get(url, headers=headers, timeout=request_timeout)
                     if response.status_code != 200:
                         logger.warning("Comments RSS returned status %d for post %s, continuing without comments", response.status_code, post_id)
-                        return ""
+                        return "", None
 
                     feed = feedparser.parse(response.text)
+                    thread_date: str | None = None
+                    date_struct = feed.feed.get("updated_parsed") or feed.feed.get("published_parsed")
+                    if not date_struct and feed.entries:
+                        date_struct = feed.entries[0].get("updated_parsed") or feed.entries[0].get("published_parsed")
+                    if date_struct:
+                        try:
+                            thread_date = datetime(*date_struct[:6], tzinfo=UTC).isoformat(timespec="seconds")
+                        except Exception:
+                            thread_date = None
                     lines = ["--- Top Comments ---"]
                     count = 0
                     for entry in feed.entries:
@@ -1172,12 +1190,11 @@ class RedditSourceAdapter:
                         if count >= comments_limit:
                             break
                     
-                    if len(lines) > 1:
-                        return "\n".join(lines)
-                    return ""
+                    comments_text = "\n".join(lines) if len(lines) > 1 else ""
+                    return comments_text, thread_date
                 except Exception as exc:
                     logger.warning("Exception fetching comments RSS for post %s: %s", post_id, exc)
-                    return ""
+                    return "", None
 
         # Run initial fetch
         async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=None) as client:
@@ -1243,13 +1260,17 @@ class RedditSourceAdapter:
             raw_candidates.sort(key=lambda x: x["prelim_score"], reverse=True)
             target_raw = raw_candidates[:reddit_candidate_cap]
 
-            # Fetch comments in parallel for selected posts
+            # Fetch comments in parallel for selected posts. Each fetch also returns the
+            # thread's recency date so search-path posts (which arrive without one) get a
+            # usable timestamp instead of being dropped downstream as "undated".
             comment_tasks = [fetch_comments_for_post(client, post["subreddit"], post["id"]) for post in target_raw]
             comments_results = await asyncio.gather(*comment_tasks)
 
             # Build Candidates list
             candidates = []
-            for post, comments_str in zip(target_raw, comments_results, strict=True):
+            for post, (comments_str, thread_date) in zip(target_raw, comments_results, strict=True):
+                if not post["published_at"] and thread_date:
+                    post["published_at"] = thread_date
                 # Construct NormalizedPayload
                 original_url = post["discussion_url"] if post["is_self"] else post["url"]
 
@@ -1365,8 +1386,10 @@ class RedditSourceAdapter:
                     ref_comments_results = await asyncio.gather(*ref_comment_tasks)
 
                     # Build refined candidates
-                    for post, comments_str in zip(ref_target_raw, ref_comments_results, strict=True):
+                    for post, (comments_str, thread_date) in zip(ref_target_raw, ref_comments_results, strict=True):
                         original_url = post["discussion_url"] if post["is_self"] else post["url"]
+                        if not post["published_at"] and thread_date:
+                            post["published_at"] = thread_date
 
                         text_parts = [post["title"]]
                         if post["selftext"]:

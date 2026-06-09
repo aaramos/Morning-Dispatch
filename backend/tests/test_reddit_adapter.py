@@ -299,6 +299,81 @@ def test_reddit_adapter_query_refinement(monkeypatch, tmp_path) -> None:
     assert candidates[0].payload.metadata["subreddit"] == "artificial"
 
 
+def test_reddit_search_post_resolves_missing_date_from_thread(monkeypatch, tmp_path) -> None:
+    """A search-path post with no provider date gets a recency date from its comment
+    thread's Atom feed (reddit's authoritative JSON is 403-blocked), so it isn't
+    excluded downstream as 'undated'."""
+    _runtime(monkeypatch, tmp_path)
+    from backend.agents.discovery.web_search import SearchHit
+
+    thread_updated = (datetime.now(UTC) - timedelta(hours=3)).isoformat(timespec="seconds")
+
+    async def mock_search_web(query: str, limit: int, days: int | None = None) -> list[SearchHit]:
+        return [
+            SearchHit(
+                provider="test",
+                title="Undated reddit post",
+                url="https://www.reddit.com/r/LocalLLaMA/comments/abc123/undated_post/",
+                snippet="No date from the web provider.",
+                score=0.8,
+                published_at=None,  # provider gave no date — must be resolved from the thread
+            )
+        ]
+
+    comments_rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <updated>{thread_updated}</updated>
+      <entry><title>c</title><content type="html">&lt;p&gt;A comment.&lt;/p&gt;</content><author><name>/u/x</name></author></entry>
+    </feed>"""
+
+    class FakeResponse:
+        def __init__(self, status_code: int, text_content: str) -> None:
+            self.status_code = status_code
+            self._text = text_content
+
+        @property
+        def text(self) -> str:
+            return self._text
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, url: str, **kwargs) -> FakeResponse:
+            if "hot/.rss" in url:
+                return FakeResponse(200, """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>""")
+            if "/comments/" in url:
+                return FakeResponse(200, comments_rss)
+            return FakeResponse(404, "")
+
+    async def mock_expand(*_args) -> Any:
+        return SimpleNamespace(subreddits=[], search_queries=["localllama"])
+
+    async def mock_refine_queries(*args, **kwargs) -> list[str]:
+        return []
+
+    monkeypatch.setattr(adapters, "expand_reddit_targets", mock_expand)
+    monkeypatch.setattr(adapters, "search_web", mock_search_web)
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr("backend.agents.discovery.query_refiner.refine_queries_for_adapter", mock_refine_queries)
+
+    adapter = RedditSourceAdapter()
+    candidates = asyncio.run(
+        adapter.query(
+            TopicProfile.from_dict({"statement": "AI Coding", "scope": "AI Coding"}),
+            SourceAdapterContext(exploration_id="explore-test", lookback_hours=24),
+        )
+    )
+    assert len(candidates) == 1
+    assert candidates[0].payload.published_at == thread_updated
+
+
 def test_reddit_adapter_low_yield_empty_raises_unavailable(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
 
