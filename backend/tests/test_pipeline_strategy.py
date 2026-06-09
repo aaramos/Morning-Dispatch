@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery.adapters import _promoted_refs, _source_plan_refs
-from backend.agents.discovery.runner import _expand_profile_queries
+from backend.agents.discovery.runner import _expand_profile_queries, datetime_now_year
 from backend.agents.discovery.types import SourceAdapterContext, TopicProfile
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.app.db import database
@@ -191,6 +191,31 @@ def test_expand_profile_queries_fails_open_without_client(monkeypatch) -> None:
         _expand_profile_queries(profile, profile.source_selection, context, low_yield=False)
     )
     assert expanded is profile
+
+
+def test_expand_profile_queries_scrubs_stale_years_even_without_client(monkeypatch) -> None:
+    # Even when expansion produces nothing (no client), stored stale-year queries must
+    # be sanitized so they don't pull out-of-window content the recency filter discards.
+    from backend.app.services import model_routing
+
+    class NoResolution:
+        client = None
+
+    monkeypatch.setattr(model_routing, "client_for_agent", lambda *a, **k: NoResolution())
+    profile = TopicProfile.from_dict({
+        "topic_id": "topic-stale",
+        "statement": "Mac local AI",
+        "source_queries": {"web_search": ["best local AI tools for Mac 2024", "WWDC 2025 recap"]},
+        "source_selection": {"web_search": True},
+        "lookback_hours": 168,
+    })
+    context = SourceAdapterContext(exploration_id="explore-stale", candidate_limit=10, lookback_hours=168)
+    expanded = asyncio.run(
+        _expand_profile_queries(profile, profile.source_selection, context, low_yield=False)
+    )
+    joined = " ".join(expanded.source_queries["web_search"])
+    assert "2024" not in joined and "2025" not in joined
+    assert str(datetime_now_year()) in joined
 
 
 # ---------------------------------------------------------------------------

@@ -506,31 +506,98 @@ def _link_context(anchor: Any) -> str:
     return f"{context[:699].rstrip()}..."
 
 
+_LINK_SOCIAL_DOMAINS = (
+    "twitter.com",
+    "x.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "tiktok.com",
+    "threads.net",
+    "whatsapp.com",
+    "t.me",
+    "telegram.me",
+    "apps.apple.com",
+    "play.google.com",
+)
+_LINK_NAV_TEXTS = frozenset(
+    {
+        "",
+        "twitter",
+        "x",
+        "facebook",
+        "instagram",
+        "linkedin",
+        "youtube",
+        "tiktok",
+        "threads",
+        "reddit",
+        "discord",
+        "home",
+        "menu",
+        "shop",
+        "store",
+        "click here",
+        "here",
+        "read",
+        "more",
+        "read more",
+        "learn more",
+        "see more",
+        "view online",
+        "read online",
+        "view all",
+        "see all",
+        "download",
+        "get the app",
+        "share",
+        "forward",
+    }
+)
+
+
 def _keep_newsletter_link(url: str, text: str) -> bool:
-    text_key = text.lower()
+    text_key = text.strip().lower()
+    # An article link carries real anchor text. Empty/boilerplate-nav anchors (the bulk
+    # of newsletter junk: "View Online", "Shop", social icons, empty image links) are
+    # navigation/chrome, not content — drop them before they flood screening.
+    if text_key in _LINK_NAV_TEXTS:
+        return False
+    if len(text_key) < 3:
+        return False
     utility_phrases = (
         "advertise",
         "archive",
         "community ai workflows",
         "email preferences",
         "follow on",
+        "forward to a friend",
+        "refer a friend",
         "highlights: news, guides & events",
         "join the ai university",
         "manage preferences",
         "manage subscription",
         "privacy policy",
+        "read in browser",
+        "read this email",
         "sign up",
+        "sponsored",
         "subscribe",
         "terms of",
         "trending ai tools",
         "unsubscribe",
         "update preferences",
+        "update your preferences",
         "view in browser",
+        "view this email",
     )
     if any(phrase in text_key for phrase in utility_phrases):
         return False
 
     parsed = urlparse(url)
+    netloc = parsed.netloc.lower()
+    if any(netloc == domain or netloc.endswith("." + domain) for domain in _LINK_SOCIAL_DOMAINS):
+        return False
     path = parsed.path.lower()
     if path.endswith((".gif", ".jpg", ".jpeg", ".png", ".webp", ".svg")):
         return False

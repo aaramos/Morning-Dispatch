@@ -139,9 +139,9 @@ def test_newsletter_body_becomes_payload(monkeypatch, tmp_path):
 def test_links_extracted_as_separate_payloads(monkeypatch, tmp_path):
     db_path = init_db(tmp_path / "dispatch.sqlite3")
     html = """
-    <a href="https://example.com/a">A</a>
-    <a href="https://example.com/b">B</a>
-    <a href="https://example.com/c">C</a>
+    <a href="https://example.com/a">Apple unveils new AI features</a>
+    <a href="https://example.com/b">Running large models on Mac Studio</a>
+    <a href="https://example.com/c">MLX framework deep dive</a>
     """
     monkeypatch.setattr(
         gmail,
@@ -158,7 +158,11 @@ def test_links_extracted_as_separate_payloads(monkeypatch, tmp_path):
         "https://example.com/b",
         "https://example.com/c",
     ]
-    assert [payload.metadata["link_text"] for payload in link_payloads] == ["A", "B", "C"]
+    assert [payload.metadata["link_text"] for payload in link_payloads] == [
+        "Apple unveils new AI features",
+        "Running large models on Mac Studio",
+        "MLX framework deep dive",
+    ]
 
 
 def test_utility_links_are_filtered(monkeypatch, tmp_path):
@@ -181,6 +185,31 @@ def test_utility_links_are_filtered(monkeypatch, tmp_path):
     link_payloads = [payload for payload in payloads if payload.source_type == "gmail_link"]
     assert len(link_payloads) == 1
     assert link_payloads[0].original_url == "https://example.com/article"
+
+
+def test_boilerplate_nav_and_social_links_filtered(monkeypatch, tmp_path):
+    # The bulk of newsletter "links" are chrome: empty-text image links, "View Online",
+    # "Shop", and social icons. They must be dropped so they don't flood screening and
+    # cause the whole Gmail lane to be discarded.
+    db_path = init_db(tmp_path / "dispatch.sqlite3")
+    html = """
+    <a href="https://example.com/real-article">Apple expands on-device AI in macOS</a>
+    <a href="https://example.com/hero-image"><img src="x.png"/></a>
+    <a href="https://example.com/online">View Online</a>
+    <a href="https://example.com/shop">Shop</a>
+    <a href="https://twitter.com/someone">Follow us</a>
+    <a href="https://www.linkedin.com/company/x">LinkedIn</a>
+    <a href="https://example.com/click">Click here</a>
+    """
+    monkeypatch.setattr(
+        gmail,
+        "get_gmail_service",
+        lambda: FakeService({"msg-1": gmail_message("msg-1", plain_text="Links inside", html=html)}),
+    )
+
+    payloads = asyncio.run(gmail.fetch_newsletters("digest-1", ["news@example.com"], 24, db_path))
+    link_payloads = [payload for payload in payloads if payload.source_type == "gmail_link"]
+    assert [p.original_url for p in link_payloads] == ["https://example.com/real-article"]
 
 
 def test_pii_filtered_payload_dropped(monkeypatch, tmp_path):
@@ -239,7 +268,7 @@ def test_watermark_uses_newest_message_when_gmail_returns_newest_first(monkeypat
 
 def test_deduplication_by_url(monkeypatch, tmp_path):
     db_path = init_db(tmp_path / "dispatch.sqlite3")
-    html = '<a href="https://example.com/a">A</a>'
+    html = '<a href="https://example.com/a">Apple AI feature deep dive</a>'
     monkeypatch.setattr(
         gmail,
         "get_gmail_service",

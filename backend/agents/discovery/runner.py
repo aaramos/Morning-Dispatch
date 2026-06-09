@@ -343,7 +343,10 @@ async def _expand_profile_queries(
 
     expansions = await expand_search_strategy(profile, lookback_hours=context.lookback_hours)
     if not expansions:
-        return profile
+        # Even with nothing to add, scrub stale-year markers so a stored strategy's
+        # "...2024"/"...2025" queries can't pull out-of-window content that recency
+        # then discards. (Previously this early-return skipped sanitization entirely.)
+        return _sanitize_bounded_recency_queries(profile, context.lookback_hours)
 
     source_queries = {key: tuple(value) for key, value in profile.source_queries.items()}
     for source in selected:
@@ -391,15 +394,28 @@ def _sanitize_bounded_recency_queries(profile: TopicProfile, lookback_hours: int
         source: clean_tuple(tuple(values))
         for source, values in profile.source_queries.items()
     }
-    updated = replace(
+    cleaned_search = clean_tuple(profile.search_queries)
+    cleaned_direct = clean_tuple(profile.direct_episode_queries)
+    cleaned_related = clean_tuple(profile.related_episode_queries)
+    cleaned_priority = clean_tuple(profile.priority_terms)
+    # Nothing stale to rewrite -> return the original object unchanged (keeps the
+    # fail-open "no-op" contract for clean profiles).
+    if (
+        cleaned_search == profile.search_queries
+        and source_queries == {k: tuple(v) for k, v in profile.source_queries.items()}
+        and cleaned_direct == profile.direct_episode_queries
+        and cleaned_related == profile.related_episode_queries
+        and cleaned_priority == profile.priority_terms
+    ):
+        return profile
+    return replace(
         profile,
-        search_queries=clean_tuple(profile.search_queries),
+        search_queries=cleaned_search,
         source_queries=source_queries,
-        direct_episode_queries=clean_tuple(profile.direct_episode_queries),
-        related_episode_queries=clean_tuple(profile.related_episode_queries),
-        priority_terms=clean_tuple(profile.priority_terms),
+        direct_episode_queries=cleaned_direct,
+        related_episode_queries=cleaned_related,
+        priority_terms=cleaned_priority,
     )
-    return updated
 
 
 def datetime_now_year() -> int:
