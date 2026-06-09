@@ -420,11 +420,16 @@ def message_published_at(message: dict[str, Any]) -> str | None:
 
 
 def _after_timestamp(db_path: str, digest_id: str, source_key: str, lookback_hours: int) -> int:
+    # A brief must snapshot the WHOLE recency window every build. Using the advancing
+    # watermark alone meant the first build consumed the window and every rebuild then
+    # fetched only messages newer than the last fetch -> zero newsletters. Bound the
+    # query at the lookback cutoff, never letting the watermark shrink the window below
+    # it (downstream dedup/recency handle re-processing).
+    boundary = int((datetime.now(UTC) - timedelta(hours=lookback_hours)).timestamp())
     watermark = get_watermark(db_path, digest_id, source_key)
     if watermark and watermark.get("last_fetched"):
-        return _timestamp_from_iso(str(watermark["last_fetched"]))
-    boundary = datetime.now(UTC) - timedelta(hours=lookback_hours)
-    return int(boundary.timestamp())
+        return min(_timestamp_from_iso(str(watermark["last_fetched"])), boundary)
+    return boundary
 
 
 def _timestamp_from_iso(value: str) -> int:

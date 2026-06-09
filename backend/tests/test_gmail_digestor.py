@@ -9,6 +9,9 @@ from typing import Any
 import pytest
 
 from backend.agents.digestor import gmail
+
+# Captured before the autouse fixture neutralizes it, so we can test the real logic.
+_REAL_AFTER_TIMESTAMP = gmail._after_timestamp
 from backend.app.db.schema import SCHEMA_SQL
 from backend.db.queries import get_watermark
 
@@ -264,6 +267,25 @@ def test_watermark_uses_newest_message_when_gmail_returns_newest_first(monkeypat
 
     watermark = get_watermark(db_path, "digest-1", "gmail:news@example.com")
     assert watermark == {"last_fetched": "2026-01-03T00:00:00+00:00", "last_id": "msg-new"}
+
+
+def test_after_timestamp_never_shrinks_below_lookback_window(tmp_path):
+    # A recent watermark must NOT shrink the fetch window: rebuilding a brief has to
+    # re-snapshot the whole recency window, not just messages newer than the last fetch
+    # (otherwise Gmail returns zero on every rebuild).
+    from datetime import UTC, datetime, timedelta
+    from backend.db.queries import upsert_watermark
+
+    db_path = init_db(tmp_path / "dispatch.sqlite3")
+    now = datetime.now(UTC)
+    # Watermark set to "just now" (as if a build a moment ago already consumed the window).
+    upsert_watermark(db_path, "digest-1", "gmail:news@example.com", now.isoformat(timespec="seconds"), "msg-x")
+
+    after = _REAL_AFTER_TIMESTAMP(db_path, "digest-1", "gmail:news@example.com", 168)
+    lookback_boundary = int((now - timedelta(hours=168)).timestamp())
+    # Must use the lookback boundary, not the recent watermark.
+    assert abs(after - lookback_boundary) <= 5
+    assert after < int(now.timestamp()) - 3600
 
 
 def test_deduplication_by_url(monkeypatch, tmp_path):
