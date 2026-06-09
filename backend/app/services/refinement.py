@@ -99,7 +99,7 @@ def start_session(payload: dict[str, Any]) -> dict[str, Any]:
                 "I searched Gmail for that newsletter pattern but didn’t find clear newsletter senders. "
                 "Name any sender or newsletter you want included, or say to continue without Gmail."
             )
-        question += "\n\n*Please also provide explicit instructions on how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
+        question += "\n\n*You can also add optional instructions for how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
         
         messages = [{"role": "assistant", "content": question}]
         session = database.create_refinement_session(
@@ -344,7 +344,7 @@ async def astream_refinement(
                     "I searched Gmail for that newsletter pattern but didn’t find clear newsletter senders. "
                     "Name any sender or newsletter you want included, or say to continue without Gmail."
                 )
-            question += "\n\n*Please also provide explicit instructions on how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
+            question += "\n\n*You can also add optional instructions for how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
 
             messages = [{"role": "assistant", "content": question}]
             session = database.create_refinement_session(
@@ -728,13 +728,22 @@ async def _astream_gmail_approval(
     ``plan`` (session snapshot), and ``done``.
     """
     rules = _normalize_gmail_rules(profile.get("gmail_rules"))
-    include_senders = _selected_gmail_senders(answer, rules)
+    intent_match = re.search(r"Instructions:\s*(.*)", answer, re.DOTALL | re.IGNORECASE)
+    if intent_match:
+        extraction_instructions = intent_match.group(1).strip()
+        sender_part = answer[:intent_match.start()].strip()
+    else:
+        extraction_instructions = ""
+        sender_part = answer
+    include_senders = _selected_gmail_senders(sender_part, rules)
     messages = [*messages, {"role": "user", "content": answer}]
 
     updated_profile = dict(profile)
     if include_senders:
         approved = gmail_allowlist.approve_senders(include_senders, source="refinement")
         rules["include_senders"] = approved or include_senders
+        if extraction_instructions:
+            rules["intent"] = extraction_instructions
         updated_profile["requested_sources"] = _merge_requested_source_lists(
             _normalize_requested_sources(updated_profile.get("requested_sources")),
             [{"adapter": "gmail", "ref": sender} for sender in include_senders],
@@ -755,10 +764,23 @@ async def _astream_gmail_approval(
         confirmation = "Got it — I'll continue without Gmail for this brief."
 
     messages.append({"role": "assistant", "content": confirmation})
-    yield {"type": "token", "text": confirmation}
 
     next_pending = AGENT_PENDING_FIELD if include_senders else None
     ready = not include_senders
+    follow_up = ""
+    if include_senders:
+        missing = _next_missing(updated_profile)
+        follow_up = (
+            _deterministic_question(missing, updated_profile)
+            if missing
+            else _strategy_deepening_question(updated_profile, messages)
+        )
+        if follow_up:
+            messages.append({"role": "assistant", "content": follow_up})
+
+    yield {"type": "token", "text": confirmation}
+    if follow_up:
+        yield {"type": "token", "text": f"\n\n{follow_up}"}
 
     updated = database.update_refinement_session(
         session_id,
@@ -1870,7 +1892,7 @@ def _advance_gmail_refinement(
                 "I searched Gmail for that newsletter pattern but didn’t find clear newsletter senders. "
                 "Name any sender or newsletter you want included, or say to continue without Gmail."
             )
-        intro += "\n\n*Please also provide explicit instructions on how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
+        intro += "\n\n*You can also add optional instructions for how I should extract information from these newsletters (e.g., 'Extract developer tools and ignore sponsorships').*"
 
         return (
             _coerce_profile(updated),
@@ -1890,7 +1912,7 @@ def _advance_gmail_refinement(
             extraction_instructions = intent_match.group(1).strip()
             sender_part = answer[:intent_match.start()].strip()
         else:
-            extraction_instructions = answer.strip()
+            extraction_instructions = ""
             sender_part = answer
 
         include_senders = _selected_gmail_senders(sender_part, rules)
@@ -2347,6 +2369,22 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
         updated["requested_sources"] = _merge_requested_source_lists(requested, requested_patch)
         updated["requested_sources_answered"] = True
 
+    source_feedback = _extract_requested_sources(user_text)
+    if source_feedback:
+        updated["requested_sources"] = _merge_requested_source_lists(
+            _normalize_requested_sources(updated.get("requested_sources")),
+            source_feedback,
+        )
+        updated["requested_sources_answered"] = True
+        source_query_hints: dict[str, list[str]] = {}
+        for source in source_feedback:
+            adapter = str(source.get("adapter") or "").strip()
+            ref = str(source.get("ref") or "").strip()
+            if adapter and ref:
+                source_query_hints.setdefault(adapter, []).append(ref)
+        if source_query_hints:
+            updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), source_query_hints)
+
     if updated.get("subtopics"):
         updated["related_interests_answered"] = True
 
@@ -2508,11 +2546,13 @@ def _email_list(value: Any) -> list[str]:
     emails: list[str] = []
     seen: set[str] = set()
     for item in value:
-        email = str(item or "").strip().lower()
-        if "@" not in email or email in seen:
-            continue
-        emails.append(email)
-        seen.add(email)
+        text = str(item or "").strip().lower()
+        matches = re.findall(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+\.[a-z]{2,}", text)
+        for email in matches:
+            if email in seen:
+                continue
+            emails.append(email)
+            seen.add(email)
     return emails
 
 
@@ -4129,6 +4169,8 @@ def _extract_requested_sources(text: str) -> list[dict[str, str]]:
     if not clean:
         return []
     patterns = (
+        ("podcasts", r"\b(?:what about|how about|add|include|use|try|pull in|look for|find|subscribe to)\s+(.{2,120}?)\s+(?:for|as)\s+(?:a\s+)?(?:podcast|show|episode)\b"),
+        ("podcasts", r"\b(?:what about|how about|add|include|use|try|pull in|look for|find|subscribe to)\s+(.{2,120}?)\s+(?:podcast|show|episode)s?\b"),
         ("podcasts", r"\binclude\s+(?:the\s+)?podcast[:\s]+([^.;,\n]+)"),
         ("podcasts", r"\bpodcast[:\s]+([^.;,\n]+)"),
         ("gmail", r"\binclude\s+(?:the\s+)?newsletter[:\s]+([^.;,\n]+)"),
@@ -4145,7 +4187,7 @@ def _extract_requested_sources(text: str) -> list[dict[str, str]]:
     seen: set[tuple[str, str]] = set()
     for adapter, pattern in patterns:
         for match in re.finditer(pattern, clean, flags=re.IGNORECASE):
-            ref = match.group(1).strip(" .\"'")
+            ref = _clean_requested_source_ref(adapter, match.group(1))
             if not ref:
                 continue
             key = (adapter, ref.lower())
@@ -4154,6 +4196,17 @@ def _extract_requested_sources(text: str) -> list[dict[str, str]]:
             requested.append({"adapter": adapter, "ref": ref})
             seen.add(key)
     return requested
+
+
+def _clean_requested_source_ref(adapter: str, value: Any) -> str:
+    ref = " ".join(str(value or "").split()).strip(" .\"'")
+    if not ref:
+        return ""
+    if adapter == "podcasts":
+        ref = re.sub(r"^(?:the\s+)?podcast\s+", "", ref, flags=re.IGNORECASE).strip()
+        ref = re.sub(r"\s+(?:for|as)\s+(?:a\s+)?(?:podcast|show|episode)s?$", "", ref, flags=re.IGNORECASE).strip()
+        ref = re.sub(r"\s+(?:podcast|show|episode)s?$", "", ref, flags=re.IGNORECASE).strip()
+    return ref.strip(" .\"'")
 
 
 def _normalize_requested_sources(value: Any) -> list[dict[str, str]]:

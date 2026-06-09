@@ -47,6 +47,7 @@ _BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
 _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 150
+_REPORTING_LOG_TIMEOUT_SECONDS = 20
 _STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode", "reddit_post"}
 # Source types that require an outbound HTTP article fetch (they compete for the
 # article-fetch budget). Everything else is "direct" — built straight from the
@@ -808,6 +809,7 @@ async def _run_exploration(
             article_results = await _run_digest_core(**digest_kwargs)
             _raise_if_cancelled(exploration_id)
             stage_seconds["editorial"] = _elapsed_stage_seconds(stage_started)
+            _persist_progress(exploration_id, progress)
 
             # Check yield to see if it is low content yield
             included_count = sum(1 for r in article_results if r.tier != "dropped")
@@ -875,8 +877,7 @@ async def _run_exploration(
         # Extract intermediates and compile/save reporting log
         intermediates = progress.pop("_intermediates", {})
         try:
-            from backend.app.services.reporting import compile_reporting_data, save_reporting_log
-            report_data = compile_reporting_data(
+            report_data = await _build_reporting_log_with_timeout(
                 exploration_id=exploration_id,
                 discovery=discovery,
                 fetched_articles=fetched_articles,
@@ -889,17 +890,31 @@ async def _run_exploration(
                 final_results=article_results,
                 progress=progress,
             )
-            progress["candidate_reporting_data"] = report_data
-            save_reporting_log(exploration_id, report_data)
+            if report_data is not None:
+                progress["candidate_reporting_status"] = {
+                    "status": "saved",
+                    "candidate_count": len(report_data),
+                }
         except Exception as exc:
             logger.exception("Failed to compile or save reporting log for exploration %s: %s", exploration_id, exc)
+            progress["candidate_reporting_status"] = {
+                "status": "failed",
+                "message": "Candidate lifecycle reporting could not be saved; the brief continued without it.",
+            }
         _add_final_source_mix_issues(progress, discovery, article_results, merged_selection)
         # Feedback loop (item 6): learn promoted sources from whatever produced
         # included content on every run mode, not just scheduled ones, so the loop
         # is active for all sources and shapes future discovery queries.
         _promote_explore_sources(topic_id=topic_id, discovery=discovery, article_results=article_results)
         _set_pipeline_stage(progress, "done", "running")
+        progress["queue"] = {
+            **dict(progress.get("queue") or {}),
+            "status": "running",
+            "message": "Finalizing the brief.",
+            "action": queue_action or "build",
+        }
         _set_candidate_count(progress, len(payloads))
+        _persist_progress(exploration_id, progress)
 
         stage_started = monotonic()
         _raise_if_cancelled(exploration_id)
@@ -1037,6 +1052,60 @@ def _apply_model_health_to_progress(progress: dict[str, Any], stats: dict[str, A
         issues.append(issue)
     progress["source_audit_issues"] = issues
     progress["built_with_issues"] = True
+
+
+async def _build_reporting_log_with_timeout(
+    *,
+    exploration_id: str,
+    discovery: DiscoveryResult,
+    fetched_articles: list[ArticleFetchResult],
+    source_window_issues: list[dict[str, Any]],
+    enriched_articles: list[ArticleFetchResult],
+    ranked_articles: list[ArticleFetchResult],
+    after_audit: list[ArticleFetchResult],
+    after_editorial: list[ArticleFetchResult],
+    after_critic: list[ArticleFetchResult],
+    final_results: list[ArticleFetchResult],
+    progress: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Build the diagnostic lifecycle report without blocking brief publication."""
+
+    def _compile_and_save() -> list[dict[str, Any]]:
+        from backend.app.services.reporting import compile_reporting_data, save_reporting_log
+
+        report_data = compile_reporting_data(
+            exploration_id=exploration_id,
+            discovery=discovery,
+            fetched_articles=fetched_articles,
+            source_window_issues=source_window_issues,
+            enriched_articles=enriched_articles,
+            ranked_articles=ranked_articles,
+            after_audit=after_audit,
+            after_editorial=after_editorial,
+            after_critic=after_critic,
+            final_results=final_results,
+            progress=dict(progress),
+        )
+        save_reporting_log(exploration_id, report_data)
+        return report_data
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_compile_and_save),
+            timeout=_REPORTING_LOG_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Candidate lifecycle reporting timed out for exploration %s after %ss; continuing brief publication.",
+            exploration_id,
+            _REPORTING_LOG_TIMEOUT_SECONDS,
+        )
+        progress["candidate_reporting_status"] = {
+            "status": "timed_out",
+            "message": "Candidate lifecycle reporting took too long and was skipped so the brief could publish.",
+        }
+        progress["built_with_issues"] = True
+        return None
 
 
 def _add_final_source_mix_issues(

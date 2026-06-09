@@ -2545,7 +2545,7 @@ function GmailApprovalCard(props: {
     });
   }
 
-  const isSubmitDisabled = props.busy || (selected.size > 0 && !extractionRules.trim());
+  const isSubmitDisabled = props.busy;
 
   return (
     <div className="gmail-approval-card">
@@ -2596,7 +2596,7 @@ function GmailApprovalCard(props: {
       {selected.size > 0 ? (
         <div style={{ marginTop: "14px", marginBottom: "14px" }} className="gmail-instructions-block">
           <label style={{ display: "block", marginBottom: "6px", fontSize: "0.88rem", fontWeight: 700, color: "#1d1d1b" }} htmlFor="gmail-rules-textarea">
-            Provide explicit instructions on how I should extract information from these newsletters (required):
+            Add extraction instructions for these newsletters (optional):
           </label>
           <textarea
             id="gmail-rules-textarea"
@@ -2755,10 +2755,13 @@ function RefinementPanel(props: {
                         <span className="stream-caret" />
                       </>
                     ) : (
-                      <span className="typing-dots">
-                        <span />
-                        <span />
-                        <span />
+                      <span className="chat-model-waiting" role="status" aria-live="polite">
+                        <span className="typing-dots" aria-hidden="true">
+                          <span />
+                          <span />
+                          <span />
+                        </span>
+                        Waiting for the model…
                       </span>
                     )}
                   </div>
@@ -2927,14 +2930,9 @@ function RefinementPanel(props: {
                   onToggle={props.onSourceToggle}
                 />
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
-                  {props.streaming ? (
-                    <span className="chat-streaming-note">
-                      <span className="typing-dots small"><span/><span/><span/></span>
-                      Morning Dispatch is replying…
-                    </span>
-                  ) : (
-                    <span className="muted-hint">Enter to send · Shift+Enter for a new line</span>
-                  )}
+                  <span className="muted-hint">
+                    {props.streaming ? "" : "Enter to send · Shift+Enter for a new line"}
+                  </span>
                   <span style={{ flex: 1 }} />
                   <button type="button" className="primary-action strategy-confirm-action" onClick={props.onJustGo} disabled={props.busy}>
                     Confirm Search Strategy

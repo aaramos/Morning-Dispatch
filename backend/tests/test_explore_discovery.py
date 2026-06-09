@@ -1893,6 +1893,11 @@ def test_explore_email_marks_exploration_emailed(monkeypatch, tmp_path) -> None:
             f"/api/explore/topic-profiles/{profile['topic_id']}/run",
             json={"source_selection": {"gmail": False, "reddit": False, "podcasts": False, "web_search": False}},
         ).json()
+        for _ in range(20):
+            exploration = client.get(f"/api/explore/explorations/{run['exploration']['exploration_id']}")
+            if exploration.json().get("brief_ref"):
+                break
+            time.sleep(0.05)
         sent = client.post(
             f"/api/explore/explorations/{run['exploration']['exploration_id']}/email",
             json={"recipient_email": "adrian@example.com"},
@@ -2019,6 +2024,30 @@ def test_streaming_finalized_refinement_session_accepts_strategy_correction(monk
         for message in done["session"]["messages"]
         if message["role"] == "user"
     )
+
+
+def test_chat_source_feedback_adds_named_podcast_to_strategy(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    from backend.app.services import refinement
+
+    base = {
+        "statement": "Track AI model releases",
+        "scope": "Track AI model releases",
+        "source_selection": {"podcasts": True, "web_search": True},
+        "source_queries": {"podcasts": ["AI model release interviews"]},
+        "requested_sources": [],
+    }
+
+    updated = refinement._merge_agent_profile_patch(
+        base,
+        {"scope": "Track AI model releases and podcast discussions"},
+        user_text="what about The AI Daily Brief for podcast",
+    )
+
+    assert {"adapter": "podcasts", "ref": "The AI Daily Brief"} in updated["requested_sources"]
+    assert "The AI Daily Brief" in updated["source_queries"]["podcasts"]
+    assert updated["requested_sources_answered"] is True
 
 
 def test_refinement_session_default_sources_are_web_only(monkeypatch, tmp_path) -> None:
@@ -2808,6 +2837,114 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
         assert final_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
         assert final_body["profile"]["gmail_rules"]["intent"] == "Extract AI topics and ignore ads"
         assert {"adapter": "gmail", "ref": "ai@example.com"} in final_body["profile"]["requested_sources"]
+
+
+def test_gmail_refinement_can_approve_sender_without_extraction_rules(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    from backend.app.services import refinement
+
+    class CandidateRecord:
+        sender = "ai@example.com"
+        sender_name = "AI Weekly"
+        subject = "AI Weekly: agents and infrastructure"
+        message_count = 2
+        latest_at = "2026-05-28T12:00:00+00:00"
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "sender": self.sender,
+                "sender_name": self.sender_name,
+                "subject": self.subject,
+                "message_count": self.message_count,
+                "latest_at": self.latest_at,
+            }
+
+    async def fake_discover_newsletter_candidates(*_args: Any, **_kwargs: Any) -> list[CandidateRecord]:
+        return [CandidateRecord()]
+
+    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Track AI infrastructure",
+                "source_selection": {"gmail": True, "web_search": True},
+            },
+        )
+        assert started.status_code == 201
+
+        confirmed = client.post(
+            f"/api/explore/refinement-sessions/{started.json()['session_id']}/messages",
+            json={"answer": "Approved: ai@example.com"},
+        )
+        assert confirmed.status_code == 200
+        confirmed_body = confirmed.json()
+        assert confirmed_body["profile"]["gmail_rules"]["include_senders"] == ["ai@example.com"]
+        assert confirmed_body["profile"]["gmail_rules"].get("intent") == "Track AI infrastructure"
+        assert {"adapter": "gmail", "ref": "ai@example.com"} in confirmed_body["profile"]["requested_sources"]
+
+
+def test_streaming_gmail_approval_prompts_for_next_refinement(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    from backend.app.services import refinement
+
+    class CandidateRecord:
+        sender = "ai@example.com"
+        sender_name = "AI Weekly"
+        subject = "AI Weekly: agents and infrastructure"
+        message_count = 2
+        latest_at = "2026-05-28T12:00:00+00:00"
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "sender": self.sender,
+                "sender_name": self.sender_name,
+                "subject": self.subject,
+                "message_count": self.message_count,
+                "latest_at": self.latest_at,
+            }
+
+    async def fake_discover_newsletter_candidates(*_args: Any, **_kwargs: Any) -> list[CandidateRecord]:
+        return [CandidateRecord()]
+
+    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        started = client.post(
+            "/api/explore/refinement-sessions",
+            json={
+                "statement": "Track AI infrastructure",
+                "source_selection": {"gmail": True, "web_search": True},
+            },
+        )
+        assert started.status_code == 201
+        session_id = started.json()["session_id"]
+
+    events: list[dict[str, Any]] = []
+
+    async def collect_events() -> None:
+        async for event in refinement.astream_refinement(
+            session_id=session_id,
+            statement="Track AI infrastructure",
+            source_selection={"gmail": True, "web_search": True},
+            models={},
+            answer="Approved: ai@example.com",
+            just_go_now=False,
+        ):
+            events.append(event)
+
+    asyncio.run(collect_events())
+
+    done = next(event for event in reversed(events) if event["type"] == "done")
+    assert done["ready"] is False
+    assert done["session"]["status"] == "active"
+    assert done["session"]["pending_field"] == "refinement_agent"
+    assistant_messages = [message["content"] for message in done["session"]["messages"] if message["role"] == "assistant"]
+    assert "Added ai@example.com" in assistant_messages[-2]
+    assert assistant_messages[-1].endswith("?")
 
 
 def test_gmail_refinement_can_continue_without_gmail_after_empty_scan(monkeypatch, tmp_path) -> None:
