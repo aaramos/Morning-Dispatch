@@ -497,7 +497,7 @@ async def run_discovery(
         progress["cancel_requested"] = True
         progress["error"] = str(exc) or "Build stopped by user."
         _set_pipeline_stage(progress, "done", "failed")
-        database.update_exploration_progress(exploration_id, progress=progress)
+        _persist_progress(exploration_id, progress)
         database.update_exploration_status(
             exploration_id,
             status="failed",
@@ -995,7 +995,7 @@ async def _run_exploration(
         )
         _set_pipeline_stage(progress, "done", "failed")
         progress["error"] = str(exc)
-        database.update_exploration_progress(exploration_id, progress=progress)
+        _persist_progress(exploration_id, progress)
         database.update_exploration_status(
             exploration_id,
             status="failed",
@@ -2778,8 +2778,19 @@ def _source_scope_label(lookback_hours: int | None) -> str:
 def _persist_progress(exploration_id: str, progress: dict[str, Any]) -> None:
     database.update_exploration_progress(
         exploration_id,
-        progress=dict(progress),
+        progress=_persistable_progress(progress),
     )
+
+
+def _persistable_progress(progress: dict[str, Any]) -> dict[str, Any]:
+    """Return the public JSON-safe progress payload.
+
+    Internal pipeline bundles such as ``_intermediates`` can contain dataclass
+    instances used by in-process reporting. They should never be written to the
+    exploration progress JSON that powers the UI.
+    """
+
+    return {key: value for key, value in dict(progress).items() if not str(key).startswith("_")}
 
 
 def _elapsed_stage_seconds(started_at: float) -> float:
