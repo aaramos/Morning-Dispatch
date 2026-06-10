@@ -666,6 +666,69 @@ def test_podcast_email_html_link_transformation() -> None:
     assert 'data-podcast-modal-target' not in transformed_html
 
 
+def test_email_html_all_modals_transformation() -> None:
+    from backend.app.services.email_delivery import _email_html
+
+    html_input = """
+    <html>
+      <body>
+        <!-- Foreign language link and modal -->
+        <a class="foreign-article-link" href="#foreign-123" data-foreign-url="https://example.com/spanish-article" data-foreign-title="Spanish Article Title">
+          Spanish Article
+        </a>
+        <div class="podcast-modal foreign-modal" id="foreign-123">
+          <div class="section-kicker">Machine translated from Spanish</div>
+          <h3>Spanish Article Title</h3>
+          <div class="podcast-actions">
+            <a href="https://example.com/spanish-article" data-external-source>View original source</a>
+          </div>
+          <p class="foreign-provenance">Machine translated from Spanish by Gemini</p>
+          <p class="foreign-status">Full article translated</p>
+          <div class="foreign-view" data-foreign-view="translated">
+            <div class="foreign-body">
+              <p>This is the English translation body.</p>
+            </div>
+          </div>
+          <div class="foreign-view" data-foreign-view="original">
+            <div class="foreign-body">
+              <p>Este es el cuerpo original en español.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Newsletter link and modal -->
+        <a class="newsletter-modal-link" href="#newsletter-456">
+          Newsletter item
+        </a>
+        <div class="podcast-modal newsletter-modal" id="newsletter-456">
+          <div class="section-kicker">jane@example.com · June 10</div>
+          <h3>Weekly Newsletter</h3>
+          <section class="newsletter-body">
+            <h4>Newsletter content</h4>
+            <p>This is the newsletter body content.</p>
+          </section>
+        </div>
+      </body>
+    </html>
+    """
+
+    transformed_html = _email_html(html_input)
+
+    # Verify foreign article transformations
+    assert "foreign-modal" not in transformed_html
+    assert 'href="https://example.com/spanish-article"' in transformed_html
+    assert "English Translation" in transformed_html
+    assert "This is the English translation body." in transformed_html
+    assert "Original Text" in transformed_html
+    assert "Este es el cuerpo original en español." in transformed_html
+
+    # Verify newsletter transformations
+    assert 'class="newsletter-modal"' not in transformed_html
+    assert 'id="newsletter-456"' in transformed_html
+    assert "Read Newsletter Content" in transformed_html
+    assert "This is the newsletter body content." in transformed_html
+
+
 def test_youtube_capacity_protection_and_lane_sorting() -> None:
     from backend.agents.discovery.runner import DiscoveryRunner
     from backend.agents.discovery.registry import SourceRegistry

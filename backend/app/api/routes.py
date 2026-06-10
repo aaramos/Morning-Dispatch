@@ -918,8 +918,6 @@ def _issue_html_for_display(
     exploration: dict[str, Any] | None = None,
 ) -> str:
     cleaned = database.clean_issue_html_for_display(html)
-    if exploration and explore.exploration_build_issues(exploration):
-        cleaned = _inject_requested_source_warning(cleaned, str(exploration.get("exploration_id") or ""))
     cleaned = _rewrite_legacy_recency_hours(cleaned)
     cleaned = _rewrite_legacy_sidebar_labels(cleaned)
     cleaned = _rewrite_legacy_story_link_targets(cleaned)
