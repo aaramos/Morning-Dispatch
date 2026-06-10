@@ -79,14 +79,32 @@ async def fetch_articles_for_payloads(
     from backend.app.core.config import get_settings
 
     cache_ttl = max(0, int(get_settings().article_fetch_cache_ttl_seconds))
-    semaphore = asyncio.Semaphore(concurrency)
+    global_semaphore = asyncio.Semaphore(concurrency)
+    domain_semaphores: dict[str, asyncio.Semaphore] = {}
+
+    def get_domain_semaphore(url: str) -> asyncio.Semaphore | None:
+        domain = _domain(url)
+        if not domain:
+            return None
+        domain = domain.lower()
+        if domain not in domain_semaphores:
+            domain_semaphores[domain] = asyncio.Semaphore(3)
+        return domain_semaphores[domain]
+
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=REQUEST_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
     ) as client:
         tasks = [
-            _fetch_one(client, semaphore, payload, cache_ttl=cache_ttl, force_refresh=force_refresh)
+            _fetch_one(
+                client,
+                global_semaphore,
+                payload,
+                domain_semaphore=get_domain_semaphore(payload.original_url),
+                cache_ttl=cache_ttl,
+                force_refresh=force_refresh,
+            )
             for payload in selected_payloads
         ]
         results = await asyncio.gather(*tasks)
@@ -292,12 +310,15 @@ async def _fetch_one(
     semaphore: asyncio.Semaphore,
     payload: NormalizedPayload,
     *,
+    domain_semaphore: asyncio.Semaphore | None = None,
     cache_ttl: int = 0,
     force_refresh: bool = False,
 ) -> ArticleFetchResult:
     original_url = canonicalize_url(unwrap_redirect_url(str(payload.original_url)))
     link_score = float((payload.metadata or {}).get("link_quality_score") or score_link_candidate(original_url, _payload_title(payload)))
     async with semaphore:
+        if domain_semaphore is not None:
+            await domain_semaphore.acquire()
         try:
             cached = _read_fetch_cache(original_url, cache_ttl) if cache_ttl > 0 and not force_refresh else None
             if cached is not None:
@@ -374,6 +395,9 @@ async def _fetch_one(
         except Exception as exc:
             logger.info("Article fetch failed for %s: %s", original_url, exc)
             return _failed(payload, original_url, None, "fetch_error", str(exc), link_score)
+        finally:
+            if domain_semaphore is not None:
+                domain_semaphore.release()
 
 
 def _fetch_cache_dir() -> Path:

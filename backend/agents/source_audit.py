@@ -588,13 +588,54 @@ def _coverage_goal(profile: TopicProfile | dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _adapter_of(result: ArticleFetchResult) -> str:
+    payload = result.payload
+    source_type = payload.source_type
+    metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
+    if source_type == "gmail_link":
+        if metadata.get("search_query") or metadata.get("search_provider"):
+            return "web_search"
+        return "gmail"
+    return {
+        "gmail": "gmail",
+        "reddit_thread": "reddit",
+        "reddit_post": "reddit",
+        "podcast_episode": "podcasts",
+        "youtube_video": "youtube",
+        "collection_chunk": "collections",
+        "market_snapshot": "markets",
+        "sec_filing": "sec_filings",
+        "fred_series": "fred",
+    }.get(source_type, "web_search")
+
+
 def _candidate_indexes(results: list[ArticleFetchResult], *, max_candidates: int | None = None) -> list[int]:
     limit = _candidate_limit(max_candidates, MAX_AUDIT_CANDIDATES)
-    return [
-        index
-        for index, result in enumerate(results[:limit])
+    eligible = [
+        (index, result)
+        for index, result in enumerate(results)
         if result.tier != "dropped" and (result.fetched or result.link_score >= 0.55)
     ]
+    grouped: dict[str, list[tuple[int, ArticleFetchResult]]] = {}
+    for index, result in eligible:
+        adapter = _adapter_of(result)
+        grouped.setdefault(adapter, []).append((index, result))
+    selected_indexes: list[int] = []
+    adapters = sorted(grouped.keys())
+    pointers = {adapter: 0 for adapter in adapters}
+    while len(selected_indexes) < limit:
+        added = False
+        for adapter in adapters:
+            ptr = pointers[adapter]
+            if ptr < len(grouped[adapter]):
+                selected_indexes.append(grouped[adapter][ptr][0])
+                pointers[adapter] += 1
+                added = True
+                if len(selected_indexes) >= limit:
+                    break
+        if not added:
+            break
+    return selected_indexes
 
 
 def _candidate_limit(value: int | None, maximum: int) -> int:

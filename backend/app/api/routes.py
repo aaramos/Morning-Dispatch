@@ -175,7 +175,7 @@ class PodcastSubscriptionUpdate(BaseModel):
 
 
 class SourceSetupPayload(BaseModel):
-    provider: Literal["tavily", "brave", "serpapi"] = "tavily"
+    provider: Literal["tavily", "brave", "serpapi", "serper"] = "serper"
     api_key: str = Field(min_length=1, max_length=1000)
 
 

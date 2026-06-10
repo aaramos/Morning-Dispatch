@@ -426,3 +426,60 @@ def test_reddit_adapter_low_yield_empty_raises_unavailable(monkeypatch, tmp_path
                 SourceAdapterContext(exploration_id="explore-test", lookback_hours=24),
             )
         )
+
+
+def test_reddit_adapter_fetches_new_rss_when_bounded(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    # Track which URLs were fetched
+    fetched_urls = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, text_content: str) -> None:
+            self.status_code = status_code
+            self._text = text_content
+
+        @property
+        def text(self) -> str:
+            return self._text
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, url: str, **kwargs) -> FakeResponse:
+            fetched_urls.append(url)
+            # Return empty feeds but status 200
+            rss_content = """<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>"""
+            return FakeResponse(status_code=200, text_content=rss_content)
+
+    async def mock_expand(*_args) -> Any:
+        return SimpleNamespace(
+            subreddits=["python"],
+            search_queries=[]
+        )
+
+    monkeypatch.setattr(adapters, "expand_reddit_targets", mock_expand)
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+
+    adapter = RedditSourceAdapter()
+    try:
+        asyncio.run(
+            adapter.query(
+                TopicProfile.from_dict({"statement": "AI Coding", "scope": "AI Coding"}),
+                SourceAdapterContext(exploration_id="explore-test", lookback_hours=24),
+            )
+        )
+    except AdapterUnavailable:
+        pass  # Expected since feeds are empty
+
+    # Verify both hot and new rss feeds were fetched
+    assert "https://www.reddit.com/r/python/hot/.rss" in fetched_urls
+    assert "https://www.reddit.com/r/python/new/.rss" in fetched_urls
+

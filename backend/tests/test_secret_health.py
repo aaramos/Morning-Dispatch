@@ -19,6 +19,7 @@ def settings(tmp_path: Path) -> Settings:
         model_settings_path=tmp_path / "data" / "model-settings.json",
         brief_settings_path=tmp_path / "data" / "brief-settings.json",
         web_search_brave_api_key="brave-configured",
+        web_search_serper_api_key="serper-configured",
         youtube_api_key="youtube-configured",
         model_api_key="model-configured",
     )
@@ -29,10 +30,13 @@ def test_secret_health_reports_paths_without_values(tmp_path):
     ensure_runtime_dirs(app_settings)
     brave_path = app_settings.secrets_dir / "brave" / "api_key"
     youtube_path = app_settings.secrets_dir / "youtube" / "api_key"
+    serper_path = app_settings.secrets_dir / "serper" / "api_key"
     brave_path.write_text("BSA" + "verysecretvalue1234567890\n", encoding="utf-8")
     youtube_path.write_text("AIza" + "VerySecretValue1234567890\n", encoding="utf-8")
+    serper_path.write_text("serper-verysecretvalue1234567890\n", encoding="utf-8")
     brave_path.chmod(0o600)
     youtube_path.chmod(0o600)
+    serper_path.chmod(0o600)
 
     payload = secret_health.status(app_settings)
 
@@ -41,8 +45,10 @@ def test_secret_health_reports_paths_without_values(tmp_path):
     rendered = str(payload)
     assert "BSAverysecretvalue" not in rendered
     assert "AIzaVerySecretValue" not in rendered
+    assert "serper-verysecretvalue" not in rendered
     assert {item["id"]: item["status"] for item in payload["items"]}["brave_key"] == "ok"
     assert {item["id"]: item["status"] for item in payload["items"]}["youtube_key"] == "ok"
+    assert {item["id"]: item["status"] for item in payload["items"]}["serper_key"] == "ok"
 
 
 def test_secret_health_flags_overly_open_secret_file(tmp_path):

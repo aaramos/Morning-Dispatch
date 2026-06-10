@@ -63,6 +63,7 @@ class TavilyBackend:
         }
         if days is not None:
             payload["days"] = max(1, int(days))
+            payload["topic"] = "news"
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(self.endpoint, json=payload)
             response.raise_for_status()
@@ -202,6 +203,69 @@ class SerpAPIBackend:
         return parsed
 
 
+@dataclass(frozen=True)
+class SerperBackend:
+    api_key: str
+    timeout_seconds: float = 8.0
+    name: str = "serper"
+    endpoint: str = "https://google.serper.dev/search"
+
+    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
+        clean_query = _clean_query(query)
+        if not clean_query:
+            return []
+
+        payload = {
+            "q": clean_query,
+            "num": max(1, min(limit, 25)),
+        }
+        if language:
+            payload["hl"] = language
+        tbs = _serpapi_tbs(days)
+        if tbs:
+            payload["tbs"] = tbs
+
+        headers = {
+            "X-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+        }
+        is_news = days is not None
+        endpoint = "https://google.serper.dev/news" if is_news else self.endpoint
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(endpoint, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+
+        results_key = "news" if is_news else "organic"
+        results = data.get(results_key) if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            return []
+        parsed: list[SearchHit] = []
+        for result in results[: max(1, min(limit, 25))]:
+            if not isinstance(result, dict):
+                continue
+            raw_url = str(result.get("link") or result.get("url") or "").strip()
+            parsed_url = _normalize_url(raw_url)
+            if not parsed_url:
+                continue
+            raw_position = result.get("position")
+            if isinstance(raw_position, (int, float)) and raw_position > 0:
+                score = min(1.0, max(0.0, 1.0 / float(raw_position)))
+            else:
+                score = 0.58
+            parsed.append(
+                SearchHit(
+                    provider=self.name,
+                    title=_repair_text_encoding(result.get("title") or parsed_url)[:220],
+                    url=parsed_url,
+                    snippet=_repair_text_encoding(result.get("snippet") or "").strip()[:600],
+                    score=score,
+                    published_at=_clean_hit_date(result.get("date")),
+                )
+            )
+        return parsed
+
+
 def _clean_hit_date(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
@@ -234,6 +298,10 @@ def _providers_from_config() -> list[WebSearchBackend]:
         providers.append(provider)
         seen.add(provider.name)
 
+    if preferred in {"", "auto", "serper", "serper_search", "serper-search"}:
+        key = str(settings.web_search_serper_api_key or _read_secret(settings, "serper", "api_key") or "").strip()
+        if key:
+            add(SerperBackend(api_key=key))
     if preferred in {"", "auto", "tavily", "tavily_search", "tavily-search"}:
         key = str(settings.web_search_tavily_api_key or _read_secret(settings, "tavily", "api_key") or "").strip()
         if key:
@@ -249,6 +317,10 @@ def _providers_from_config() -> list[WebSearchBackend]:
     if preferred not in {"", "auto"}:
         # A named primary provider should still have configured backups. This is
         # especially useful for transient Tavily failures such as HTTP 432.
+        if "serper" not in seen:
+            key = str(settings.web_search_serper_api_key or _read_secret(settings, "serper", "api_key") or "").strip()
+            if key:
+                add(SerperBackend(api_key=key))
         if "brave" not in seen:
             key = str(settings.web_search_brave_api_key or _read_secret(settings, "brave", "api_key") or "").strip()
             if key:

@@ -54,10 +54,11 @@ class Settings:
     # resurrect content outside a multi-day recency window.
     article_fetch_cache_ttl_seconds: int = 0
     model_routes: dict[str, dict[str, object]] = field(default_factory=lambda: dict(DEFAULT_MODEL_ROUTES))
-    web_search_provider: str = "auto"
+    web_search_provider: str = "serper"
     web_search_tavily_api_key: str | None = None
     web_search_brave_api_key: str | None = None
     web_search_serpapi_api_key: str | None = None
+    web_search_serper_api_key: str | None = None
     youtube_api_key: str | None = None
     youtube_max_results: int = 40
     youtube_duration_filter: str = "medium"
@@ -258,7 +259,7 @@ def get_settings() -> Settings:
     fred_api_key = os.environ.get("MORNING_DISPATCH_FRED_API_KEY") or _secret_text(
         secrets_dir / "fred" / "api_key"
     )
-    web_search_provider = (os.environ.get("MORNING_DISPATCH_WEB_SEARCH_PROVIDER") or "auto").strip().lower()
+    web_search_provider = (os.environ.get("MORNING_DISPATCH_WEB_SEARCH_PROVIDER") or "serper").strip().lower()
     shared_search_env_path = _shared_search_env_path()
     web_search_tavily_api_key = (
         os.environ.get("MORNING_DISPATCH_TAVILY_API_KEY")
@@ -291,6 +292,17 @@ def get_settings() -> Settings:
             (
                 "SERPAPI_API_KEY",
                 "SERP_API_KEY",
+            ),
+        )
+    )
+    web_search_serper_api_key = (
+        os.environ.get("MORNING_DISPATCH_SERPER_API_KEY")
+        or _secret_text(secrets_dir / "serper" / "api_key")
+        or _env_file_value(
+            shared_search_env_path,
+            (
+                "SERPER_API_KEY",
+                "SERPER_SEARCH_API_KEY",
             ),
         )
     )
@@ -340,6 +352,7 @@ def get_settings() -> Settings:
         web_search_tavily_api_key=web_search_tavily_api_key,
         web_search_brave_api_key=web_search_brave_api_key,
         web_search_serpapi_api_key=web_search_serpapi_api_key,
+        web_search_serper_api_key=web_search_serper_api_key,
         youtube_api_key=youtube_api_key,
         youtube_max_results=max(1, min(_int_from_env("MORNING_DISPATCH_YOUTUBE_MAX_RESULTS", 40), 50)),
         youtube_duration_filter=os.environ.get("MORNING_DISPATCH_YOUTUBE_DURATION_FILTER", "medium"),
@@ -379,6 +392,7 @@ def ensure_runtime_dirs(settings: Settings) -> None:
         settings.secrets_dir / "tavily",
         settings.secrets_dir / "brave",
         settings.secrets_dir / "serpapi",
+        settings.secrets_dir / "serper",
         settings.secrets_dir / "youtube",
         settings.secrets_dir / "fred",
         settings.secrets_dir / "model",

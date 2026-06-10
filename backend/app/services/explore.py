@@ -403,6 +403,7 @@ def save_web_search_credentials(*, provider: str, api_key: str) -> dict[str, Any
         "tavily": "tavily",
         "brave": "brave",
         "serpapi": "serpapi",
+        "serper": "serper",
     }
     folder = folder_map.get(clean_provider)
     if folder is None:
@@ -1375,6 +1376,22 @@ def _candidate_known_stale(candidate: Candidate, cutoff: datetime) -> bool:
     return False
 
 
+def _candidate_known_in_window_date(candidate: Candidate, cutoff: datetime) -> bool:
+    payload = candidate.payload
+    url_date = _date_from_url(getattr(payload, "original_url", None))
+    if url_date is not None:
+        return url_date >= cutoff
+    values: list[Any] = [getattr(payload, "published_at", None)]
+    metadata = payload.metadata if isinstance(getattr(payload, "metadata", None), dict) else {}
+    for key in _DATE_METADATA_KEYS:
+        values.append(metadata.get(key))
+    for value in values:
+        parsed = _parse_datetime_hint(value)
+        if parsed is not None:
+            return parsed >= cutoff
+    return False
+
+
 def _select_fetch_payloads_for_budget(
     candidates: list[Candidate],
     *,
@@ -1421,7 +1438,12 @@ def _select_fetch_payloads_for_budget(
     selected_fetch: list[tuple[float, NormalizedPayload]] = []
     if max_articles > 0 and fetch_grouped:
         for adapter in fetch_grouped:
-            fetch_grouped[adapter].sort(key=lambda item: item.score, reverse=True)
+            if cutoff is not None:
+                fetch_grouped[adapter].sort(
+                    key=lambda c: (not _candidate_known_in_window_date(c, cutoff), -c.score)
+                )
+            else:
+                fetch_grouped[adapter].sort(key=lambda item: item.score, reverse=True)
         adapters = sorted(
             fetch_grouped.keys(),
             key=lambda adapter: fetch_grouped[adapter][0].score if fetch_grouped.get(adapter) else 0.0,
@@ -2019,7 +2041,30 @@ async def _adjudicate_dates_before_source_window_filter(
         }
 
     limit = max(1, min(int(max_candidates or len(at_risk_indexes)), len(at_risk_indexes)))
-    selected_indexes = at_risk_indexes[:limit]
+    # Round-robin selection by lane/adapter to prevent lane monopolization (P0-3)
+    grouped: dict[str, list[int]] = {}
+    for index in at_risk_indexes:
+        adapter = _adapter_from_payload_type(
+            article_results[index].payload.source_type,
+            article_results[index].payload.metadata,
+        )
+        grouped.setdefault(adapter, []).append(index)
+    
+    selected_indexes: list[int] = []
+    adapters = sorted(grouped.keys())
+    pointers = {adapter: 0 for adapter in adapters}
+    while len(selected_indexes) < limit:
+        added = False
+        for adapter in adapters:
+            ptr = pointers[adapter]
+            if ptr < len(grouped[adapter]):
+                selected_indexes.append(grouped[adapter][ptr])
+                pointers[adapter] += 1
+                added = True
+                if len(selected_indexes) >= limit:
+                    break
+        if not added:
+            break
     selected_results = [article_results[index] for index in selected_indexes]
     settings = get_settings()
     audit_client = model_routing.client_for_agent(
@@ -2092,7 +2137,34 @@ def _apply_source_window_filter(
     rather than rendering an empty section.
     """
     if lookback_hours is None:
-        return article_results, [], []
+        kept: list[ArticleFetchResult] = []
+        issues: list[dict[str, str]] = []
+        for result in article_results:
+            if result.tier == "dropped":
+                continue
+            if _is_strict_undated_result(result):
+                item_key = _undated_item_key(result)
+                if database.has_served_undated_item(profile.topic_id, item_key):
+                    reason = "Undated item was already shown once and is hidden from future editions."
+                    issues.append(
+                        {
+                            "source_name": _source_window_issue_name(result),
+                            "source": _source_label_for_result(result),
+                            "item": _source_window_issue_name(result),
+                            "item_url": str(
+                                result.final_url
+                                or result.original_url
+                                or result.payload.original_url
+                                or ""
+                            ).strip(),
+                            "reason": reason,
+                        }
+                    )
+                    continue
+                kept.append(_mark_undated_once(result))
+            else:
+                kept.append(result)
+        return kept, issues, []
     cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
     kept: list[ArticleFetchResult] = []
     issues: list[dict[str, str]] = []

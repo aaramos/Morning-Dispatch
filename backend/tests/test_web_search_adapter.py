@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from datetime import datetime, UTC, timedelta
 
 import pytest
 
@@ -276,6 +277,57 @@ def test_search_web_uses_serpapi_aliases(monkeypatch, tmp_path) -> None:
     assert results[0].url == "https://example.com/s"
 
 
+def test_search_web_uses_serper_aliases(monkeypatch, tmp_path) -> None:
+    class FakeResponse:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, *_args, **kwargs) -> FakeResponse:
+            return FakeResponse(
+                {
+                    "organic": [
+                        {
+                            "title": "Serper Source",
+                            "link": "https://example.com/serper",
+                            "snippet": "A serper result",
+                        }
+                    ]
+                }
+            )
+
+        async def get(self, *_args, **_kwargs) -> FakeResponse:
+            raise AssertionError("Get should not be called for Serper")
+
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_SERPER_API_KEY", "test-key")
+    monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "serper")
+    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+
+    results = asyncio.run(web_search.search_web("local AI", limit=2))
+
+    assert len(results) == 1
+    assert results[0].provider == "serper"
+    assert results[0].title == "Serper Source"
+    assert results[0].url == "https://example.com/serper"
+
+
+
 def test_search_web_rejects_unknown_provider(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "unsupported_provider")
@@ -476,7 +528,7 @@ def test_web_search_adapter_allows_twenty_refinement_queries(monkeypatch, tmp_pa
     )
 
     assert len(observed) == 20
-    assert all(limit == 20 for _query, limit in observed)
+    assert all(limit == 25 for _query, limit in observed)
 
 
 def test_search_web_trims_long_provider_queries(monkeypatch, tmp_path) -> None:
@@ -595,3 +647,66 @@ def test_query_refiner_includes_date_and_recency_constraints(monkeypatch, tmp_pa
     assert prompt["lookback_hours"] == 168
     assert "current_date" in prompt
     assert "Do not widen the time window" in captured["system"]
+
+
+def test_web_search_adapter_refines_on_stale_hits(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    from backend.agents.discovery.web_search import SearchHit
+
+    # Initial search returns only stale (old date) hit
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None):
+        if "refined" in query:
+            # Refinement query returns a fresh hit
+            return [
+                SearchHit(
+                    provider="test",
+                    title="Fresh refined hit",
+                    url="https://example.com/fresh",
+                    snippet="Fresh snippet",
+                    score=0.9,
+                    published_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                )
+            ]
+        # Initial query returns stale hit
+        return [
+            SearchHit(
+                provider="test",
+                title="Stale initial hit",
+                url="https://example.com/stale",
+                snippet="Stale snippet",
+                score=0.8,
+                published_at=(datetime.now(UTC) - timedelta(days=10)).isoformat(timespec="seconds"),
+            )
+        ]
+
+    monkeypatch.setenv("MORNING_DISPATCH_TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("backend.agents.discovery.adapters.search_web", fake_search_web)
+
+    refinement_queries_called = []
+    async def mock_refine_queries(adapter_name, profile, initial_results, initial_queries, lookback_hours) -> list[str]:
+        refinement_queries_called.append(initial_results)
+        return ["refined_query"]
+
+    monkeypatch.setattr(
+        "backend.agents.discovery.query_refiner.refine_queries_for_adapter",
+        mock_refine_queries,
+    )
+
+    adapter = WebSearchSourceAdapter()
+    candidates = asyncio.run(
+        adapter.query(
+            TopicProfile.from_dict(
+                {
+                    "statement": "AI infrastructure",
+                    "scope": "AI infrastructure market signals",
+                    "search_queries": ["initial_query"],
+                }
+            ),
+            SourceAdapterContext(exploration_id="explore-query", candidate_limit=5, lookback_hours=24),
+        )
+    )
+
+    # Refinement should have been called because the only hit was outside the 24 hour window
+    assert len(refinement_queries_called) == 1
+    # Check that we got candidates from both initial and refined results
+    assert len(candidates) == 2

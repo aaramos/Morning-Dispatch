@@ -232,7 +232,7 @@ class WebSearchSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         queries = _web_search_queries(profile, _requested_refs(profile, "web_search"), adapter=self.name)
-        per_query_limit = max(4, min(20, max(1, context.candidate_limit)))
+        per_query_limit = max(4, min(25, max(1, context.candidate_limit)))
         days = lookback_to_days(context.lookback_hours)
         results = await asyncio.gather(
             *(search_web(query, limit=per_query_limit, days=days) for query in queries),
@@ -252,7 +252,22 @@ class WebSearchSourceAdapter:
                 existing = hits_by_url.get(key)
                 if existing is None or _search_score(hit.score) > _search_score(existing[0].score):
                     hits_by_url[key] = (hit, query, query_index)
-        if len(hits_by_url) < 3:
+
+        # Calculate in-window dated hits count
+        from backend.app.services.explore import _parse_datetime_hint
+        cutoff = None
+        if context.lookback_hours is not None:
+            cutoff = datetime.now(UTC) - timedelta(hours=max(1, context.lookback_hours))
+        
+        in_window_count = 0
+        for hit, _, _ in hits_by_url.values():
+            dt = _parse_datetime_hint(hit.published_at)
+            if dt is not None:
+                if cutoff is None or dt >= cutoff:
+                    in_window_count += 1
+
+        target_yield = min(3, context.candidate_limit)
+        if in_window_count < target_yield:
             try:
                 from backend.agents.discovery.query_refiner import refine_queries_for_adapter
                 refined_queries = await refine_queries_for_adapter(
@@ -1004,7 +1019,7 @@ class RedditSourceAdapter:
         limit_per_source = getattr(settings, "reddit_fetch_limit_per_source", 25)
         comments_limit = getattr(settings, "reddit_fetch_comments", 10)
         request_timeout = getattr(settings, "reddit_request_timeout_seconds", 10.0)
-        reddit_candidate_cap = min(max(1, context.candidate_limit), 20)
+        reddit_candidate_cap = min(max(1, context.candidate_limit), 100)
 
         # 1. Expand search targets
         targets = await expand_reddit_targets(profile)
@@ -1039,53 +1054,69 @@ class RedditSourceAdapter:
         import httpx
 
         async def fetch_subreddit_rss(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
-            rss_url = f"https://www.reddit.com/r/{sub}/hot/.rss"
-            async with fetch_semaphore:
-                try:
-                    logger.info("Fetching subreddit hot RSS: r/%s", sub)
-                    response = await client.get(rss_url, headers=headers, timeout=request_timeout)
-                    if response.status_code != 200:
-                        logger.warning("Reddit RSS returned status %d for r/%s", response.status_code, sub)
+            urls = [f"https://www.reddit.com/r/{sub}/hot/.rss"]
+            if context.lookback_hours is not None:
+                urls.append(f"https://www.reddit.com/r/{sub}/new/.rss")
+
+            async def fetch_one(url: str) -> list[dict[str, Any]]:
+                async with fetch_semaphore:
+                    try:
+                        logger.info("Fetching subreddit RSS: %s", url)
+                        response = await client.get(url, headers=headers, timeout=request_timeout)
+                        if response.status_code != 200:
+                            logger.warning("Reddit RSS returned status %d for %s", response.status_code, url)
+                            return []
+
+                        feed = feedparser.parse(response.text)
+                        posts = []
+                        for entry in feed.entries:
+                            link = entry.get("link", "")
+                            match = re.search(r"/comments/([a-z0-9]+)/", link)
+                            post_id = match.group(1) if match else str(hash(link))
+                            title = entry.get("title", "Reddit Post")
+
+                            published_at = None
+                            # Reddit's Atom feed usually exposes <updated> (updated_parsed)
+                            # and not always <published>; fall back so hot posts carry a
+                            # date and the recency gate can actually filter them.
+                            date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+                            if date_struct:
+                                try:
+                                    published_at = datetime(*date_struct[:6], tzinfo=UTC).isoformat(timespec="seconds")
+                                except Exception:
+                                    pass
+
+                            posts.append({
+                                "id": post_id,
+                                "title": title,
+                                "selftext": entry.get("content", [{"value": entry.get("summary", "")}])[0].get("value", ""),
+                                "url": link,
+                                "permalink": link,
+                                "score": 10,  # fallback score
+                                "upvote_ratio": 1.0,
+                                "num_comments": 0,
+                                "flair": None,
+                                "subreddit": sub,
+                                "published_at": published_at,
+                                "is_self": True,
+                                "fetch_mode": "subreddit",
+                            })
+                        return posts
+                    except Exception as exc:
+                        logger.warning("Exception fetching RSS url %s: %s", url, exc)
                         return []
 
-                    feed = feedparser.parse(response.text)
-                    posts = []
-                    for entry in feed.entries:
-                        link = entry.get("link", "")
-                        match = re.search(r"/comments/([a-z0-9]+)/", link)
-                        post_id = match.group(1) if match else str(hash(link))
-                        title = entry.get("title", "Reddit Post")
-
-                        published_at = None
-                        # Reddit's Atom feed usually exposes <updated> (updated_parsed)
-                        # and not always <published>; fall back so hot posts carry a
-                        # date and the recency gate can actually filter them.
-                        date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
-                        if date_struct:
-                            try:
-                                published_at = datetime(*date_struct[:6], tzinfo=UTC).isoformat(timespec="seconds")
-                            except Exception:
-                                pass
-
-                        posts.append({
-                            "id": post_id,
-                            "title": title,
-                            "selftext": entry.get("content", [{"value": entry.get("summary", "")}])[0].get("value", ""),
-                            "url": link,
-                            "permalink": link,
-                            "score": 10,  # fallback score
-                            "upvote_ratio": 1.0,
-                            "num_comments": 0,
-                            "flair": None,
-                            "subreddit": sub,
-                            "published_at": published_at,
-                            "is_self": True,
-                            "fetch_mode": "subreddit",
-                        })
-                    return posts
-                except Exception as exc:
-                    logger.warning("Exception fetching hot RSS for r/%s: %s", sub, exc)
-                    return []
+            results = await asyncio.gather(*(fetch_one(url) for url in urls), return_exceptions=True)
+            merged = {}
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.warning("Exception during Reddit RSS fetch gather for r/%s: %s", sub, res)
+                    continue
+                for post in res:
+                    pid = post["id"]
+                    if pid not in merged:
+                        merged[pid] = post
+            return list(merged.values())
 
         async def fetch_search_via_web(q: str) -> list[dict[str, Any]]:
             try:

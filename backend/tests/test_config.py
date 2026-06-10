@@ -79,3 +79,47 @@ def test_web_search_saved_key_overrides_shared_search_key(monkeypatch, tmp_path)
     settings = get_settings()
 
     assert settings.web_search_brave_api_key == "saved-brave-key"
+
+
+def test_web_search_uses_serper_by_default(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
+    monkeypatch.delenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", raising=False)
+
+    settings = get_settings()
+
+    assert settings.web_search_provider == "serper"
+
+
+def test_web_search_reuses_serper_shared_search_keys(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime"
+    shared_env = tmp_path / "hermes.env"
+    shared_env.write_text(
+        "\n".join(
+            [
+                "SERPER_API_KEY=shared-serper-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(shared_env))
+    monkeypatch.delenv("MORNING_DISPATCH_SERPER_API_KEY", raising=False)
+
+    settings = get_settings()
+
+    assert settings.web_search_serper_api_key == "shared-serper-key"
+

@@ -2264,7 +2264,7 @@ function DispatchApp() {
     try {
       await api("/api/admin/web-search/credentials", {
         method: "POST",
-        body: JSON.stringify({ provider: "tavily", api_key: webKey.trim() }),
+        body: JSON.stringify({ provider: "serper", api_key: webKey.trim() }),
       });
       setWebKey("");
       await refreshSourcesAndSelect(enableSource === "foreign_media" ? "foreign_media" : "web_search");
@@ -5494,7 +5494,7 @@ function AdminApp() {
   const [defaultControlsDraft, setDefaultControlsDraft] = useState<BriefControlsDraft>(defaultBriefControls);
   const [pipelineLimitsDraft, setPipelineLimitsDraft] = useState<PipelineLimitsDraft>(defaultPipelineLimits);
   const [issueDetails, setIssueDetails] = useState<{ built_with_issues: boolean; issues: ExplorationIssue[] } | null>(null);
-  const [webProvider, setWebProvider] = useState<"tavily" | "brave" | "serpapi">("tavily");
+  const [webProvider, setWebProvider] = useState<"tavily" | "brave" | "serpapi" | "serper">("serper");
   const [webKey, setWebKey] = useState("");
   const [adminGmailSecret, setAdminGmailSecret] = useState("");
   const [gmailAllowlist, setGmailAllowlist] = useState<GmailAllowlistResponse | null>(null);
@@ -6366,7 +6366,8 @@ function AdminApp() {
                   <p>{sources?.sources.web_search?.enabled ? "Connected." : sources?.sources.web_search?.reason}</p>
                   <label>
                     Provider
-                    <select value={webProvider} onChange={(event) => setWebProvider(event.target.value as "tavily" | "brave" | "serpapi")}>
+                    <select value={webProvider} onChange={(event) => setWebProvider(event.target.value as "tavily" | "brave" | "serpapi" | "serper")}>
+                      <option value="serper">Serper</option>
                       <option value="tavily">Tavily</option>
                       <option value="brave">Brave</option>
                       <option value="serpapi">SerpAPI</option>

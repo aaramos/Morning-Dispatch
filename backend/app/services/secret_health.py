@@ -67,6 +67,12 @@ def status(settings: Settings) -> dict[str, Any]:
             configured=bool(settings.web_search_serpapi_api_key),
         ),
         _secret_item(
+            "serper_key",
+            "Serper key",
+            settings.secrets_dir / "serper" / "api_key",
+            configured=bool(settings.web_search_serper_api_key),
+        ),
+        _secret_item(
             "model_key",
             "Local model API key",
             settings.secrets_dir / "model" / "api_key",
