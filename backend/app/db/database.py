@@ -3815,8 +3815,12 @@ def _translation_badge_html(result: ArticleFetchResult) -> str:
 
 def _translation_original_html(result: ArticleFetchResult) -> str:
     translation = _translation_metadata(result)
-    original_title = str(translation.get("original_title") or (result.payload.metadata or {}).get("original_search_title") or "").strip()
-    original_summary = str(translation.get("original_summary") or (result.payload.metadata or {}).get("original_search_summary") or "").strip()
+    original_title = _clean_newsletter_text(
+        str(translation.get("original_title") or (result.payload.metadata or {}).get("original_search_title") or "")
+    )
+    original_summary = _clean_newsletter_text(
+        str(translation.get("original_summary") or (result.payload.metadata or {}).get("original_search_summary") or "")
+    )
     if not original_title and not original_summary:
         return ""
     source_language_name = str(translation.get("source_language_name") or (result.payload.metadata or {}).get("source_language_name") or "original").strip()
@@ -3911,6 +3915,12 @@ def _supports_foreign_article_modal(result: ArticleFetchResult, *, issue_id: str
 def _foreign_article_attributes(result: ArticleFetchResult, *, modal_id: str) -> str:
     translation = _translation_metadata(result)
     payload_metadata = result.payload.metadata or {}
+    original_title = _clean_newsletter_text(
+        str(translation.get("original_title") or payload_metadata.get("original_search_title") or "")
+    )
+    original_summary = _clean_newsletter_text(
+        str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or "")
+    )
     values = {
         "foreign-article-target": modal_id,
         "foreign-url": _result_url(result),
@@ -3918,8 +3928,8 @@ def _foreign_article_attributes(result: ArticleFetchResult, *, modal_id: str) ->
         "foreign-summary": _story_summary(result),
         "foreign-source-language": str(translation.get("source_language") or payload_metadata.get("source_language") or ""),
         "foreign-source-language-name": str(translation.get("source_language_name") or payload_metadata.get("source_language_name") or ""),
-        "foreign-original-title": str(translation.get("original_title") or payload_metadata.get("original_search_title") or ""),
-        "foreign-original-summary": str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or ""),
+        "foreign-original-title": original_title,
+        "foreign-original-summary": original_summary,
         "foreign-translation-quality": _translation_quality_label(translation),
         "foreign-translation-mode": str(translation.get("mode") or ""),
         "foreign-translator": str(translation.get("translator") or ""),
@@ -4407,8 +4417,12 @@ def _render_foreign_article_modal(result: ArticleFetchResult, modal_id: str, iss
     translation = _translation_metadata(result)
     payload_metadata = result.payload.metadata or {}
     source_language_name = str(translation.get("source_language_name") or payload_metadata.get("source_language_name") or "Original").strip()
-    original_title = str(translation.get("original_title") or payload_metadata.get("original_search_title") or _story_title(result)).strip()
-    original_summary = str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or "").strip()
+    original_title = _clean_newsletter_text(
+        str(translation.get("original_title") or payload_metadata.get("original_search_title") or _story_title(result))
+    )
+    original_summary = _clean_newsletter_text(
+        str(translation.get("original_summary") or payload_metadata.get("original_search_summary") or "")
+    )
     original_body = str(translation.get("original_body") or "").strip()
     original_seed = "\n\n".join(part for part in (original_title, original_body or original_summary) if part)
     original_html = _render_transcript_paragraphs(original_seed)
@@ -5527,7 +5541,7 @@ def _ensure_generated_footer_style(soup: BeautifulSoup) -> None:
 
 
 def _clean_newsletter_text(value: str | None) -> str:
-    text = unescape(value or "")
+    text = unescape(_repair_text_encoding(value or ""))
     text = ZERO_WIDTH_RE.sub(" ", text)
     text = IMAGE_PLACEHOLDER_RE.sub(" ", text)
     text = FOLLOW_IMAGE_RE.sub(" ", text)
@@ -5551,6 +5565,20 @@ def _clean_newsletter_text(value: str | None) -> str:
     text = text.strip(" -|")
     if re.fullmatch(r"(?:online|read online|click here)[:.!?]?", text, flags=re.IGNORECASE):
         return ""
+    return text
+
+
+def _repair_text_encoding(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for encoding in ("latin1", "cp1252"):
+        try:
+            repaired = text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if repaired != text:
+            return repaired
     return text
 
 

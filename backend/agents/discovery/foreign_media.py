@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery.language_support import trusted_language_options
 from backend.agents.discovery.types import Candidate, CostProfile, SourceAdapterContext, TopicProfile
-from backend.agents.discovery.web_search import lookback_to_days, search_web
+from backend.agents.discovery.web_search import _repair_text_encoding, lookback_to_days, search_web
 from backend.app.core.config import get_settings
 from backend.app.services import model_routing
 
@@ -24,6 +24,66 @@ SCRIPT_RE = {
     "ja": re.compile(r"[\u3040-\u30ff\u3400-\u9fff]"),
     "zh": re.compile(r"[\u3400-\u9fff]"),
     "yue": re.compile(r"[\u3400-\u9fff]"),
+}
+REGION_LANGUAGE_SEEDS: dict[str, tuple[tuple[str, str], ...]] = {
+    "east_asia": (
+        ("zh", "Chinese-language coverage for China and Taiwan"),
+        ("ja", "Japanese-language coverage for Japan"),
+        ("ko", "Korean-language coverage for South Korea"),
+    ),
+    "asia": (
+        ("zh", "Chinese-language coverage for China and Taiwan"),
+        ("ja", "Japanese-language coverage for Japan"),
+        ("ko", "Korean-language coverage for South Korea"),
+        ("hi", "Hindi-language coverage for India"),
+        ("id", "Indonesian-language coverage for Southeast Asia"),
+        ("vi", "Vietnamese-language coverage for Vietnam"),
+    ),
+    "europe": (
+        ("de", "German-language coverage for DACH markets"),
+        ("fr", "French-language coverage for France"),
+        ("nl", "Dutch-language coverage for the Netherlands"),
+        ("it", "Italian-language coverage for Italy"),
+        ("es", "Spanish-language coverage for Spain"),
+        ("pl", "Polish-language coverage for Central Europe"),
+    ),
+    "latin_america": (
+        ("es", "Spanish-language coverage for Latin America"),
+        ("pt", "Portuguese-language coverage for Brazil"),
+    ),
+    "middle_east": (
+        ("ar", "Arabic-language coverage for Middle East markets"),
+        ("fa", "Persian-language coverage for Iran"),
+        ("tr", "Turkish-language coverage for Turkey"),
+    ),
+    "africa": (
+        ("ar", "Arabic-language coverage for North Africa"),
+        ("sw", "Swahili-language coverage for East Africa"),
+        ("yo", "Yoruba-language coverage for West Africa"),
+        ("am", "Amharic-language coverage for Ethiopia"),
+    ),
+    "oceania": (
+        ("mi", "Maori-language coverage for New Zealand and Pacific context"),
+        ("fj", "Fijian-language coverage for Pacific regional context"),
+    ),
+}
+REGION_ALIASES: dict[str, str] = {
+    "east asia": "east_asia",
+    "east asian": "east_asia",
+    "china japan korea": "east_asia",
+    "asia pacific": "asia",
+    "apac": "asia",
+    "asia": "asia",
+    "europe": "europe",
+    "eu": "europe",
+    "latin america": "latin_america",
+    "latam": "latin_america",
+    "south america": "latin_america",
+    "middle east": "middle_east",
+    "mena": "middle_east",
+    "africa": "africa",
+    "oceania": "oceania",
+    "pacific": "oceania",
 }
 FOREIGN_MEDIA_BLOCKED_DOMAINS = {
     "blog.maxthon.com",
@@ -136,8 +196,8 @@ class ForeignMediaSourceAdapter:
                         adapter=self.name,
                         payload=NormalizedPayload(
                             source_type="foreign_web",
-                            source_name=hit.title or hit.url,
-                            raw_text=hit.snippet,
+                            source_name=_repair_text_encoding(hit.title) or hit.url,
+                            raw_text=_repair_text_encoding(hit.snippet),
                             original_url=hit.url,
                             published_at=hit.published_at,
                             metadata={
@@ -149,8 +209,8 @@ class ForeignMediaSourceAdapter:
                                 "language_reason": item.get("reason") or item.get("rationale") or "",
                                 "native_entity_terms": list(item.get("native_entity_terms") or []),
                                 "needs_translation": True,
-                                "original_search_title": hit.title,
-                                "original_search_summary": hit.snippet,
+                                "original_search_title": _repair_text_encoding(hit.title),
+                                "original_search_summary": _repair_text_encoding(hit.snippet),
                                 "foreign_quality": quality,
                             },
                         ),
@@ -223,6 +283,13 @@ def _derive_language_seeds(profile: TopicProfile) -> list[dict[str, Any]]:
     text = _profile_text(profile)
     known_languages = {item["code"]: item for item in trusted_language_options()}
     selected: dict[str, dict[str, Any]] = {}
+
+    for region in _normalized_regions(profile.foreign_regions):
+        for code, reason in REGION_LANGUAGE_SEEDS.get(region, ()):
+            if code in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
+                continue
+            base = known_languages.get(code) or {"code": code, "name": _code_to_name(code)}
+            selected.setdefault(code, {**base, "reason": reason, "native_entity_terms": []})
 
     for code, reason in _explicit_language_requests(text):
         if code not in NON_FOREIGN_MEDIA_LANGUAGE_CODES:
@@ -335,6 +402,7 @@ def _profile_text(profile: TopicProfile) -> str:
         [
             profile.statement,
             profile.scope,
+            *profile.foreign_regions,
             *profile.subtopics,
             *profile.keywords,
             *profile.search_queries,
@@ -342,6 +410,19 @@ def _profile_text(profile: TopicProfile) -> str:
             *profile.exclusions,
         ]
     ).casefold()
+
+
+def _normalized_regions(value: Any) -> list[str]:
+    regions: list[str] = []
+    seen: set[str] = set()
+    for raw in _string_list(value, limit=12):
+        key = re.sub(r"[^a-z0-9]+", " ", raw.casefold()).strip()
+        normalized = REGION_ALIASES.get(key, key.replace(" ", "_"))
+        if normalized not in REGION_LANGUAGE_SEEDS or normalized in seen:
+            continue
+        regions.append(normalized)
+        seen.add(normalized)
+    return regions
 
 
 def _explicit_language_requests(text: str) -> list[tuple[str, str]]:

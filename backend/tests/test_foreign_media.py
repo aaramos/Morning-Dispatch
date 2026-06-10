@@ -72,6 +72,26 @@ def test_foreign_language_plan_does_not_treat_english_exclusion_as_language_requ
     assert [item["code"] for item in plan] == ["ko", "ja"]
 
 
+def test_foreign_region_seeds_languages_when_entities_are_weak(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Track regional AI infrastructure policy and supply-chain developments.",
+            "scope": "Native-language regional AI infrastructure coverage",
+            "source_selection": {"foreign_media": True},
+            "foreign_regions": ["east_asia"],
+        }
+    )
+
+    plan = asyncio.run(foreign_language_plan_for_profile(profile))
+    codes = [item["code"] for item in plan]
+
+    assert "zh" in codes
+    assert "ja" in codes
+    assert "ko" in codes
+    assert "en" not in codes
+
+
 def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     calls: list[dict[str, object]] = []
@@ -377,6 +397,58 @@ def test_metadata_only_translation_modal_still_lazy_loads() -> None:
 
     assert 'data-foreign-loaded="true"' not in html
     assert "Translated summary stub." in html
+
+
+def test_foreign_original_metadata_is_repaired_before_render() -> None:
+    def garble(value: str) -> str:
+        return value.encode("utf-8").decode("latin1")
+
+    garbled_title = garble("AI Daily Brief: インフラAIインフラの最新シグナル")
+    garbled_summary = garble("メモリー製造業者とGPUエコシステムからの最新シグナル。")
+
+    payload = NormalizedPayload(
+        source_type="foreign_web",
+        source_name="example.kr",
+        original_url="https://example.kr/news/1",
+        metadata={
+            "source_language": "ko",
+            "source_language_name": "Korean",
+            "original_search_title": garbled_title,
+            "original_search_summary": garbled_summary,
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url,
+        final_url=payload.original_url,
+        title="Translated title",
+        text="Translated summary",
+        excerpt="Translated summary",
+        editor_summary="Translated summary",
+        domain="example.kr",
+        status="fetched",
+        tier="lead",
+        relevance_score=0.9,
+        metadata={
+            "translation": {
+                "translated": True,
+                "source_language": "ko",
+                "source_language_name": "Korean",
+                "original_title": garbled_title,
+                "original_summary": garbled_summary,
+            }
+        },
+    )
+
+    modal_html = database._render_foreign_article_modal(result, "foreign-mojibake", "explore-1")
+    original_html = database._translation_original_html(result)
+
+    assert garbled_title not in modal_html
+    assert garbled_summary not in modal_html
+    assert "AI Daily Brief: インフラAIインフラの最新シグナル" in modal_html
+    assert "メモリー製造業者とGPUエコシステムからの最新シグナル。" in modal_html
+    assert garbled_title not in original_html
+    assert "AI Daily Brief: インフラAIインフラの最新シグナル" in original_html
 
 
 def test_foreign_translation_assess_failed_drops_article() -> None:

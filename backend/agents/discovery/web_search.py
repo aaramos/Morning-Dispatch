@@ -20,6 +20,20 @@ class SearchHit:
     published_at: str | None = None
 
 
+def _repair_text_encoding(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for encoding in ("latin1", "cp1252"):
+        try:
+            repaired = text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if repaired != text:
+            return repaired
+    return text
+
+
 class WebSearchBackend(Protocol):
     name: str
 
@@ -70,9 +84,9 @@ class TavilyBackend:
             parsed.append(
                 SearchHit(
                     provider=self.name,
-                    title=str(result.get("title") or parsed_url).strip()[:220],
+                    title=_repair_text_encoding(result.get("title") or parsed_url)[:220],
                     url=parsed_url,
-                    snippet=str(result.get("content") or result.get("snippet") or "").strip()[:600],
+                    snippet=_repair_text_encoding(result.get("content") or result.get("snippet") or "").strip()[:600],
                     score=float(result.get("score") if isinstance(result.get("score"), (int, float)) else 0.58),
                     published_at=_clean_hit_date(result.get("published_date")),
                 )
@@ -120,9 +134,9 @@ class BraveBackend:
             parsed.append(
                 SearchHit(
                     provider=self.name,
-                    title=str(result.get("title") or parsed_url).strip()[:220],
+                    title=_repair_text_encoding(result.get("title") or parsed_url)[:220],
                     url=parsed_url,
-                    snippet=str(result.get("description") or result.get("extra_snippets") or "").strip()[:600],
+                    snippet=_repair_text_encoding(result.get("description") or result.get("extra_snippets") or "").strip()[:600],
                     score=float(result.get("score") if isinstance(result.get("score"), (int, float)) else 0.58),
                     published_at=_clean_hit_date(result.get("page_age") or result.get("age")),
                 )
@@ -178,9 +192,9 @@ class SerpAPIBackend:
             parsed.append(
                 SearchHit(
                     provider=self.name,
-                    title=str(result.get("title") or parsed_url).strip()[:220],
+                    title=_repair_text_encoding(result.get("title") or parsed_url)[:220],
                     url=parsed_url,
-                    snippet=str(result.get("snippet") or "").strip()[:600],
+                    snippet=_repair_text_encoding(result.get("snippet") or "").strip()[:600],
                     score=score,
                     published_at=_clean_hit_date(result.get("date")),
                 )
