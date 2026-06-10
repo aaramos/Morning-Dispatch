@@ -77,6 +77,11 @@ class Settings:
     reddit_fetch_limit_per_source: int = 25
     reddit_fetch_comments: int = 10
     reddit_request_timeout_seconds: float = 10.0
+    google_news_max_queries: int = 5
+    google_news_request_delay_seconds: float = 3.0
+    google_news_request_timeout_seconds: float = 10.0
+    google_news_unfurl_links: bool = True
+    google_news_locale: str = "en-US:US"
 
 
 def _path_from_env(name: str, default: Path) -> Path:
@@ -374,6 +379,11 @@ def get_settings() -> Settings:
         reddit_fetch_limit_per_source=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_LIMIT_PER_SOURCE", 25),
         reddit_fetch_comments=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_COMMENTS", 10),
         reddit_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_REQUEST_TIMEOUT_SECONDS", 10.0),
+        google_news_max_queries=_int_from_env("MORNING_DISPATCH_GOOGLE_NEWS_MAX_QUERIES", 5),
+        google_news_request_delay_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_DELAY_SECONDS", 3.0),
+        google_news_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_TIMEOUT_SECONDS", 10.0),
+        google_news_unfurl_links=_bool_from_env("MORNING_DISPATCH_GOOGLE_NEWS_UNFURL_LINKS", True),
+        google_news_locale=os.environ.get("MORNING_DISPATCH_GOOGLE_NEWS_LOCALE", "en-US:US").strip(),
     )
 
 
@@ -386,6 +396,7 @@ def ensure_runtime_dirs(settings: Settings) -> None:
         settings.data_dir / "digest-output",
         settings.data_dir / "podcast-audio",
         settings.data_dir / "podcast-transcripts",
+        settings.data_dir / "google-news-decode-cache",
         settings.secrets_dir,
         settings.secrets_dir / "gmail",
         settings.secrets_dir / "podcastindex",

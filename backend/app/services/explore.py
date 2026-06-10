@@ -392,6 +392,13 @@ async def source_status() -> dict[str, Any]:
                 "reason": None,
                 "mode": "public-json-rss",
             },
+            "google_news": {
+                "label": "Google News",
+                "enabled": True,
+                "setup_required": False,
+                "reason": None,
+                "mode": "public-rss",
+            },
         }
     }
 
@@ -1516,6 +1523,8 @@ def _adapter_from_payload_type(source_type: str, metadata: dict[str, Any] | None
     metadata = metadata or {}
     if source_type == "gmail_link":
         if metadata.get("search_query") or metadata.get("search_provider"):
+            if metadata.get("search_provider") == "google_news_rss":
+                return "google_news"
             return "web_search"
         return "gmail"
     return {
@@ -1631,6 +1640,8 @@ def _infer_payload_adapter(payload: Any) -> str | None:
         return "markets"
     if source_type in {"gmail", "gmail_link"}:
         if metadata.get("search_query") or metadata.get("search_provider"):
+            if metadata.get("search_provider") == "google_news_rss":
+                return "google_news"
             return "web_search"
         return "gmail"
     return None
@@ -1694,6 +1705,12 @@ def _extract_promoted_source(*, adapter: str | None, payload: Any) -> dict[str, 
 
     if normalized_adapter == "reddit":
         ref = str(metadata.get("subreddit") or source_name).strip()
+        if not ref:
+            return None
+        return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}
+
+    if normalized_adapter == "google_news":
+        ref = str(metadata.get("publisher") or source_name).strip()
         if not ref:
             return None
         return {"adapter": normalized_adapter, "ref": ref, "has_feed": False, "feed_url": None}

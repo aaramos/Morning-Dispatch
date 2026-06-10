@@ -34,14 +34,15 @@ refinement_chat: |
         "youtube": ["query"],
         "podcasts": ["query"],
         "collections": ["query"],
-        "markets": ["TICKER"]
+        "markets": ["TICKER"],
+        "google_news": ["query"]
       },
       "foreign_regions": ["east_asia|asia|europe|latin_america|middle_east|africa|oceania"],
       "depth": "practitioner|informed-generalist",
       "recency_weighting": "breaking|recent|last_year|all_available",
       "lookback_hours": 168,
       "exclusions": ["thing to avoid"],
-      "requested_sources": [{"adapter": "web_search|gmail|podcasts|foreign_media|youtube|collections|markets", "ref": "source name"}],
+      "requested_sources": [{"adapter": "web_search|gmail|podcasts|foreign_media|youtube|collections|markets|google_news", "ref": "source name"}],
       "source_selection": {"web_search": true},
       "foreign_language_plan": [
         {"code": "ko", "name": "Korean", "native_query": "idiomatic query", "native_entity_terms": ["native entity"], "reason": "why this language helps"}
@@ -109,12 +110,13 @@ refinement_agent: |
         "youtube": ["query"],
         "podcasts": ["query"],
         "collections": ["query"],
-        "markets": ["company or ticker theme"]
+        "markets": ["company or ticker theme"],
+        "google_news": ["query"]
       },
       "depth": "practitioner|informed-generalist",
       "recency_weighting": "breaking|recent|last_year|all_available",
       "exclusions": ["thing to avoid"],
-      "requested_sources": [{"adapter": "web_search|gmail|podcasts|foreign_media|youtube|collections|markets", "ref": "source name"}],
+      "requested_sources": [{"adapter": "web_search|gmail|podcasts|foreign_media|youtube|collections|markets|google_news", "ref": "source name"}],
       "source_selection": {"web_search": true},
       "foreign_language_plan": [
         {
@@ -166,14 +168,15 @@ strategy_refinement_chat: |
         "youtube": ["video/channel query"],
         "podcasts": ["show or episode topic"],
         "collections": ["local document query"],
-        "markets": ["TICKER"]
+        "markets": ["TICKER"],
+        "google_news": ["query"]
       },
       "foreign_regions": ["east_asia|asia|europe|latin_america|middle_east|africa|oceania"],
       "replace_source_queries": false,
       "foreign_language_plan": [
         {"code": "zh", "name": "Chinese", "native_query": "idiomatic query", "native_entity_terms": [], "reason": "why"}
       ],
-      "requested_sources": [{"adapter": "podcasts|youtube|web_search|foreign_media|gmail|collections|markets", "ref": "source name"}],
+      "requested_sources": [{"adapter": "podcasts|youtube|web_search|foreign_media|gmail|collections|markets|google_news", "ref": "source name"}],
       "recency_weighting": "breaking|recent|last_year|all_available",
       "lookback_hours": 336,
       "exclusions": ["thing to avoid"],
@@ -247,7 +250,8 @@ strategy_refinement: |
         "youtube": ["video/channel query"],
         "podcasts": ["show or episode topic"],
         "collections": ["local document query"],
-        "markets": ["TICKER"]
+        "markets": ["TICKER"],
+        "google_news": ["query"]
       },
       "replace_source_queries": false,
       "foreign_language_plan": [
@@ -259,7 +263,7 @@ strategy_refinement: |
           "reason": "why this language helps"
         }
       ],
-      "requested_sources": [{"adapter": "podcasts|youtube|web_search|foreign_media|gmail|collections|markets", "ref": "specific source name"}],
+      "requested_sources": [{"adapter": "podcasts|youtube|web_search|foreign_media|gmail|collections|markets|google_news", "ref": "specific source name"}],
       "recency_weighting": "breaking|recent|last_year|all_available",
       "lookback_hours": 336,
       "exclusions": ["thing to avoid"],
@@ -309,6 +313,7 @@ query_refinement: |
   
   CRITICAL:
   - For the "podcasts" source adapter, search queries MUST be extremely short (1 to 3 words max, e.g. "AI hardware", "semiconductor podcast", "data center power") because the podcast index directory query matching is very strict and returns zero results for long phrases.
+  - For the "google_news" source adapter, queries should be short, headline-style keywords (e.g., "apple stock" or "climate policy", not full questions).
   - Suggest alternative synonyms or broader concepts if specific keywords are too narrow.
   
   Format your response as a strict JSON object with this shape:
@@ -393,7 +398,7 @@ query_broadening: |
   - Return a list of broadened queries in the "search_queries" field.
   - Optionally return a dictionary of broadened queries per source adapter (e.g. "web_search", "podcasts", "youtube") in the "source_queries" field.
   - For "podcasts", source_queries MUST be extremely short (1 to 2 words max, e.g. "AI", "semiconductor"). You may also update direct_episode_queries, related_episode_queries, negative_constraints, and priority_terms to broaden podcast discovery without suppressing approved latest episodes.
-  - Use source-specific repair behavior: web_search should broaden restrictive terms and add aliases; foreign_media should add native-language variants; gmail should stay inside approved sender/query boundaries; podcasts should add adjacent show/episode/guest terms; youtube should use video/channel/interview phrasing; markets should stay ticker-only; reddit should add subreddit-native terms.
+  - Use source-specific repair behavior: web_search should broaden restrictive terms and add aliases; foreign_media should add native-language variants; gmail should stay inside approved sender/query boundaries; podcasts should add adjacent show/episode/guest terms; youtube should use video/channel/interview phrasing; markets should stay ticker-only; reddit should add subreddit-native terms; google_news should focus on short headline keywords.
 
   Format your response as a strict JSON object with this shape:
   {

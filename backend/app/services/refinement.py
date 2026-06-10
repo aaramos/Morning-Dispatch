@@ -61,7 +61,7 @@ QUESTIONS = {
     GMAIL_RULES_FIELD: "How do you want me to use Gmail for this brief? For example: AI-related newsletters received in the last 7 days.",
 }
 
-VALID_SOURCE_ADAPTERS = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit"}
+VALID_SOURCE_ADAPTERS = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news"}
 PODCAST_STRATEGY_FIELDS = (
     "direct_episode_queries",
     "related_episode_queries",

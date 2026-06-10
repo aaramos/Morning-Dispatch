@@ -1482,3 +1482,168 @@ class RedditSourceAdapter:
 
     async def fetch(self, candidate: Candidate) -> Any:
         return candidate.payload
+
+
+class GoogleNewsSourceAdapter:
+    name = "google_news"
+    cost_profile = CostProfile(label="medium", timeout_seconds=45.0)
+    good_for = ("breaking_news", "headlines", "broad_discovery", "mainstream_coverage")
+
+    async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
+        import httpx
+        from backend.agents.discovery.google_news import fetch_google_news_sequential, decode_google_news_url
+        
+        queries = _web_search_queries(profile, _requested_refs(profile, "google_news"), adapter=self.name)
+        settings = get_settings()
+        max_queries = getattr(settings, "google_news_max_queries", 5)
+        queries = queries[:max_queries]
+        
+        if not queries:
+            return []
+            
+        locale_str = getattr(settings, "google_news_locale", "en-US:US")
+        hl, gl, ceid = "en-US", "US", "US:en"
+        if ":" in locale_str:
+            hl_part, gl_part = locale_str.split(":", 1)
+            hl = hl_part
+            gl = gl_part
+            ceid = f"{gl_part}:{hl_part.split('-')[0]}"
+            
+        try:
+            hits = await fetch_google_news_sequential(
+                queries,
+                lookback_hours=context.lookback_hours,
+                limit=10,
+                hl=hl,
+                gl=gl,
+                ceid=ceid,
+            )
+        except BaseException as exc:
+            raise exc
+
+        hits_by_url: dict[str, tuple[Any, str, int]] = {}
+        seen_titles: set[str] = set()
+        
+        def normalize_title(title: str) -> str:
+            cleaned = title.lower()
+            cleaned = re.sub(r"[^\w\s]", "", cleaned)
+            return "".join(cleaned.split())
+            
+        for i, hit in enumerate(hits):
+            url_key = _dedupe_url_key(hit.url)
+            title_key = normalize_title(hit.title)
+            
+            if title_key in seen_titles:
+                continue
+                
+            existing = hits_by_url.get(url_key)
+            if existing is None:
+                hits_by_url[url_key] = (hit, url_key, i)
+                seen_titles.add(title_key)
+                
+        unique_hits = [item[0] for item in hits_by_url.values()]
+        if len(unique_hits) < 3:
+            logger.info("Low-yield detected for Google News adapter. Initiating query refinement...")
+            try:
+                from backend.agents.discovery.query_refiner import refine_queries_for_adapter
+                refined_queries = await refine_queries_for_adapter(
+                    adapter_name=self.name,
+                    profile=profile,
+                    initial_results=unique_hits,
+                    initial_queries=queries,
+                    lookback_hours=context.lookback_hours,
+                )
+            except Exception as exc:
+                logger.warning("Failed to refine queries for Google News adapter: %s", exc)
+                refined_queries = []
+                
+            if refined_queries:
+                refined_queries = refined_queries[:3]
+                try:
+                    ref_hits = await fetch_google_news_sequential(
+                        refined_queries,
+                        lookback_hours=context.lookback_hours,
+                        limit=10,
+                        hl=hl,
+                        gl=gl,
+                        ceid=ceid,
+                    )
+                    
+                    for hit in ref_hits:
+                        url_key = _dedupe_url_key(hit.url)
+                        title_key = normalize_title(hit.title)
+                        
+                        if title_key in seen_titles:
+                            continue
+                            
+                        existing = hits_by_url.get(url_key)
+                        if existing is None:
+                            hits_by_url[url_key] = (hit, url_key, -1)
+                            seen_titles.add(title_key)
+                except Exception as exc:
+                    logger.warning("Error fetching refined Google News: %s", exc)
+
+        candidate_limit = max(1, context.candidate_limit)
+        
+        def get_score(pos: int) -> float:
+            if pos == -1:
+                return 0.75
+            return max(0.55, 0.90 - pos * 0.02)
+            
+        ordered_items = sorted(
+            hits_by_url.values(),
+            key=lambda x: get_score(x[2]),
+            reverse=True
+        )
+        
+        top_items = ordered_items[:candidate_limit]
+        
+        unfurl_enabled = getattr(settings, "google_news_unfurl_links", True)
+        unfurl_delay = getattr(settings, "google_news_request_delay_seconds", 3.0)
+        
+        decoded_items = []
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            for idx, (hit, url_key, pos) in enumerate(top_items):
+                decoded_url = None
+                if unfurl_enabled:
+                    if idx > 0:
+                        await asyncio.sleep(unfurl_delay)
+                    decoded_url = await decode_google_news_url(hit.url, client=client)
+                
+                decoded_items.append((hit, decoded_url or hit.url, pos))
+                
+        candidates = []
+        for hit, final_url, pos in decoded_items:
+            score = get_score(pos)
+            is_refined = (pos == -1)
+            
+            metadata = {
+                "link_quality_score": score,
+                "search_query_rank": pos + 1 if not is_refined else 1,
+                "search_provider": "google_news_rss",
+                "publisher": hit.publisher,
+                "google_news_url": hit.url,
+            }
+            if is_refined:
+                metadata["is_refined_query"] = True
+                
+            payload = NormalizedPayload(
+                source_type="gmail_link",
+                source_name=hit.publisher,
+                raw_text=hit.snippet,
+                original_url=final_url,
+                published_at=hit.published_at,
+                metadata=metadata,
+            )
+            
+            candidates.append(Candidate(
+                adapter=self.name,
+                payload=payload,
+                score=score,
+                reason=f"Google News article from {hit.publisher}.",
+            ))
+            
+        return candidates
+
+    async def fetch(self, candidate: Candidate) -> Any:
+        return candidate.payload

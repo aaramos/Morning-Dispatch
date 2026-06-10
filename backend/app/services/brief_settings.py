@@ -33,6 +33,7 @@ LANE_CAPS: dict[str, int] = {
     "web_search": 750,
     "gmail": 750,
     "reddit": 500,
+    "google_news": 750,
 }
 
 # Single source of truth for per-source ceilings. For each source the configured
@@ -48,6 +49,7 @@ PER_SOURCE_MAX: dict[str, int] = {
     "collections": 50,
     "podcasts": 40,
     "youtube": 40,
+    "google_news": 80,
 }
 # Sources not listed above fall back to this cap.
 DEFAULT_PER_SOURCE_MAX = 50

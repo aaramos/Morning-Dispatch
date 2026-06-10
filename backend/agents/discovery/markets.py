@@ -290,11 +290,11 @@ def _safe_earnings_date(ticker: Any) -> str | None:
 
 
 def fetch_google_news_rss(ticker_symbol: str, company_name: str) -> list[dict[str, Any]]:
+    from backend.agents.discovery.google_news import build_search_url, decode_google_news_url_sync
     sites = ["reuters.com", "cnbc.com", "bloomberg.com", "wsj.com", "ft.com", "marketwatch.com"]
     site_query = " OR ".join(f"site:{site}" for site in sites)
     query = f'({site_query}) AND ("{company_name}" OR "{ticker_symbol}")'
-    encoded_query = urllib.parse.quote(query)
-    url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+    url = build_search_url(query)
 
     articles = []
     try:
@@ -328,9 +328,17 @@ def fetch_google_news_rss(ticker_symbol: str, company_name: str) -> list[dict[st
                     except Exception:
                         pass
 
+                from backend.app.core.config import get_settings
+                unfurl_enabled = getattr(get_settings(), "google_news_unfurl_links", True)
+                final_url = link_text
+                if unfurl_enabled and link_text:
+                    decoded = decode_google_news_url_sync(link_text)
+                    if decoded:
+                        final_url = decoded
+
                 articles.append({
                     "title": clean_title,
-                    "url": link_text,
+                    "url": final_url,
                     "published_at": published_at.isoformat(timespec="seconds") if published_at else None,
                     "publisher": source_text or "Google News",
                 })

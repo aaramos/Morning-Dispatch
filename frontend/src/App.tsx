@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 
-type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets" | "reddit";
+type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets" | "reddit" | "google_news";
 type FlowState = "idle" | "refining" | "confirm" | "building" | "ready" | "schedule";
 type SortMode = "recent" | "name";
 type SchedulePreset = "daily" | "weekdays" | "weekly" | "monthly";
@@ -501,6 +501,7 @@ const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
   { key: "collections", label: "Collections", icon: "▣" },
   { key: "markets", label: "Markets", icon: "$" },
   { key: "reddit", label: "Reddit", icon: "👽" },
+  { key: "google_news", label: "Google News", icon: "📰" },
 ];
 
 const foreignRegionOptions: Array<{ key: string; label: string }> = [
@@ -524,6 +525,7 @@ const defaultSourceSelection: Record<SourceKey, boolean> = {
   collections: false,
   markets: false,
   reddit: false,
+  google_news: false,
 };
 const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   web_search: true,
@@ -534,6 +536,7 @@ const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   collections: true,
   markets: true,
   reddit: true,
+  google_news: true,
 };
 
 const defaultContentLimits: ContentLimitsDraft = {
@@ -549,6 +552,7 @@ const defaultContentLimits: ContentLimitsDraft = {
     collections: 50,
     markets: 80,
     reddit: 60,
+    google_news: 80,
   },
   quality_floor: "standard",
 };
@@ -565,6 +569,7 @@ const defaultMediumContentLimits: ContentLimitsDraft = {
     collections: 30,
     markets: 48,
     reddit: 36,
+    google_news: 48,
   },
   quality_floor: "standard",
 };
@@ -7554,6 +7559,7 @@ function enabledSourceSelection(selection: Record<SourceKey, boolean>, status: S
     collections: Boolean(selection.collections && status?.sources.collections?.enabled),
     markets: Boolean(selection.markets && status?.sources.markets?.enabled),
     reddit: Boolean(selection.reddit && status?.sources.reddit?.enabled),
+    google_news: Boolean(selection.google_news && status?.sources.google_news?.enabled),
   };
 }
 
@@ -7660,6 +7666,7 @@ function formatSourceLabel(source: string): string {
   if (source === "youtube") return "YouTube";
   if (source === "collections") return "Collections";
   if (source === "markets") return "Markets";
+  if (source === "google_news") return "Google News";
   return source.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
@@ -7774,6 +7781,7 @@ function sourceFromIssueName(sourceName: string): string {
   if (lowered.includes("podcast")) return "Podcast";
   if (lowered.includes("youtube")) return "YouTube";
   if (lowered.includes("market") || /^[A-Z0-9.=-]{1,12}$/.test(sourceName.trim())) return "Markets";
+  if (lowered.includes("google_news") || lowered.includes("google news") || lowered.includes("google-news")) return "Google News";
   if (/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(sourceName)) return "Foreign Media";
   return "Web";
 }

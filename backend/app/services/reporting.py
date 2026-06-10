@@ -44,6 +44,7 @@ SOURCE_ISSUE_ADAPTERS = {
     "web": "web_search",
     "web search": "web_search",
     "youtube": "youtube",
+    "google news": "google_news",
 }
 
 
