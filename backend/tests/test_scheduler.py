@@ -194,6 +194,43 @@ def test_scheduler_runs_due_topic_profiles(monkeypatch, tmp_path):
     assert delivered == scheduled_exploration_ids
 
 
+def test_scheduler_sends_topic_digest_to_configured_recipients(monkeypatch, tmp_path):
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = database.upsert_topic_profile(
+        {
+            "statement": "Explore local AI news",
+            "scope": "Local AI and tools",
+            "source_selection": {"gmail": False, "reddit": False, "podcasts": False, "web_search": False},
+            "schedule": "hourly",
+            "delivery_config": {
+                "email_enabled": True,
+                "recipient_emails": ["alpha@example.com", "beta@example.com"],
+            },
+        }
+    )
+
+    sent: list[tuple[str, str | None]] = []
+
+    async def fake_run_scheduled(topic_id: str, source_selection: dict[str, bool] | None = None):
+        exploration = database.create_exploration(topic_id=topic_id, mode="scheduled", source_selection=source_selection or {})
+        database.update_exploration_status(exploration["exploration_id"], status="complete", brief_ref="/tmp/fake-brief.html")
+        return {"exploration": {"exploration_id": exploration["exploration_id"]}}
+
+    def fake_send_exploration_brief(exploration_id: str, recipient_email: str | None = None) -> dict[str, str]:
+        sent.append((exploration_id, recipient_email))
+        return {"status": "sent"}
+
+    monkeypatch.setattr(scheduler.explore, "run_scheduled", fake_run_scheduled)
+    monkeypatch.setattr(scheduler.email_delivery, "send_exploration_brief", fake_send_exploration_brief)
+
+    count = asyncio.run(scheduler.run_due_digests_once(datetime(2026, 5, 22, 12, 0, tzinfo=UTC)))
+
+    assert count == 1
+    assert [recipient for _exploration_id, recipient in sent] == ["alpha@example.com", "beta@example.com"]
+    assert database.get_topic_profile(topic["topic_id"])["profile"]["delivery_config"]["last_delivery_status"] == "sent"
+
+
 def test_scheduler_pauses_topic_email_after_first_delivery_failure(monkeypatch, tmp_path):
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()

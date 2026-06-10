@@ -382,6 +382,15 @@ type ScheduledDeliveryFailure = {
 
 type ModelRouteDraft = Record<string, { model: string }>;
 
+type EditingDigestDraft = {
+  topicId: string;
+  preset: SchedulePreset;
+  time: string;
+  emailEnabled: boolean;
+  recipients: string[];
+  newRecipient: string;
+};
+
 type LibraryResponse = {
   explorations: Exploration[];
   deleted_explorations: Exploration[];
@@ -903,6 +912,8 @@ type RefinementStreamBody = {
   statement?: string;
   source_selection?: Record<string, boolean>;
   foreign_regions?: string[];
+  recency_weighting?: SourceScope;
+  lookback_hours?: number | null;
   answer?: string;
   models?: Record<string, unknown>;
   just_go_now?: boolean;
@@ -1115,6 +1126,7 @@ function DispatchApp() {
   const [queuedRefinementTurns, setQueuedRefinementTurns] = useState(0);
   const buildBriefRef = useRef<() => void>(() => undefined);
   const [autoBuildRequest, setAutoBuildRequest] = useState(0);
+  const recencyOverrideRef = useRef<Pick<ConfirmationDraft, "recency_weighting" | "lookback_hours"> | null>(null);
 
   const topicById = useMemo(() => new Map(allTopics.map((topic) => [topic.topic_id, topic])), [allTopics]);
   const activeDigest = scheduledTopics[0] ?? null;
@@ -1159,6 +1171,33 @@ function DispatchApp() {
   const sourceLocked = flow === "building";
   const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
   const canBuild = buildInterest.length > 0 && !busy;
+  const updateDraft = useCallback((nextDraft: ConfirmationDraft) => {
+    if (nextDraft.sourceScopeTouched) {
+      recencyOverrideRef.current = {
+        recency_weighting: nextDraft.recency_weighting,
+        lookback_hours: nextDraft.lookback_hours,
+      };
+    }
+    setDraft(nextDraft);
+  }, []);
+  const draftWithStickyRecency = useCallback((
+    profile: TopicProfile,
+    defaults = defaultContentLimits,
+    current?: ConfirmationDraft,
+  ) => {
+    const override = recencyOverrideRef.current;
+    if (!override) return draftFromProfile(profile, defaults, current);
+    return draftFromProfile(
+      profile,
+      defaults,
+      {
+        ...(current ?? emptyDraft(defaults)),
+        recency_weighting: override.recency_weighting,
+        lookback_hours: override.lookback_hours,
+        sourceScopeTouched: true,
+      },
+    );
+  }, []);
   const currentIssues = buildAttentionIssues(exploration);
   const backgroundBuild = useMemo(
     () => recentExplorations.find((item) => item.status === "queued" || item.status === "running") ?? null,
@@ -1233,9 +1272,9 @@ function DispatchApp() {
 
   useEffect(() => {
     if (!session) return;
-    setDraft(draftFromProfile(session.profile, defaultControls.content_limits));
+    setDraft((current) => draftWithStickyRecency(session.profile, defaultControls.content_limits, current));
     setForeignRegionsDraft(session.profile.foreign_regions ?? []);
-  }, [defaultControls.content_limits, session]);
+  }, [defaultControls.content_limits, draftWithStickyRecency, session]);
 
   useEffect(() => {
     if (session || !topicProfile) return;
@@ -1490,15 +1529,15 @@ function DispatchApp() {
     // messages in order. Merging the two produced out-of-order / duplicated turns
     // (notably for "Build brief", where the optimistic and persisted text differ).
     setSession(resolved);
-    setDraft(draftFromProfile(resolved.profile, defaultControls.content_limits));
-    setSourceSelection(sourceSelectionFromRecord(resolved.profile.source_selection));
+    setDraft((current) => draftWithStickyRecency(resolved.profile, defaultControls.content_limits, current));
+    setSourceSelection((current) => mergeSourceSelections(sourceSelectionFromRecord(resolved.profile.source_selection), current));
     if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
     const finalized = resolved.status === "finalized" || ready;
     setFlow(finalized ? "confirm" : "refining");
     setMessage(triggerBuild ? "Building the brief..." : finalized ? "Confirm the brief setup" : "Your turn");
     if (triggerBuild) setAutoBuildRequest((value) => value + 1);
     return resolved;
-  }, [beginLiveRefinementStream, defaultControls.content_limits, endLiveRefinementStream]);
+  }, [beginLiveRefinementStream, defaultControls.content_limits, draftWithStickyRecency, endLiveRefinementStream]);
 
   async function startFlow(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
@@ -1530,6 +1569,8 @@ function DispatchApp() {
         statement: interest,
         source_selection: selectedEnabledSources,
         foreign_regions: foreignRegionsDraft,
+        recency_weighting: draft.recency_weighting,
+        lookback_hours: draft.lookback_hours,
         models: {},
       });
     } catch (error) {
@@ -1567,6 +1608,8 @@ function DispatchApp() {
           statement: activeInterest,
           source_selection: selectedEnabledSources,
           foreign_regions: foreignRegionsDraft,
+          recency_weighting: draft.recency_weighting,
+          lookback_hours: draft.lookback_hours,
           answer: justGoNow ? "" : pendingAnswer,
           just_go_now: justGoNow,
           models: {},
@@ -1583,6 +1626,8 @@ function DispatchApp() {
     activeInterest,
     answer,
     busy,
+    draft.lookback_hours,
+    draft.recency_weighting,
     foreignRegionsDraft,
     runRefinementStream,
     selectedEnabledSources,
@@ -1682,7 +1727,7 @@ function DispatchApp() {
         const resolved: RefinementSession = finalSession;
         setSession(resolved);
         const proposal = resolved.pending_strategy_refinement?.proposed_profile;
-        if (proposal) setDraft(draftFromProfile(proposal, defaultControls.content_limits));
+        if (proposal) setDraft((current) => draftWithStickyRecency(proposal, defaultControls.content_limits, current));
         if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
         setFlow("confirm");
         if (hasProposal) {
@@ -1705,7 +1750,7 @@ function DispatchApp() {
       setStrategyStreamingText("");
       setStrategyPreparingProposal(false);
     }
-  }, [activeInterest, busy, defaultControls.content_limits, selectedEnabledSources, session, strategyPreparingProposal, strategyStreaming, topicProfile?.statement, topicProfile?.topic_id]);
+  }, [activeInterest, busy, defaultControls.content_limits, draftWithStickyRecency, selectedEnabledSources, session, strategyPreparingProposal, strategyStreaming, topicProfile?.statement, topicProfile?.topic_id]);
 
   useEffect(() => {
     const canProcessStrategyQueue = !busy && !strategyStreaming && !strategyPreparingProposal;
@@ -1729,7 +1774,7 @@ function DispatchApp() {
         body: JSON.stringify({ apply }),
       });
       setSession(updated);
-      setDraft(draftFromProfile(updated.profile, defaultControls.content_limits));
+      setDraft((current) => draftWithStickyRecency(updated.profile, defaultControls.content_limits, current));
       if (updated.topic_profile) setTopicProfile(updated.topic_profile);
       if (!updated.pending_strategy_refinement) setFlow("confirm");
       setStrategyConfirmation(apply ? strategyUpdateConfirmation("Search strategy updated.", updated.profile) : "Discarded the proposed strategy update.");
@@ -1846,7 +1891,7 @@ function DispatchApp() {
 
     const proposal = resolved.pending_strategy_refinement?.proposed_profile;
     if (proposal && hasProposal) {
-      setDraft(draftFromProfile(proposal, defaultControls.content_limits));
+      setDraft((current) => draftWithStickyRecency(proposal, defaultControls.content_limits, current));
       if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
       setFlow("confirm");
       setStrategyConfirmation(
@@ -2009,6 +2054,7 @@ function DispatchApp() {
       setStatement("");
       setSourceSelection(sourceSelectionFromRecord(targetExploration.source_selection));
       setSession(nextSession);
+      recencyOverrideRef.current = null;
       setDraft(draftFromProfile(nextSession.profile, defaultControls.content_limits));
       setAnswer("");
       setBriefHtml("");
@@ -2179,6 +2225,7 @@ function DispatchApp() {
       setTopicProfile(item.topic);
       if (item.topic) {
         setStatement(item.topic.statement);
+        recencyOverrideRef.current = null;
         setDraft(draftFromProfile(item.topic.profile, defaultControls.content_limits));
         setSourceSelection(sourceSelectionFromRecord(item.topic.profile.source_selection));
       }
@@ -2210,6 +2257,7 @@ function DispatchApp() {
 
   function loadTopicForConfirmation(topic: TopicProfileResponse) {
     clearInterestDraft();
+    recencyOverrideRef.current = null;
     setRefinementTargetExplorationId(null);
     setTopicProfile(topic);
     setSession(null);
@@ -2226,6 +2274,7 @@ function DispatchApp() {
 
   function resetForNewBrief() {
     clearInterestDraft();
+    recencyOverrideRef.current = null;
     setStrategyConfirmation("");
     setRefinementTargetExplorationId(null);
     setStatement("");
@@ -2250,7 +2299,17 @@ function DispatchApp() {
       return;
     }
     setSourceSelection((current) => {
-      return { ...current, [key]: !current[key] };
+      const nextSelection = { ...current, [key]: !current[key] };
+      const nextSourceSelection = enabledSourceSelection(nextSelection, sourceStatus);
+      setSession((existing) => existing ? {
+        ...existing,
+        profile: { ...existing.profile, source_selection: nextSourceSelection },
+      } : existing);
+      setTopicProfile((existing) => existing ? {
+        ...existing,
+        profile: { ...existing.profile, source_selection: nextSourceSelection },
+      } : existing);
+      return nextSelection;
     });
   }
 
@@ -2425,6 +2484,7 @@ function DispatchApp() {
         setStatement("");
         setSourceSelection(sourceSelectionFromRecord(target.source_selection));
         setSession(nextSession);
+        recencyOverrideRef.current = null;
         setDraft(draftFromProfile(nextSession.profile));
         setAnswer("");
         setBriefHtml("");
@@ -2480,6 +2540,7 @@ function DispatchApp() {
         setStatement("");
         setSourceSelection(nextSourceSelection);
         setSession(nextSession);
+        recencyOverrideRef.current = null;
         setDraft(draftFromProfile(nextSession.profile));
         setAnswer("");
         setBriefHtml("");
@@ -2510,6 +2571,70 @@ function DispatchApp() {
   void refineSearchStrategy;
   void confirmStrategyRefinement;
 
+  const recentBriefsBlock =
+    homeRecentItems.length || activeDigest ? (
+      <div className="recent-block">
+        <div className="section-header-row">
+          <p className="section-kicker">Recent Briefs</p>
+          <DisclosureButton
+            expanded={recentExpanded}
+            label={recentExpanded ? "Hide" : "Show"}
+            onToggle={() => setRecentExpanded((current) => !current)}
+          />
+        </div>
+        {recentExpanded ? (
+          <>
+            {activeDigest ? (
+              <div className="active-digest-row">
+                <span className="live-dot" />
+                <strong>{profileName(activeDigest)}</strong>
+                <button
+                  type="button"
+                  className="active-digest-link"
+                  onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}
+                  disabled={!activeDigest.latest_exploration}
+                >
+                  Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}
+                </button>
+              </div>
+            ) : null}
+            <div className="recent-list">
+              {homeRecentItems.map((item) => (
+                <div className="recent-pill-row" key={homeRecentKey(item)}>
+                  <button className="recent-pill" onClick={() => void openHomeRecentItem(item)}>
+                    <span>{homeRecentIcon(item)}</span>
+                    <strong>{homeRecentTitle(item)}</strong>
+                    <em>{homeRecentMeta(item)}</em>
+                    {item.digest ? <b>digest</b> : homeRecentBadge(item) ? <b>{homeRecentBadge(item)}</b> : null}
+                  </button>
+                  {item.kind === "exploration" ? (
+                    <button
+                      type="button"
+                      className="recent-delete"
+                      onClick={() => void deleteHomeExploration(item)}
+                      disabled={busy}
+                      aria-label={`Delete ${homeRecentTitle(item)}`}
+                    >
+                      Delete
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+            {homeDeleteUndo ? (
+              <div className="undo-note">
+                <span>
+                  Deleted "{homeDeleteUndo.title}".
+                  {homeDeleteUndo.until ? ` Undo until ${formatDateTime(homeDeleteUndo.until)}.` : " Undo is available for 7 days."}
+                </span>
+                <button type="button" className="secondary-action" onClick={() => void restoreHomeExploration()} disabled={busy}>Undo</button>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </div>
+    ) : null;
+
   return (
     <main className="dispatch-page">
       <section className="dispatch-frame">
@@ -2525,68 +2650,6 @@ function DispatchApp() {
         <section className="dispatch-body">
           {scheduledDeliveryFailures.length ? (
             <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} />
-          ) : null}
-          {homeRecentItems.length || activeDigest ? (
-            <div className="recent-block">
-              <div className="section-header-row">
-                <p className="section-kicker">Recent Briefs</p>
-                <DisclosureButton
-                  expanded={recentExpanded}
-                  label={recentExpanded ? "Hide" : "Show"}
-                  onToggle={() => setRecentExpanded((current) => !current)}
-                />
-              </div>
-              {recentExpanded ? (
-                <>
-                  {activeDigest ? (
-                    <div className="active-digest-row">
-                      <span className="live-dot" />
-                      <strong>{profileName(activeDigest)}</strong>
-                      <button
-                        type="button"
-                        className="active-digest-link"
-                        onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}
-                        disabled={!activeDigest.latest_exploration}
-                      >
-                        Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}
-                      </button>
-                    </div>
-                  ) : null}
-                  <div className="recent-list">
-                    {homeRecentItems.map((item) => (
-                      <div className="recent-pill-row" key={homeRecentKey(item)}>
-                        <button className="recent-pill" onClick={() => void openHomeRecentItem(item)}>
-                          <span>{homeRecentIcon(item)}</span>
-                          <strong>{homeRecentTitle(item)}</strong>
-                          <em>{homeRecentMeta(item)}</em>
-                          {item.digest ? <b>digest</b> : homeRecentBadge(item) ? <b>{homeRecentBadge(item)}</b> : null}
-                        </button>
-                        {item.kind === "exploration" ? (
-                          <button
-                            type="button"
-                            className="recent-delete"
-                            onClick={() => void deleteHomeExploration(item)}
-                            disabled={busy}
-                            aria-label={`Delete ${homeRecentTitle(item)}`}
-                          >
-                            Delete
-                          </button>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                  {homeDeleteUndo ? (
-                    <div className="undo-note">
-                      <span>
-                        Deleted "{homeDeleteUndo.title}".
-                        {homeDeleteUndo.until ? ` Undo until ${formatDateTime(homeDeleteUndo.until)}.` : " Undo is available for 7 days."}
-                      </span>
-                      <button type="button" className="secondary-action" onClick={() => void restoreHomeExploration()} disabled={busy}>Undo</button>
-                    </div>
-                  ) : null}
-                </>
-              ) : null}
-            </div>
           ) : null}
 
           {flow === "idle" || flow === "refining" || flow === "confirm" || streaming ? (
@@ -2623,7 +2686,7 @@ function DispatchApp() {
               }}
               statement={statement}
               onStatementChange={setStatement}
-              onDraftChange={setDraft}
+              onDraftChange={updateDraft}
               onForeignRegionsChange={updateForeignRegions}
               sourceStatus={sourceStatus}
               sourceLocked={sourceLocked}
@@ -2685,6 +2748,7 @@ function DispatchApp() {
               onSchedule={() => void scheduleBrief()}
             />
           ) : null}
+          {recentBriefsBlock}
         </section>
       </section>
       <p className="screen-reader-status" aria-live="polite">{message}</p>
@@ -2855,7 +2919,7 @@ function recencyText(weighting?: string, lookbackHours?: number | null): string 
 function recencyControlValue(lookbackHours: number | null): { unlimited: boolean; amount: number; unit: RecencyUnit } {
   if (lookbackHours === null) return { unlimited: true, amount: 7, unit: "days" };
   const hours = Math.max(0, Number(lookbackHours) || 168);
-  const days = hours <= 24 ? 0 : Math.max(1, Math.round(hours / 24));
+  const days = Math.max(1, Math.round(hours / 24));
   if (days > 365 || (days >= 30 && days % 30 === 0)) {
     return { unlimited: false, amount: Math.min(365, Math.round(days / 30)), unit: "months" };
   }
@@ -2902,14 +2966,16 @@ function RecencyControl(props: {
         />
         Unlimited
       </label>
-      <input
-        type="number"
-        min={0}
-        max={amountMax}
+      <select
+        className="recency-amount-select"
         value={current.amount}
         disabled={current.unlimited}
         onChange={(event) => update({ amount: Number(event.target.value) })}
-      />
+      >
+        {Array.from({ length: amountMax }, (_, index) => index + 1).map((amount) => (
+          <option value={amount} key={amount}>{amount}</option>
+        ))}
+      </select>
       <select
         value={current.unit}
         disabled={current.unlimited}
@@ -3019,7 +3085,7 @@ function RefinementPanel(props: {
       query,
       index,
     })));
-  const recencyLabel = recencyText(preview?.recency_weighting, preview?.lookback_hours);
+  const recencyLabel = recencyText(props.draft.recency_weighting, props.draft.lookback_hours);
   const scopeText = preview?.scope || props.profile?.scope || "";
   const foreignRegions = props.foreignRegions;
   const progressState = props.refinementProgress
@@ -5488,7 +5554,7 @@ function AdminApp() {
   const [busy, setBusy] = useState(false);
   const [explorationSort, setExplorationSort] = useState<SortMode>(() => loadSessionValue("admin.explorationSort", "recent"));
   const [digestSort, setDigestSort] = useState<SortMode>(() => loadSessionValue("admin.digestSort", "recent"));
-  const [editingDigest, setEditingDigest] = useState<{ topicId: string; preset: SchedulePreset; time: string } | null>(null);
+  const [editingDigest, setEditingDigest] = useState<EditingDigestDraft | null>(null);
   const [editingAdvancedSettings, setEditingAdvancedSettings] = useState<{
     topic: TopicProfileResponse;
     controls: BriefControlsDraft;
@@ -5953,6 +6019,10 @@ function AdminApp() {
     window.location.href = `/?refine_exploration=${encodeURIComponent(exploration.exploration_id)}`;
   }
 
+  function refineTopicFromAdmin(topic: TopicProfileResponse) {
+    window.location.href = `/?refine_topic=${encodeURIComponent(topic.topic_id)}`;
+  }
+
   async function cloneAndRefineFromAdmin(exploration: Exploration) {
     setBusy(true);
     try {
@@ -6070,6 +6140,20 @@ function AdminApp() {
     }
   }
 
+  async function deleteTopicFromAdmin(topic: TopicProfileResponse) {
+    if (!window.confirm(`Delete incomplete brief plan "${profileName(topic)}" from the library?`)) return;
+    setBusy(true);
+    try {
+      await api(`/api/explore/topic-profiles/${topic.topic_id}`, { method: "DELETE" });
+      await loadAdmin();
+      setMessage("Incomplete brief plan deleted");
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not delete brief plan"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function rebuildLegacyDigest(digest: Digest) {
     setBusy(true);
     try {
@@ -6158,16 +6242,25 @@ function AdminApp() {
 
   function startEditingDigest(topic: TopicProfileResponse) {
     const config = topic.profile.schedule_config ?? {};
+    const recipients = digestRecipients(topic, status?.delivery?.email.recipient_email ?? "");
     setEditingDigest({
       topicId: topic.topic_id,
       preset: ((topic.schedule ?? "daily") as SchedulePreset),
       time: typeof config.time_of_day === "string" ? config.time_of_day : "08:00",
+      emailEnabled: digestEmailEnabled(topic),
+      recipients,
+      newRecipient: "",
     });
     setMessage("Editing schedule");
   }
 
   async function saveDigestSchedule(topic: TopicProfileResponse) {
     if (!editingDigest || editingDigest.topicId !== topic.topic_id) return;
+    const recipients = uniqueCleanList(editingDigest.recipients);
+    if (editingDigest.emailEnabled && recipients.length === 0) {
+      setMessage("Add at least one email address or turn off email delivery.");
+      return;
+    }
     setBusy(true);
     try {
       await api(`/api/explore/topic-profiles/${topic.topic_id}/schedule`, {
@@ -6176,6 +6269,8 @@ function AdminApp() {
           schedule: editingDigest.preset,
           time_of_day: editingDigest.time || "08:00",
           timezone: "America/Los_Angeles",
+          email_enabled: editingDigest.emailEnabled,
+          recipient_emails: recipients,
         }),
       });
       setEditingDigest(null);
@@ -6186,6 +6281,34 @@ function AdminApp() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function addDigestRecipient() {
+    if (!editingDigest) return;
+    const additions = parseEmailEntries(editingDigest.newRecipient);
+    if (!additions.length) return;
+    const invalid = additions.find((email) => !email.includes("@"));
+    if (invalid) {
+      setMessage(`Enter a valid email address: ${invalid}`);
+      return;
+    }
+    setEditingDigest({
+      ...editingDigest,
+      recipients: uniqueCleanList([...editingDigest.recipients, ...additions]),
+      newRecipient: "",
+      emailEnabled: true,
+    });
+  }
+
+  function removeDigestRecipient(email: string) {
+    if (!editingDigest) return;
+    const key = email.toLowerCase();
+    const recipients = editingDigest.recipients.filter((item) => item.toLowerCase() !== key);
+    setEditingDigest({
+      ...editingDigest,
+      recipients,
+      emailEnabled: recipients.length > 0 ? editingDigest.emailEnabled : false,
+    });
   }
 
   async function rebuildDigest(topic: TopicProfileResponse) {
@@ -6573,7 +6696,9 @@ function AdminApp() {
                     </div>
                     <div className="button-row">
                       <button type="button" className="secondary-action" onClick={() => openAdvancedSettings(item.topic)} disabled={busy}>Advanced Settings</button>
+                      <button type="button" className="secondary-action" onClick={() => refineTopicFromAdmin(item.topic)} disabled={busy}>Refine</button>
                       <button type="button" className="secondary-action" onClick={() => void buildTopicFromAdmin(item.topic)} disabled={busy}>Build brief</button>
+                      <button type="button" className="secondary-action destructive" onClick={() => void deleteTopicFromAdmin(item.topic)} disabled={busy}>Delete</button>
                     </div>
                   </article>
                 );
@@ -6633,23 +6758,15 @@ function AdminApp() {
                     <LibraryBuildProgress exploration={item.exploration} />
                   ) : null}
                   {item.topic && editingDigest?.topicId === item.topic.topic_id ? (
-                    <div className="inline-schedule-editor">
-                      <select
-                        value={editingDigest.preset}
-                        onChange={(event) => setEditingDigest({ ...editingDigest, preset: event.target.value as SchedulePreset })}
-                      >
-                        {schedulePresets.map((preset) => (
-                          <option value={preset.value} key={preset.value}>{preset.label}</option>
-                        ))}
-                      </select>
-                      <input
-                        type="time"
-                        value={editingDigest.time}
-                        onChange={(event) => setEditingDigest({ ...editingDigest, time: event.target.value })}
-                      />
-                      <button type="button" onClick={() => void saveDigestSchedule(item.topic!)} disabled={busy}>Save</button>
-                      <button type="button" className="ghost-action" onClick={() => setEditingDigest(null)} disabled={busy}>Cancel</button>
-                    </div>
+                    <DigestScheduleEditor
+                      draft={editingDigest}
+                      busy={busy}
+                      onDraftChange={setEditingDigest}
+                      onAddRecipient={addDigestRecipient}
+                      onRemoveRecipient={removeDigestRecipient}
+                      onSave={() => void saveDigestSchedule(item.topic!)}
+                      onCancel={() => setEditingDigest(null)}
+                    />
                   ) : null}
                   {item.exploration.status === "complete" ? (
                     <div className="inline-email-editor">
@@ -6777,23 +6894,15 @@ function AdminApp() {
                     <LibraryBuildProgress exploration={topic.latest_exploration} />
                   ) : null}
                   {editingDigest?.topicId === topic.topic_id ? (
-                    <div className="inline-schedule-editor">
-                      <select
-                        value={editingDigest.preset}
-                        onChange={(event) => setEditingDigest({ ...editingDigest, preset: event.target.value as SchedulePreset })}
-                      >
-                        {schedulePresets.map((preset) => (
-                          <option value={preset.value} key={preset.value}>{preset.label}</option>
-                        ))}
-                      </select>
-                      <input
-                        type="time"
-                        value={editingDigest.time}
-                        onChange={(event) => setEditingDigest({ ...editingDigest, time: event.target.value })}
-                      />
-                      <button type="button" onClick={() => void saveDigestSchedule(topic)} disabled={busy}>Save</button>
-                      <button type="button" className="ghost-action" onClick={() => setEditingDigest(null)} disabled={busy}>Cancel</button>
-                    </div>
+                    <DigestScheduleEditor
+                      draft={editingDigest}
+                      busy={busy}
+                      onDraftChange={setEditingDigest}
+                      onAddRecipient={addDigestRecipient}
+                      onRemoveRecipient={removeDigestRecipient}
+                      onSave={() => void saveDigestSchedule(topic)}
+                      onCancel={() => setEditingDigest(null)}
+                    />
                   ) : null}
                 </article>
               );
@@ -7269,6 +7378,70 @@ function LibrarySection(props: {
   );
 }
 
+function DigestScheduleEditor(props: {
+  draft: EditingDigestDraft;
+  busy: boolean;
+  onDraftChange: (draft: EditingDigestDraft) => void;
+  onAddRecipient: () => void;
+  onRemoveRecipient: (email: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="inline-schedule-editor">
+      <select
+        value={props.draft.preset}
+        onChange={(event) => props.onDraftChange({ ...props.draft, preset: event.target.value as SchedulePreset })}
+      >
+        {schedulePresets.map((preset) => (
+          <option value={preset.value} key={preset.value}>{preset.label}</option>
+        ))}
+      </select>
+      <input
+        type="time"
+        value={props.draft.time}
+        onChange={(event) => props.onDraftChange({ ...props.draft, time: event.target.value })}
+      />
+      <label className="inline-check">
+        <input
+          type="checkbox"
+          checked={props.draft.emailEnabled}
+          onChange={(event) => props.onDraftChange({ ...props.draft, emailEnabled: event.target.checked })}
+        />
+        Email this digest
+      </label>
+      <div className="digest-recipient-editor">
+        <span className="digest-recipient-label">Recipients</span>
+        <div className="digest-recipient-list">
+          {props.draft.recipients.length ? props.draft.recipients.map((email) => (
+            <span className="digest-recipient-chip" key={email}>
+              {email}
+              <button type="button" onClick={() => props.onRemoveRecipient(email)} aria-label={`Remove ${email}`} disabled={props.busy}>x</button>
+            </span>
+          )) : <em>No email recipients</em>}
+        </div>
+        <div className="digest-recipient-add">
+          <input
+            type="email"
+            value={props.draft.newRecipient}
+            onChange={(event) => props.onDraftChange({ ...props.draft, newRecipient: event.target.value })}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                props.onAddRecipient();
+              }
+            }}
+            placeholder="name@example.com"
+          />
+          <button type="button" className="secondary-action" onClick={props.onAddRecipient} disabled={props.busy || !props.draft.newRecipient.trim()}>Add email</button>
+        </div>
+      </div>
+      <button type="button" onClick={props.onSave} disabled={props.busy}>Save</button>
+      <button type="button" className="ghost-action" onClick={props.onCancel} disabled={props.busy}>Cancel</button>
+    </div>
+  );
+}
+
 function DisclosureButton(props: { expanded: boolean; label: string; onToggle: () => void }) {
   return (
     <button type="button" className="disclosure-button" onClick={props.onToggle} aria-expanded={props.expanded}>
@@ -7291,8 +7464,8 @@ function emptyDraft(defaults = defaultContentLimits): ConfirmationDraft {
   };
 }
 
-function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits): ConfirmationDraft {
-  return {
+function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits, preserve?: ConfirmationDraft): ConfirmationDraft {
+  const nextDraft: ConfirmationDraft = {
     scope: profile.scope || profile.statement || "",
     depth: profile.depth === "practitioner" ? "practitioner" : "informed-generalist",
     recency_weighting: sourceScopeFromProfile(profile),
@@ -7302,6 +7475,20 @@ function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits
     recency_scope_confirmed: false,
     sourceScopeTouched: false,
   };
+  if (!preserve?.sourceScopeTouched) return nextDraft;
+  return {
+    ...nextDraft,
+    recency_weighting: preserve.recency_weighting,
+    lookback_hours: preserve.lookback_hours,
+    sourceScopeTouched: true,
+  };
+}
+
+function mergeSourceSelections(
+  incoming: Record<SourceKey, boolean>,
+  sticky: Record<SourceKey, boolean>,
+): Record<SourceKey, boolean> {
+  return { ...incoming, ...sticky };
 }
 
 function briefControlsFromProfile(profile: TopicProfile, defaults = defaultBriefControls): BriefControlsDraft {
@@ -7529,6 +7716,29 @@ function uniqueCleanList(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
+function parseEmailEntries(value: string): string[] {
+  return uniqueCleanList(value.split(/[\s,;]+/));
+}
+
+function digestEmailEnabled(topic: TopicProfileResponse): boolean {
+  const config = topic.profile.delivery_config ?? {};
+  return Boolean(config.email_enabled);
+}
+
+function digestRecipients(topic: TopicProfileResponse, fallback = ""): string[] {
+  const config = topic.profile.delivery_config ?? {};
+  if (Array.isArray(config.recipient_emails)) {
+    return uniqueCleanList(config.recipient_emails.map((value) => String(value || "")));
+  }
+  if (typeof config.recipient_email === "string" && config.recipient_email.trim()) {
+    return uniqueCleanList([config.recipient_email]);
+  }
+  if (digestEmailEnabled(topic) && fallback.trim()) {
+    return uniqueCleanList([fallback]);
+  }
+  return [];
+}
+
 function cleanSourceQueryRecord(value: Record<string, string[]> | undefined): Record<string, string[]> {
   const cleaned: Record<string, string[]> = {};
   for (const [source, queries] of Object.entries(value ?? {})) {
@@ -7691,9 +7901,8 @@ function formatSourceSelection(selection: Record<string, boolean>): string {
 
 function sourcePlan(selection: Record<string, boolean>): string {
   const enabled = sourceOptions.filter((source) => selection[source.key]).map((source) => source.label);
-  const disabled = sourceOptions.filter((source) => !selection[source.key]).map((source) => source.label);
   if (!enabled.length) return "No sources selected";
-  return disabled.length ? `Running: ${enabled.join(", ")} (${disabled.join(", ")} excluded)` : `Running: ${enabled.join(", ")}`;
+  return `Running: ${enabled.join(", ")}`;
 }
 
 function formatPipeline(pipeline: Array<[string, string]>): string {

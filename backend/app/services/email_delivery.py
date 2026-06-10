@@ -20,9 +20,17 @@ SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 def delivery_capability(settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
     token_scopes = gmail_token_scopes(settings)
+    health = gmail_credentials_health(settings)
+    has_send_scope = SEND_SCOPE in token_scopes
+    gmail_valid = bool(health.get("valid"))
+    reason = health.get("reason")
+    if gmail_valid and not has_send_scope:
+        reason = "Reconnect Gmail in Admin Sources to grant send permission."
     return {
-        "gmail_send_ready": SEND_SCOPE in token_scopes,
-        "requires_gmail_reconnect": settings.gmail_credentials_path.exists() and SEND_SCOPE not in token_scopes,
+        "gmail_send_ready": gmail_valid and has_send_scope,
+        "requires_gmail_reconnect": bool(health.get("requires_reconnect"))
+        or (settings.gmail_credentials_path.exists() and not has_send_scope),
+        "gmail_send_reason": reason,
         "token_scopes": sorted(token_scopes),
     }
 
@@ -517,6 +525,8 @@ def _token_scopes(settings: Settings) -> set[str]:
 
 def _delivery_error(exc: Exception) -> str:
     detail = str(exc)
+    if "invalid_grant" in detail or "expired or revoked" in detail:
+        return "Reconnect Gmail in Admin Sources. Google says the saved token has expired or was revoked."
     if "insufficient" in detail.lower() or "permission" in detail.lower():
         return "Gmail send permission is missing. Reconnect Gmail from Admin."
     return detail[:500]

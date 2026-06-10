@@ -298,6 +298,8 @@ async def astream_refinement(
     answer: str,
     just_go_now: bool,
     foreign_regions: list[str] | None = None,
+    recency_weighting: str | None = None,
+    lookback_hours: int | None = None,
 ):
     """AI-led streaming refinement turn.
 
@@ -320,6 +322,8 @@ async def astream_refinement(
                     "statement": clean_statement,
                     "source_selection": source_selection or {},
                     "foreign_regions": foreign_regions or [],
+                    "recency_weighting": recency_weighting,
+                    "lookback_hours": lookback_hours,
                     "models": models,
                 }
             )
@@ -406,6 +410,16 @@ async def astream_refinement(
     prev_selection = _source_selection_dict(profile.get("source_selection"))
     incoming_selection = source_selection or {}
     profile["source_selection"] = {**prev_selection, **incoming_selection}
+    if recency_weighting == "all_available":
+        profile["recency_weighting"] = "all_available"
+        profile["lookback_hours"] = None
+    elif lookback_hours is not None:
+        coerced_lookback = _coerce_lookback_hours(lookback_hours)
+        if coerced_lookback is not None:
+            profile["lookback_hours"] = coerced_lookback
+            profile["recency_weighting"] = _recency_from_lookback_hours(coerced_lookback)
+    elif recency_weighting:
+        profile["recency_weighting"] = recency_weighting
 
     if profile["source_selection"].get("gmail") and not prev_selection.get("gmail"):
         profile["gmail_rules"] = {}
@@ -2057,7 +2071,9 @@ def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
             }
         return profile
     requested_sources = _extract_requested_sources(statement)
-    lookback_hours = _extract_lookback_hours(statement)
+    payload_lookback = _coerce_lookback_hours(payload.get("lookback_hours"))
+    payload_recency = str(payload.get("recency_weighting") or "").strip()
+    lookback_hours = payload_lookback if payload_lookback is not None else _extract_lookback_hours(statement)
     return {
         "topic_id": database.new_id(),
         "statement": statement,
@@ -2068,7 +2084,7 @@ def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "source_queries": {},
         "foreign_language_plan": [],
         "depth": "",
-        "recency_weighting": "",
+        "recency_weighting": payload_recency,
         "lookback_hours": lookback_hours,
         "exclusions": [],
         "source_selection": {**DEFAULT_EXPLORE_SOURCE_SELECTION, **selected_sources},

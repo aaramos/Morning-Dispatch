@@ -123,6 +123,8 @@ class RefinementStreamMessage(BaseModel):
     statement: str = ""
     source_selection: dict[str, bool] = Field(default_factory=dict)
     foreign_regions: list[str] = Field(default_factory=list)
+    recency_weighting: Literal["breaking", "recent", "last_year", "all_available", "balanced", "evergreen"] | None = None
+    lookback_hours: int | None = Field(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
     answer: str = ""
     models: dict[str, Any] = Field(default_factory=dict)
     just_go_now: bool = False
@@ -157,6 +159,7 @@ class TopicProfileSchedule(BaseModel):
     time_of_day: str | None = Field(default=None, max_length=8)
     timezone: str | None = Field(default=None, max_length=80)
     email_enabled: bool | None = None
+    recipient_emails: list[str] | None = None
 
 
 class TopicProfileContentLimitsUpdate(BaseModel):
@@ -246,6 +249,8 @@ async def stream_refinement(payload: RefinementStreamMessage) -> StreamingRespon
                 statement=payload.statement,
                 source_selection=payload.source_selection,
                 foreign_regions=payload.foreign_regions,
+                recency_weighting=payload.recency_weighting,
+                lookback_hours=payload.lookback_hours,
                 models=payload.models,
                 answer=payload.answer,
                 just_go_now=payload.just_go_now,
@@ -445,6 +450,8 @@ def schedule_topic_profile(topic_id: str, payload: TopicProfileSchedule) -> dict
         delivery_config.pop(key, None)
     if payload.email_enabled is not None:
         delivery_config["email_enabled"] = bool(payload.email_enabled)
+    if payload.recipient_emails is not None:
+        delivery_config["recipient_emails"] = _clean_recipient_emails(payload.recipient_emails)
     profile = {
         **record["profile"],
         "topic_id": topic_id,
@@ -457,6 +464,21 @@ def schedule_topic_profile(topic_id: str, payload: TopicProfileSchedule) -> dict
         "deleted": False,
     }
     return database.upsert_topic_profile(profile)
+
+
+def _clean_recipient_emails(values: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        email = str(value or "").strip()
+        key = email.lower()
+        if not email or key in seen:
+            continue
+        if "@" not in email:
+            raise HTTPException(status_code=400, detail=f"Enter a valid recipient email address: {email}")
+        cleaned.append(email)
+        seen.add(key)
+    return cleaned[:12]
 
 
 @router.post("/explore/topic-profiles/{topic_id}/content-limits")

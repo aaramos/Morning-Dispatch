@@ -119,14 +119,19 @@ async def run_due_digests_once(now: datetime | None = None) -> int:
             if _scheduled_delivery_paused(delivery_config):
                 logger.warning("Scheduled email delivery is paused after a failed send for topic %s", topic_id)
                 continue
-            delivery = email_delivery.send_exploration_brief(str(result["exploration"]["exploration_id"]))
-            if delivery.get("status") == "failed":
+            exploration_id = str(result["exploration"]["exploration_id"])
+            deliveries = [
+                email_delivery.send_exploration_brief(exploration_id, recipient_email=recipient)
+                for recipient in _scheduled_recipient_emails(delivery_config)
+            ]
+            delivery = next((item for item in deliveries if item.get("status") == "failed"), deliveries[-1] if deliveries else {"status": "skipped", "error": "No delivery email configured."})
+            if delivery.get("status") == "failed" or delivery.get("status") == "skipped":
                 error = str(delivery.get("error") or "Email delivery failed.")
                 database.record_topic_delivery_result(topic_id=topic_id, status="failed", error=error)
                 _last_error = f"Scheduled explore {topic_id}: {error}"
                 delivery_error_seen = True
                 logger.warning("Scheduled email delivery failed for topic %s: %s", topic_id, error)
-            elif delivery.get("status") == "sent":
+            elif deliveries and all(item.get("status") == "sent" for item in deliveries):
                 database.record_topic_delivery_result(
                     topic_id=topic_id,
                     status="sent",
@@ -146,6 +151,25 @@ async def run_due_digests_once(now: datetime | None = None) -> int:
 
 def _scheduled_email_enabled(delivery_config: Any) -> bool:
     return isinstance(delivery_config, dict) and bool(delivery_config.get("email_enabled"))
+
+
+def _scheduled_recipient_emails(delivery_config: Any) -> list[str | None]:
+    if not isinstance(delivery_config, dict):
+        return [None]
+    values = delivery_config.get("recipient_emails")
+    if not isinstance(values, list):
+        legacy = str(delivery_config.get("recipient_email") or "").strip()
+        return [legacy] if legacy else [None]
+    recipients: list[str | None] = []
+    seen: set[str] = set()
+    for value in values:
+        email = str(value or "").strip()
+        key = email.lower()
+        if not email or key in seen:
+            continue
+        recipients.append(email)
+        seen.add(key)
+    return recipients
 
 
 def _scheduled_delivery_paused(delivery_config: Any) -> bool:
