@@ -480,3 +480,41 @@ def test_strip_refinement_closing_language_preserves_paragraphs():
     assert "\n\n" in cleaned
     assert "quantized local models" in cleaned
     assert cleaned.strip().endswith("?")
+
+
+def test_parse_chat_payload_surfaces_refinement_intent_and_nullable_recency():
+    text = json.dumps(
+        {
+            "reply": "I'll keep refining this with you.",
+            "intent": "confirm_changes",
+            "profile_patch": {
+                "lookback_hours": None,
+                "foreign_regions": ["east_asia"],
+                "source_queries": {"web_search": ["AI infrastructure supply chain"]},
+            },
+        }
+    )
+
+    patch, ready, intent = refinement._parse_chat_payload(text)
+
+    assert ready is False
+    assert intent == "confirm_changes"
+    assert patch["lookback_hours"] is None
+    assert patch["foreign_regions"] == ["east_asia"]
+
+
+def test_parse_chat_payload_build_intent_marks_ready():
+    patch, ready, intent = refinement._parse_chat_payload(
+        json.dumps(
+            {
+                "reply": "I'll build it now.",
+                "intent": "build",
+                "ready": False,
+                "profile_patch": {"scope": "AI infrastructure"},
+            }
+        )
+    )
+
+    assert patch["scope"] == "AI infrastructure"
+    assert ready is True
+    assert intent == "build"

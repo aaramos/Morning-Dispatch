@@ -7,6 +7,7 @@ type SortMode = "recent" | "name";
 type SchedulePreset = "daily" | "weekdays" | "weekly" | "monthly";
 type SourceScope = "breaking" | "recent" | "last_year" | "all_available";
 type RefinementProgressPhase = "starting" | "answering" | "confirming";
+type RecencyUnit = "days" | "months";
 
 type SourceStatus = {
   label: string;
@@ -38,6 +39,7 @@ type TopicProfile = {
   search_queries?: string[];
   source_queries?: Record<string, string[]>;
   foreign_language_plan?: Array<{ code: string; name: string; native_query: string; reason?: string }>;
+  foreign_regions?: string[];
   direct_episode_queries?: string[];
   related_episode_queries?: string[];
   negative_constraints?: string[];
@@ -144,12 +146,13 @@ type ConfirmedProfilePayload = {
   scope: string;
   depth: ConfirmationDraft["depth"];
   recency_weighting: SourceScope;
-  lookback_hours?: number;
+  lookback_hours?: number | null;
   exclusions: string[];
   source_selection: Record<string, boolean>;
   requested_sources: Array<{ adapter: string; ref: string }>;
   subtopics: string[];
   keywords: string[];
+  foreign_regions?: string[];
   search_queries: string[];
   source_queries: Record<string, string[]>;
   direct_episode_queries?: string[];
@@ -403,7 +406,7 @@ type ConfirmationDraft = {
   scope: string;
   depth: "practitioner" | "informed-generalist";
   recency_weighting: SourceScope;
-  lookback_hours: number;
+  lookback_hours: number | null;
   exclusions: string;
   content_limits: ContentLimitsDraft;
   sourceScopeTouched?: boolean;
@@ -419,7 +422,7 @@ type ContentLimitsDraft = {
 };
 
 type BriefControlsDraft = {
-  lookback_hours: number;
+  lookback_hours: number | null;
   content_limits: ContentLimitsDraft;
   youtube_presets?: {
     max: number;
@@ -450,6 +453,7 @@ type PipelineLimitsDraft = {
   article_fetches: number;
   article_fetch_concurrency: number;
   model_refinement_items: number;
+  date_adjudication_candidates: number;
   source_audit_candidates: number;
   editorial_candidates: number;
   critic_articles: number;
@@ -499,6 +503,18 @@ const sourceOptions: Array<{ key: SourceKey; label: string; icon: string }> = [
   { key: "reddit", label: "Reddit", icon: "👽" },
 ];
 
+const foreignRegionOptions: Array<{ key: string; label: string }> = [
+  { key: "asia", label: "Asia" },
+  { key: "east_asia", label: "East Asia" },
+  { key: "china", label: "China" },
+  { key: "japan", label: "Japan" },
+  { key: "korea", label: "Korea" },
+  { key: "europe", label: "Europe" },
+  { key: "latin_america", label: "Latin America" },
+  { key: "middle_east", label: "Middle East" },
+  { key: "africa", label: "Africa" },
+];
+
 const defaultSourceSelection: Record<SourceKey, boolean> = {
   web_search: true,
   foreign_media: false,
@@ -521,65 +537,65 @@ const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
 };
 
 const defaultContentLimits: ContentLimitsDraft = {
-  total_items: 250,
-  target_items: 25,
+  total_items: 1000,
+  target_items: 50,
   lead_items: 5,
   per_source: {
-    web_search: 40,
-    foreign_media: 40,
-    gmail: 40,
-    podcasts: 20,
-    youtube: 20,
-    collections: 25,
-    markets: 40,
-    reddit: 20,
+    web_search: 80,
+    foreign_media: 80,
+    gmail: 80,
+    podcasts: 40,
+    youtube: 40,
+    collections: 50,
+    markets: 80,
+    reddit: 60,
   },
   quality_floor: "standard",
 };
 const defaultMediumContentLimits: ContentLimitsDraft = {
-  total_items: 150,
-  target_items: 15,
+  total_items: 600,
+  target_items: 30,
   lead_items: 3,
   per_source: {
-    web_search: 24,
-    foreign_media: 24,
-    gmail: 24,
-    podcasts: 12,
-    youtube: 12,
-    collections: 15,
-    markets: 24,
-    reddit: 12,
+    web_search: 48,
+    foreign_media: 48,
+    gmail: 48,
+    podcasts: 24,
+    youtube: 24,
+    collections: 30,
+    markets: 48,
+    reddit: 36,
   },
   quality_floor: "standard",
 };
 const defaultBriefControls: BriefControlsDraft = {
-  lookback_hours: 336,
+  lookback_hours: 168,
   content_limits: defaultMediumContentLimits,
   youtube_presets: {
-    max: 20,
-    large: 16,
-    medium: 12,
-    focused: 8,
-  },
-  podcast_presets: {
-    max: 20,
-    large: 16,
-    medium: 12,
-    focused: 8,
-  },
-  gmail_presets: {
     max: 40,
     large: 32,
     medium: 24,
     focused: 16,
   },
+  podcast_presets: {
+    max: 40,
+    large: 32,
+    medium: 24,
+    focused: 16,
+  },
+  gmail_presets: {
+    max: 80,
+    large: 64,
+    medium: 48,
+    focused: 32,
+  },
 };
 const briefControlBounds = {
-  source_window_days: { min: 1, max: 365 },
-  total_items: { min: 1, max: 250 },
-  target_items: { min: 1, max: 250 },
+  source_window_days: { min: 0, max: 10950 },
+  total_items: { min: 1, max: 1000 },
+  target_items: { min: 1, max: 1000 },
   lead_items: { min: 0, max: 20 },
-  per_source: { min: 1, max: 50 },
+  per_source: { min: 1, max: 80 },
 };
 
 function scaleContentLimits(limits: ContentLimitsDraft, scale: number): ContentLimitsDraft {
@@ -600,12 +616,13 @@ function scaleContentLimits(limits: ContentLimitsDraft, scale: number): ContentL
   };
 }
 const defaultPipelineLimits: PipelineLimitsDraft = {
-  article_fetches: 250,
-  article_fetch_concurrency: 10,
-  model_refinement_items: 150,
-  source_audit_candidates: 28,
-  editorial_candidates: 150,
-  critic_articles: 50,
+  article_fetches: 1000,
+  article_fetch_concurrency: 35,
+  model_refinement_items: 250,
+  date_adjudication_candidates: 100,
+  source_audit_candidates: 150,
+  editorial_candidates: 500,
+  critic_articles: 250,
   critic_newsletter_records: 20,
 };
 const pipelineLimitFields: Array<{
@@ -619,42 +636,49 @@ const pipelineLimitFields: Array<{
     key: "article_fetches",
     label: "Article fetches",
     min: 1,
-    max: 250,
+    max: 1000,
     note: "Maximum article URLs the fetch step will retrieve.",
   },
   {
     key: "article_fetch_concurrency",
     label: "Fetch concurrency",
     min: 1,
-    max: 20,
+    max: 40,
     note: "Parallel article fetches during extraction.",
   },
   {
     key: "model_refinement_items",
     label: "Model-enriched items",
     min: 0,
-    max: 150,
+    max: 250,
     note: "Candidate summaries/refinements sent through the model.",
+  },
+  {
+    key: "date_adjudication_candidates",
+    label: "Date adjudication candidates",
+    min: 1,
+    max: 100,
+    note: "Candidates reviewed for publication-date ambiguity before strict recency filtering.",
   },
   {
     key: "source_audit_candidates",
     label: "Source audit candidates",
     min: 1,
-    max: 28,
+    max: 150,
     note: "Candidates reviewed in the pre-ranking source audit.",
   },
   {
     key: "editorial_candidates",
     label: "Editorial candidates",
     min: 1,
-    max: 150,
+    max: 500,
     note: "Candidates the editorial model can sort and include.",
   },
   {
     key: "critic_articles",
     label: "Critic articles",
     min: 1,
-    max: 50,
+    max: 250,
     note: "Draft articles reviewed by the critic pass.",
   },
   {
@@ -854,7 +878,7 @@ type RefinementStreamEvent =
   | { type: "session"; session_id: string }
   | { type: "token"; text: string }
   | { type: "plan"; session: RefinementSession }
-  | { type: "done"; session: RefinementSession; ready: boolean }
+  | { type: "done"; session: RefinementSession; ready: boolean; trigger_build?: boolean }
   | { type: "gmail_candidates" } & GmailCandidatePayload
   | { type: "gmail_approved"; senders: string[] }
   | { type: "error"; message: string };
@@ -873,6 +897,7 @@ type RefinementStreamBody = {
   session_id?: string | null;
   statement?: string;
   source_selection?: Record<string, boolean>;
+  foreign_regions?: string[];
   answer?: string;
   models?: Record<string, unknown>;
   just_go_now?: boolean;
@@ -1055,6 +1080,8 @@ function DispatchApp() {
   const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
   const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
   const [strategyConfirmation, setStrategyConfirmation] = useState("");
+  const [foreignRegionsDraft, setForeignRegionsDraft] = useState<string[]>([]);
+  const [queuedStrategyRefinementTurns, setQueuedStrategyRefinementTurns] = useState(0);
   const [initialRefineExplorationId] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     const refineExplorationId = params.get("refine_exploration");
@@ -1078,6 +1105,11 @@ function DispatchApp() {
   const [progressNow, setProgressNow] = useState(0);
   const activeRefinementStreams = useRef(0);
   const activeRefinementTurns = useRef(0);
+  const refinementAnswerQueue = useRef<string[]>([]);
+  const strategyRefinementQueue = useRef<string[]>([]);
+  const [queuedRefinementTurns, setQueuedRefinementTurns] = useState(0);
+  const buildBriefRef = useRef<() => void>(() => undefined);
+  const [autoBuildRequest, setAutoBuildRequest] = useState(0);
 
   const topicById = useMemo(() => new Map(allTopics.map((topic) => [topic.topic_id, topic])), [allTopics]);
   const activeDigest = scheduledTopics[0] ?? null;
@@ -1197,7 +1229,13 @@ function DispatchApp() {
   useEffect(() => {
     if (!session) return;
     setDraft(draftFromProfile(session.profile, defaultControls.content_limits));
+    setForeignRegionsDraft(session.profile.foreign_regions ?? []);
   }, [defaultControls.content_limits, session]);
+
+  useEffect(() => {
+    if (session || !topicProfile) return;
+    setForeignRegionsDraft(topicProfile.profile.foreign_regions ?? []);
+  }, [session, topicProfile]);
 
   useEffect(() => {
     if (!activeRefinementProgress) return;
@@ -1231,20 +1269,48 @@ function DispatchApp() {
     }
   }
 
-  function beginLiveRefinementStream() {
+  const beginLiveRefinementStream = useCallback(() => {
     activeRefinementStreams.current += 1;
     if (activeRefinementStreams.current === 1) {
       setStreamingText("");
     }
     setStreaming(true);
-  }
+  }, []);
 
-  function endLiveRefinementStream() {
+  const endLiveRefinementStream = useCallback(() => {
     activeRefinementStreams.current = Math.max(0, activeRefinementStreams.current - 1);
     if (activeRefinementStreams.current === 0) {
       setStreaming(false);
       setStreamingText("");
     }
+  }, []);
+
+  function queueRefinementMessage(message: string) {
+    const clean = message.trim();
+    if (!clean) return;
+    refinementAnswerQueue.current.push(clean);
+    setQueuedRefinementTurns(refinementAnswerQueue.current.length);
+  }
+
+  function queueStrategyRefinementMessage(message: string) {
+    const clean = message.trim();
+    if (!clean) return;
+    strategyRefinementQueue.current.push(clean);
+    setQueuedStrategyRefinementTurns(strategyRefinementQueue.current.length);
+  }
+
+  function shiftQueuedRefinementMessage(): string | null {
+    const next = refinementAnswerQueue.current.shift() ?? null;
+    if (!next) return null;
+    setQueuedRefinementTurns(refinementAnswerQueue.current.length);
+    return next;
+  }
+
+  function shiftQueuedStrategyRefinementMessage(): string | null {
+    const next = strategyRefinementQueue.current.shift() ?? null;
+    if (!next) return null;
+    setQueuedStrategyRefinementTurns(strategyRefinementQueue.current.length);
+    return next;
   }
 
   function updateSearchQuery(target: QueryEditTarget, nextValue: string | null) {
@@ -1325,9 +1391,45 @@ function DispatchApp() {
     ));
   }
 
+  function updateForeignRegions(nextRegions: string[]) {
+    const cleanRegions = uniqueCleanList(nextRegions);
+    setForeignRegionsDraft(cleanRegions);
+    const applyRegions = (profile: TopicProfile): TopicProfile => ({
+      ...profile,
+      foreign_regions: cleanRegions,
+    });
+    const applyPreview = (preview: StrategyPreview | undefined): StrategyPreview | undefined => (
+      preview
+        ? {
+          ...preview,
+          reasoning_summary: preview.reasoning_summary,
+        }
+        : preview
+    );
+    setSession((current) => {
+      if (!current) return current;
+      const pending = current.pending_strategy_refinement
+        ? {
+          ...current.pending_strategy_refinement,
+          proposed_profile: applyRegions(current.pending_strategy_refinement.proposed_profile),
+          strategy_preview: applyPreview(current.pending_strategy_refinement.strategy_preview),
+        }
+        : current.pending_strategy_refinement;
+      return {
+        ...current,
+        profile: applyRegions(current.profile),
+        pending_strategy_refinement: pending,
+        strategy_preview: applyPreview(current.strategy_preview),
+      };
+    });
+    setTopicProfile((current) => (
+      current ? { ...current, profile: applyRegions(current.profile) } : current
+    ));
+  }
+
   // Drives one AI-led streaming turn: streams prose into the live bubble, applies the
   // plan snapshot, and advances the flow. Returns the final session (or null on error).
-  async function runRefinementStream(
+  const runRefinementStream = useCallback(async function runRefinementStream(
     body: RefinementStreamBody,
     optimisticUser?: string,
   ): Promise<RefinementSession | null> {
@@ -1340,6 +1442,7 @@ function DispatchApp() {
     let live = "";
     let finalSession: RefinementSession | null = null;
     let ready = false;
+    let triggerBuild = false;
     let streamError = "";
     try {
       await streamRefinement(body, (event) => {
@@ -1351,6 +1454,7 @@ function DispatchApp() {
         } else if (event.type === "done") {
           finalSession = event.session;
           ready = event.ready;
+          triggerBuild = event.trigger_build === true;
         } else if (event.type === "gmail_candidates") {
           // Pause the stream; render the approval UI — next user turn is the approval reply.
           setGmailCandidates({
@@ -1386,9 +1490,10 @@ function DispatchApp() {
     if (resolved.topic_profile) setTopicProfile(resolved.topic_profile);
     const finalized = resolved.status === "finalized" || ready;
     setFlow(finalized ? "confirm" : "refining");
-    setMessage(finalized ? "Confirm the brief setup" : "Your turn");
+    setMessage(triggerBuild ? "Building the brief..." : finalized ? "Confirm the brief setup" : "Your turn");
+    if (triggerBuild) setAutoBuildRequest((value) => value + 1);
     return resolved;
-  }
+  }, [beginLiveRefinementStream, defaultControls.content_limits, endLiveRefinementStream]);
 
   async function startFlow(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
@@ -1419,6 +1524,7 @@ function DispatchApp() {
       await runRefinementStream({
         statement: interest,
         source_selection: selectedEnabledSources,
+        foreign_regions: foreignRegionsDraft,
         models: {},
       });
     } catch (error) {
@@ -1432,12 +1538,19 @@ function DispatchApp() {
     }
   }
 
-  async function answerRefinement(justGoNow = false, answerOverride?: string) {
-    if (busy || streaming || activeRefinementTurns.current > 0) return;
+  const answerRefinement = useCallback(async (justGoNow = false, answerOverride?: string) => {
     if (!activeInterest) return;
     const effectiveAnswer = (answerOverride ?? answer).trim();
     if (!session && !justGoNow && !effectiveAnswer) return;
     if (!justGoNow && !effectiveAnswer) return;
+    if (busy || streaming || activeRefinementTurns.current > 0) {
+      if (!justGoNow && effectiveAnswer) {
+        queueRefinementMessage(effectiveAnswer);
+        setMessage("Reply queued while model is working.");
+        setAnswer("");
+      }
+      return;
+    }
     const pendingAnswer = effectiveAnswer;
     setAnswer("");
     beginRefinementTurn();
@@ -1448,6 +1561,7 @@ function DispatchApp() {
           session_id: session?.session_id ?? null,
           statement: activeInterest,
           source_selection: selectedEnabledSources,
+          foreign_regions: foreignRegionsDraft,
           answer: justGoNow ? "" : pendingAnswer,
           just_go_now: justGoNow,
           models: {},
@@ -1460,11 +1574,40 @@ function DispatchApp() {
     } finally {
       endRefinementTurn();
     }
-  }
+  }, [
+    activeInterest,
+    answer,
+    busy,
+    foreignRegionsDraft,
+    runRefinementStream,
+    selectedEnabledSources,
+    session,
+    streaming,
+  ]);
 
-  async function refineSearchStrategy(instruction: string) {
+  useEffect(() => {
+    const canProcessRefinementQueue = !busy && !streaming && activeRefinementTurns.current === 0;
+    if (!canProcessRefinementQueue || queuedRefinementTurns === 0) return;
+    const timer = window.setTimeout(() => {
+      const queuedMessage = shiftQueuedRefinementMessage();
+      if (!queuedMessage) return;
+      void answerRefinement(false, queuedMessage);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [queuedRefinementTurns, streaming, busy, answerRefinement]);
+
+  const refineSearchStrategy = useCallback(async (instruction: string, fromQueue = false) => {
     const cleanInstruction = instruction.trim();
     if (!cleanInstruction) return;
+    if (!fromQueue && (busy || strategyStreaming || strategyPreparingProposal)) {
+      queueStrategyRefinementMessage(cleanInstruction);
+      setMessage("Strategy update queued while model is working.");
+      return;
+    }
+    if (fromQueue && (busy || strategyStreaming || strategyPreparingProposal)) {
+      queueStrategyRefinementMessage(cleanInstruction);
+      return;
+    }
     const baseStatement = activeInterest || topicProfile?.statement || session?.statement || "";
     if (!baseStatement) {
       const message = "I do not have an active brief plan to refine. Close this and start from the brief interest again.";
@@ -1557,7 +1700,18 @@ function DispatchApp() {
       setStrategyStreamingText("");
       setStrategyPreparingProposal(false);
     }
-  }
+  }, [activeInterest, busy, defaultControls.content_limits, selectedEnabledSources, session, strategyPreparingProposal, strategyStreaming, topicProfile?.statement, topicProfile?.topic_id]);
+
+  useEffect(() => {
+    const canProcessStrategyQueue = !busy && !strategyStreaming && !strategyPreparingProposal;
+    if (!canProcessStrategyQueue || queuedStrategyRefinementTurns === 0) return;
+    const timer = window.setTimeout(() => {
+      const queuedMessage = shiftQueuedStrategyRefinementMessage();
+      if (!queuedMessage) return;
+      void refineSearchStrategy(queuedMessage, true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [busy, queuedStrategyRefinementTurns, strategyPreparingProposal, strategyStreaming, refineSearchStrategy]);
 
   async function confirmStrategyRefinement(apply: boolean) {
     if (!session?.session_id) return;
@@ -1597,12 +1751,13 @@ function DispatchApp() {
       scope: draftOverride.scope.trim() || interest,
       depth: draftOverride.depth,
       recency_weighting: draftOverride.recency_weighting,
-      ...(lookbackHours ? { lookback_hours: lookbackHours } : {}),
+      lookback_hours: lookbackHours,
       exclusions: splitList(draftOverride.exclusions),
       source_selection: selectedEnabledSources,
       requested_sources: baseProfile?.requested_sources ?? [],
       subtopics: baseProfile?.subtopics ?? [],
       keywords: baseProfile?.keywords ?? [],
+      foreign_regions: baseProfile?.foreign_regions ?? foreignRegionsDraft,
       search_queries: uniqueCleanList(baseProfile?.search_queries ?? []),
       source_queries: cleanSourceQueryRecord(baseProfile?.source_queries),
       direct_episode_queries: uniqueCleanList(baseProfile?.direct_episode_queries ?? []),
@@ -1775,6 +1930,19 @@ function DispatchApp() {
       endRefinementProgress();
     }
   }
+
+  useEffect(() => {
+    buildBriefRef.current = () => {
+      void buildBrief();
+    };
+  });
+
+  useEffect(() => {
+    if (!autoBuildRequest) return;
+    if (flow !== "confirm" || busy || streaming) return;
+    setAutoBuildRequest(0);
+    buildBriefRef.current();
+  }, [autoBuildRequest, busy, flow, streaming]);
 
   async function rebuildBrief() {
     if (!exploration || !hasEnabledSource(selectedEnabledSources)) return;
@@ -2422,6 +2590,8 @@ function DispatchApp() {
               session={session}
               interest={submittedInterest || statement}
               profile={session?.profile ?? topicProfile?.profile ?? null}
+              draft={draft}
+              foreignRegions={session?.profile.foreign_regions ?? topicProfile?.profile.foreign_regions ?? foreignRegionsDraft}
               sourceSelection={sourceSelection}
               answer={answer}
               busy={busy}
@@ -2430,15 +2600,16 @@ function DispatchApp() {
               refinementProgress={activeRefinementProgress}
               progressNow={progressNow}
               gmailCandidates={gmailCandidates}
+              queuedRefinementTurns={queuedRefinementTurns}
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
-	              onGmailApprove={(approvedSenders, instructions) => {
-	                let reply = "none";
-	                if (!approvedSenders.length) {
-	                  setSourceSelection((current) => ({ ...current, gmail: false }));
-	                }
-	                if (approvedSenders.length) {
-	                  reply = `Approved: ${approvedSenders.join(", ")}`;
+              onGmailApprove={(approvedSenders, instructions) => {
+                let reply = "none";
+                if (!approvedSenders.length) {
+                  setSourceSelection((current) => ({ ...current, gmail: false }));
+                }
+                if (approvedSenders.length) {
+                  reply = `Approved: ${approvedSenders.join(", ")}`;
                   if (instructions.trim()) {
                     reply += `\nInstructions: ${instructions.trim()}`;
                   }
@@ -2447,6 +2618,8 @@ function DispatchApp() {
               }}
               statement={statement}
               onStatementChange={setStatement}
+              onDraftChange={setDraft}
+              onForeignRegionsChange={updateForeignRegions}
               sourceStatus={sourceStatus}
               sourceLocked={sourceLocked}
               onSourceToggle={updateSource}
@@ -2562,7 +2735,7 @@ function GmailApprovalCard(props: {
     });
   }
 
-  const isSubmitDisabled = props.busy;
+  const isSubmitDisabled = false;
 
   return (
     <div className="gmail-approval-card">
@@ -2622,7 +2795,7 @@ function GmailApprovalCard(props: {
             onChange={(e) => setExtractionRules(e.target.value)}
             placeholder="e.g. Extract dev tools and ignore sponsorships"
             rows={3}
-            disabled={props.busy}
+            disabled={false}
           />
         </div>
       ) : null}
@@ -2643,7 +2816,7 @@ function GmailApprovalCard(props: {
             type="button"
             className="secondary-action"
             onClick={() => props.onApprove([], "")}
-            disabled={props.busy}
+            disabled={false}
           >
             Skip Gmail
           </button>
@@ -2657,6 +2830,7 @@ function GmailApprovalCard(props: {
 }
 
 function recencyText(weighting?: string, lookbackHours?: number | null): string {
+  if (lookbackHours === null || weighting === "all_available") return "Unlimited";
   if (lookbackHours && lookbackHours > 0) {
     if (lookbackHours <= 48) return `Last ${lookbackHours} hours`;
     const days = Math.round(lookbackHours / 24);
@@ -2673,11 +2847,115 @@ function recencyText(weighting?: string, lookbackHours?: number | null): string 
   return weighting ? map[weighting] ?? weighting : "";
 }
 
+function recencyControlValue(lookbackHours: number | null): { unlimited: boolean; amount: number; unit: RecencyUnit } {
+  if (lookbackHours === null) return { unlimited: true, amount: 7, unit: "days" };
+  const hours = Math.max(0, Number(lookbackHours) || 168);
+  const days = hours <= 24 ? 0 : Math.max(1, Math.round(hours / 24));
+  if (days > 365 || (days >= 30 && days % 30 === 0)) {
+    return { unlimited: false, amount: Math.min(365, Math.round(days / 30)), unit: "months" };
+  }
+  return { unlimited: false, amount: Math.min(365, days), unit: "days" };
+}
+
+function lookbackHoursFromRecencyControl(amount: number, unit: RecencyUnit, unlimited: boolean): number | null {
+  if (unlimited) return null;
+  const cleanAmount = clampContentLimit(amount, 0, 365);
+  if (unit === "months") return Math.min(262800, cleanAmount * 30 * 24);
+  if (cleanAmount === 0) return 24;
+  return Math.min(262800, cleanAmount * 24);
+}
+
+function sourceScopeFromLookbackHours(lookbackHours: number | null): SourceScope {
+  if (lookbackHours === null) return "all_available";
+  if (lookbackHours <= 48) return "breaking";
+  if (lookbackHours >= 365 * 24) return "last_year";
+  return "recent";
+}
+
+function RecencyControl(props: {
+  label?: string;
+  value: number | null;
+  onChange: (lookbackHours: number | null) => void;
+  compact?: boolean;
+}) {
+  const current = recencyControlValue(props.value);
+  const amountMax = 365;
+
+  function update(next: Partial<typeof current>) {
+    const merged = { ...current, ...next };
+    props.onChange(lookbackHoursFromRecencyControl(merged.amount, merged.unit, merged.unlimited));
+  }
+
+  return (
+    <div className={`recency-control ${props.compact ? "compact" : ""}`}>
+      <strong>{props.label ?? "Recency"}</strong>
+      <label className="recency-unlimited-toggle">
+        <input
+          type="checkbox"
+          checked={current.unlimited}
+          onChange={(event) => update({ unlimited: event.target.checked })}
+        />
+        Unlimited
+      </label>
+      <input
+        type="number"
+        min={0}
+        max={amountMax}
+        value={current.amount}
+        disabled={current.unlimited}
+        onChange={(event) => update({ amount: Number(event.target.value) })}
+      />
+      <select
+        value={current.unit}
+        disabled={current.unlimited}
+        onChange={(event) => update({ unit: event.target.value as RecencyUnit })}
+      >
+        <option value="days">Days</option>
+        <option value="months">Months</option>
+      </select>
+    </div>
+  );
+}
+
+function ForeignRegionPicker(props: {
+  selected: string[];
+  onChange: (regions: string[]) => void;
+}) {
+  const selected = new Set(props.selected);
+  return (
+    <div className="foreign-region-picker">
+      <strong>Foreign regions</strong>
+      <div className="foreign-region-row">
+        {foreignRegionOptions.map((region) => {
+          const enabled = selected.has(region.key);
+          return (
+            <button
+              key={region.key}
+              type="button"
+              className={enabled ? "active" : ""}
+              onClick={() => {
+                const next = new Set(selected);
+                if (enabled) next.delete(region.key);
+                else next.add(region.key);
+                props.onChange(Array.from(next));
+              }}
+            >
+              {region.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function RefinementPanel(props: {
   flow: "idle" | "refining" | "confirm";
   session: RefinementSession | null;
   interest: string;
   profile: TopicProfile | null;
+  draft: ConfirmationDraft;
+  foreignRegions: string[];
   sourceSelection: Record<string, boolean>;
   answer: string;
   busy: boolean;
@@ -2686,12 +2964,15 @@ function RefinementPanel(props: {
   refinementProgress: RefinementProgress | null;
   progressNow: number;
   gmailCandidates: GmailCandidatePayload | null;
+  queuedRefinementTurns: number;
   onAnswerChange: (value: string) => void;
   onSend: () => void;
   onGmailApprove: (approvedSenders: string[], instructions: string) => void;
   // Starting Flow props
   statement: string;
   onStatementChange: (value: string) => void;
+  onDraftChange: (draft: ConfirmationDraft) => void;
+  onForeignRegionsChange: (regions: string[]) => void;
   sourceStatus: SourceStatusResponse | null;
   sourceLocked: boolean;
   onSourceToggle: (source: SourceKey) => void;
@@ -2735,10 +3016,20 @@ function RefinementPanel(props: {
     })));
   const recencyLabel = recencyText(preview?.recency_weighting, preview?.lookback_hours);
   const scopeText = preview?.scope || props.profile?.scope || "";
+  const foreignRegions = props.foreignRegions;
   const progressState = props.refinementProgress
     ? refinementProgressState(props.refinementProgress, props.progressNow)
     : null;
   const thinking = props.streaming || Boolean(progressState);
+
+  function updateDraftRecency(lookbackHours: number | null) {
+    props.onDraftChange({
+      ...props.draft,
+      lookback_hours: lookbackHours,
+      recency_weighting: sourceScopeFromLookbackHours(lookbackHours),
+      sourceScopeTouched: true,
+    });
+  }
 
   useEffect(() => {
     const node = threadRef.current;
@@ -2871,6 +3162,10 @@ function RefinementPanel(props: {
                   locked={props.sourceLocked}
                   onToggle={props.onSourceToggle}
                 />
+                {props.sourceSelection.foreign_media ? (
+                  <ForeignRegionPicker selected={foreignRegions} onChange={props.onForeignRegionsChange} />
+                ) : null}
+                <RecencyControl value={props.draft.lookback_hours} onChange={updateDraftRecency} compact />
                 <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "4px" }}>
                   <button
                     className="primary-action"
@@ -2890,11 +3185,10 @@ function RefinementPanel(props: {
                   onChange={(event) => props.onAnswerChange(event.target.value)}
                   placeholder="Add anything else to adjust..."
                   rows={1}
-                  disabled={props.busy || props.streaming}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
-                      if (!props.busy && !props.streaming && props.answer.trim()) props.onSend();
+                      if (props.answer.trim()) props.onSend();
                     }
                   }}
                 />
@@ -2902,7 +3196,7 @@ function RefinementPanel(props: {
                   type="button"
                   className="chat-send"
                   onClick={props.onSend}
-                  disabled={props.busy || props.streaming || !props.answer.trim()}
+                  disabled={!props.answer.trim()}
                   aria-label="Send"
                 >
                   →
@@ -2915,11 +3209,15 @@ function RefinementPanel(props: {
                   locked={props.sourceLocked}
                   onToggle={props.onSourceToggle}
                 />
+                {props.sourceSelection.foreign_media ? (
+                  <ForeignRegionPicker selected={foreignRegions} onChange={props.onForeignRegionsChange} />
+                ) : null}
                 {props.sourceSelection.podcasts && props.onEnsurePodcastTopicId ? (
                   <PodcastShowPicker ensureTopicId={props.onEnsurePodcastTopicId} />
                 ) : null}
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", width: "100%" }}>
+                <div className="chat-build-row">
                   <span className="muted-hint">Or type further adjustments above</span>
+                  <RecencyControl value={props.draft.lookback_hours} onChange={updateDraftRecency} compact />
                   <button
                     className="primary-action build-brief-action"
                     type="button"
@@ -2939,19 +3237,23 @@ function RefinementPanel(props: {
                   onChange={(event) => props.onAnswerChange(event.target.value)}
                   placeholder={props.gmailCandidates ? "Reply with numbers, names, all, none, or click senders above…" : finalized ? "Add anything else…" : "Answer the next question or refine the strategy…"}
                   rows={1}
-                  disabled={props.busy || props.streaming}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
-                      if (!props.busy && !props.streaming && props.answer.trim()) props.onSend();
+                      if (props.answer.trim()) props.onSend();
                     }
                   }}
                 />
+                {props.queuedRefinementTurns > 0 ? (
+                  <small className="muted-hint" style={{ whiteSpace: "nowrap" }}>
+                    {props.queuedRefinementTurns} queued response{props.queuedRefinementTurns === 1 ? "" : "s"}
+                  </small>
+                ) : null}
                 <button
                   type="button"
                   className="chat-send"
                   onClick={props.onSend}
-                  disabled={props.busy || props.streaming || !props.answer.trim()}
+                  disabled={!props.answer.trim()}
                   aria-label="Send"
                 >
                   →
@@ -2964,11 +3266,15 @@ function RefinementPanel(props: {
                   locked={props.sourceLocked}
                   onToggle={props.onSourceToggle}
                 />
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
+                {props.sourceSelection.foreign_media ? (
+                  <ForeignRegionPicker selected={foreignRegions} onChange={props.onForeignRegionsChange} />
+                ) : null}
+                <div className="chat-build-row">
                   <span className="muted-hint">
                     {props.streaming ? "" : "Enter to send · Shift+Enter for a new line"}
                   </span>
                   <span style={{ flex: 1 }} />
+                  <RecencyControl value={props.draft.lookback_hours} onChange={updateDraftRecency} compact />
                   <button type="button" className="primary-action strategy-confirm-action" onClick={props.onBuild} disabled={props.busy}>
                     Build brief
                   </button>
@@ -3310,7 +3616,7 @@ function ConfirmationPanel(props: {
 
   function submitInlineStrategyRefinement() {
     const clean = inlineStrategyInstruction.trim();
-    if (!clean || props.busy || props.strategyStreaming) return;
+    if (!clean) return;
     setPendingInlineStrategyRequest(clean);
     props.onStrategyRefine(clean);
     setInlineStrategyInstruction("");
@@ -3469,7 +3775,7 @@ function ConfirmationPanel(props: {
               onChange={(event) => setInlineStrategyInstruction(event.target.value)}
               placeholder="Example: include frontier labs as demand signals, keep markets ticker-only, and remove stale year-specific queries..."
               rows={3}
-              disabled={props.busy || props.strategyStreaming}
+              disabled={false}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                   event.preventDefault();
@@ -3481,7 +3787,7 @@ function ConfirmationPanel(props: {
               type="button"
               className="secondary-action"
               onClick={submitInlineStrategyRefinement}
-              disabled={props.busy || props.strategyStreaming || !inlineStrategyInstruction.trim()}
+              disabled={!inlineStrategyInstruction.trim()}
             >
               Send to AI
             </button>
@@ -3557,20 +3863,16 @@ function ConfirmationPanel(props: {
         ) : null}
       </div>
       <div className="confirmation-actions">
-        {props.draft.recency_weighting !== "all_available" ? (
-          <NumberStepper
-            label="Recency window (days)"
-            value={Math.max(1, Math.round(props.draft.lookback_hours / 24))}
-            min={briefControlBounds.source_window_days.min}
-            max={briefControlBounds.source_window_days.max}
-            compact
-            onChange={(days) => props.onDraftChange({
-              ...props.draft,
-              lookback_hours: clampContentLimit(days, 1, 365) * 24,
-              sourceScopeTouched: true,
-            })}
-          />
-        ) : null}
+        <RecencyControl
+          value={props.draft.lookback_hours}
+          onChange={(lookbackHours) => props.onDraftChange({
+            ...props.draft,
+            lookback_hours: lookbackHours,
+            recency_weighting: sourceScopeFromLookbackHours(lookbackHours),
+            sourceScopeTouched: true,
+          })}
+          compact
+        />
         <button
           type="button"
           className="primary-action build-brief-action"
@@ -3629,7 +3931,7 @@ function StrategyRefinementModal(props: {
 
   function submit() {
     const clean = instruction.trim();
-    if (!clean || props.busy) {
+    if (!clean) {
       inputRef.current?.focus();
       return;
     }
@@ -3764,7 +4066,7 @@ function StrategyRefinementModal(props: {
             <button type="button" className="secondary-action" onClick={props.onClose} disabled={props.busy}>
               Done
             </button>
-            <button type="button" className="primary-action" onClick={submit} disabled={props.busy || !instruction.trim() || props.streaming}>
+            <button type="button" className="primary-action" onClick={submit} disabled={!instruction.trim()}>
               Send to AI
             </button>
           </div>
@@ -3938,7 +4240,7 @@ function ContentLimitsPanel(props: {
               label={source.label}
               value={props.limits.per_source[source.key] ?? defaults.per_source[source.key] ?? 3}
               min={briefControlBounds.per_source.min}
-              max={briefControlBounds.per_source.max}
+              max={defaultContentLimits.per_source[source.key] ?? briefControlBounds.per_source.max}
               compact
               onChange={(value) => updateSourceLimit(source.key, value)}
             />
@@ -3961,22 +4263,17 @@ function BriefControlsPanel(props: {
   showReset?: boolean;
   onChange: (controls: BriefControlsDraft) => void;
 }) {
-  const sourceWindowDays = Math.max(0, Math.round((Number(props.controls.lookback_hours) || 0) / 24));
-  const presets = props.controls.youtube_presets ?? { max: 20, large: 16, medium: 12, focused: 8 };
-  const podcastPresets = props.controls.podcast_presets ?? { max: 20, large: 16, medium: 12, focused: 8 };
-  const gmailPresets = props.controls.gmail_presets ?? { max: 40, large: 32, medium: 24, focused: 16 };
+  const presets = props.controls.youtube_presets ?? defaultBriefControls.youtube_presets!;
+  const podcastPresets = props.controls.podcast_presets ?? defaultBriefControls.podcast_presets!;
+  const gmailPresets = props.controls.gmail_presets ?? defaultBriefControls.gmail_presets!;
 
   return (
     <div className="brief-controls-panel">
-      <div className="content-limit-grid">
-        <NumberStepper
-          label="Source window (days)"
-          value={sourceWindowDays}
-          min={briefControlBounds.source_window_days.min}
-          max={briefControlBounds.source_window_days.max}
-          onChange={(days) => props.onChange({ ...props.controls, lookback_hours: days * 24 })}
-        />
-      </div>
+      <RecencyControl
+        label="Default recency"
+        value={props.controls.lookback_hours}
+        onChange={(lookback_hours) => props.onChange({ ...props.controls, lookback_hours })}
+      />
       <ContentLimitsPanel
         limits={props.controls.content_limits}
         defaults={props.defaults.content_limits}
@@ -3989,13 +4286,13 @@ function BriefControlsPanel(props: {
       />
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>YouTube scale presets</strong>
-        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source video limits for YouTube for each profile scale (Max 20).</p>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source video limits for YouTube for each profile scale (Max 40).</p>
         <div className="content-limit-grid">
           <NumberStepper
             label="Max profile"
             value={presets.max}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, max: val }
@@ -4005,7 +4302,7 @@ function BriefControlsPanel(props: {
             label="Large profile"
             value={presets.large}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, large: val }
@@ -4015,7 +4312,7 @@ function BriefControlsPanel(props: {
             label="Medium profile"
             value={presets.medium}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, medium: val }
@@ -4025,7 +4322,7 @@ function BriefControlsPanel(props: {
             label="Focused profile"
             value={presets.focused}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               youtube_presets: { ...presets, focused: val }
@@ -4035,13 +4332,13 @@ function BriefControlsPanel(props: {
       </div>
       <div className="settings-youtube-presets" style={{ marginTop: "24px", paddingTop: "18px", borderTop: "1px solid var(--line)" }}>
         <strong>Podcast scale presets</strong>
-        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for podcast items for each profile scale (Max 20).</p>
+        <p className="muted" style={{ margin: "4px 0 12px", fontSize: "0.85rem" }}>Configure per-source limits for podcast items for each profile scale (Max 40).</p>
         <div className="content-limit-grid">
           <NumberStepper
             label="Max profile"
             value={podcastPresets.max}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, max: val }
@@ -4051,7 +4348,7 @@ function BriefControlsPanel(props: {
             label="Large profile"
             value={podcastPresets.large}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, large: val }
@@ -4061,7 +4358,7 @@ function BriefControlsPanel(props: {
             label="Medium profile"
             value={podcastPresets.medium}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, medium: val }
@@ -4071,7 +4368,7 @@ function BriefControlsPanel(props: {
             label="Focused profile"
             value={podcastPresets.focused}
             min={1}
-            max={25}
+            max={40}
             onChange={(val) => props.onChange({
               ...props.controls,
               podcast_presets: { ...podcastPresets, focused: val }
@@ -4087,7 +4384,7 @@ function BriefControlsPanel(props: {
             label="Max profile"
             value={gmailPresets.max}
             min={1}
-            max={25}
+            max={80}
             onChange={(val) => props.onChange({
               ...props.controls,
               gmail_presets: { ...gmailPresets, max: val }
@@ -4097,7 +4394,7 @@ function BriefControlsPanel(props: {
             label="Large profile"
             value={gmailPresets.large}
             min={1}
-            max={25}
+            max={80}
             onChange={(val) => props.onChange({
               ...props.controls,
               gmail_presets: { ...gmailPresets, large: val }
@@ -4107,7 +4404,7 @@ function BriefControlsPanel(props: {
             label="Medium profile"
             value={gmailPresets.medium}
             min={1}
-            max={25}
+            max={80}
             onChange={(val) => props.onChange({
               ...props.controls,
               gmail_presets: { ...gmailPresets, medium: val }
@@ -4117,7 +4414,7 @@ function BriefControlsPanel(props: {
             label="Focused profile"
             value={gmailPresets.focused}
             min={1}
-            max={25}
+            max={80}
             onChange={(val) => props.onChange({
               ...props.controls,
               gmail_presets: { ...gmailPresets, focused: val }
@@ -7002,25 +7299,29 @@ function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits
 }
 
 function briefControlsFromProfile(profile: TopicProfile, defaults = defaultBriefControls): BriefControlsDraft {
-  const explicit = Number(profile.lookback_hours ?? 0);
   return {
-    lookback_hours: Number.isFinite(explicit) && explicit >= 1
-      ? Math.min(8760, Math.floor(explicit))
-      : defaults.lookback_hours,
+    lookback_hours: normalizeLookbackHours(profile.lookback_hours, defaults.lookback_hours),
     content_limits: contentLimitsFromProfile(profile, defaults.content_limits),
   };
 }
 
 function contentLimitsFromProfile(profile: TopicProfile, defaults = defaultContentLimits): ContentLimitsDraft {
   const saved = profile.content_limits ?? {};
+  const savedPerSource = saved.per_source ?? {};
+  const perSource: Partial<Record<SourceKey, number>> = {};
+  for (const source of sourceOptions) {
+    const sourceMax = defaultContentLimits.per_source[source.key] ?? briefControlBounds.per_source.max;
+    perSource[source.key] = clampContentLimit(
+      Number(savedPerSource[source.key] ?? defaults.per_source[source.key] ?? sourceMax),
+      briefControlBounds.per_source.min,
+      sourceMax,
+    );
+  }
   return {
-    total_items: clampContentLimit(Number(saved.total_items ?? defaults.total_items), 1, 250),
-    target_items: clampContentLimit(Number(saved.target_items ?? defaults.target_items), 1, 250),
+    total_items: clampContentLimit(Number(saved.total_items ?? defaults.total_items), briefControlBounds.total_items.min, briefControlBounds.total_items.max),
+    target_items: clampContentLimit(Number(saved.target_items ?? defaults.target_items), briefControlBounds.target_items.min, briefControlBounds.target_items.max),
     lead_items: clampContentLimit(Number(saved.lead_items ?? defaults.lead_items), 0, 20),
-    per_source: {
-      ...defaults.per_source,
-      ...(saved.per_source ?? {}),
-    },
+    per_source: perSource,
     quality_floor: saved.quality_floor === "strong" ? "strong" : "standard",
   };
 }
@@ -7028,12 +7329,13 @@ function contentLimitsFromProfile(profile: TopicProfile, defaults = defaultConte
 function pipelineLimitsFromProfile(profile: TopicProfile, defaults = defaultPipelineLimits): PipelineLimitsDraft {
   const saved = profile.pipeline_limits ?? {};
   return {
-    article_fetches: clampContentLimit(Number(saved.article_fetches ?? defaults.article_fetches), 1, 250),
-    article_fetch_concurrency: clampContentLimit(Number(saved.article_fetch_concurrency ?? defaults.article_fetch_concurrency), 1, 20),
-    model_refinement_items: clampContentLimit(Number(saved.model_refinement_items ?? defaults.model_refinement_items), 0, 150),
-    source_audit_candidates: clampContentLimit(Number(saved.source_audit_candidates ?? defaults.source_audit_candidates), 1, 28),
-    editorial_candidates: clampContentLimit(Number(saved.editorial_candidates ?? defaults.editorial_candidates), 1, 150),
-    critic_articles: clampContentLimit(Number(saved.critic_articles ?? defaults.critic_articles), 1, 50),
+    article_fetches: clampContentLimit(Number(saved.article_fetches ?? defaults.article_fetches), 1, 1000),
+    article_fetch_concurrency: clampContentLimit(Number(saved.article_fetch_concurrency ?? defaults.article_fetch_concurrency), 1, 40),
+    model_refinement_items: clampContentLimit(Number(saved.model_refinement_items ?? defaults.model_refinement_items), 0, 250),
+    date_adjudication_candidates: clampContentLimit(Number(saved.date_adjudication_candidates ?? defaults.date_adjudication_candidates), 1, 100),
+    source_audit_candidates: clampContentLimit(Number(saved.source_audit_candidates ?? defaults.source_audit_candidates), 1, 150),
+    editorial_candidates: clampContentLimit(Number(saved.editorial_candidates ?? defaults.editorial_candidates), 1, 500),
+    critic_articles: clampContentLimit(Number(saved.critic_articles ?? defaults.critic_articles), 1, 250),
     critic_newsletter_records: clampContentLimit(Number(saved.critic_newsletter_records ?? defaults.critic_newsletter_records), 0, 20),
   };
 }
@@ -7045,8 +7347,10 @@ function clampContentLimit(value: number, min: number, max: number): number {
 
 function validateBriefControls(controls: BriefControlsDraft, sourceSelection: Record<SourceKey, boolean>): string[] {
   const errors: string[] = [];
-  const sourceWindowDays = Number(controls.lookback_hours) / 24;
-  addBoundsError(errors, "Source window", sourceWindowDays, briefControlBounds.source_window_days.min, briefControlBounds.source_window_days.max, "days");
+  if (controls.lookback_hours !== null) {
+    const sourceWindowDays = Number(controls.lookback_hours) <= 24 ? 0 : Number(controls.lookback_hours) / 24;
+    addBoundsError(errors, "Source window", sourceWindowDays, briefControlBounds.source_window_days.min, briefControlBounds.source_window_days.max, "days");
+  }
   errors.push(...validateContentLimits(controls.content_limits, sourceSelection));
   return errors;
 }
@@ -7060,7 +7364,8 @@ function validateContentLimits(contentLimits: ContentLimitsDraft, sourceSelectio
     .filter((source) => sourceSelection[source.key])
     .forEach((source) => {
       const value = contentLimits.per_source[source.key] ?? 0;
-      addBoundsError(errors, `${source.label} maximum`, value, briefControlBounds.per_source.min, briefControlBounds.per_source.max);
+      const sourceMax = defaultContentLimits.per_source[source.key] ?? briefControlBounds.per_source.max;
+      addBoundsError(errors, `${source.label} maximum`, value, briefControlBounds.per_source.min, sourceMax);
     });
   return errors;
 }
@@ -7072,24 +7377,20 @@ function addBoundsError(errors: string[], label: string, value: number, min: num
   }
 }
 
-function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number {
-  if (draft.sourceScopeTouched) return clampContentLimit(Number(draft.lookback_hours || 0), 1, 8760);
+function lookbackHoursForConfirmedDraft(profile: TopicProfile | null | undefined, draft: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number | null {
+  if (draft.sourceScopeTouched) return normalizeLookbackHours(draft.lookback_hours, defaultLookbackHours);
   return lookbackHoursForBuild(profile, draft, defaultLookbackHours);
 }
 
-function lookbackHoursForBuild(profile: TopicProfile | null | undefined, draft?: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number {
-  if (draft?.sourceScopeTouched && Number.isFinite(Number(draft.lookback_hours)) && Number(draft.lookback_hours) >= 1) {
-    return Math.min(8760, Math.floor(Number(draft.lookback_hours)));
-  }
-  const explicit = Number(profile?.lookback_hours ?? 0);
-  if (Number.isFinite(explicit) && explicit >= 1) return Math.min(8760, Math.floor(explicit));
-  if (!draft && Number.isFinite(defaultLookbackHours) && defaultLookbackHours >= 1) {
-    return Math.min(8760, Math.floor(defaultLookbackHours));
-  }
+function lookbackHoursForBuild(profile: TopicProfile | null | undefined, draft?: ConfirmationDraft, defaultLookbackHours = defaultBriefControls.lookback_hours): number | null {
+  if (draft?.sourceScopeTouched) return normalizeLookbackHours(draft.lookback_hours, defaultLookbackHours);
+  if (profile && "lookback_hours" in profile) return normalizeLookbackHours(profile.lookback_hours ?? null, defaultLookbackHours);
+  if (!draft) return normalizeLookbackHours(defaultLookbackHours, defaultBriefControls.lookback_hours);
   return lookbackHoursFromSourceScope(draft?.recency_weighting ?? normalizeSourceScope(profile?.recency_weighting));
 }
 
 function sourceScopeFromProfile(profile: TopicProfile): SourceScope {
+  if (profile.lookback_hours === null) return "all_available";
   const explicit = Number(profile.lookback_hours ?? 0);
   if (Number.isFinite(explicit) && explicit >= 1) {
     if (explicit <= 48) return "breaking";
@@ -7099,14 +7400,16 @@ function sourceScopeFromProfile(profile: TopicProfile): SourceScope {
   return normalizeSourceScope(profile.recency_weighting);
 }
 
-function lookbackHoursFromSourceScope(sourceScope: SourceScope): number {
-  if (sourceScope === "last_year" || sourceScope === "all_available") return 8760;
-  if (sourceScope === "recent") return 336;
+function lookbackHoursFromSourceScope(sourceScope: SourceScope): number | null {
+  if (sourceScope === "all_available") return null;
+  if (sourceScope === "last_year") return 8760;
+  if (sourceScope === "recent") return 168;
   return 24;
 }
 
-function sourceScopeConfirmation(sourceScope: SourceScope, lookbackHours?: number): string {
-  if (lookbackHours && sourceScope !== "all_available") {
+function sourceScopeConfirmation(sourceScope: SourceScope, lookbackHours?: number | null): string {
+  if (lookbackHours === null || sourceScope === "all_available") return "I’ll use all available dates; no source-window filter will run.";
+  if (lookbackHours) {
     const days = Math.max(1, Math.round(lookbackHours / 24));
     return `I’ll look for sources dated within the last ${days === 1 ? "day" : `${days} days`}.`;
   }
@@ -7114,6 +7417,16 @@ function sourceScopeConfirmation(sourceScope: SourceScope, lookbackHours?: numbe
   if (sourceScope === "recent") return "I’ll look for sources dated within the last 3 days.";
   if (sourceScope === "last_year") return "I’ll look for sources dated within the last year.";
   return "I’ll use the best available sources, even when older context is useful.";
+}
+
+function normalizeLookbackHours(value: number | null | undefined, fallback: number | null = 168): number | null {
+  if (value === null) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    if (numeric === 0) return 24;
+    return Math.min(262800, Math.floor(numeric));
+  }
+  return fallback === undefined ? 168 : fallback;
 }
 
 function normalizeSourceScope(value: string | undefined): SourceScope {

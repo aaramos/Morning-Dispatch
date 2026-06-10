@@ -19,6 +19,7 @@ from backend.agents.discovery.types import (
     SourceAdapterContext,
     TopicProfile,
 )
+from backend.app.services import brief_settings
 
 _GOOD_FOR_SIGNAL_MAP: dict[str, tuple[str, ...]] = {
     "breaking_news": (
@@ -442,13 +443,7 @@ def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candi
 
 
 def _lane_limit(profile: TopicProfile, adapter_name: str, *, default: int, system_max: int) -> int:
-    per_source = profile.content_limits.get("per_source") if isinstance(profile.content_limits, dict) else None
-    if not isinstance(per_source, dict):
-        return min(default, system_max)
-    raw_limit = _source_limit(per_source.get(adapter_name))
-    if raw_limit is None:
-        return min(default, system_max)
-    return min(raw_limit, system_max)
+    return brief_settings.source_lane_cap(adapter_name)
 
 
 def _source_limit(value: Any) -> int | None:

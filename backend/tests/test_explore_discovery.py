@@ -798,12 +798,12 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         assert updated.json()["profile"]["content_limits"] == {
             "lead_items": 2,
             "per_source": {
-                "collections": 15,
-                "foreign_media": 24,
-                "gmail": 24,
-                "markets": 24,
-                "podcasts": 12,
-                "reddit": 18,
+                "collections": 30,
+                "foreign_media": 48,
+                "gmail": 48,
+                "markets": 48,
+                "podcasts": 24,
+                "reddit": 36,
                 "web_search": 5,
                 "youtube": 2,
             },
@@ -816,6 +816,7 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
             "article_fetches": 90,
             "article_fetch_concurrency": 4,
             "model_refinement_items": 30,
+            "date_adjudication_candidates": 100,
             "source_audit_candidates": 10,
             "editorial_candidates": 40,
             "critic_articles": 15,
@@ -3659,7 +3660,7 @@ def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> 
     assert observed["cached_lookup_model"] == "topic-brief-model"
     assert observed["cached_write_model"] == "topic-brief-model"
     assert observed["refine_model"] == "topic-brief-model"
-    assert observed["refine_model_max_items"] == 150
+    assert observed["refine_model_max_items"] == 250
     assert observed["editorial_model"] == "topic-brief-model"
     assert observed["critic_model"] == "topic-brief-model"
 

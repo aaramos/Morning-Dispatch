@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 _BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
 _BUILD_QUEUE_EVENT: asyncio.Event | None = None
 _PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
-_EXPLORE_MODEL_REFINEMENT_LIMIT = 150
+_EXPLORE_MODEL_REFINEMENT_LIMIT = 250
 _REPORTING_LOG_TIMEOUT_SECONDS = 20
 _STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode", "reddit_post"}
 # Source types that require an outbound HTTP article fetch (they compete for the
@@ -765,7 +765,7 @@ async def _run_exploration(
                 "article_results": fetched_articles,
                 "lookback_hours": lookback_hours,
                 "inference_run_id": exploration_id,
-                "max_candidates": pipeline_limits["source_audit_candidates"],
+                "max_candidates": pipeline_limits["date_adjudication_candidates"],
             }
             if _accepts_param(_adjudicate_dates_before_source_window_filter, "low_yield"):
                 adjudicate_kwargs["low_yield"] = low_yield_mode
@@ -2776,12 +2776,12 @@ def _resolve_candidate_limit(profile: TopicProfile, candidate_limit: int | None)
         saved_limit = profile.content_limits.get("total_items")
     if saved_limit is not None:
         try:
-            return max(1, min(int(saved_limit), 250))
+            return max(1, min(int(saved_limit), brief_settings.MAX_CANDIDATE_BUDGET))
         except (TypeError, ValueError):
             pass
     if candidate_limit is not None:
-        return max(1, min(int(candidate_limit), 250))
-    return 250
+        return max(1, min(int(candidate_limit), brief_settings.MAX_CANDIDATE_BUDGET))
+    return brief_settings.MAX_CANDIDATE_BUDGET
 
 
 async def broaden_queries_with_agent(
@@ -2954,7 +2954,7 @@ def _bounded_lookback_hours(value: int) -> int:
         hours = int(value)
     except (TypeError, ValueError):
         return 24
-    return min(8760, max(1, hours))
+    return min(brief_settings.MAX_LOOKBACK_HOURS, max(1, hours))
 
 
 def _adapter_label(adapter: str) -> str:

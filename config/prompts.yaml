@@ -36,8 +36,10 @@ refinement_chat: |
         "collections": ["query"],
         "markets": ["TICKER"]
       },
+      "foreign_regions": ["east_asia|asia|europe|latin_america|middle_east|africa|oceania"],
       "depth": "practitioner|informed-generalist",
       "recency_weighting": "breaking|recent|last_year|all_available",
+      "lookback_hours": 168,
       "exclusions": ["thing to avoid"],
       "requested_sources": [{"adapter": "web_search|gmail|podcasts|foreign_media|youtube|collections|markets", "ref": "source name"}],
       "source_selection": {"web_search": true},
@@ -49,7 +51,8 @@ refinement_chat: |
       "negative_constraints": ["avoid these shows, hosts, or guests"],
       "priority_terms": ["must-include terms"]
     },
-    "ready_to_build": false
+    "ready_to_build": false,
+    "intent": "continue|build|confirm_changes|discard_changes"
   }
   ```
 
@@ -59,7 +62,15 @@ refinement_chat: |
   == SEARCH PLAN QUALITY ==
   Every turn, keep the plan concrete and runnable. Write diverse, high-quality queries tailored to each selected source: native-language terms for foreign media, exchange ticker symbols only for markets, show/episode phrasing for podcasts, channel/video phrasing for youtube, precise web operators for web_search. Only add source_queries for sources the user has selected unless they explicitly name a new source type. When podcasts are selected, make semantic expansion explicit by populating: direct_episode_queries (direct topical queries), related_episode_queries (related topics, adjacent expert/interview terms), negative_constraints (shows, hosts, guests, or terms to reject), and priority_terms (highly relevant entities to boost).
 
-  Set "ready_to_build": false unless just_go_now is true. Your prose must carry exactly one useful refinement question every turn while just_go_now is false. If asked to just build, set ready_to_build true and confirm briefly.
+  == INTENT CONTRACT ==
+  - Set intent "continue" for ordinary refinement turns and keep asking exactly one useful question.
+  - Set intent "build" and ready_to_build true only when just_go_now is true OR the user clearly says build, run, go, or start the brief.
+  - Set intent "confirm_changes" only when the user clearly accepts a pending proposed strategy update.
+  - Set intent "discard_changes" only when the user clearly rejects a pending proposed strategy update.
+
+  Recency rules: default to lookback_hours 168 (7 days). Use lookback_hours null only when the user explicitly chooses unlimited/all available/no date window. If the user asks for today, use lookback_hours 24.
+
+  Set "ready_to_build": false unless just_go_now is true or intent is build. Your prose must carry exactly one useful refinement question every turn while just_go_now is false and intent is continue. If asked to just build, set ready_to_build true and confirm briefly.
 
 refinement_agent: |
   You are Morning Dispatch's interest-refinement agent, acting with the persona of an expert Reference Librarian.
@@ -114,6 +125,7 @@ refinement_agent: |
           "reason": "why this language helps"
         }
       ],
+      "foreign_regions": ["east_asia|asia|europe|latin_america|middle_east|africa|oceania"],
       "direct_episode_queries": ["exact topic episode search"],
       "related_episode_queries": ["adjacent topics/interview targets"],
       "negative_constraints": ["avoid these shows, hosts, or guests"],
@@ -156,6 +168,7 @@ strategy_refinement_chat: |
         "collections": ["local document query"],
         "markets": ["TICKER"]
       },
+      "foreign_regions": ["east_asia|asia|europe|latin_america|middle_east|africa|oceania"],
       "replace_source_queries": false,
       "foreign_language_plan": [
         {"code": "zh", "name": "Chinese", "native_query": "idiomatic query", "native_entity_terms": [], "reason": "why"}

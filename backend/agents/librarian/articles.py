@@ -29,7 +29,7 @@ try:  # pragma: no cover - import-time capability probe
 except ImportError:  # pragma: no cover
     _HTML_PARSER = "html.parser"
 
-MAX_ARTICLE_FETCHES = 250
+MAX_ARTICLE_FETCHES = 1000
 MIN_ARTICLE_TEXT_CHARS = 450
 MIN_CONTEXT_FALLBACK_CHARS = 180
 REQUEST_TIMEOUT_SECONDS = 12

@@ -15,7 +15,7 @@ from backend.agents.model.metrics import record_model_response_metric
 from backend.app.core.config import get_settings
 from backend.app.core.prompt_loader import load_prompt
 
-MAX_CRITIC_ARTICLES = 50
+MAX_CRITIC_ARTICLES = 250
 MAX_NEWSLETTER_RECORDS = 20
 AUTO_REPAIR_ACTIONS = {"drop_article", "demote_article", "replace_lead", "clean_text"}
 DROP_FINDING_TYPES = {"duplicate", "promotional", "broken_link_noise", "low_value"}

@@ -297,6 +297,7 @@ async def astream_refinement(
     models: Any,
     answer: str,
     just_go_now: bool,
+    foreign_regions: list[str] | None = None,
 ):
     """AI-led streaming refinement turn.
 
@@ -318,6 +319,7 @@ async def astream_refinement(
                 {
                     "statement": clean_statement,
                     "source_selection": source_selection or {},
+                    "foreign_regions": foreign_regions or [],
                     "models": models,
                 }
             )
@@ -375,7 +377,7 @@ async def astream_refinement(
                 "lookback_hours": rules["lookback_hours"],
             }
             yield {"type": "plan", "session": response}
-            yield {"type": "done", "session": response, "ready": False}
+            yield {"type": "done", "session": response, "ready": False, "trigger_build": False}
             return
 
         session = database.create_refinement_session(
@@ -393,10 +395,12 @@ async def astream_refinement(
             if clean_answer and not just_go_now:
                 session = {**session, "status": "active", "pending_field": AGENT_PENDING_FIELD}
             else:
-                yield {"type": "done", "session": _session_response(session), "ready": True}
+                yield {"type": "done", "session": _session_response(session), "ready": True, "trigger_build": False}
                 return
         profile = dict(session["profile"])
         messages = _messages(session)
+
+    pending_field = session.get("pending_field") or ""
 
     # Detect if source selection toggled Gmail on/off
     prev_selection = _source_selection_dict(profile.get("source_selection"))
@@ -463,7 +467,7 @@ async def astream_refinement(
             yield {"type": "token", "text": intro}
             yield {"type": "plan", "session": response_gmail}
             yield {**gmail_candidates_event, "type": "gmail_candidates"}
-            yield {"type": "done", "session": response_gmail, "ready": False}
+            yield {"type": "done", "session": response_gmail, "ready": False, "trigger_build": False}
             return
 
     # --- Gmail sender-approval intercept -------------------------------------------
@@ -544,8 +548,11 @@ async def astream_refinement(
     final_visible, _ = _visible_prose(full_text, final=True)
 
     assistant_text = final_visible.strip()
-    patch, ready_flag = _parse_chat_payload(full_text)
-    ready = just_go_now
+    patch, ready_flag, intent = _parse_chat_payload(full_text)
+    intent = _normalize_refinement_intent(intent)
+    if just_go_now:
+        intent = "build"
+    ready = intent == "build"
 
     patched = _merge_agent_profile_patch(profile, patch, user_text=_user_authored_text(profile, messages))
     patched = _seed_profile_with_hints(patched)
@@ -565,6 +572,32 @@ async def astream_refinement(
         yield {"type": "token", "text": assistant_text}
 
     topic_id = session.get("topic_id")
+
+    if intent in {"confirm_changes", "discard_changes"} and _pending_strategy_refinement(profile):
+        persisted = database.update_refinement_session(
+            session_id,
+            profile=_coerce_profile(profile),
+            messages=messages,
+            pending_field=session.get("pending_field"),
+            turn_count=turn_count,
+            status="active",
+            topic_id=topic_id,
+        )
+        if persisted is None:
+            yield {"type": "error", "message": "Failed to persist strategy confirmation turn"}
+            return
+        try:
+            confirmed = confirm_strategy_refinement(session_id, {"apply": intent == "confirm_changes"})
+        except Exception as exc:
+            logger.exception("Failed to resolve pending strategy proposal from chat intent")
+            yield {"type": "error", "message": str(exc) or "Could not resolve pending strategy proposal"}
+            return
+        if confirmed is None:
+            yield {"type": "error", "message": "Refinement session not found"}
+            return
+        yield {"type": "plan", "session": confirmed}
+        yield {"type": "done", "session": confirmed, "ready": False, "trigger_build": False}
+        return
 
     # --- Gmail discovery intercept -------------------------------------------------
     # When the AI has set gmail in source_selection but no include_senders are
@@ -605,7 +638,7 @@ async def astream_refinement(
                 return
             yield {"type": "plan", "session": response_gmail}
             yield {**gmail_candidates_event, "type": "gmail_candidates"}
-            yield {"type": "done", "session": response_gmail, "ready": False}
+            yield {"type": "done", "session": response_gmail, "ready": False, "trigger_build": False}
             return
 
     if ready:
@@ -650,7 +683,7 @@ async def astream_refinement(
         yield {"type": "error", "message": "Failed to persist refinement session"}
         return
     yield {"type": "plan", "session": response}
-    yield {"type": "done", "session": response, "ready": ready}
+    yield {"type": "done", "session": response, "ready": ready, "trigger_build": ready}
 
 
 async def _astream_gmail_discovery(
@@ -802,7 +835,7 @@ async def _astream_gmail_approval(
         return
     yield {"type": "gmail_approved", "senders": include_senders}
     yield {"type": "plan", "session": response}
-    yield {"type": "done", "session": response, "ready": ready}
+    yield {"type": "done", "session": response, "ready": ready, "trigger_build": ready}
 
 
 async def _astream_fallback(
@@ -832,7 +865,8 @@ async def _astream_fallback(
     if assistant:
         yield {"type": "token", "text": assistant}
     yield {"type": "plan", "session": result}
-    yield {"type": "done", "session": result, "ready": result.get("status") == "finalized"}
+    ready = result.get("status") == "finalized"
+    yield {"type": "done", "session": result, "ready": ready, "trigger_build": bool(just_go_now and ready)}
 
 
 async def astream_refine_strategy(
@@ -922,7 +956,7 @@ async def astream_refine_strategy(
             yield {"type": "token", "text": tail}
 
     prose = final_visible.strip()
-    patch_dict, _ = _parse_chat_payload(full_text)
+    patch_dict, _, _ = _parse_chat_payload(full_text)
     raw_block = _extract_json_block(full_text)
     requires_changes = bool((raw_block or {}).get("requires_changes", True))
     findings = _string_list((raw_block or {}).get("findings"), limit=8)
@@ -1105,7 +1139,7 @@ async def astream_review_strategy(
             yield {"type": "token", "text": tail}
 
     prose = final_visible.strip()
-    patch_dict, _ = _parse_chat_payload(full_text)
+    patch_dict, _, _ = _parse_chat_payload(full_text)
     raw_block = _extract_json_block(full_text)
     requires_changes = bool((raw_block or {}).get("requires_changes", False))
     reviewed_at = datetime.now(UTC).isoformat(timespec="seconds")
@@ -1249,12 +1283,24 @@ def _visible_prose(full_text: str, *, final: bool = False) -> tuple[str, bool]:
     return visible, False
 
 
-def _parse_chat_payload(full_text: str) -> tuple[dict[str, Any], bool]:
+def _parse_chat_payload(full_text: str) -> tuple[dict[str, Any], bool, str]:
     block = _extract_json_block(full_text)
     if not isinstance(block, dict):
-        return {}, False
+        return {}, False, "continue"
     patch = block.get("profile_patch")
-    return (patch if isinstance(patch, dict) else {}), bool(block.get("ready_to_build"))
+    intent = str(block.get("intent") or "").strip()
+    return (
+        patch if isinstance(patch, dict) else {},
+        bool(block.get("ready_to_build")) or _normalize_refinement_intent(intent) == "build",
+        intent,
+    )
+
+
+def _normalize_refinement_intent(value: Any) -> str:
+    intent = str(value or "").strip().casefold()
+    if intent in {"build", "confirm_changes", "discard_changes"}:
+        return intent
+    return "continue"
 
 
 def _extract_json_block(text: str) -> dict[str, Any] | None:
@@ -1290,6 +1336,7 @@ def _build_refinement_chat_prompt(
         "search_queries": _string_list(profile.get("search_queries")),
         "source_queries": _clean_source_queries(profile.get("source_queries")),
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "foreign_regions": _string_list(profile.get("foreign_regions"), limit=16),
         "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
         "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
@@ -1681,6 +1728,7 @@ def _profile_for_strategy_review(base_profile: dict[str, Any], payload_profile: 
             "search_queries",
             "source_queries",
             "foreign_language_plan",
+            "foreign_regions",
             "requested_sources",
             *PODCAST_STRATEGY_FIELDS,
             "depth",
@@ -1720,6 +1768,7 @@ def _strategy_fingerprint(profile: dict[str, Any]) -> str:
         "search_queries": _string_list(profile.get("search_queries"), limit=20),
         "source_queries": _clean_source_queries(profile.get("source_queries")),
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "foreign_regions": _string_list(profile.get("foreign_regions"), limit=16),
         "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
         "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
@@ -1820,6 +1869,7 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
                 "search_queries": _string_list(profile.get("search_queries"), limit=20),
                 "source_queries": _clean_source_queries(profile.get("source_queries")),
                 "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+                "foreign_regions": _string_list(profile.get("foreign_regions"), limit=16),
                 "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
                 "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
                 "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
@@ -2209,6 +2259,7 @@ def _build_refinement_agent_prompt(
         "search_queries": _string_list(profile.get("search_queries")),
         "source_queries": _clean_source_queries(profile.get("source_queries")),
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "foreign_regions": _string_list(profile.get("foreign_regions"), limit=16),
         "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
         "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
@@ -2366,9 +2417,8 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
     recency = _normalize_recency(patch.get("recency_weighting"))
     if recency:
         updated["recency_weighting"] = recency
-    lookback_hours = _coerce_lookback_hours(patch.get("lookback_hours"))
-    if lookback_hours:
-        updated["lookback_hours"] = lookback_hours
+    if "lookback_hours" in patch:
+        updated["lookback_hours"] = _coerce_lookback_hours(patch.get("lookback_hours"))
 
     if "source_queries" in patch:
         if bool(patch.get("replace_source_queries")):
@@ -2385,6 +2435,12 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
         updated["foreign_language_plan"] = _merge_foreign_language_plan(
             updated.get("foreign_language_plan"),
             patch.get("foreign_language_plan"),
+        )
+    if "foreign_regions" in patch:
+        updated["foreign_regions"] = _merge_string_lists(
+            updated.get("foreign_regions"),
+            patch.get("foreign_regions"),
+            limit=16,
         )
     if "gmail_rules" in patch:
         updated["gmail_rules"] = _normalize_gmail_rules(patch.get("gmail_rules"))
@@ -3176,8 +3232,10 @@ def _apply_answer(profile: dict[str, Any], field: str, answer: str) -> dict[str,
             updated["recency_weighting"] = _recency_from_lookback_hours(lookback_hours)
         else:
             updated["recency_weighting"] = _normalize_recency(answer) or "recent"
-            if updated["recency_weighting"] in {"last_year", "all_available"}:
+            if updated["recency_weighting"] == "last_year":
                 updated["lookback_hours"] = 8760
+            elif updated["recency_weighting"] == "all_available":
+                updated["lookback_hours"] = None
         updated["source_scope_answered"] = True
     elif field == "exclusions":
         updated["exclusions_answered"] = True
@@ -3318,8 +3376,10 @@ def _coerce_model_field_updates(
         if not normalized:
             return None
         updates: dict[str, Any] = {"recency_weighting": normalized, "source_scope_answered": True}
-        if normalized in {"last_year", "all_available"}:
+        if normalized == "last_year":
             updates["lookback_hours"] = 8760
+        elif normalized == "all_available":
+            updates["lookback_hours"] = None
         return updates
 
     if field == "exclusions":
@@ -3383,7 +3443,7 @@ def _coerce_lookback_hours(value: Any) -> int | None:
         return None
     if hours < 1:
         return None
-    return min(hours, 8760)
+    return min(hours, 262800)
 
 
 def _build_refinement_prompt(*, field: str, answer: str, profile: dict[str, Any]) -> str:
@@ -4149,6 +4209,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "search_queries": _string_list(profile.get("search_queries"), limit=20),
         "source_queries": source_queries,
         "foreign_language_plan": _normalize_foreign_language_plan(profile.get("foreign_language_plan")),
+        "foreign_regions": _string_list(profile.get("foreign_regions"), limit=16),
         "direct_episode_queries": _string_list(profile.get("direct_episode_queries"), limit=16),
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
         "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),

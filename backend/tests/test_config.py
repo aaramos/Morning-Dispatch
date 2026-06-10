@@ -20,7 +20,7 @@ def test_production_model_defaults(monkeypatch, tmp_path):
     settings = get_settings()
 
     assert settings.librarian_model == "Gemma4-MTP-26B-8Bit"
-    assert settings.librarian_model_max_items == 150
+    assert settings.librarian_model_max_items == 250
     assert settings.youtube_max_results == 40
     assert settings.collections_max_results == 50
     assert settings.markets_max_core_companies == 10

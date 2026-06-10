@@ -14,7 +14,7 @@ from backend.agents.model.metrics import record_model_response_metric
 from backend.app.core.config import get_settings
 from backend.app.core.prompt_loader import load_prompt
 
-MAX_EDITORIAL_CANDIDATES = 150
+MAX_EDITORIAL_CANDIDATES = 500
 ALLOWED_SECTIONS = {
     "Models & Labs",
     "Agents & Developer Tools",

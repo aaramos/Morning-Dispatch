@@ -78,7 +78,7 @@ class DeliverySettingsPayload(BaseModel):
 
 
 class BriefDefaultsPayload(BaseModel):
-    lookback_hours: int = Field(default=168, ge=1, le=8760)
+    lookback_hours: int | None = Field(default=168, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
     content_limits: dict[str, Any] = Field(default_factory=dict)
     youtube_presets: dict[str, int] = Field(default_factory=dict)
     podcast_presets: dict[str, int] = Field(default_factory=dict)
@@ -87,8 +87,9 @@ class BriefDefaultsPayload(BaseModel):
 
 class PipelineLimitsPayload(BaseModel):
     article_fetches: int = Field(default=brief_settings.MAX_ARTICLE_FETCHES, ge=1, le=brief_settings.MAX_ARTICLE_FETCHES)
-    article_fetch_concurrency: int = Field(default=10, ge=1, le=brief_settings.MAX_ARTICLE_FETCH_CONCURRENCY)
+    article_fetch_concurrency: int = Field(default=brief_settings.DEFAULT_PIPELINE_LIMITS["article_fetch_concurrency"], ge=1, le=brief_settings.MAX_ARTICLE_FETCH_CONCURRENCY)
     model_refinement_items: int = Field(default=brief_settings.MODEL_REFINEMENT_LIMIT, ge=0, le=brief_settings.MODEL_REFINEMENT_LIMIT)
+    date_adjudication_candidates: int = Field(default=brief_settings.DATE_ADJUDICATION_CANDIDATES, ge=1, le=brief_settings.DATE_ADJUDICATION_CANDIDATES)
     source_audit_candidates: int = Field(default=brief_settings.MAX_AUDIT_CANDIDATES, ge=1, le=brief_settings.MAX_AUDIT_CANDIDATES)
     editorial_candidates: int = Field(default=brief_settings.MAX_EDITORIAL_CANDIDATES, ge=1, le=brief_settings.MAX_EDITORIAL_CANDIDATES)
     critic_articles: int = Field(default=brief_settings.MAX_CRITIC_ARTICLES, ge=1, le=brief_settings.MAX_CRITIC_ARTICLES)

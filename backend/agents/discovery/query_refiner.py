@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,8 +15,8 @@ from backend.app.services import model_routing
 logger = logging.getLogger(__name__)
 
 _SCREENING_BATCH_SIZE = 15
-_SCREENING_MAX_CANDIDATES_PER_SOURCE = 80
-_SCREENING_MAX_CONCURRENCY = 4
+_SCREENING_MAX_CANDIDATES_PER_SOURCE = 500
+_SCREENING_MAX_CONCURRENCY = 8
 _SCREENING_BATCH_TIMEOUT_SECONDS = 90.0
 
 
@@ -364,12 +365,6 @@ async def screen_candidates(
 def _screening_sample(candidates: list[Any]) -> list[Any]:
     if len(candidates) <= _SCREENING_MAX_CANDIDATES_PER_SOURCE:
         return candidates
-    ranked = sorted(
-        candidates,
-        key=lambda c: (
-            getattr(c, "score", 0.0),
-            getattr(c.payload, "published_at", None) or getattr(c.payload, "fetched_at", None) or "",
-        ),
-        reverse=True,
-    )
-    return ranked[:_SCREENING_MAX_CANDIDATES_PER_SOURCE]
+    # Do not screen only the highest-ranked items. Those scores can be noisy at
+    # this stage, and source-quality failures often hide in the long tail.
+    return random.sample(candidates, _SCREENING_MAX_CANDIDATES_PER_SOURCE)

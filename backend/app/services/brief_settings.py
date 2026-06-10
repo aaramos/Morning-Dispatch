@@ -17,31 +17,40 @@ from backend.agents.source_audit import MAX_AUDIT_CANDIDATES
 from backend.agents.editorial_decisions import MAX_EDITORIAL_CANDIDATES
 from backend.app.core.config import Settings
 
-MAX_CANDIDATE_BUDGET = 250
+MAX_CANDIDATE_BUDGET = 1000
 MAX_LEAD_ITEMS = 20
-MAX_LOOKBACK_HOURS = 8760
+MAX_LOOKBACK_HOURS = 262800
 MAX_LOOKBACK_DAYS = MAX_LOOKBACK_HOURS // 24
-MAX_PER_SOURCE_LIMIT = 40
+MAX_PER_SOURCE_LIMIT = 80
 MAX_TARGET_ITEMS = 250
-MODEL_REFINEMENT_LIMIT = 150
-MAX_ARTICLE_FETCH_CONCURRENCY = 20
+MODEL_REFINEMENT_LIMIT = 250
+MAX_ARTICLE_FETCH_CONCURRENCY = 40
+DATE_ADJUDICATION_CANDIDATES = 100
+
+GLOBAL_LANE_CEILING = 750
+DEFAULT_LANE_CAP = 250
+LANE_CAPS: dict[str, int] = {
+    "web_search": 750,
+    "gmail": 750,
+    "reddit": 500,
+}
 
 # Single source of truth for per-source ceilings. For each source the configured
 # value is BOTH the system maximum AND the default cap a brief gets unless a
 # preset scales it down. Adding a source here automatically gives it a discovery
 # lane limit, an inclusion cap, and a generated set of presets.
 PER_SOURCE_MAX: dict[str, int] = {
-    "web_search": 40,
-    "foreign_media": 40,
-    "gmail": 40,
-    "markets": 40,
-    "reddit": 30,
-    "collections": 25,
-    "podcasts": 20,
-    "youtube": 20,
+    "web_search": 80,
+    "foreign_media": 80,
+    "gmail": 80,
+    "markets": 80,
+    "reddit": 60,
+    "collections": 50,
+    "podcasts": 40,
+    "youtube": 40,
 }
 # Sources not listed above fall back to this cap.
-DEFAULT_PER_SOURCE_MAX = 25
+DEFAULT_PER_SOURCE_MAX = 50
 
 # Cross-source "Top Stories" lead section (item 5). The lead count is the number
 # of best-of items pulled from every source into the top section of the brief.
@@ -60,7 +69,7 @@ PRESET_SCALE: dict[str, float] = {
 
 SYSTEM_CONTENT_LIMITS: dict[str, Any] = {
     "total_items": MAX_CANDIDATE_BUDGET,
-    "target_items": 25,
+    "target_items": 50,
     "lead_items": TOP_STORIES_DEFAULT,
     "quality_floor": "standard",
     "per_source": dict(PER_SOURCE_MAX),
@@ -70,7 +79,7 @@ SYSTEM_CONTENT_LIMITS: dict[str, Any] = {
 def _percent_presets(max_value: int) -> dict[str, int]:
     """Generate focused/medium/large/max presets as percentages of a ceiling."""
     return {
-        tier: max(1, round(max_value * scale))
+        tier: max(1, math.ceil(max_value * scale))
         for tier, scale in PRESET_SCALE.items()
     }
 
@@ -101,17 +110,18 @@ def _scaled_content_limits(scale: float) -> dict[str, Any]:
     }
 
 DEFAULT_BRIEF_CONTROLS: dict[str, Any] = {
-    "lookback_hours": 336,
+    "lookback_hours": 168,
     "content_limits": _scaled_content_limits(0.6),
 }
 
 DEFAULT_PIPELINE_LIMITS: dict[str, int] = {
     "article_fetches": MAX_ARTICLE_FETCHES,
-    # Fetch is I/O-bound; 15 in-flight shortens the fetch stage on large candidate
+    # Fetch is I/O-bound; 35 in-flight shortens the fetch stage on large candidate
     # pools. Kept modest to avoid tripping per-site rate limits (which would reduce
     # successful fetches). Tunable per-profile up to MAX_ARTICLE_FETCH_CONCURRENCY.
-    "article_fetch_concurrency": 15,
+    "article_fetch_concurrency": 35,
     "model_refinement_items": MODEL_REFINEMENT_LIMIT,
+    "date_adjudication_candidates": DATE_ADJUDICATION_CANDIDATES,
     "source_audit_candidates": MAX_AUDIT_CANDIDATES,
     "editorial_candidates": MAX_EDITORIAL_CANDIDATES,
     "critic_articles": MAX_CRITIC_ARTICLES,
@@ -122,6 +132,7 @@ PIPELINE_LIMIT_BOUNDS: dict[str, tuple[int, int]] = {
     "article_fetches": (1, MAX_ARTICLE_FETCHES),
     "article_fetch_concurrency": (1, MAX_ARTICLE_FETCH_CONCURRENCY),
     "model_refinement_items": (0, MODEL_REFINEMENT_LIMIT),
+    "date_adjudication_candidates": (1, DATE_ADJUDICATION_CANDIDATES),
     "source_audit_candidates": (1, MAX_AUDIT_CANDIDATES),
     "editorial_candidates": (1, MAX_EDITORIAL_CANDIDATES),
     "critic_articles": (1, MAX_CRITIC_ARTICLES),
@@ -207,8 +218,7 @@ def normalize_brief_controls(value: Any) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
     fallback = DEFAULT_BRIEF_CONTROLS
     return {
-        "lookback_hours": _bounded_int(raw.get("lookback_hours"), 1, MAX_LOOKBACK_HOURS)
-        or int(fallback["lookback_hours"]),
+        "lookback_hours": _normalize_lookback_hours(raw, fallback=int(fallback["lookback_hours"])),
         "content_limits": normalize_content_limits(raw.get("content_limits")),
     }
 
@@ -247,8 +257,9 @@ def system_limits(settings: Settings) -> list[dict[str, Any]]:
                 {"label": "Candidate budget", "value": f"1-{MAX_CANDIDATE_BUDGET}", "note": "Maximum deduped candidates a brief can request."},
                 {"label": "Target visible stories", "value": f"1-{MAX_TARGET_ITEMS}", "note": "Maximum visible-story target a brief can request."},
                 {"label": "Lead stories", "value": f"0-{MAX_LEAD_ITEMS}", "note": "Maximum preferred lead count."},
-                {"label": "Source window", "value": f"1-{MAX_LOOKBACK_DAYS} days", "note": "365-day maximum source window."},
-                {"label": "Per-source maximum", "value": "1-40", "note": "Maximum per-source diversity target (up to 20 for YouTube/podcasts, 40 for markets/web/gmail/foreign media)."},
+                {"label": "Source window", "value": f"1-{MAX_LOOKBACK_DAYS} days or unlimited", "note": "Thirty-year maximum bounded window; unlimited disables source-window filtering."},
+                {"label": "Per-source maximum", "value": f"1-{MAX_PER_SOURCE_LIMIT}", "note": "Maximum per-source inclusion target; media sources are capped by their own ceilings."},
+                {"label": "Discovery lane ceiling", "value": f"1-{GLOBAL_LANE_CEILING}", "note": "Maximum candidates one selected source lane can pass forward."},
             ],
         },
         {
@@ -276,6 +287,7 @@ def system_limits(settings: Settings) -> list[dict[str, Any]]:
             "group": "AI review caps",
             "items": [
                 {"label": "Model-enriched items", "value": str(min(settings.librarian_model_max_items, MODEL_REFINEMENT_LIMIT)), "note": "Hard ceiling for article summarization/refinement."},
+                {"label": "AI date review candidates", "value": str(DATE_ADJUDICATION_CANDIDATES), "note": "Hard ceiling for ambiguous-date adjudication before filtering."},
                 {"label": "Source audit candidates", "value": str(MAX_AUDIT_CANDIDATES), "note": "Hard ceiling for the pre-ranking quality audit window."},
                 {"label": "Editorial candidates", "value": str(MAX_EDITORIAL_CANDIDATES), "note": "Hard ceiling for the editorial selection window."},
                 {"label": "Critic articles", "value": str(MAX_CRITIC_ARTICLES), "note": "Hard ceiling for critic article review."},
@@ -306,6 +318,11 @@ def _source_max_limit(source_name: str) -> int:
 def source_inclusion_max(source_name: str) -> int:
     """Public per-source inclusion ceiling (single source of truth, item 7)."""
     return _source_max_limit(source_name)
+
+
+def source_lane_cap(source_name: str) -> int:
+    """Discovery lane ceiling independent of final brief inclusion caps."""
+    return min(LANE_CAPS.get(source_name, DEFAULT_LANE_CAP), GLOBAL_LANE_CEILING)
 
 
 # Default minimum number of items each active source may inject into a brief even
@@ -344,6 +361,12 @@ def _per_source_limits(value: Any) -> dict[str, int]:
         val = min(val, max_allowed)
         limits[key] = val
     return limits
+
+
+def _normalize_lookback_hours(raw: dict[str, Any], *, fallback: int) -> int | None:
+    if "lookback_hours" in raw and raw.get("lookback_hours") is None:
+        return None
+    return _bounded_int(raw.get("lookback_hours"), 1, MAX_LOOKBACK_HOURS) or fallback
 
 
 def _bounded_int(value: Any, minimum: int, maximum: int) -> int | None:

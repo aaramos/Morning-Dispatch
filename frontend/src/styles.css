@@ -2613,6 +2613,90 @@ label {
 .chat-send:disabled { background: #cfcdc4; cursor: not-allowed; }
 .chat-undercaption { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 0.78rem; color: #9a9993; }
 .chat-undercaption .spacer { flex: 1; }
+.chat-build-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  flex-wrap: wrap;
+}
+.recency-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #d8d7cf;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #45433d;
+}
+.recency-control strong {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #77746c;
+  white-space: nowrap;
+}
+.recency-control input[type="number"] {
+  width: 76px;
+  min-height: 34px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  padding: 0 8px;
+  font: inherit;
+  font-weight: 700;
+}
+.recency-control select {
+  min-height: 34px;
+  border: 1px solid #d8d7cf;
+  border-radius: 8px;
+  padding: 0 8px;
+  background: #fff;
+  font: inherit;
+}
+.recency-control.compact {
+  padding: 6px 8px;
+}
+.recency-unlimited-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78rem;
+  color: #5f5c55;
+  white-space: nowrap;
+}
+.foreign-region-picker {
+  display: grid;
+  gap: 7px;
+}
+.foreign-region-picker strong {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #77746c;
+}
+.foreign-region-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.foreign-region-row button {
+  border: 1px solid #d8d7cf;
+  border-radius: 999px;
+  background: #ffffff;
+  min-height: 34px;
+  padding: 0 12px;
+  font: inherit;
+  font-weight: 700;
+  color: #55534e;
+  cursor: pointer;
+}
+.foreign-region-row button.active {
+  border-color: #9bd6bd;
+  background: #eef8f3;
+  color: #1c6b4d;
+}
 .chat-streaming-note { display: inline-flex; align-items: center; gap: 7px; color: #78756d; }
 .chat-refinement-status {
   display: flex;

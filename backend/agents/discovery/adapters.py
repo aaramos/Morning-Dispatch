@@ -1133,10 +1133,10 @@ class RedditSourceAdapter:
 
             Returns (comments_text, thread_date_iso). Reddit's authoritative JSON
             (created_utc) is 403-blocked for unauthenticated requests, but the comment
-            thread's Atom feed (already fetched here) is allowed and carries the thread's
-            most-recent-activity timestamp. We use that as the post's recency date for
-            search-path posts that arrived without one, so a recently-discussed thread is
-            no longer dropped as "undated". Fails open to (text, None).
+            thread's Atom feed (already fetched here) is allowed. Feed-level updated
+            timestamps can be misleading for recency, so derive the thread date from
+            the earliest usable comment timestamp when possible. Fails open to
+            (text, None).
             """
             url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.rss"
             async with comments_semaphore:
@@ -1148,14 +1148,25 @@ class RedditSourceAdapter:
 
                     feed = feedparser.parse(response.text)
                     thread_date: str | None = None
-                    date_struct = feed.feed.get("updated_parsed") or feed.feed.get("published_parsed")
-                    if not date_struct and feed.entries:
-                        date_struct = feed.entries[0].get("updated_parsed") or feed.entries[0].get("published_parsed")
-                    if date_struct:
+                    comment_dates: list[datetime] = []
+                    for entry in feed.entries:
+                        date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+                        if not date_struct:
+                            continue
                         try:
-                            thread_date = datetime(*date_struct[:6], tzinfo=UTC).isoformat(timespec="seconds")
+                            comment_dates.append(datetime(*date_struct[:6], tzinfo=UTC))
                         except Exception:
-                            thread_date = None
+                            continue
+                    date_value: datetime | None = min(comment_dates) if comment_dates else None
+                    if date_value is None:
+                        date_struct = feed.feed.get("published_parsed") or feed.feed.get("updated_parsed")
+                        if date_struct:
+                            try:
+                                date_value = datetime(*date_struct[:6], tzinfo=UTC)
+                            except Exception:
+                                date_value = None
+                    if date_value is not None:
+                        thread_date = date_value.isoformat(timespec="seconds")
                     lines = ["--- Top Comments ---"]
                     count = 0
                     for entry in feed.entries:

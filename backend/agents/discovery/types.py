@@ -61,6 +61,7 @@ class TopicProfile:
     search_queries: tuple[str, ...] = ()
     source_queries: dict[str, tuple[str, ...]] = field(default_factory=dict)
     foreign_language_plan: tuple[dict[str, Any], ...] = ()
+    foreign_regions: tuple[str, ...] = ()
     depth: Depth = "informed-generalist"
     recency_weighting: RecencyWeighting = "recent"
     lookback_hours: int | None = None
@@ -101,6 +102,7 @@ class TopicProfile:
             search_queries=tuple(_string_list(payload.get("search_queries"))),
             source_queries=_source_queries(payload.get("source_queries")),
             foreign_language_plan=tuple(_dict_list(payload.get("foreign_language_plan"))),
+            foreign_regions=tuple(_string_list(payload.get("foreign_regions"))[:16]),
             depth=depth,
             recency_weighting=recency,
             lookback_hours=lookback_hours,
@@ -131,6 +133,7 @@ class TopicProfile:
             "search_queries": list(self.search_queries),
             "source_queries": {key: list(value) for key, value in self.source_queries.items()},
             "foreign_language_plan": [dict(item) for item in self.foreign_language_plan],
+            "foreign_regions": list(self.foreign_regions),
             "depth": self.depth,
             "recency_weighting": self.recency_weighting,
             "lookback_hours": self.lookback_hours,
@@ -310,7 +313,7 @@ def _content_limits(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     limits: dict[str, Any] = {}
-    total_items = _positive_int(value.get("total_items"), maximum=250)
+    total_items = _positive_int(value.get("total_items"), maximum=1000)
     if total_items is not None:
         limits["total_items"] = total_items
     target_items = _positive_int(value.get("target_items"), maximum=250)
@@ -326,7 +329,7 @@ def _content_limits(value: Any) -> dict[str, Any]:
     if isinstance(raw_per_source, dict):
         for raw_key, raw_limit in raw_per_source.items():
             key = _clean_text(raw_key)
-            source_limit = _positive_int(raw_limit, maximum=50)
+            source_limit = _positive_int(raw_limit, maximum=80)
             if key in VALID_SOURCE_ADAPTERS and source_limit is not None:
                 per_source[key] = source_limit
     if per_source:
@@ -338,7 +341,7 @@ def _content_limits(value: Any) -> dict[str, Any]:
     if isinstance(raw_min_items, dict):
         for raw_key, raw_floor in raw_min_items.items():
             key = _clean_text(raw_key)
-            floor = _positive_int(raw_floor, maximum=50, allow_zero=True)
+            floor = _positive_int(raw_floor, maximum=80, allow_zero=True)
             if key in VALID_SOURCE_ADAPTERS and floor is not None:
                 min_items[key] = floor
     if min_items:
@@ -398,7 +401,7 @@ def _lookback_hours(value: Any) -> int | None:
         return None
     if hours < 1:
         return None
-    return min(hours, 8760)
+    return min(hours, 262800)
 
 
 def _lookback_hours_from_text(value: Any) -> int | None:

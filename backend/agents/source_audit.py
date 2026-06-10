@@ -16,7 +16,7 @@ from backend.agents.model.metrics import record_model_error_metric, record_model
 from backend.app.core.config import get_settings
 from backend.app.core.prompt_loader import load_prompt
 
-MAX_AUDIT_CANDIDATES = 28
+MAX_AUDIT_CANDIDATES = 150
 RETRY_AUDIT_CANDIDATES = 4
 URL_DATE_RE = re.compile(r"/(20\d{2})[/-](0?[1-9]|1[0-2])(?:[/-](0?[1-9]|[12]\d|3[01]))?")
 SYNDICATED_AGGREGATOR_DOMAINS = {

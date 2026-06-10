@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery.adapters import _promoted_refs, _source_plan_refs
+from backend.agents.discovery import query_refiner
 from backend.agents.discovery.runner import _expand_profile_queries, datetime_now_year
 from backend.agents.discovery.types import SourceAdapterContext, TopicProfile
 from backend.agents.librarian.articles import ArticleFetchResult
@@ -64,9 +65,9 @@ def test_percent_presets_match_historical_tiers() -> None:
 
 
 def test_source_max_is_single_source_of_truth() -> None:
-    assert brief_settings.source_inclusion_max("reddit") == 30
-    assert brief_settings.source_inclusion_max("web_search") == 40
-    assert brief_settings.source_inclusion_max("youtube") == 20
+    assert brief_settings.source_inclusion_max("reddit") == 60
+    assert brief_settings.source_inclusion_max("web_search") == 80
+    assert brief_settings.source_inclusion_max("youtube") == 40
     # Unknown sources fall back to the default ceiling.
     assert brief_settings.source_inclusion_max("mystery") == brief_settings.DEFAULT_PER_SOURCE_MAX
 
@@ -76,7 +77,27 @@ def test_source_min_items_defaults_and_overrides() -> None:
     assert brief_settings.source_min_items("web_search", {}) == brief_settings.DEFAULT_SOURCE_FLOOR
     assert brief_settings.source_min_items("web_search", {"min_items": {"web_search": 3}}) == 3
     # Floor can never exceed the source ceiling.
-    assert brief_settings.source_min_items("youtube", {"min_items": {"youtube": 999}}) == 20
+    assert brief_settings.source_min_items("youtube", {"min_items": {"youtube": 999}}) == 40
+
+
+def test_screening_sample_randomizes_large_candidate_pools(monkeypatch) -> None:
+    candidates = list(range(query_refiner._SCREENING_MAX_CANDIDATES_PER_SOURCE + 25))
+    observed: dict[str, int] = {}
+
+    def fake_sample(population, k):
+        observed["population"] = len(population)
+        observed["sample_size"] = k
+        return list(population[-k:])
+
+    monkeypatch.setattr(query_refiner.random, "sample", fake_sample)
+
+    sampled = query_refiner._screening_sample(candidates)
+
+    assert observed == {
+        "population": len(candidates),
+        "sample_size": query_refiner._SCREENING_MAX_CANDIDATES_PER_SOURCE,
+    }
+    assert sampled == candidates[-query_refiner._SCREENING_MAX_CANDIDATES_PER_SOURCE :]
 
 
 # ---------------------------------------------------------------------------

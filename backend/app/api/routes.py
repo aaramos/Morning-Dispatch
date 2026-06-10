@@ -51,9 +51,10 @@ class TopicProfileCreate(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     search_queries: list[str] = Field(default_factory=list)
     source_queries: dict[str, list[str]] = Field(default_factory=dict)
+    foreign_regions: list[str] = Field(default_factory=list)
     depth: Literal["practitioner", "informed-generalist"] = "informed-generalist"
     recency_weighting: Literal["breaking", "recent", "last_year", "all_available", "balanced", "evergreen"] = "recent"
-    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
+    lookback_hours: int | None = Field(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
     exclusions: list[str] = Field(default_factory=list)
     source_selection: dict[str, bool] = Field(default_factory=dict)
     requested_sources: list[dict[str, Any]] = Field(default_factory=list)
@@ -73,8 +74,8 @@ class TopicProfileCreate(BaseModel):
 class ExplorationCreate(BaseModel):
     mode: Literal["show_now", "scheduled"] = "show_now"
     source_selection: dict[str, bool] = Field(default_factory=dict)
-    candidate_limit: int = Field(default=150, ge=1, le=250)
-    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
+    candidate_limit: int = Field(default=150, ge=1, le=brief_settings.MAX_CANDIDATE_BUDGET)
+    lookback_hours: int | None = Field(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
 
 
 class ExplorationRebuildCreate(ExplorationCreate):
@@ -84,8 +85,8 @@ class ExplorationRebuildCreate(ExplorationCreate):
 
 class TopicProfileBuildCreate(TopicProfileCreate):
     mode: Literal["show_now", "scheduled"] = "show_now"
-    candidate_limit: int = Field(default=150, ge=1, le=250)
-    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
+    candidate_limit: int = Field(default=150, ge=1, le=brief_settings.MAX_CANDIDATE_BUDGET)
+    lookback_hours: int | None = Field(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
     refinement_session_id: str | None = None
 
 
@@ -121,6 +122,7 @@ class RefinementStreamMessage(BaseModel):
     session_id: str | None = None
     statement: str = ""
     source_selection: dict[str, bool] = Field(default_factory=dict)
+    foreign_regions: list[str] = Field(default_factory=list)
     answer: str = ""
     models: dict[str, Any] = Field(default_factory=dict)
     just_go_now: bool = False
@@ -159,7 +161,7 @@ class TopicProfileSchedule(BaseModel):
 
 class TopicProfileContentLimitsUpdate(BaseModel):
     content_limits: dict[str, Any] = Field(default_factory=dict)
-    lookback_hours: int | None = Field(default=None, ge=1, le=8760)
+    lookback_hours: int | None = Field(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
     pipeline_limits: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -243,6 +245,7 @@ async def stream_refinement(payload: RefinementStreamMessage) -> StreamingRespon
                 session_id=payload.session_id,
                 statement=payload.statement,
                 source_selection=payload.source_selection,
+                foreign_regions=payload.foreign_regions,
                 models=payload.models,
                 answer=payload.answer,
                 just_go_now=payload.just_go_now,
@@ -794,7 +797,7 @@ def delete_digest(digest_id: str) -> dict[str, Any]:
 @router.post("/digests/{digest_id}/run", status_code=202)
 async def run_digest(
     digest_id: str,
-    lookback_hours: int | None = Query(default=None, ge=1, le=720),
+    lookback_hours: int | None = Query(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS),
 ) -> dict[str, Any]:
     try:
         run = await digest_runner.run_digest(digest_id, lookback_hours=lookback_hours)
