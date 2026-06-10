@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery import adapters, youtube
+from backend.agents.discovery.runner import _redact_status_message
 from backend.agents.discovery.adapters import YouTubeSourceAdapter
 from backend.agents.discovery.types import AdapterUnavailable, SourceAdapterContext, TopicProfile
 from backend.agents.librarian.articles import ArticleFetchResult, direct_article_results
@@ -35,6 +36,57 @@ def test_search_youtube_requires_api_key(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(AdapterUnavailable, match="API key"):
         asyncio.run(youtube.search_youtube(api_key=None, query="local AI", limit=3))
+
+
+def test_search_youtube_429_maps_to_clean_rate_limit_message(monkeypatch, tmp_path) -> None:
+    class FakeResponse:
+        status_code = 429
+        text = "rate limited"
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "error": {
+                    "message": "Requests per minute exceeded.",
+                    "errors": [{"reason": "userRateLimitExceeded"}],
+                }
+            }
+
+        def raise_for_status(self) -> None:
+            raise AssertionError("handled YouTube errors should not reach raise_for_status")
+
+    class FakeClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def get(self, _url: str, **_kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(youtube.httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(AdapterUnavailable) as exc:
+        asyncio.run(youtube.search_youtube(api_key="secret-key", query="local AI", limit=3))
+
+    assert str(exc.value) == "YouTube API rate limit exceeded."
+    assert "secret-key" not in str(exc.value)
+
+
+def test_runner_status_message_redacts_query_secrets() -> None:
+    message = (
+        "Client error '429' for url "
+        "'https://www.googleapis.com/youtube/v3/search?key=AIza-secret-value&part=snippet'"
+    )
+
+    redacted = _redact_status_message(message)
+
+    assert "AIza-secret-value" not in redacted
+    assert "key=REDACTED" in redacted
 
 
 def test_search_youtube_maps_videos_and_records_quota(monkeypatch, tmp_path) -> None:
@@ -160,6 +212,72 @@ def test_youtube_adapter_maps_transcripts_to_candidates(monkeypatch, tmp_path) -
     assert candidates[0].payload.original_url == "https://www.youtube.com/watch?v=video-1"
     assert candidates[0].payload.metadata["youtube_title"] == "Local AI Systems Talk"
     assert candidates[0].payload.metadata["transcript_source"] == "native"
+
+
+def test_youtube_adapter_skips_when_daily_quota_is_exhausted(monkeypatch, tmp_path) -> None:
+    async def fake_search_youtube(**_kwargs: object) -> youtube.YouTubeSearchResult:
+        raise AssertionError("adapter should not call YouTube when quota preflight fails")
+
+    _runtime(monkeypatch, tmp_path)
+    database.init_database()
+    database.record_youtube_quota(youtube.YOUTUBE_DAILY_QUOTA_UNITS)
+    monkeypatch.setenv("MORNING_DISPATCH_YOUTUBE_API_KEY", "key")
+    monkeypatch.setattr(adapters, "search_youtube", fake_search_youtube)
+
+    with pytest.raises(AdapterUnavailable, match="quota"):
+        asyncio.run(
+            YouTubeSourceAdapter().query(
+                TopicProfile.from_dict(
+                    {
+                        "statement": "local AI systems",
+                        "scope": "local AI systems",
+                        "search_queries": [
+                            "local AI systems",
+                            "edge AI models",
+                            "Apple Silicon LLM",
+                        ],
+                        "source_selection": {"youtube": True},
+                    }
+                ),
+                SourceAdapterContext(exploration_id="explore-1", candidate_limit=3),
+            )
+        )
+
+
+def test_youtube_adapter_degrades_fanout_when_quota_is_high(monkeypatch, tmp_path) -> None:
+    calls: list[str] = []
+
+    async def fake_search_youtube(**kwargs: object) -> youtube.YouTubeSearchResult:
+        calls.append(str(kwargs.get("query") or ""))
+        return youtube.YouTubeSearchResult(videos=(), quota_units=101)
+
+    _runtime(monkeypatch, tmp_path)
+    database.init_database()
+    database.record_youtube_quota(youtube.YOUTUBE_QUOTA_WARNING_UNITS)
+    monkeypatch.setenv("MORNING_DISPATCH_YOUTUBE_API_KEY", "key")
+    monkeypatch.setattr(adapters, "search_youtube", fake_search_youtube)
+
+    candidates = asyncio.run(
+        YouTubeSourceAdapter().query(
+            TopicProfile.from_dict(
+                {
+                    "statement": "local AI systems",
+                    "scope": "local AI systems",
+                    "search_queries": [
+                        "local AI systems",
+                        "edge AI models",
+                        "Apple Silicon LLM",
+                        "MLX inference",
+                    ],
+                    "source_selection": {"youtube": True},
+                }
+            ),
+            SourceAdapterContext(exploration_id="explore-1", candidate_limit=3),
+        )
+    )
+
+    assert candidates == []
+    assert len(calls) == 2
 
 
 def test_youtube_credentials_enable_source_status(monkeypatch, tmp_path) -> None:

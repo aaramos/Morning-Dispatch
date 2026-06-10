@@ -21,6 +21,15 @@ from backend.agents.discovery.types import (
 )
 from backend.app.services import brief_settings
 
+_SECRET_QUERY_RE = re.compile(r"(?i)([?&](?:key|api_key|apikey|token|access_token|client_secret)=)([^&\s'\"<>]+)")
+
+
+def _redact_status_message(value: object, *, limit: int = 240) -> str:
+    text = str(value or "")
+    text = _SECRET_QUERY_RE.sub(r"\1REDACTED", text)
+    return text[:limit]
+
+
 _GOOD_FOR_SIGNAL_MAP: dict[str, tuple[str, ...]] = {
     "breaking_news": (
         "breaking",
@@ -303,7 +312,7 @@ class DiscoveryRunner:
                 status="skipped",
                 elapsed_ms=_elapsed_ms(started_at),
                 timeout_seconds=timeout,
-                message=str(exc),
+                message=_redact_status_message(exc),
             )
         except Exception as exc:
             status = AdapterStatus(
@@ -311,20 +320,40 @@ class DiscoveryRunner:
                 status="failed",
                 elapsed_ms=_elapsed_ms(started_at),
                 timeout_seconds=timeout,
-                message=str(exc)[:240],
+                message=_redact_status_message(exc),
             )
         else:
+            adapter_reason = _candidate_adapter_reason(candidates)
             status = AdapterStatus(
                 name=adapter.name,
-                status="completed",
+                status="partial" if adapter_reason else "completed",
                 candidate_count=len(candidates),
                 elapsed_ms=_elapsed_ms(started_at),
                 timeout_seconds=timeout,
+                message=_partial_status_message(adapter_reason),
+                reason_code=adapter_reason,
             )
 
         if callback is not None:
             callback(status)
         return candidates, status
+
+
+def _candidate_adapter_reason(candidates: list[Candidate]) -> str | None:
+    for candidate in candidates:
+        metadata = candidate.payload.metadata or {}
+        reason = metadata.get("adapter_reason_code") or candidate.metadata.get("adapter_reason_code")
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+    return None
+
+
+def _partial_status_message(reason: str | None) -> str | None:
+    if reason == "time_budget":
+        return "Returned partial results before the source time budget expired."
+    if reason:
+        return "Returned partial results with degraded source coverage."
+    return None
 
 
 async def _expand_profile_queries(

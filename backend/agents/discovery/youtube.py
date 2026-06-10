@@ -78,8 +78,7 @@ async def search_youtube(
     quota_units = 100
     async with httpx.AsyncClient(timeout=10.0) as client:
         search_response = await client.get(YOUTUBE_SEARCH_ENDPOINT, params=params)
-        if search_response.status_code in {400, 401, 403}:
-            raise AdapterUnavailable(_youtube_error_message(search_response))
+        _raise_for_youtube_error(search_response)
         search_response.raise_for_status()
         search_data = search_response.json()
 
@@ -98,8 +97,7 @@ async def search_youtube(
             },
         )
         quota_units += 1
-        if videos_response.status_code in {400, 401, 403}:
-            raise AdapterUnavailable(_youtube_error_message(videos_response))
+        _raise_for_youtube_error(videos_response)
         videos_response.raise_for_status()
         videos_data = videos_response.json()
 
@@ -177,6 +175,11 @@ def _published_after(recency_weighting: RecencyWeighting) -> str | None:
 def _duration_filter(value: str) -> str:
     clean = str(value or "medium").strip().lower()
     return clean if clean in {"any", "short", "medium", "long"} else "medium"
+
+
+def _raise_for_youtube_error(response: httpx.Response) -> None:
+    if response.status_code in {400, 401, 403, 429} or response.status_code >= 500:
+        raise AdapterUnavailable(_youtube_error_message(response))
 
 
 def _video_ids(payload: Any) -> list[str]:
@@ -261,9 +264,21 @@ def _youtube_error_message(response: httpx.Response) -> str:
     error = payload.get("error") if isinstance(payload, dict) else None
     if not isinstance(error, dict):
         return f"YouTube API returned HTTP {response.status_code}."
+    reason_values: list[str] = []
+    for item in error.get("errors") or ():
+        if isinstance(item, dict):
+            reason = str(item.get("reason") or "").strip()
+            if reason:
+                reason_values.append(reason)
     message = str(error.get("message") or "").strip()
     if not message:
         return f"YouTube API returned HTTP {response.status_code}."
-    if "quota" in message.lower():
+    reasons = " ".join(reason_values).lower()
+    message_lower = message.lower()
+    if "quota" in reasons or "quota" in message_lower:
         return "YouTube quota exceeded."
+    if response.status_code == 429 or "ratelimit" in reasons or "rate limit" in message_lower:
+        return "YouTube API rate limit exceeded."
+    if response.status_code >= 500:
+        return "YouTube API is temporarily unavailable."
     return f"YouTube API error: {message}"

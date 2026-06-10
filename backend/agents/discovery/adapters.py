@@ -49,7 +49,14 @@ from backend.agents.discovery.markets import (
     fetch_fred_macro_data,
 )
 from backend.agents.discovery.web_search import lookback_to_days, search_web
-from backend.agents.discovery.youtube import fetch_youtube_transcript, search_youtube
+from backend.agents.discovery.youtube import (
+    YOUTUBE_DAILY_QUOTA_UNITS,
+    YOUTUBE_QUOTA_WARNING_UNITS,
+    fetch_youtube_transcript,
+    search_youtube,
+)
+
+_YOUTUBE_SEARCH_PASS_UNITS = 101
 
 
 class GmailSourceAdapter:
@@ -350,13 +357,29 @@ class YouTubeSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         settings = get_settings()
-        queries = _web_search_queries(profile, _requested_refs(profile, "youtube"), adapter=self.name)[:6]
+        quota_used = _youtube_quota_units_used()
+        if quota_used + _YOUTUBE_SEARCH_PASS_UNITS > YOUTUBE_DAILY_QUOTA_UNITS:
+            raise AdapterUnavailable(
+                f"YouTube daily quota is exhausted today ({quota_used}/{YOUTUBE_DAILY_QUOTA_UNITS} units used)."
+            )
+
+        degraded_for_quota = quota_used >= YOUTUBE_QUOTA_WARNING_UNITS
+        max_initial_queries = 2 if degraded_for_quota else 6
+        remaining_query_slots = max(0, (YOUTUBE_DAILY_QUOTA_UNITS - quota_used) // _YOUTUBE_SEARCH_PASS_UNITS)
+        queries = _web_search_queries(profile, _requested_refs(profile, "youtube"), adapter=self.name)[
+            : max(0, min(max_initial_queries, remaining_query_slots))
+        ]
         if not queries:
             return []
         per_query_limit = max(1, min(12, settings.youtube_max_results, max(1, context.candidate_limit)))
-        results = await asyncio.gather(
-            *(
-                search_youtube(
+        videos_by_id: dict[str, Any] = {}
+        errors: list[BaseException] = []
+        target_video_count = max(1, min(context.candidate_limit, settings.youtube_max_results, per_query_limit))
+        for query in queries:
+            if quota_used + _YOUTUBE_SEARCH_PASS_UNITS > YOUTUBE_DAILY_QUOTA_UNITS:
+                break
+            try:
+                result = await search_youtube(
                     api_key=settings.youtube_api_key,
                     query=query,
                     limit=per_query_limit,
@@ -364,21 +387,19 @@ class YouTubeSourceAdapter:
                     duration_filter=settings.youtube_duration_filter,
                     lookback_hours=context.lookback_hours,
                 )
-                for query in queries
-            ),
-            return_exceptions=True,
-        )
-        videos_by_id: dict[str, Any] = {}
-        errors: list[BaseException] = []
-        for result in results:
-            if isinstance(result, BaseException):
-                errors.append(result)
+            except Exception as exc:
+                errors.append(exc)
+                if isinstance(exc, AdapterUnavailable):
+                    break
                 continue
+            quota_used += max(0, int(result.quota_units or 0))
             for video in result.videos:
                 videos_by_id.setdefault(video.video_id, video)
+            if len(videos_by_id) >= target_video_count:
+                break
 
         refined_video_ids: set[str] = set()
-        if len(videos_by_id) < 3:
+        if len(videos_by_id) < 3 and not degraded_for_quota and quota_used + _YOUTUBE_SEARCH_PASS_UNITS <= YOUTUBE_DAILY_QUOTA_UNITS:
             try:
                 from backend.agents.discovery.query_refiner import refine_queries_for_adapter
                 refined_queries = await refine_queries_for_adapter(
@@ -392,11 +413,14 @@ class YouTubeSourceAdapter:
                 logger.warning("Failed to refine queries for YouTube adapter: %s", exc)
                 refined_queries = []
             if refined_queries:
-                refined_queries = refined_queries[:2]
+                remaining_query_slots = max(0, (YOUTUBE_DAILY_QUOTA_UNITS - quota_used) // _YOUTUBE_SEARCH_PASS_UNITS)
+                refined_queries = refined_queries[: max(0, min(2, remaining_query_slots))]
                 refined_recency = profile.recency_weighting if context.lookback_hours is not None else "all_available"
-                refined_results = await asyncio.gather(
-                    *(
-                        search_youtube(
+                for query in refined_queries:
+                    if quota_used + _YOUTUBE_SEARCH_PASS_UNITS > YOUTUBE_DAILY_QUOTA_UNITS:
+                        break
+                    try:
+                        result = await search_youtube(
                             api_key=settings.youtube_api_key,
                             query=query,
                             limit=per_query_limit,
@@ -404,18 +428,18 @@ class YouTubeSourceAdapter:
                             duration_filter="any",
                             lookback_hours=context.lookback_hours,
                         )
-                        for query in refined_queries
-                    ),
-                    return_exceptions=True,
-                )
-                for result in refined_results:
-                    if isinstance(result, BaseException):
-                        errors.append(result)
+                    except Exception as exc:
+                        errors.append(exc)
+                        if isinstance(exc, AdapterUnavailable):
+                            break
                         continue
+                    quota_used += max(0, int(result.quota_units or 0))
                     for video in result.videos:
                         if video.video_id not in videos_by_id:
                             videos_by_id[video.video_id] = video
                             refined_video_ids.add(video.video_id)
+                    if len(videos_by_id) >= target_video_count:
+                        break
 
         if not videos_by_id and errors:
             raise errors[0]
@@ -426,6 +450,14 @@ class YouTubeSourceAdapter:
 
     async def fetch(self, candidate: Candidate) -> Any:
         return candidate.payload
+
+
+def _youtube_quota_units_used() -> int:
+    try:
+        return int(database.youtube_quota_summary().get("units_used") or 0)
+    except Exception as exc:
+        logger.warning("Unable to read YouTube quota summary; proceeding without preflight: %s", exc)
+        return 0
 
 
 class CollectionsSourceAdapter:
@@ -1491,7 +1523,7 @@ class GoogleNewsSourceAdapter:
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
         import httpx
-        from backend.agents.discovery.google_news import fetch_google_news_sequential, decode_google_news_url
+        from backend.agents.discovery import google_news
         
         queries = _web_search_queries(profile, _requested_refs(profile, "google_news"), adapter=self.name)
         settings = get_settings()
@@ -1508,18 +1540,56 @@ class GoogleNewsSourceAdapter:
             hl = hl_part
             gl = gl_part
             ceid = f"{gl_part}:{hl_part.split('-')[0]}"
-            
-        try:
-            hits = await fetch_google_news_sequential(
-                queries,
-                lookback_hours=context.lookback_hours,
-                limit=10,
-                hl=hl,
-                gl=gl,
-                ceid=ceid,
-            )
-        except BaseException as exc:
-            raise exc
+
+        request_timeout = float(getattr(settings, "google_news_request_timeout_seconds", 10.0))
+        request_delay = float(getattr(settings, "google_news_request_delay_seconds", 3.0))
+        deadline = time.monotonic() + max(1.0, self.cost_profile.timeout_seconds - 3.0)
+        degraded_reason: str | None = None
+
+        def remaining_seconds() -> float:
+            return deadline - time.monotonic()
+
+        def has_time(min_seconds: float = 0.75) -> bool:
+            return remaining_seconds() > min_seconds
+
+        async def fetch_query_hits(query_list: list[str]) -> list[Any]:
+            nonlocal degraded_reason
+            hits: list[Any] = []
+            for index, query in enumerate(query_list):
+                if not has_time(1.25):
+                    degraded_reason = degraded_reason or "time_budget"
+                    break
+                if index > 0:
+                    sleep_for = min(request_delay, max(0.0, remaining_seconds() - 1.25))
+                    if sleep_for > 0:
+                        await asyncio.sleep(sleep_for)
+                if not has_time(1.25):
+                    degraded_reason = degraded_reason or "time_budget"
+                    break
+                try:
+                    timeout = max(0.5, min(request_timeout + 0.25, remaining_seconds() - 0.25))
+                    batch = await asyncio.wait_for(
+                        google_news.fetch_google_news(
+                            query,
+                            lookback_hours=context.lookback_hours,
+                            limit=10,
+                            hl=hl,
+                            gl=gl,
+                            ceid=ceid,
+                        ),
+                        timeout=timeout,
+                    )
+                except TimeoutError:
+                    degraded_reason = degraded_reason or "time_budget"
+                    logger.warning("Google News query timed out inside adapter deadline: %s", query)
+                    break
+                except Exception as exc:
+                    logger.warning("Error fetching Google News for query %s: %s", query, exc)
+                    continue
+                hits.extend(batch)
+            return hits
+
+        hits = await fetch_query_hits(queries)
 
         hits_by_url: dict[str, tuple[Any, str, int]] = {}
         seen_titles: set[str] = set()
@@ -1542,7 +1612,7 @@ class GoogleNewsSourceAdapter:
                 seen_titles.add(title_key)
                 
         unique_hits = [item[0] for item in hits_by_url.values()]
-        if len(unique_hits) < 3:
+        if len(unique_hits) < 3 and has_time(10.0):
             logger.info("Low-yield detected for Google News adapter. Initiating query refinement...")
             try:
                 from backend.agents.discovery.query_refiner import refine_queries_for_adapter
@@ -1559,29 +1629,20 @@ class GoogleNewsSourceAdapter:
                 
             if refined_queries:
                 refined_queries = refined_queries[:3]
-                try:
-                    ref_hits = await fetch_google_news_sequential(
-                        refined_queries,
-                        lookback_hours=context.lookback_hours,
-                        limit=10,
-                        hl=hl,
-                        gl=gl,
-                        ceid=ceid,
-                    )
+                ref_hits = await fetch_query_hits(refined_queries)
+                for hit in ref_hits:
+                    url_key = _dedupe_url_key(hit.url)
+                    title_key = normalize_title(hit.title)
                     
-                    for hit in ref_hits:
-                        url_key = _dedupe_url_key(hit.url)
-                        title_key = normalize_title(hit.title)
+                    if title_key in seen_titles:
+                        continue
                         
-                        if title_key in seen_titles:
-                            continue
-                            
-                        existing = hits_by_url.get(url_key)
-                        if existing is None:
-                            hits_by_url[url_key] = (hit, url_key, -1)
-                            seen_titles.add(title_key)
-                except Exception as exc:
-                    logger.warning("Error fetching refined Google News: %s", exc)
+                    existing = hits_by_url.get(url_key)
+                    if existing is None:
+                        hits_by_url[url_key] = (hit, url_key, -1)
+                        seen_titles.add(title_key)
+        elif len(unique_hits) < 3:
+            degraded_reason = degraded_reason or "time_budget"
 
         candidate_limit = max(1, context.candidate_limit)
         
@@ -1602,13 +1663,35 @@ class GoogleNewsSourceAdapter:
         unfurl_delay = getattr(settings, "google_news_request_delay_seconds", 3.0)
         
         decoded_items = []
+        max_unfurl = min(len(top_items), 10)
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for idx, (hit, url_key, pos) in enumerate(top_items):
                 decoded_url = None
-                if unfurl_enabled:
-                    if idx > 0:
-                        await asyncio.sleep(unfurl_delay)
-                    decoded_url = await decode_google_news_url(hit.url, client=client)
+                if unfurl_enabled and idx < max_unfurl:
+                    cached_url = google_news.cached_decoded_google_news_url(hit.url)
+                    if cached_url:
+                        decoded_url = cached_url
+                    elif has_time(1.25):
+                        if idx > 0:
+                            sleep_for = min(unfurl_delay, max(0.0, remaining_seconds() - 1.25))
+                            if sleep_for > 0:
+                                await asyncio.sleep(sleep_for)
+                        if has_time(1.25):
+                            try:
+                                timeout = max(0.5, min(request_timeout, remaining_seconds() - 0.25))
+                                decoded_url = await asyncio.wait_for(
+                                    google_news.decode_google_news_url(hit.url, client=client),
+                                    timeout=timeout,
+                                )
+                            except TimeoutError:
+                                degraded_reason = degraded_reason or "time_budget"
+                                logger.warning("Google News URL decode timed out inside adapter deadline: %s", hit.url)
+                            except Exception as exc:
+                                logger.warning("Error decoding Google News URL %s: %s", hit.url, exc)
+                    else:
+                        degraded_reason = degraded_reason or "time_budget"
+                elif unfurl_enabled and idx >= max_unfurl:
+                    degraded_reason = degraded_reason or "time_budget"
                 
                 decoded_items.append((hit, decoded_url or hit.url, pos))
                 
@@ -1624,6 +1707,8 @@ class GoogleNewsSourceAdapter:
                 "publisher": hit.publisher,
                 "google_news_url": hit.url,
             }
+            if degraded_reason:
+                metadata["adapter_reason_code"] = degraded_reason
             if is_refined:
                 metadata["is_refined_query"] = True
                 

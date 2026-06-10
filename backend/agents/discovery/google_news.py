@@ -193,6 +193,10 @@ def _read_decode_cache(guid: str) -> str | None:
     return None
 
 
+def cached_decoded_google_news_url(proxy_url: str) -> str | None:
+    return _read_decode_cache(extract_google_news_id(proxy_url))
+
+
 def _write_decode_cache(guid: str, decoded_url: str) -> None:
     path = _decode_cache_dir() / f"{hashlib.sha256(guid.encode('utf-8')).hexdigest()}.json"
     try:

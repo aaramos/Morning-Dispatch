@@ -8,7 +8,7 @@ from typing import Any, Literal, Protocol
 from backend.agents.digestor.base import NormalizedPayload
 
 AdapterName = Literal["gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news"]
-AdapterStatusValue = Literal["pending", "running", "completed", "timed_out", "failed", "skipped"]
+AdapterStatusValue = Literal["pending", "running", "completed", "partial", "timed_out", "failed", "skipped"]
 Depth = Literal["practitioner", "informed-generalist"]
 RecencyWeighting = Literal["breaking", "recent", "last_year", "all_available"]
 ScheduleValue = Literal["hourly", "daily", "weekdays", "weekly", "monthly"]
@@ -219,9 +219,10 @@ class AdapterStatus:
     elapsed_ms: int = 0
     timeout_seconds: float | None = None
     message: str | None = None
+    reason_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "name": self.name,
             "status": self.status,
             "candidate_count": self.candidate_count,
@@ -229,6 +230,9 @@ class AdapterStatus:
             "timeout_seconds": self.timeout_seconds,
             "message": self.message,
         }
+        if self.reason_code:
+            payload["reason_code"] = self.reason_code
+        return payload
 
 
 @dataclass(frozen=True)

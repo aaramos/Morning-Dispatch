@@ -12,9 +12,11 @@ from types import SimpleNamespace
 import httpx
 from bs4 import BeautifulSoup
 
+from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery import google_news
 from backend.agents.discovery.adapters import GoogleNewsSourceAdapter
 from backend.agents.discovery.types import SourceAdapterContext, TopicProfile, Candidate
+from backend.agents.librarian import articles
 from backend.app.core.config import get_settings
 
 
@@ -276,8 +278,7 @@ def test_decode_google_news_url_sync_success(monkeypatch, tmp_path) -> None:
 def test_google_news_adapter_query(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
 
-    # Mock fetch_google_news_sequential to return sample hits
-    async def mock_fetch_seq(queries, **kwargs):
+    async def mock_fetch_news(query, **kwargs):
         return [
             google_news.GoogleNewsHit(
                 title="Google News Integration works",
@@ -302,11 +303,19 @@ def test_google_news_adapter_query(monkeypatch, tmp_path) -> None:
                 snippet="Another snippet content.",
                 publisher="TechCrunch",
                 published_at="2026-06-09T13:00:00+00:00"
-            )
+            ),
+            google_news.GoogleNewsHit(
+                title="Third unique article",
+                url="https://news.google.com/rss/articles/CBMi_third/",
+                decoded_url=None,
+                snippet="A third snippet.",
+                publisher="Wired",
+                published_at="2026-06-09T14:00:00+00:00"
+            ),
         ]
 
     monkeypatch.setattr(GoogleNewsSourceAdapter, "query", GoogleNewsSourceAdapter.query)
-    monkeypatch.setattr(google_news, "fetch_google_news_sequential", mock_seq_helper := mock_fetch_seq)
+    monkeypatch.setattr(google_news, "fetch_google_news", mock_fetch_news)
 
     # Mock decode URL to return original/decoded
     async def mock_decode(url, **kwargs):
@@ -324,7 +333,7 @@ def test_google_news_adapter_query(monkeypatch, tmp_path) -> None:
         "scope": "Google News RSS source adapter design.",
         "search_queries": ["morning dispatch improvement"],
     })
-    context = SourceAdapterContext(exploration_id="explore-new-connector", candidate_limit=5)
+    context = SourceAdapterContext(exploration_id="explore-new-connector", candidate_limit=2)
 
     candidates = asyncio.run(adapter.query(profile, context))
 
@@ -347,3 +356,84 @@ def test_google_news_adapter_query(monkeypatch, tmp_path) -> None:
     cand_2 = candidates[1]
     assert cand_2.payload.source_name == "TechCrunch"
     assert cand_2.payload.original_url == "https://techcrunch.com/second-story"
+
+
+def test_google_news_adapter_returns_partial_proxy_candidates_when_decode_times_out(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_DELAY_SECONDS", "0")
+    monkeypatch.setenv("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_TIMEOUT_SECONDS", "0.5")
+
+    async def mock_fetch_news(query, **kwargs):
+        return [
+            google_news.GoogleNewsHit(
+                title="First recent article",
+                url="https://news.google.com/rss/articles/CBMi_first/",
+                decoded_url=None,
+                snippet="A description of the first article.",
+                publisher="The Verge",
+                published_at="2026-06-09T12:00:00+00:00",
+            ),
+            google_news.GoogleNewsHit(
+                title="Second recent article",
+                url="https://news.google.com/rss/articles/CBMi_second/",
+                decoded_url=None,
+                snippet="A description of the second article.",
+                publisher="TechCrunch",
+                published_at="2026-06-09T13:00:00+00:00",
+            ),
+            google_news.GoogleNewsHit(
+                title="Third recent article",
+                url="https://news.google.com/rss/articles/CBMi_third/",
+                decoded_url=None,
+                snippet="A description of the third article.",
+                publisher="Wired",
+                published_at="2026-06-09T14:00:00+00:00",
+            ),
+        ]
+
+    async def slow_decode(url, **kwargs):
+        await asyncio.sleep(2)
+        return "https://publisher.example.com/decoded"
+
+    monkeypatch.setattr(google_news, "fetch_google_news", mock_fetch_news)
+    monkeypatch.setattr(google_news, "decode_google_news_url", slow_decode)
+
+    adapter = GoogleNewsSourceAdapter()
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "AI infrastructure news",
+            "scope": "AI infrastructure news",
+            "search_queries": ["ai infrastructure"],
+        }
+    )
+
+    candidates = asyncio.run(adapter.query(profile, SourceAdapterContext(exploration_id="explore-google", candidate_limit=3)))
+
+    assert len(candidates) == 3
+    assert [candidate.payload.original_url for candidate in candidates] == [
+        "https://news.google.com/rss/articles/CBMi_first/",
+        "https://news.google.com/rss/articles/CBMi_second/",
+        "https://news.google.com/rss/articles/CBMi_third/",
+    ]
+    assert all(candidate.payload.metadata["adapter_reason_code"] == "time_budget" for candidate in candidates)
+
+
+def test_article_selection_decodes_google_news_proxy_url(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    proxy_url = "https://news.google.com/rss/articles/CBMi_selected/"
+    publisher_url = "https://publisher.example.com/2026/06/09/ai-infrastructure-story"
+    monkeypatch.setattr(google_news, "decode_google_news_url_sync", lambda _url: publisher_url)
+
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="Google News",
+        raw_text="A Google News result about AI infrastructure.",
+        original_url=proxy_url,
+        metadata={"search_provider": "google_news_rss", "google_news_url": proxy_url},
+    )
+
+    selected = articles.select_article_payloads([payload], max_articles=1)
+
+    assert len(selected) == 1
+    assert selected[0].original_url == publisher_url
+    assert selected[0].metadata["canonical_url"] == publisher_url
