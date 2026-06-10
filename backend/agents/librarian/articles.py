@@ -205,8 +205,10 @@ def select_article_payloads(
     for payload in payloads:
         if payload.source_type not in {"gmail_link", "foreign_web"} or not payload.original_url:
             continue
-        canonical_url = canonicalize_url(_resolve_google_news_proxy_url(unwrap_redirect_url(payload.original_url), payload.metadata))
+        canonical_url = canonicalize_url(unwrap_redirect_url(payload.original_url))
         score = score_link_candidate(canonical_url, _payload_title(payload))
+        if (payload.metadata or {}).get("search_provider") == "google_news_rss":
+            score = max(score, 0.55)
         if score <= 0:
             continue
         metadata = {**(payload.metadata or {}), "canonical_url": canonical_url, "link_quality_score": score}
@@ -266,32 +268,6 @@ def unwrap_redirect_url(url: str) -> str:
     return current
 
 
-def _resolve_google_news_proxy_url(url: str, metadata: dict[str, object] | None = None) -> str:
-    metadata = metadata or {}
-    proxy_url = url if _is_google_news_proxy_url(url) else ""
-    raw_google_url = metadata.get("google_news_url")
-    if not proxy_url and isinstance(raw_google_url, str) and _is_google_news_proxy_url(raw_google_url):
-        proxy_url = raw_google_url
-    if not proxy_url:
-        return url
-    try:
-        from backend.agents.discovery.google_news import decode_google_news_url_sync
-
-        decoded = decode_google_news_url_sync(proxy_url)
-    except Exception as exc:
-        logger.info("Google News proxy decode failed for %s: %s", proxy_url, exc)
-        return url
-    return decoded or url
-
-
-def _is_google_news_proxy_url(url: str) -> bool:
-    parsed = urlparse(str(url or ""))
-    if parsed.netloc.lower() != "news.google.com":
-        return False
-    path = parsed.path.lower()
-    return "/articles/" in path or "/rss/articles/" in path
-
-
 def score_link_candidate(url: str, link_text: str = "") -> float:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -340,7 +316,7 @@ async def _fetch_one(
     cache_ttl: int = 0,
     force_refresh: bool = False,
 ) -> ArticleFetchResult:
-    original_url = canonicalize_url(_resolve_google_news_proxy_url(unwrap_redirect_url(str(payload.original_url)), payload.metadata))
+    original_url = canonicalize_url(unwrap_redirect_url(str(payload.original_url)))
     link_score = float((payload.metadata or {}).get("link_quality_score") or score_link_candidate(original_url, _payload_title(payload)))
     async with semaphore:
         if domain_semaphore is not None:

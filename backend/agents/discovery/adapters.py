@@ -48,7 +48,7 @@ from backend.agents.discovery.markets import (
     fetch_sec_filings,
     fetch_fred_macro_data,
 )
-from backend.agents.discovery.web_search import lookback_to_days, search_web
+from backend.agents.discovery.web_search import SerperBackend, lookback_to_days, search_web
 from backend.agents.discovery.youtube import (
     YOUTUBE_DAILY_QUOTA_UNITS,
     YOUTUBE_QUOTA_WARNING_UNITS,
@@ -1518,7 +1518,7 @@ class RedditSourceAdapter:
 
 class GoogleNewsSourceAdapter:
     name = "google_news"
-    cost_profile = CostProfile(label="medium", timeout_seconds=45.0)
+    cost_profile = CostProfile(label="slow", timeout_seconds=120.0)
     good_for = ("breaking_news", "headlines", "broad_discovery", "mainstream_coverage")
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
@@ -1554,39 +1554,38 @@ class GoogleNewsSourceAdapter:
 
         async def fetch_query_hits(query_list: list[str]) -> list[Any]:
             nonlocal degraded_reason
+            if not has_time(1.25):
+                degraded_reason = degraded_reason or "time_budget"
+                return []
+            timeout = max(
+                0.5,
+                min((request_timeout * 2) + (request_delay * 2) + 1.0, remaining_seconds() - 0.25),
+            )
+
+            async def fetch_one(query: str) -> list[Any]:
+                return await asyncio.wait_for(
+                    google_news.fetch_google_news(
+                        query,
+                        lookback_hours=context.lookback_hours,
+                        limit=10,
+                        hl=hl,
+                        gl=gl,
+                        ceid=ceid,
+                    ),
+                    timeout=timeout,
+                )
+
+            results = await asyncio.gather(*(fetch_one(query) for query in query_list), return_exceptions=True)
             hits: list[Any] = []
-            for index, query in enumerate(query_list):
-                if not has_time(1.25):
-                    degraded_reason = degraded_reason or "time_budget"
-                    break
-                if index > 0:
-                    sleep_for = min(request_delay, max(0.0, remaining_seconds() - 1.25))
-                    if sleep_for > 0:
-                        await asyncio.sleep(sleep_for)
-                if not has_time(1.25):
-                    degraded_reason = degraded_reason or "time_budget"
-                    break
-                try:
-                    timeout = max(0.5, min(request_timeout + 0.25, remaining_seconds() - 0.25))
-                    batch = await asyncio.wait_for(
-                        google_news.fetch_google_news(
-                            query,
-                            lookback_hours=context.lookback_hours,
-                            limit=10,
-                            hl=hl,
-                            gl=gl,
-                            ceid=ceid,
-                        ),
-                        timeout=timeout,
-                    )
-                except TimeoutError:
+            for query, result in zip(query_list, results, strict=False):
+                if isinstance(result, TimeoutError):
                     degraded_reason = degraded_reason or "time_budget"
                     logger.warning("Google News query timed out inside adapter deadline: %s", query)
-                    break
-                except Exception as exc:
-                    logger.warning("Error fetching Google News for query %s: %s", query, exc)
                     continue
-                hits.extend(batch)
+                if isinstance(result, Exception):
+                    logger.warning("Error fetching Google News for query %s: %s", query, result)
+                    continue
+                hits.extend(result)
             return hits
 
         hits = await fetch_query_hits(queries)
@@ -1664,14 +1663,24 @@ class GoogleNewsSourceAdapter:
         
         decoded_items = []
         max_unfurl = min(len(top_items), 10)
+        decode_state = google_news.GoogleNewsDecodeState()
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for idx, (hit, url_key, pos) in enumerate(top_items):
                 decoded_url = None
+                resolution = "google_news_proxy"
+                reason_code: str | None = None
                 if unfurl_enabled and idx < max_unfurl:
                     cached_url = google_news.cached_decoded_google_news_url(hit.url)
                     if cached_url:
                         decoded_url = cached_url
-                    elif has_time(1.25):
+                        resolution = "google_news_decode_cache"
+                    else:
+                        cached_failure = google_news.cached_google_news_decode_failure(hit.url)
+                        if cached_failure:
+                            reason_code = cached_failure
+                        elif decode_state.blocked:
+                            reason_code = decode_state.reason or "decode_blocked"
+                    if not decoded_url and reason_code is None and has_time(1.25):
                         if idx > 0:
                             sleep_for = min(unfurl_delay, max(0.0, remaining_seconds() - 1.25))
                             if sleep_for > 0:
@@ -1680,23 +1689,51 @@ class GoogleNewsSourceAdapter:
                             try:
                                 timeout = max(0.5, min(request_timeout, remaining_seconds() - 0.25))
                                 decoded_url = await asyncio.wait_for(
-                                    google_news.decode_google_news_url(hit.url, client=client),
+                                    google_news.decode_google_news_url(hit.url, client=client, state=decode_state),
                                     timeout=timeout,
                                 )
+                                if decoded_url:
+                                    resolution = "google_news_decode"
+                                else:
+                                    reason_code = (
+                                        google_news.cached_google_news_decode_failure(hit.url)
+                                        or decode_state.reason
+                                        or "decode_failed"
+                                    )
                             except TimeoutError:
-                                degraded_reason = degraded_reason or "time_budget"
+                                reason_code = "time_budget"
                                 logger.warning("Google News URL decode timed out inside adapter deadline: %s", hit.url)
                             except Exception as exc:
+                                reason_code = "decode_failed"
                                 logger.warning("Error decoding Google News URL %s: %s", hit.url, exc)
-                    else:
-                        degraded_reason = degraded_reason or "time_budget"
+                    elif not decoded_url and reason_code is None:
+                        reason_code = "time_budget"
+                    if not decoded_url and getattr(settings, "google_news_serper_fallback", True) and has_time(1.25):
+                        try:
+                            timeout = max(0.5, min(8.0, remaining_seconds() - 0.25))
+                            fallback_url = await asyncio.wait_for(
+                                _google_news_serper_fallback_url(
+                                    hit,
+                                    settings=settings,
+                                    lookback_hours=context.lookback_hours,
+                                ),
+                                timeout=timeout,
+                            )
+                            if fallback_url:
+                                decoded_url = fallback_url
+                                resolution = "serper_fallback"
+                                reason_code = None
+                        except TimeoutError:
+                            reason_code = reason_code or "time_budget"
                 elif unfurl_enabled and idx >= max_unfurl:
-                    degraded_reason = degraded_reason or "time_budget"
+                    resolution = "decode_deferred"
                 
-                decoded_items.append((hit, decoded_url or hit.url, pos))
+                if not decoded_url and reason_code:
+                    resolution = reason_code
+                decoded_items.append((hit, decoded_url or hit.url, pos, resolution, reason_code))
                 
         candidates = []
-        for hit, final_url, pos in decoded_items:
+        for hit, final_url, pos, resolution, reason_code in decoded_items:
             score = get_score(pos)
             is_refined = (pos == -1)
             
@@ -1706,9 +1743,12 @@ class GoogleNewsSourceAdapter:
                 "search_provider": "google_news_rss",
                 "publisher": hit.publisher,
                 "google_news_url": hit.url,
+                "title": hit.title,
+                "link_text": hit.title,
+                "google_news_resolution": resolution,
             }
-            if degraded_reason:
-                metadata["adapter_reason_code"] = degraded_reason
+            if reason_code:
+                metadata["adapter_reason_code"] = reason_code
             if is_refined:
                 metadata["is_refined_query"] = True
                 
@@ -1732,3 +1772,63 @@ class GoogleNewsSourceAdapter:
 
     async def fetch(self, candidate: Candidate) -> Any:
         return candidate.payload
+
+
+async def _google_news_serper_fallback_url(
+    hit: Any,
+    *,
+    settings: Any,
+    lookback_hours: int | None,
+) -> str | None:
+    key = _serper_api_key(settings)
+    if not key:
+        return None
+    title = " ".join(str(getattr(hit, "title", "") or "").split()).strip()
+    publisher = " ".join(str(getattr(hit, "publisher", "") or "").split()).strip()
+    if not title:
+        return None
+    query = f'"{title}" {publisher}'.strip()
+    try:
+        backend = SerperBackend(api_key=key, timeout_seconds=8.0)
+        results = await backend.search(query, limit=5, days=lookback_to_days(lookback_hours))
+    except Exception as exc:
+        logger.info("Google News Serper fallback failed for %s: %s", title, exc)
+        return None
+    for result in results:
+        if _serper_result_matches_publisher(result, publisher):
+            return result.url
+    return None
+
+
+def _serper_api_key(settings: Any) -> str:
+    key = str(getattr(settings, "web_search_serper_api_key", None) or "").strip()
+    if key:
+        return key
+    try:
+        return (settings.secrets_dir / "serper" / "api_key").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _serper_result_matches_publisher(result: Any, publisher: str) -> bool:
+    publisher_tokens = _publisher_tokens(publisher)
+    if not publisher_tokens:
+        return True
+    parsed = urlparse(str(getattr(result, "url", "") or ""))
+    haystack = " ".join(
+        [
+            parsed.netloc.lower().removeprefix("www."),
+            str(getattr(result, "title", "") or "").lower(),
+            str(getattr(result, "snippet", "") or "").lower(),
+        ]
+    )
+    return any(token in haystack for token in publisher_tokens)
+
+
+def _publisher_tokens(value: str) -> set[str]:
+    stop = {"the", "news", "daily", "journal", "post", "finance", "media", "online", "com"}
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+        if len(token) >= 4 and token not in stop
+    }

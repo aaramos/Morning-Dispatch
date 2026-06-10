@@ -21,6 +21,8 @@ from backend.app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+GOOGLE_NEWS_DECODE_NEGATIVE_TTL_SECONDS = 6 * 60 * 60
+
 
 @dataclass(frozen=True)
 class GoogleNewsHit:
@@ -30,6 +32,12 @@ class GoogleNewsHit:
     snippet: str          # <description> with HTML stripped (BeautifulSoup)
     publisher: str        # <source> text, fallback "Google News"
     published_at: str | None  # RFC-822 <pubDate> → UTC ISO 8601 (timespec="seconds")
+
+
+@dataclass
+class GoogleNewsDecodeState:
+    blocked: bool = False
+    reason: str | None = None
 
 
 def build_search_url(
@@ -180,6 +188,10 @@ def _decode_cache_dir() -> Path:
     return get_settings().data_dir / "google-news-decode-cache"
 
 
+def _decode_negative_cache_dir() -> Path:
+    return get_settings().data_dir / "google-news-decode-cache-negative"
+
+
 def _read_decode_cache(guid: str) -> str | None:
     path = _decode_cache_dir() / f"{hashlib.sha256(guid.encode('utf-8')).hexdigest()}.json"
     try:
@@ -197,6 +209,10 @@ def cached_decoded_google_news_url(proxy_url: str) -> str | None:
     return _read_decode_cache(extract_google_news_id(proxy_url))
 
 
+def cached_google_news_decode_failure(proxy_url: str) -> str | None:
+    return _read_decode_negative_cache(extract_google_news_id(proxy_url))
+
+
 def _write_decode_cache(guid: str, decoded_url: str) -> None:
     path = _decode_cache_dir() / f"{hashlib.sha256(guid.encode('utf-8')).hexdigest()}.json"
     try:
@@ -209,15 +225,60 @@ def _write_decode_cache(guid: str, decoded_url: str) -> None:
         logger.info("Could not write Google News decode cache for %s: %s", guid, exc)
 
 
+def _read_decode_negative_cache(guid: str) -> str | None:
+    path = _decode_negative_cache_dir() / f"{hashlib.sha256(guid.encode('utf-8')).hexdigest()}.json"
+    try:
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            cached_at = float(payload.get("cached_at") or 0)
+            ttl = float(payload.get("ttl_seconds") or GOOGLE_NEWS_DECODE_NEGATIVE_TTL_SECONDS)
+            if time.time() - cached_at <= ttl:
+                return str(payload.get("reason") or "decode_failed")
+    except Exception:
+        pass
+    return None
+
+
+def _write_decode_negative_cache(
+    guid: str,
+    reason: str,
+    *,
+    ttl_seconds: int = GOOGLE_NEWS_DECODE_NEGATIVE_TTL_SECONDS,
+) -> None:
+    path = _decode_negative_cache_dir() / f"{hashlib.sha256(guid.encode('utf-8')).hexdigest()}.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "cached_at": time.time(),
+                    "guid": guid,
+                    "reason": reason,
+                    "ttl_seconds": ttl_seconds,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.info("Could not write Google News negative decode cache for %s: %s", guid, exc)
+
+
 async def decode_google_news_url(
     proxy_url: str,
     client: httpx.AsyncClient | None = None,
+    state: GoogleNewsDecodeState | None = None,
 ) -> str | None:
     guid = extract_google_news_id(proxy_url)
     
     cached = _read_decode_cache(guid)
     if cached:
         return cached
+    if state is not None and state.blocked:
+        return None
+    cached_failure = _read_decode_negative_cache(guid)
+    if cached_failure:
+        return None
 
     settings = get_settings()
     timeout = getattr(settings, "google_news_request_timeout_seconds", 10.0)
@@ -228,15 +289,25 @@ async def decode_google_news_url(
     async def _do_decode(async_client: httpx.AsyncClient) -> str | None:
         art_url = f"https://news.google.com/articles/{guid}"
         try:
+            _set_google_consent_cookie(async_client)
             resp = await async_client.get(art_url, headers=headers, timeout=timeout)
+            if _google_news_decode_blocked(resp):
+                _write_decode_negative_cache(guid, "decode_blocked")
+                if state is not None:
+                    state.blocked = True
+                    state.reason = "decode_blocked"
+                logger.warning("Google News decode appears blocked for %s", guid)
+                return None
             if resp.status_code != 200:
                 logger.warning("GET article redirect returned %d for %s", resp.status_code, guid)
+                _write_decode_negative_cache(guid, f"http_{resp.status_code}")
                 return None
             
             soup = BeautifulSoup(resp.text, "html.parser")
             elem = soup.find(attrs={"data-n-a-sg": True, "data-n-a-ts": True})
             if not elem:
                 logger.warning("Could not find data-n-a-sg / data-n-a-ts in page for %s", guid)
+                _write_decode_negative_cache(guid, "signature_missing")
                 return None
                 
             sig = elem.get("data-n-a-sg")
@@ -264,10 +335,18 @@ async def decode_google_news_url(
             
             if resp_post.status_code != 200:
                 logger.warning("POST batchexecute returned %d for %s", resp_post.status_code, guid)
+                if _google_news_decode_blocked(resp_post):
+                    if state is not None:
+                        state.blocked = True
+                        state.reason = "decode_blocked"
+                    _write_decode_negative_cache(guid, "decode_blocked")
+                else:
+                    _write_decode_negative_cache(guid, f"http_{resp_post.status_code}")
                 return None
                 
             parts = resp_post.text.split("\n\n")
             if len(parts) < 2:
+                _write_decode_negative_cache(guid, "decode_response_malformed")
                 return None
             data = json.loads(parts[1])
             
@@ -282,6 +361,7 @@ async def decode_google_news_url(
                                 
         except Exception as e:
             logger.warning("Error decoding Google News URL for %s: %s", guid, e)
+            _write_decode_negative_cache(guid, "decode_exception")
         return None
 
     decoded_url = None
@@ -304,6 +384,9 @@ def decode_google_news_url_sync(proxy_url: str) -> str | None:
     cached = _read_decode_cache(guid)
     if cached:
         return cached
+    cached_failure = _read_decode_negative_cache(guid)
+    if cached_failure:
+        return None
 
     settings = get_settings()
     timeout = getattr(settings, "google_news_request_timeout_seconds", 10.0)
@@ -313,14 +396,17 @@ def decode_google_news_url_sync(proxy_url: str) -> str | None:
 
     try:
         with httpx.Client(follow_redirects=True) as client:
+            _set_google_consent_cookie(client)
             art_url = f"https://news.google.com/articles/{guid}"
             resp = client.get(art_url, headers=headers, timeout=timeout)
             if resp.status_code != 200:
+                _write_decode_negative_cache(guid, "decode_blocked" if _google_news_decode_blocked(resp) else f"http_{resp.status_code}")
                 return None
                 
             soup = BeautifulSoup(resp.text, "html.parser")
             elem = soup.find(attrs={"data-n-a-sg": True, "data-n-a-ts": True})
             if not elem:
+                _write_decode_negative_cache(guid, "signature_missing")
                 return None
                 
             sig = elem.get("data-n-a-sg")
@@ -347,10 +433,12 @@ def decode_google_news_url_sync(proxy_url: str) -> str | None:
             )
             
             if resp_post.status_code != 200:
+                _write_decode_negative_cache(guid, "decode_blocked" if _google_news_decode_blocked(resp_post) else f"http_{resp_post.status_code}")
                 return None
                 
             parts = resp_post.text.split("\n\n")
             if len(parts) < 2:
+                _write_decode_negative_cache(guid, "decode_response_malformed")
                 return None
             data = json.loads(parts[1])
             
@@ -366,4 +454,24 @@ def decode_google_news_url_sync(proxy_url: str) -> str | None:
                                 return decoded_url
     except Exception as e:
         logger.warning("Error decoding sync Google News URL for %s: %s", guid, e)
+        _write_decode_negative_cache(guid, "decode_exception")
     return None
+
+
+def _set_google_consent_cookie(client: object) -> None:
+    try:
+        client.cookies.set("CONSENT", "YES+cb", domain=".google.com", path="/")
+    except Exception:
+        pass
+
+
+def _google_news_decode_blocked(response: httpx.Response) -> bool:
+    if response.status_code == 429:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(str(response.url))
+    except Exception:
+        return False
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    return host.endswith("google.com") and "/sorry" in path

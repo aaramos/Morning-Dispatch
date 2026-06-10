@@ -16,8 +16,11 @@ from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery import google_news
 from backend.agents.discovery.adapters import GoogleNewsSourceAdapter
 from backend.agents.discovery.types import SourceAdapterContext, TopicProfile, Candidate
+from backend.agents.editor import prepare_issue_articles
 from backend.agents.librarian import articles
+from backend.agents.librarian.articles import ArticleFetchResult
 from backend.app.core.config import get_settings
+from backend.app.db import database
 
 
 def _runtime(monkeypatch, tmp_path) -> None:
@@ -273,6 +276,40 @@ def test_decode_google_news_url_sync_success(monkeypatch, tmp_path) -> None:
     assert decoded == target_url
 
 
+def test_decode_google_news_url_negative_cache_and_circuit_breaker(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    first_guid = "CBMi_blocked_one"
+    second_guid = "CBMi_blocked_two"
+    first_proxy = f"https://news.google.com/articles/{first_guid}"
+    second_proxy = f"https://news.google.com/articles/{second_guid}"
+    calls = {"get": 0}
+
+    class FakeResponse:
+        status_code = 429
+        text = ""
+        url = "https://www.google.com/sorry/index"
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.cookies = httpx.Cookies()
+
+        async def get(self, url: str, **kwargs) -> FakeResponse:
+            calls["get"] += 1
+            return FakeResponse()
+
+    state = google_news.GoogleNewsDecodeState()
+    client = FakeAsyncClient()
+
+    assert asyncio.run(google_news.decode_google_news_url(first_proxy, client=client, state=state)) is None
+    assert state.blocked is True
+    assert state.reason == "decode_blocked"
+    assert google_news.cached_google_news_decode_failure(first_proxy) == "decode_blocked"
+
+    assert asyncio.run(google_news.decode_google_news_url(second_proxy, client=client, state=state)) is None
+    assert calls["get"] == 1
+
+
 # --- Adapter Integration Tests ---
 
 def test_google_news_adapter_query(monkeypatch, tmp_path) -> None:
@@ -351,6 +388,9 @@ def test_google_news_adapter_query(monkeypatch, tmp_path) -> None:
     assert cand_1.payload.metadata["search_provider"] == "google_news_rss"
     assert cand_1.payload.metadata["publisher"] == "The Verge"
     assert cand_1.payload.metadata["google_news_url"] == "https://news.google.com/rss/articles/CBMi_first/"
+    assert cand_1.payload.metadata["title"] == "Google News Integration works"
+    assert cand_1.payload.metadata["link_text"] == "Google News Integration works"
+    assert cand_1.payload.metadata["google_news_resolution"] == "google_news_decode"
 
     # Check details of the second candidate
     cand_2 = candidates[1]
@@ -418,22 +458,201 @@ def test_google_news_adapter_returns_partial_proxy_candidates_when_decode_times_
     assert all(candidate.payload.metadata["adapter_reason_code"] == "time_budget" for candidate in candidates)
 
 
-def test_article_selection_decodes_google_news_proxy_url(monkeypatch, tmp_path) -> None:
+def test_google_news_adapter_uses_serper_fallback_when_decode_fails(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("MORNING_DISPATCH_SERPER_API_KEY", "serper-test-key")
+
+    async def mock_fetch_news(query, **kwargs):
+        return [
+            google_news.GoogleNewsHit(
+                title="Nvidia AI infrastructure demand accelerates",
+                url="https://news.google.com/rss/articles/CBMi_serper/",
+                decoded_url=None,
+                snippet="Nvidia AI infrastructure demand accelerates.",
+                publisher="The Verge",
+                published_at="2026-06-09T12:00:00+00:00",
+            ),
+            google_news.GoogleNewsHit(
+                title="AMD AI infrastructure demand accelerates",
+                url="https://news.google.com/rss/articles/CBMi_serper_2/",
+                decoded_url=None,
+                snippet="AMD AI infrastructure demand accelerates.",
+                publisher="Reuters",
+                published_at="2026-06-09T12:05:00+00:00",
+            ),
+            google_news.GoogleNewsHit(
+                title="Memory supply chain demand accelerates",
+                url="https://news.google.com/rss/articles/CBMi_serper_3/",
+                decoded_url=None,
+                snippet="Memory supply chain demand accelerates.",
+                publisher="Bloomberg",
+                published_at="2026-06-09T12:10:00+00:00",
+            ),
+        ]
+
+    async def mock_decode(url, **kwargs):
+        return None
+
+    class FakeSerperBackend:
+        def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+            assert api_key == "serper-test-key"
+
+        async def search(self, query: str, *, limit: int, days: int | None = None):
+            assert '"Nvidia AI infrastructure demand accelerates" The Verge' == query
+            return [
+                SimpleNamespace(
+                    url="https://www.theverge.com/2026/6/9/nvidia-ai-infrastructure",
+                    title="Nvidia AI infrastructure demand accelerates",
+                    snippet="The Verge reports on Nvidia AI infrastructure.",
+                )
+            ]
+
+    monkeypatch.setattr(google_news, "fetch_google_news", mock_fetch_news)
+    monkeypatch.setattr(google_news, "decode_google_news_url", mock_decode)
+    monkeypatch.setattr("backend.agents.discovery.adapters.SerperBackend", FakeSerperBackend)
+
+    adapter = GoogleNewsSourceAdapter()
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "AI infrastructure news",
+            "scope": "AI infrastructure news",
+            "search_queries": ["ai infrastructure"],
+        }
+    )
+
+    candidates = asyncio.run(adapter.query(profile, SourceAdapterContext(exploration_id="explore-google", candidate_limit=1)))
+
+    assert len(candidates) == 1
+    assert candidates[0].payload.original_url == "https://www.theverge.com/2026/6/9/nvidia-ai-infrastructure"
+    assert candidates[0].payload.metadata["google_news_resolution"] == "serper_fallback"
+    assert "adapter_reason_code" not in candidates[0].payload.metadata
+
+
+def test_article_selection_keeps_google_news_proxy_without_sync_decode(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     proxy_url = "https://news.google.com/rss/articles/CBMi_selected/"
-    publisher_url = "https://publisher.example.com/2026/06/09/ai-infrastructure-story"
-    monkeypatch.setattr(google_news, "decode_google_news_url_sync", lambda _url: publisher_url)
+    monkeypatch.setattr(
+        google_news,
+        "decode_google_news_url_sync",
+        lambda _url: pytest.fail("article selection should not synchronously decode Google News proxy URLs"),
+    )
 
     payload = NormalizedPayload(
         source_type="gmail_link",
         source_name="Google News",
         raw_text="A Google News result about AI infrastructure.",
         original_url=proxy_url,
-        metadata={"search_provider": "google_news_rss", "google_news_url": proxy_url},
+        metadata={
+            "search_provider": "google_news_rss",
+            "google_news_url": proxy_url,
+            "title": "AI infrastructure story from Google News",
+            "link_text": "AI infrastructure story from Google News",
+        },
     )
 
     selected = articles.select_article_payloads([payload], max_articles=1)
 
     assert len(selected) == 1
-    assert selected[0].original_url == publisher_url
-    assert selected[0].metadata["canonical_url"] == publisher_url
+    assert selected[0].original_url == proxy_url.rstrip("/")
+    assert selected[0].metadata["canonical_url"] == proxy_url.rstrip("/")
+    assert selected[0].metadata["link_quality_score"] >= 0.55
+
+
+def test_google_news_headline_only_result_survives_and_renders_as_news(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="The Verge",
+        raw_text="AI infrastructure and HBM supply chain context from Google News.",
+        original_url="https://news.google.com/rss/articles/CBMi_headline/",
+        metadata={
+            "search_provider": "google_news_rss",
+            "google_news_url": "https://news.google.com/rss/articles/CBMi_headline/",
+            "title": "AI infrastructure demand drives HBM supply chain investment",
+            "link_text": "AI infrastructure demand drives HBM supply chain investment",
+        },
+    )
+    result = ArticleFetchResult(
+        payload=payload,
+        original_url=str(payload.original_url),
+        final_url=str(payload.original_url),
+        canonical_url=str(payload.original_url),
+        title="AI infrastructure demand drives HBM supply chain investment",
+        text="",
+        excerpt="Google News snippet about AI infrastructure, HBM memory, supply chain investment, and chip capacity.",
+        domain="news.google.com",
+        status="no_content",
+        error="Readable article text was too short (0 chars)",
+        link_score=0.55,
+        metadata={},
+    )
+
+    prepared = prepare_issue_articles(
+        {"interest": "AI infrastructure HBM memory supply chain", "threshold": 0.45},
+        [result],
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0].tier == "lower_confidence"
+    assert prepared[0].section == "News"
+
+    html = database.render_ingested_issue(
+        "Google News Brief",
+        "Snapshot",
+        [payload],
+        prepared,
+        lookback_hours=24,
+        source_selection={"google_news": True},
+    )
+
+    assert "Worth a skim" in html
+    assert "AI infrastructure demand drives HBM supply chain investment" in html
+    assert ">News</span>" in html
+
+
+def test_google_news_remainder_renders_in_dedicated_news_section(monkeypatch, tmp_path) -> None:
+    _runtime(monkeypatch, tmp_path)
+    payloads: list[NormalizedPayload] = []
+    results: list[ArticleFetchResult] = []
+    for index in range(6):
+        payload = NormalizedPayload(
+            source_type="gmail_link",
+            source_name="Reuters",
+            raw_text=f"AI infrastructure news item {index}",
+            original_url=f"https://publisher.example.com/news-{index}",
+            metadata={
+                "search_provider": "google_news_rss",
+                "title": f"AI infrastructure news item {index}",
+                "link_text": f"AI infrastructure news item {index}",
+            },
+        )
+        payloads.append(payload)
+        results.append(
+            ArticleFetchResult(
+                payload=payload,
+                original_url=str(payload.original_url),
+                final_url=str(payload.original_url),
+                canonical_url=str(payload.original_url),
+                title=f"AI infrastructure news item {index}",
+                text="AI infrastructure coverage about chips, models, and investment signals.",
+                excerpt="AI infrastructure coverage about chips, models, and investment signals.",
+                domain="publisher.example.com",
+                status="fetched",
+                link_score=0.8 - (index * 0.01),
+                relevance_score=0.8 - (index * 0.01),
+                tier="main",
+                section="News",
+            )
+        )
+
+    html = database.render_ingested_issue(
+        "Google News Brief",
+        "Snapshot",
+        payloads,
+        results,
+        lookback_hours=24,
+        source_selection={"google_news": True},
+    )
+
+    assert '<h2 id="source-news-heading">News</h2>' in html

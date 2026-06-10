@@ -2846,7 +2846,18 @@ def render_ingested_issue(
         if newsletter_payloads is not None
         else [payload for payload in payloads if payload.source_type == "gmail"]
     )
-    fetched_articles = [result for result in article_results if result.fetched and result.tier != "dropped"]
+    visible_results = [result for result in article_results if result.tier != "dropped"]
+    fetched_articles = [result for result in visible_results if result.fetched]
+    headline_fallback_articles = [
+        result
+        for result in visible_results
+        if (
+            not result.fetched
+            and result.tier == "lower_confidence"
+            and not _is_media_result(result)
+            and (result.payload.metadata or {}).get("search_provider") == "google_news_rss"
+        )
+    ]
     market_articles = [result for result in fetched_articles if result.payload.source_type == "market_snapshot"]
     story_articles = [
         result
@@ -2886,7 +2897,7 @@ def render_ingested_issue(
     ordered_main = ([lead_article] if lead_article else []) + mixable
     lower_confidence_articles = [
         result
-        for result in story_articles
+        for result in [*story_articles, *headline_fallback_articles]
         if result is not lead_article and result.tier == "lower_confidence"
     ]
 
@@ -2956,7 +2967,7 @@ def render_ingested_issue(
     # stating so, instead of silently vanishing from the brief.
     empty_source_html = _render_empty_source_notes(
         source_selection,
-        rendered_results=[*story_articles, *media_articles, *market_articles],
+        rendered_results=[*story_articles, *headline_fallback_articles, *media_articles, *market_articles],
     )
 
     lower_html = "\n".join(
@@ -2968,9 +2979,9 @@ def render_ingested_issue(
         market_html=market_html,
         newsletter_html=newsletter_html,
         newsletter_count=len(newsletter_items),
-        article_count=len(story_articles),
+        article_count=len(story_articles) + len(headline_fallback_articles),
         media_count=len(media_articles),
-        source_results=[*story_articles, *media_articles, *market_articles],
+        source_results=[*story_articles, *headline_fallback_articles, *media_articles, *market_articles],
         lookback_hours=lookback_hours,
     )
     empty_state = ""
@@ -3722,6 +3733,8 @@ def _source_label(result: ArticleFetchResult) -> str:
         return "Legacy Discussion"
     if source_type == "gmail_link":
         metadata = result.payload.metadata or {}
+        if metadata.get("search_provider") == "google_news_rss":
+            return "News"
         if metadata.get("search_query") or metadata.get("search_provider"):
             return "Web Search"
         if _translation_metadata(result).get("translated"):
@@ -4115,6 +4128,7 @@ _MAX_PODCAST_TOP_STORIES = 2
 # fall back to alphabetical order after these.
 _SOURCE_SECTION_ORDER = (
     "Gmail",
+    "News",
     "Web",
     "Foreign Media",
     "Reddit",
@@ -4166,6 +4180,7 @@ def _render_source_sections(
 
 _SELECTED_SOURCE_LABELS: dict[str, str] = {
     "gmail": "Gmail",
+    "google_news": "News",
     "web_search": "Web",
     "foreign_media": "Foreign Media",
     "reddit": "Reddit",
@@ -4563,6 +4578,7 @@ def _render_source_mix(results: list[ArticleFetchResult]) -> str:
         return ""
     ordered_labels = [
         "Gmail",
+        "News",
         "Web",
         "Foreign Media",
         "YouTube",
@@ -4598,6 +4614,8 @@ def _origin_source_label(result: ArticleFetchResult) -> str:
     source_type = result.payload.source_type
     metadata = result.payload.metadata or {}
     if source_type == "gmail_link":
+        if metadata.get("search_provider") == "google_news_rss":
+            return "News"
         if metadata.get("search_query") or metadata.get("search_provider"):
             return "Web"
         if _translation_metadata(result).get("translated"):
@@ -5411,6 +5429,8 @@ def _editor_note_for_payload(payload: NormalizedPayload) -> str:
     if payload.source_type == "market_snapshot":
         return "Public-market snapshot retrieved from free market data."
     if payload.source_type == "gmail_link":
+        if (payload.metadata or {}).get("search_provider") == "google_news_rss":
+            return "Article candidate discovered through Google News RSS. Article fetch and enrichment are pending."
         return "Extracted from an approved Gmail newsletter. Article fetch and enrichment are pending."
     return "Newsletter body ingested from an approved Gmail sender."
 
@@ -5435,6 +5455,11 @@ def _editor_note_for_result(result: ArticleFetchResult) -> str:
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         ticker = str((result.payload.metadata or {}).get("ticker") or result.payload.source_name or "market")
         return f"Public-market context for {ticker}.{score}"
+    if (result.payload.metadata or {}).get("search_provider") == "google_news_rss":
+        score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
+        if result.fetched:
+            return f"Fetched from a link discovered through Google News RSS.{score}"
+        return f"Lower-confidence Google News fallback because article fetch returned: {result.status}."
     if result.fetched:
         score = f" Relevance score: {int((result.relevance_score or 0) * 100)}%." if result.relevance_score else ""
         return f"Fetched from a link discovered in an approved Gmail newsletter.{score}"

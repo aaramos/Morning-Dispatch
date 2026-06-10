@@ -70,7 +70,9 @@ def _prepare_result(
 ) -> ArticleFetchResult:
     source_text = result.text or result.excerpt or fallback_text(result)
     keywords = list(result.keywords)
-    if result.payload.source_type == "reddit_thread":
+    if _is_google_news_result(result):
+        section = "News"
+    elif result.payload.source_type == "reddit_thread":
         section = "Community Signals"
     elif result.payload.source_type == "podcast_episode":
         section = "Podcast Signals"
@@ -97,6 +99,7 @@ def _prepare_result(
     elif (
         _requires_ai_topic_gate(interest_tokens)
         and result.payload.source_type == "gmail_link"
+        and not _is_google_news_result(result)
         and not topic_signal
     ):
         tier = "dropped"
@@ -118,6 +121,13 @@ def _prepare_result(
         if relevance >= max(0.30, threshold - 0.16) and result.link_score >= 0.30:
             tier = "main"
         elif relevance >= 0.24 and result.link_score >= 0.34:
+            tier = "lower_confidence"
+        else:
+            tier = "dropped"
+    elif _is_google_news_result(result):
+        if result.fetched and relevance >= threshold:
+            tier = "main"
+        elif relevance >= 0.18 and result.link_score >= 0.45:
             tier = "lower_confidence"
         else:
             tier = "dropped"
@@ -148,6 +158,11 @@ def _is_approved_podcast_latest(result: ArticleFetchResult) -> bool:
         result.payload.source_type == "podcast_episode"
         and bool(metadata.get("subscribed_show") or payload_metadata.get("subscribed_show"))
     )
+
+
+def _is_google_news_result(result: ArticleFetchResult) -> bool:
+    metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    return metadata.get("search_provider") == "google_news_rss"
 
 
 def _translation_unavailable(result: ArticleFetchResult) -> bool:

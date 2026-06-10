@@ -2274,6 +2274,8 @@ def _source_label_for_result(result: ArticleFetchResult) -> str:
     if source_type == "gmail_link":
         metadata = result.payload.metadata or {}
         if metadata.get("search_query") or metadata.get("search_provider"):
+            if metadata.get("search_provider") == "google_news_rss":
+                return "Google News"
             return "Web Search"
         return "Gmail"
     if source_type == "podcast_episode":
@@ -2569,13 +2571,17 @@ def _set_pipeline_stage(progress: dict[str, Any], stage: str, value: str) -> Non
 
 def _set_source_status(progress: dict[str, Any], adapter_status: Any) -> None:
     sources = dict(progress.get("sources", {}))
-    sources[adapter_status.name] = {
+    source_status = {
         "status": adapter_status.status,
         "candidate_count": adapter_status.candidate_count,
         "message": adapter_status.message,
         "elapsed_ms": adapter_status.elapsed_ms,
         "timeout_seconds": adapter_status.timeout_seconds,
     }
+    reason_code = getattr(adapter_status, "reason_code", None)
+    if reason_code:
+        source_status["reason_code"] = reason_code
+    sources[adapter_status.name] = source_status
     progress["sources"] = sources
 
 

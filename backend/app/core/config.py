@@ -81,6 +81,7 @@ class Settings:
     google_news_request_delay_seconds: float = 3.0
     google_news_request_timeout_seconds: float = 10.0
     google_news_unfurl_links: bool = True
+    google_news_serper_fallback: bool = True
     google_news_locale: str = "en-US:US"
 
 
@@ -383,6 +384,7 @@ def get_settings() -> Settings:
         google_news_request_delay_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_DELAY_SECONDS", 3.0),
         google_news_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_TIMEOUT_SECONDS", 10.0),
         google_news_unfurl_links=_bool_from_env("MORNING_DISPATCH_GOOGLE_NEWS_UNFURL_LINKS", True),
+        google_news_serper_fallback=_bool_from_env("MORNING_DISPATCH_GOOGLE_NEWS_SERPER_FALLBACK", True),
         google_news_locale=os.environ.get("MORNING_DISPATCH_GOOGLE_NEWS_LOCALE", "en-US:US").strip(),
     )
 
