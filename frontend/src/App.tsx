@@ -48,6 +48,8 @@ type TopicProfile = {
   recency_weighting?: string;
   lookback_hours?: number | null;
   exclusions?: string[];
+  must_have_terms?: string[];
+  must_have_aliases?: Record<string, string[]>;
   source_selection: Record<string, boolean>;
   requested_sources?: Array<{ adapter: string; ref: string }>;
   promoted_sources?: Array<{ adapter: string; ref: string; has_feed: boolean; feed_url: string | null }>;
@@ -99,6 +101,8 @@ type StrategyPreview = {
   lookback_hours: number | null;
   recency_weighting: string;
   exclusions: string[];
+  must_have_terms?: string[];
+  must_have_aliases?: Record<string, string[]>;
   reasoning_summary: string;
 };
 
@@ -159,6 +163,8 @@ type ConfirmedProfilePayload = {
   related_episode_queries?: string[];
   negative_constraints?: string[];
   priority_terms?: string[];
+  must_have_terms?: string[];
+  must_have_aliases?: Record<string, string[]>;
   gmail_rules?: TopicProfile["gmail_rules"];
   models: Record<string, never>;
   schedule?: string | null;
@@ -417,6 +423,7 @@ type ConfirmationDraft = {
   recency_weighting: SourceScope;
   lookback_hours: number | null;
   exclusions: string;
+  must_have: string;
   content_limits: ContentLimitsDraft;
   sourceScopeTouched?: boolean;
   recency_scope_confirmed?: boolean;
@@ -1803,6 +1810,8 @@ function DispatchApp() {
       recency_weighting: draftOverride.recency_weighting,
       lookback_hours: lookbackHours,
       exclusions: splitList(draftOverride.exclusions),
+      must_have_terms: splitList(draftOverride.must_have),
+      must_have_aliases: baseProfile?.must_have_aliases ?? {},
       source_selection: selectedEnabledSources,
       requested_sources: baseProfile?.requested_sources ?? [],
       subtopics: baseProfile?.subtopics ?? [],
@@ -3087,6 +3096,8 @@ function RefinementPanel(props: {
     })));
   const recencyLabel = recencyText(props.draft.recency_weighting, props.draft.lookback_hours);
   const scopeText = preview?.scope || props.profile?.scope || "";
+  const mustHaveTerms = preview?.must_have_terms ?? props.profile?.must_have_terms ?? [];
+  const mustHaveAliases = preview?.must_have_aliases ?? props.profile?.must_have_aliases ?? {};
   const foreignRegions = props.foreignRegions;
   const progressState = props.refinementProgress
     ? refinementProgressState(props.refinementProgress, props.progressNow)
@@ -3446,6 +3457,17 @@ function RefinementPanel(props: {
               <div className="plan-value">{preview!.exclusions.join(" · ")}</div>
             </div>
           ) : null}
+          {mustHaveTerms.length ? (
+            <div className="plan-group">
+              <div className="plan-label">Must include</div>
+              <div className="plan-value">
+                {mustHaveTerms.map((term) => {
+                  const aliases = mustHaveAliases[term.toLowerCase()] ?? [];
+                  return aliases.length ? `${term} (${aliases.join(", ")})` : term;
+                }).join(" · ")}
+              </div>
+            </div>
+          ) : null}
           {finalized ? (
             <div className="plan-ready-note">Strategy is ready for the build step.</div>
           ) : null}
@@ -3584,6 +3606,17 @@ function StrategyReviewCard(props: { preview: StrategyPreview }) {
           <div className="strategy-review-block">
             <strong>Avoids</strong>
             <span>{preview.exclusions.join(", ")}</span>
+          </div>
+        ) : null}
+        {preview.must_have_terms?.length ? (
+          <div className="strategy-review-block">
+            <strong>Must include</strong>
+            <span>
+              {preview.must_have_terms.map((term) => {
+                const aliases = preview.must_have_aliases?.[term.toLowerCase()] ?? [];
+                return aliases.length ? `${term} (${aliases.join(", ")})` : term;
+              }).join(", ")}
+            </span>
           </div>
         ) : null}
       </div>
@@ -3749,6 +3782,14 @@ function ConfirmationPanel(props: {
             value={props.draft.exclusions}
             onChange={(event) => props.onDraftChange({ ...props.draft, exclusions: event.target.value })}
             placeholder="Anything to avoid"
+          />
+        </label>
+        <label>
+          Must include
+          <input
+            value={props.draft.must_have}
+            onChange={(event) => props.onDraftChange({ ...props.draft, must_have: event.target.value })}
+            placeholder="Term every item must mention"
           />
         </label>
       </div>
@@ -7389,6 +7430,10 @@ function DigestScheduleEditor(props: {
 }) {
   return (
     <div className="inline-schedule-editor">
+      <div className="schedule-editor-heading">
+        <strong>Schedule delivery</strong>
+        <span>Add or remove email recipients for this digest, then save.</span>
+      </div>
       <select
         value={props.draft.preset}
         onChange={(event) => props.onDraftChange({ ...props.draft, preset: event.target.value as SchedulePreset })}
@@ -7411,7 +7456,7 @@ function DigestScheduleEditor(props: {
         Email this digest
       </label>
       <div className="digest-recipient-editor">
-        <span className="digest-recipient-label">Recipients</span>
+        <span className="digest-recipient-label">Email recipients</span>
         <div className="digest-recipient-list">
           {props.draft.recipients.length ? props.draft.recipients.map((email) => (
             <span className="digest-recipient-chip" key={email}>
@@ -7458,6 +7503,7 @@ function emptyDraft(defaults = defaultContentLimits): ConfirmationDraft {
     recency_weighting: "recent",
     lookback_hours: defaultBriefControls.lookback_hours,
     exclusions: "",
+    must_have: "",
     content_limits: defaults,
     recency_scope_confirmed: false,
     sourceScopeTouched: false,
@@ -7471,6 +7517,7 @@ function draftFromProfile(profile: TopicProfile, defaults = defaultContentLimits
     recency_weighting: sourceScopeFromProfile(profile),
     lookback_hours: lookbackHoursForBuild(profile, undefined, defaultBriefControls.lookback_hours),
     exclusions: (profile.exclusions ?? []).join(", "),
+    must_have: (profile.must_have_terms ?? []).join(", "),
     content_limits: contentLimitsFromProfile(profile, defaults),
     recency_scope_confirmed: false,
     sourceScopeTouched: false,

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any
 
@@ -46,6 +47,8 @@ async def refine_queries_for_adapter(
             "scope": profile.scope,
             "keywords": list(profile.keywords),
             "original_queries": initial_queries,
+            "must_have_terms": list(profile.must_have_terms),
+            "must_have_aliases": {key: list(value) for key, value in (profile.must_have_aliases or {}).items()},
             "results_count": len(initial_results),
             "current_date": datetime.now(UTC).date().isoformat(),
             "lookback_hours": lookback_hours,
@@ -53,6 +56,7 @@ async def refine_queries_for_adapter(
                 "Review the original search queries and the number of results found for this source. "
                 "Suggest up to 4 alternative or refined queries (e.g., using synonyms, related terms, broader concepts) "
                 "that will help find relevant recent content for the user's topic profile without widening the source recency window. "
+                "If must_have_terms are provided, every query must include at least one must-have term or one of its aliases. "
                 "Provide the queries in the 'refined_queries' list."
             ),
         }
@@ -85,7 +89,7 @@ async def refine_queries_for_adapter(
                 adapter_name,
                 cleaned_queries,
             )
-            return cleaned_queries
+            return enforce_must_have_on_queries(profile, cleaned_queries)
 
         logger.warning(
             "Query refinement agent returned invalid payload for %s: %s",
@@ -132,6 +136,8 @@ async def expand_search_strategy(
             "keywords": list(profile.keywords),
             "subtopics": list(profile.subtopics),
             "original_queries": base_queries,
+            "must_have_terms": list(profile.must_have_terms),
+            "must_have_aliases": {key: list(value) for key, value in (profile.must_have_aliases or {}).items()},
             "current_date": datetime.now(UTC).date().isoformat(),
             "lookback_hours": lookback_hours,
             "mode": "proactive_expansion",
@@ -141,7 +147,9 @@ async def expand_search_strategy(
                 "that surface related items the original queries would miss — even if "
                 "they are only loosely tied to the interest and would rate lower. "
                 "Do not repeat the original queries. Keep them within the same broad "
-                "interest. Provide them in the 'refined_queries' list."
+                "interest. If must_have_terms are provided, every query must include "
+                "at least one must-have term or one of its aliases. "
+                "Provide them in the 'refined_queries' list."
             ),
         }
         system_prompt = load_prompt("query_refinement")
@@ -167,7 +175,7 @@ async def expand_search_strategy(
                 break
         if cleaned:
             logger.info("Proactive search-strategy expansion added queries: %s", cleaned)
-        return cleaned
+        return enforce_must_have_on_queries(profile, cleaned)
     except Exception as exc:
         logger.warning("Proactive search-strategy expansion failed: %s", exc)
         return []
@@ -240,6 +248,8 @@ async def screen_candidates(
                 "statement": profile.statement,
                 "scope": profile.scope,
                 "exclusions": list(profile.exclusions),
+                "must_have_terms": list(profile.must_have_terms),
+                "must_have_aliases": {key: list(value) for key, value in (profile.must_have_aliases or {}).items()},
                 "candidates_json": json.dumps(cand_list, ensure_ascii=False),
             }
 
@@ -368,3 +378,55 @@ def _screening_sample(candidates: list[Any]) -> list[Any]:
     # Do not screen only the highest-ranked items. Those scores can be noisy at
     # this stage, and source-quality failures often hide in the long tail.
     return random.sample(candidates, _SCREENING_MAX_CANDIDATES_PER_SOURCE)
+
+
+def enforce_must_have_on_queries(profile: TopicProfile, queries: list[str]) -> list[str]:
+    """Ensure model-generated queries remain anchored to user-required terms."""
+    anchor_sets = _must_have_query_alias_sets(profile)
+    if not anchor_sets:
+        return queries
+    primary_anchor = str(profile.must_have_terms[0]).strip()
+    if not primary_anchor:
+        return queries
+
+    anchored: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        value = str(query or "").strip()
+        if not value:
+            continue
+        if not query_mentions_must_have(value, profile):
+            value = f"{value} {primary_anchor}".strip()
+        key = value.casefold()
+        if key not in seen:
+            anchored.append(value)
+            seen.add(key)
+    return anchored
+
+
+def query_mentions_must_have(query: str, profile: TopicProfile) -> bool:
+    haystack = _fold_query_text(query)
+    for _anchor, aliases in _must_have_query_alias_sets(profile):
+        if any(alias and alias in haystack for alias in aliases):
+            return True
+    return False
+
+
+def _must_have_query_alias_sets(profile: TopicProfile) -> list[tuple[str, set[str]]]:
+    aliases_by_key = {
+        _fold_query_text(key): {_fold_query_text(alias) for alias in aliases if _fold_query_text(alias)}
+        for key, aliases in (profile.must_have_aliases or {}).items()
+    }
+    alias_sets: list[tuple[str, set[str]]] = []
+    for term in profile.must_have_terms:
+        anchor = str(term or "").strip()
+        folded = _fold_query_text(anchor)
+        if not folded:
+            continue
+        alias_sets.append((anchor, {folded, *aliases_by_key.get(folded, set())}))
+    return alias_sets
+
+
+def _fold_query_text(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    return "".join(char for char in text if not unicodedata.combining(char))

@@ -31,7 +31,7 @@ PENDING_STRATEGY_FIELD = "strategy_refinement"
 PENDING_STRATEGY_PROFILE_KEY = "pending_strategy_refinement"
 STRATEGY_REVIEW_PROFILE_KEY = "strategy_review"
 STRATEGY_REVIEW_RESOLVED_STATUSES = {"passed", "applied", "discarded", "suppressed", "unavailable"}
-FIELD_ORDER = ("scope", "related_interests", "depth", "recency_weighting", "requested_sources", "exclusions")
+FIELD_ORDER = ("scope", "related_interests", "depth", "recency_weighting", "requested_sources", "exclusions", "must_have")
 FIELD_HINT_TEXT_SOURCE = ("statement", "scope", "keywords", "subtopics")
 DEPTH_PRACTITIONER_TOKENS = (
     "deep",
@@ -58,6 +58,7 @@ QUESTIONS = {
     "recency_weighting": "How recent does the source material need to be? For example: last 24 hours, last 3 days, no more than a year old, or best available regardless of date.",
     "requested_sources": "Any specific podcast, YouTube channel, newsletter, site, company, or collection I should try to include?",
     "exclusions": "Anything I should avoid so the brief stays focused?",
+    "must_have": "Is there a term every single item must mention, like a place, company, product, or model? Optional; I’ll also match common aliases and translations.",
     GMAIL_RULES_FIELD: "How do you want me to use Gmail for this brief? For example: AI-related newsletters received in the last 7 days.",
 }
 
@@ -657,6 +658,7 @@ async def astream_refinement(
 
     if ready:
         patched = _fill_defaults(patched)
+        patched["must_have_aliases"] = await expand_must_have_aliases(patched)
         pre_critique = _diagnostics_query_snapshot(patched)
         patched = _critique_search_plan(patched)
         patched["refinement_diagnostics"] = _enrich_diagnostics(
@@ -698,6 +700,52 @@ async def astream_refinement(
         return
     yield {"type": "plan", "session": response}
     yield {"type": "done", "session": response, "ready": ready, "trigger_build": ready}
+
+
+async def expand_must_have_aliases(profile: dict[str, Any]) -> dict[str, list[str]]:
+    terms = _string_list(profile.get("must_have_terms"), limit=6)
+    if not terms:
+        return {}
+    existing = _clean_must_have_aliases(profile.get("must_have_aliases"), terms=terms)
+    term_keys = {term.casefold() for term in terms}
+    if term_keys and term_keys.issubset(existing.keys()):
+        return existing
+
+    settings = get_settings()
+    try:
+        resolution = model_routing.client_for_agent("refinement", settings=settings)
+        client = resolution.client
+    except Exception as exc:  # pragma: no cover - routing varies by deployment
+        logger.warning("Could not route must-have alias expansion: %s", exc)
+        return existing
+    if client is None:
+        return existing
+
+    languages = []
+    for item in _normalize_foreign_language_plan(profile.get("foreign_language_plan")):
+        languages.append({"code": item.get("code"), "name": item.get("name")})
+    prompt = {
+        "statement": str(profile.get("statement") or ""),
+        "scope": str(profile.get("scope") or ""),
+        "must_have_terms": terms,
+        "foreign_languages": languages,
+        "foreign_regions": _string_list(profile.get("foreign_regions"), limit=16),
+        "instructions": (
+            "Generate official names, unambiguous abbreviations, and native-language renderings for each must-have term. "
+            "Do not include broader categories or parent geographies as aliases."
+        ),
+    }
+    try:
+        payload = await client.complete_json(
+            system=load_prompt("must_have_alias_expansion"),
+            prompt=json.dumps(prompt, ensure_ascii=False),
+            max_tokens=600,
+        )
+    except Exception as exc:  # pragma: no cover - provider failures should not disable the gate
+        logger.warning("Must-have alias expansion failed: %s", exc)
+        return existing
+    aliases = _clean_must_have_aliases(payload.get("aliases"), terms=terms) if isinstance(payload, dict) else {}
+    return {**existing, **aliases}
 
 
 async def _astream_gmail_discovery(
@@ -1355,6 +1403,8 @@ def _build_refinement_chat_prompt(
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
         "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
         "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
+        "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
+        "must_have_aliases": _clean_must_have_aliases(profile.get("must_have_aliases"), terms=_string_list(profile.get("must_have_terms"), limit=6)),
         "depth": _normalize_depth(profile.get("depth")),
         "recency_weighting": _normalize_recency(profile.get("recency_weighting")),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -1665,6 +1715,8 @@ def _strategy_proposal_summary(patch: dict[str, Any]) -> str:
         changed.append("recency window")
     if patch.get("exclusions"):
         changed.append("exclusions")
+    if patch.get("must_have_terms") or patch.get("must_have_aliases"):
+        changed.append("must-have terms")
     if changed:
         return f"I prepared a proposed update covering {', '.join(changed[:5])}. Review it before applying."
     return "I prepared a proposed search strategy update. Review it before applying."
@@ -1749,6 +1801,8 @@ def _profile_for_strategy_review(base_profile: dict[str, Any], payload_profile: 
             "recency_weighting",
             "lookback_hours",
             "exclusions",
+            "must_have_terms",
+            "must_have_aliases",
             "source_selection",
             "gmail_rules",
             "schedule",
@@ -1788,6 +1842,8 @@ def _strategy_fingerprint(profile: dict[str, Any]) -> str:
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
         "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
         "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
+        "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
+        "must_have_aliases": _clean_must_have_aliases(profile.get("must_have_aliases"), terms=_string_list(profile.get("must_have_terms"), limit=6)),
         "depth": str(profile.get("depth") or ""),
         "recency_weighting": str(profile.get("recency_weighting") or ""),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -1888,6 +1944,8 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
                 "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
                 "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
                 "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
+                "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
+                "must_have_aliases": _clean_must_have_aliases(profile.get("must_have_aliases"), terms=_string_list(profile.get("must_have_terms"), limit=6)),
                 "requested_sources": _normalize_requested_sources(profile.get("requested_sources")),
                 "source_selection": _source_selection_dict(profile.get("source_selection")),
                 "selected_sources": selected_sources,
@@ -2087,6 +2145,8 @@ def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "recency_weighting": payload_recency,
         "lookback_hours": lookback_hours,
         "exclusions": [],
+        "must_have_terms": [],
+        "must_have_aliases": {},
         "source_selection": {**DEFAULT_EXPLORE_SOURCE_SELECTION, **selected_sources},
         "requested_sources": requested_sources,
         "gmail_rules": {},
@@ -2095,6 +2155,7 @@ def _initial_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "depth_answered": False,
         "source_scope_answered": False,
         "exclusions_answered": False,
+        "must_have_answered": False,
         "promoted_sources": [],
         "models": {**{"refinement": None, "brief": None}, **_models(payload.get("models"))},
         "schedule": None,
@@ -2280,6 +2341,8 @@ def _build_refinement_agent_prompt(
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
         "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
         "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
+        "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
+        "must_have_aliases": _clean_must_have_aliases(profile.get("must_have_aliases"), terms=_string_list(profile.get("must_have_terms"), limit=6)),
         "depth": _normalize_depth(profile.get("depth")),
         "recency_weighting": _normalize_recency(profile.get("recency_weighting")),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -2421,6 +2484,15 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
             updated[key] = _string_list(patch.get(key), limit=20)
         else:
             updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
+    if "must_have_terms" in patch:
+        updated["must_have_terms"] = _merge_string_lists(updated.get("must_have_terms"), patch.get("must_have_terms"), limit=6)
+        updated["must_have_answered"] = True
+    if "must_have_aliases" in patch:
+        terms = _string_list(updated.get("must_have_terms"), limit=6)
+        updated["must_have_aliases"] = {
+            **_clean_must_have_aliases(updated.get("must_have_aliases"), terms=terms),
+            **_clean_must_have_aliases(patch.get("must_have_aliases"), terms=terms),
+        }
     if "keywords" in patch:
         keywords = _string_list(patch.get("keywords"), limit=16)
         if keywords:
@@ -2834,6 +2906,23 @@ def _clean_source_queries(value: Any) -> dict[str, list[str]]:
             query_list = normalize_market_query_tickers(query_list)[:20]
         if query_list:
             cleaned[source_key] = query_list
+    return cleaned
+
+
+def _clean_must_have_aliases(value: Any, *, terms: list[str] | None = None) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {term.casefold() for term in terms or [] if term}
+    cleaned: dict[str, list[str]] = {}
+    for raw_key, raw_values in value.items():
+        key = str(raw_key or "").strip().casefold()
+        if not key:
+            continue
+        if allowed and key not in allowed:
+            continue
+        aliases = _string_list(raw_values, limit=12)
+        if aliases:
+            cleaned[key] = aliases
     return cleaned
 
 
@@ -3264,6 +3353,22 @@ def _apply_answer(profile: dict[str, Any], field: str, answer: str) -> dict[str,
                 for part in re.split(r"[,;]", answer)
                 if part.strip(" .")
             ]
+    elif field == "must_have":
+        updated["must_have_answered"] = True
+        lowered = answer.lower().strip()
+        if lowered in {"no", "none", "nothing", "nope", "n/a", "skip"} or "nothing" in lowered:
+            updated["must_have_terms"] = []
+            updated["must_have_aliases"] = {}
+        else:
+            updated["must_have_terms"] = [
+                part.strip(" .")
+                for part in re.split(r"[,;\n]", answer)
+                if part.strip(" .")
+            ][:6]
+            updated["must_have_aliases"] = _clean_must_have_aliases(
+                updated.get("must_have_aliases"),
+                terms=_string_list(updated.get("must_have_terms"), limit=6),
+            )
     elif field == "requested_sources":
         updated["requested_sources_answered"] = True
     return _coerce_profile(_merge_requested_source_hints(updated, answer))
@@ -3410,6 +3515,23 @@ def _coerce_model_field_updates(
         if raw_answer.strip():
             return {"exclusions": [raw_answer.strip(" .")], "exclusions_answered": True}
 
+    if field == "must_have":
+        terms = parsed.get("must_have_terms") or parsed.get("must_have")
+        if isinstance(terms, str):
+            terms = [item for item in re.split(r"[,;\n]", terms) if item.strip(" .")]
+        lowered = str(raw_answer).strip().lower()
+        if isinstance(terms, list):
+            cleaned = [str(item).strip(" .") for item in terms if str(item).strip(" .")][:6]
+            return {
+                "must_have_terms": cleaned,
+                "must_have_aliases": _clean_must_have_aliases(parsed.get("must_have_aliases"), terms=cleaned),
+                "must_have_answered": True,
+            }
+        if lowered in {"no", "none", "nothing", "nope", "n/a", "skip"} or "nothing" in lowered:
+            return {"must_have_terms": [], "must_have_aliases": {}, "must_have_answered": True}
+        if raw_answer.strip():
+            return {"must_have_terms": [raw_answer.strip(" .")], "must_have_answered": True}
+
     return None
 
 
@@ -3491,6 +3613,15 @@ def _build_refinement_prompt(*, field: str, answer: str, profile: dict[str, Any]
             'Examples: "last 24 hours" -> {"recency_weighting": "breaking", "lookback_hours": 24}; '
             '"last 3 days" -> {"recency_weighting": "recent", "lookback_hours": 72}; '
             '"no more than a year old" -> {"recency_weighting": "last_year", "lookback_hours": 8760}.\n'
+            f"\nCurrent profile snapshot: {profile_snapshot}\n"
+            f"User answer: {answer}"
+        )
+    if field == "must_have":
+        return (
+            "Return strict JSON with must_have_terms and optional must_have_aliases.\n"
+            'Example response: {"must_have_terms": ["Mexico City"], "must_have_aliases": {"mexico city": ["CDMX", "Ciudad de México"]}}.\n'
+            'If there is no required anchor term, return {"must_have_terms": [], "must_have_aliases": {}}.\n'
+            "Only include terms the user explicitly confirms every item must mention.\n"
             f"\nCurrent profile snapshot: {profile_snapshot}\n"
             f"User answer: {answer}"
         )
@@ -3913,6 +4044,8 @@ def _next_missing(profile: dict[str, Any]) -> str | None:
             return field
         if field == "exclusions" and not profile.get("exclusions") and not bool(profile.get("exclusions_answered")):
             return field
+        if field == "must_have" and not bool(profile.get("must_have_answered")) and not _string_list(profile.get("must_have_terms"), limit=6):
+            return field
     return None
 
 
@@ -4090,6 +4223,8 @@ def _question_repeats_answered_constraint(question: str, profile: dict[str, Any]
         return bool(profile.get("source_scope_answered")) or bool(_normalize_recency(profile.get("recency_weighting")))
     if field == "exclusions":
         return bool(profile.get("exclusions_answered")) or bool(_string_list(profile.get("exclusions")))
+    if field == "must_have":
+        return bool(profile.get("must_have_answered")) or bool(_string_list(profile.get("must_have_terms"), limit=6))
     if field == "requested_sources":
         return bool(profile.get("requested_sources_answered")) or bool(_normalize_requested_sources(profile.get("requested_sources")))
     if field == "depth":
@@ -4140,6 +4275,8 @@ def _field_from_question(question: str) -> str:
         or "expert level" in lowered
     ):
         return "depth"
+    if "must mention" in lowered or "must include" in lowered or "every single item" in lowered or "required term" in lowered:
+        return "must_have"
     if "anything to avoid" in lowered or "avoid" in lowered or "exclude" in lowered:
         return "exclusions"
     if "specific source" in lowered or "sources you want" in lowered or "podcast" in lowered or "youtube" in lowered:
@@ -4155,7 +4292,9 @@ def _next_priority_field(profile: dict[str, Any]) -> str | None:
     depth_confirmed = bool(profile.get("depth_answered"))
     source_scope_confirmed = bool(profile.get("source_scope_answered"))
     if depth_confirmed and source_scope_confirmed:
-        return "exclusions"
+        if not bool(profile.get("exclusions_answered")):
+            return "exclusions"
+        return "must_have"
     if not depth_confirmed and not source_scope_confirmed:
         text = _collect_hint_text(profile)
         depth_score = _signal_strength(text, DEPTH_PRACTITIONER_TOKENS)
@@ -4230,6 +4369,8 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "related_episode_queries": _string_list(profile.get("related_episode_queries"), limit=16),
         "negative_constraints": _string_list(profile.get("negative_constraints"), limit=16),
         "priority_terms": _string_list(profile.get("priority_terms"), limit=16),
+        "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
+        "must_have_aliases": _clean_must_have_aliases(profile.get("must_have_aliases"), terms=_string_list(profile.get("must_have_terms"), limit=6)),
         "depth": str(profile.get("depth") or ""),
         "recency_weighting": str(profile.get("recency_weighting") or ""),
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
@@ -4249,6 +4390,7 @@ def _coerce_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "depth_answered": bool(profile.get("depth_answered")),
         "source_scope_answered": bool(profile.get("source_scope_answered")),
         "exclusions_answered": bool(profile.get("exclusions_answered")),
+        "must_have_answered": bool(profile.get("must_have_answered")),
         "_revisit_existing": bool(profile.get("_revisit_existing")),
         "promoted_sources": [
             dict(source)
@@ -4303,6 +4445,8 @@ def _sanitize_bounded_recency_query_years(profile: dict[str, Any]) -> dict[str, 
     updated["direct_episode_queries"] = clean_list(profile.get("direct_episode_queries"), limit=16)
     updated["related_episode_queries"] = clean_list(profile.get("related_episode_queries"), limit=16)
     updated["priority_terms"] = clean_list(profile.get("priority_terms"), limit=16)
+    updated["must_have_terms"] = clean_list(profile.get("must_have_terms"), limit=6)
+    updated["must_have_aliases"] = _clean_must_have_aliases(profile.get("must_have_aliases"), terms=updated["must_have_terms"])
     source_queries = {}
     for source, queries in _clean_source_queries(profile.get("source_queries")).items():
         source_queries[source] = clean_list(queries, limit=20)
@@ -4341,6 +4485,8 @@ def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
         "recency_already_answered": bool(profile.get("source_scope_answered")) or bool(_normalize_recency(profile.get("recency_weighting"))),
         "excluded_publishers_or_source_types": _string_list(profile.get("exclusions")),
         "exclusions_already_answered": bool(profile.get("exclusions_answered")) or bool(_string_list(profile.get("exclusions"))),
+        "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
+        "must_have_already_answered": bool(profile.get("must_have_answered")) or bool(_string_list(profile.get("must_have_terms"), limit=6)),
         "market_tracking_interest": _market_tracking_interest(statement),
         "gmail_rules_needed": gmail_needs_instructions,
         "recommended_question_focus": (
@@ -4538,6 +4684,8 @@ def _strategy_preview(profile: dict[str, Any]) -> dict[str, Any]:
         "lookback_hours": _coerce_lookback_hours(profile.get("lookback_hours")),
         "recency_weighting": str(profile.get("recency_weighting") or ""),
         "exclusions": _string_list(profile.get("exclusions")),
+        "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
+        "must_have_aliases": _clean_must_have_aliases(profile.get("must_have_aliases"), terms=_string_list(profile.get("must_have_terms"), limit=6)),
         "diagnostics": dict(profile.get("refinement_diagnostics"))
         if isinstance(profile.get("refinement_diagnostics"), dict)
         else {},

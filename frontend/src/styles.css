@@ -2356,6 +2356,21 @@ label {
   border-top: 1px solid #d8d7cf;
 }
 
+.schedule-editor-heading {
+  flex: 1 1 100%;
+  display: grid;
+  gap: 3px;
+}
+
+.schedule-editor-heading strong {
+  font-size: 0.95rem;
+}
+
+.schedule-editor-heading span {
+  color: #77756f;
+  font-size: 0.86rem;
+}
+
 .inline-check {
   display: inline-flex;
   align-items: center;

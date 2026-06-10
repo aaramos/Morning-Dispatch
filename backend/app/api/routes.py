@@ -69,6 +69,8 @@ class TopicProfileCreate(BaseModel):
     related_episode_queries: list[str] = Field(default_factory=list)
     negative_constraints: list[str] = Field(default_factory=list)
     priority_terms: list[str] = Field(default_factory=list)
+    must_have_terms: list[str] = Field(default_factory=list)
+    must_have_aliases: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class ExplorationCreate(BaseModel):

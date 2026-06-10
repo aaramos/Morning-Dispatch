@@ -68,6 +68,8 @@ class TopicProfile:
     recency_weighting: RecencyWeighting = "recent"
     lookback_hours: int | None = None
     exclusions: tuple[str, ...] = ()
+    must_have_terms: tuple[str, ...] = ()
+    must_have_aliases: dict[str, tuple[str, ...]] = field(default_factory=dict)
     source_selection: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_SOURCE_SELECTION))
     requested_sources: tuple[dict[str, Any], ...] = ()
     promoted_sources: tuple[dict[str, Any], ...] = ()
@@ -109,6 +111,8 @@ class TopicProfile:
             recency_weighting=recency,
             lookback_hours=lookback_hours,
             exclusions=tuple(_string_list(payload.get("exclusions"))),
+            must_have_terms=tuple(_string_list(payload.get("must_have_terms"))[:6]),
+            must_have_aliases=_must_have_aliases(payload.get("must_have_aliases")),
             source_selection=_source_selection(payload.get("source_selection")),
             requested_sources=tuple(_dict_list(payload.get("requested_sources"))),
             promoted_sources=tuple(_dict_list(payload.get("promoted_sources"))),
@@ -140,6 +144,8 @@ class TopicProfile:
             "recency_weighting": self.recency_weighting,
             "lookback_hours": self.lookback_hours,
             "exclusions": list(self.exclusions),
+            "must_have_terms": list(self.must_have_terms),
+            "must_have_aliases": {key: list(value) for key, value in self.must_have_aliases.items()},
             "source_selection": dict(self.source_selection),
             "requested_sources": [dict(source) for source in self.requested_sources],
             "promoted_sources": [dict(source) for source in self.promoted_sources],
@@ -309,6 +315,20 @@ def _source_queries(value: Any) -> dict[str, tuple[str, ...]]:
         if cleaned:
             queries[key] = cleaned
     return queries
+
+
+def _must_have_aliases(value: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, dict):
+        return {}
+    aliases: dict[str, tuple[str, ...]] = {}
+    for raw_key, raw_values in value.items():
+        key = _clean_text(raw_key).casefold()
+        if not key:
+            continue
+        cleaned = tuple(_string_list(raw_values)[:12])
+        if cleaned:
+            aliases[key] = cleaned
+    return aliases
 
 
 def _dict(value: Any) -> dict[str, Any]:

@@ -2909,6 +2909,8 @@ async def broaden_queries_with_agent(
             "related_episode_queries": list(profile.related_episode_queries),
             "negative_constraints": list(profile.negative_constraints),
             "priority_terms": list(profile.priority_terms),
+            "must_have_terms": list(profile.must_have_terms),
+            "must_have_aliases": {key: list(value) for key, value in (profile.must_have_aliases or {}).items()},
         }
         if starved_sources:
             # Tell the model which lanes came up empty so it can target them.
@@ -2936,12 +2938,20 @@ async def broaden_queries_with_agent(
         cleaned_search: list[str] = []
         if isinstance(broadened_search, list):
             cleaned_search = [str(q).strip() for q in broadened_search if str(q).strip()]
+        if cleaned_search:
+            from backend.agents.discovery.query_refiner import enforce_must_have_on_queries
+
+            cleaned_search = enforce_must_have_on_queries(profile, cleaned_search)
 
         cleaned_source: dict[str, tuple[str, ...]] = {}
         if isinstance(broadened_source, dict):
             for key, val in broadened_source.items():
                 if isinstance(val, list):
                     cleaned_val = [str(q).strip() for q in val if str(q).strip()]
+                    if cleaned_val:
+                        from backend.agents.discovery.query_refiner import enforce_must_have_on_queries
+
+                        cleaned_val = enforce_must_have_on_queries(profile, cleaned_val)
                     if cleaned_val:
                         cleaned_source[key] = tuple(cleaned_val)
 

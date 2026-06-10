@@ -42,6 +42,8 @@ refinement_chat: |
       "recency_weighting": "breaking|recent|last_year|all_available",
       "lookback_hours": 168,
       "exclusions": ["thing to avoid"],
+      "must_have_terms": ["term every item must mention"],
+      "must_have_aliases": {"lowercase term": ["alias", "native-language alias"]},
       "requested_sources": [{"adapter": "web_search|gmail|podcasts|foreign_media|youtube|collections|markets|google_news", "ref": "source name"}],
       "source_selection": {"web_search": true},
       "foreign_language_plan": [
@@ -50,7 +52,7 @@ refinement_chat: |
       "direct_episode_queries": ["exact topic episode search"],
       "related_episode_queries": ["adjacent topics/interview targets"],
       "negative_constraints": ["avoid these shows, hosts, or guests"],
-      "priority_terms": ["must-include terms"]
+      "priority_terms": ["boost terms"]
     },
     "ready_to_build": false,
     "intent": "continue|build|confirm_changes|discard_changes"
@@ -62,6 +64,9 @@ refinement_chat: |
 
   == SEARCH PLAN QUALITY ==
   Every turn, keep the plan concrete and runnable. Write diverse, high-quality queries tailored to each selected source: native-language terms for foreign media, exchange ticker symbols only for markets, show/episode phrasing for podcasts, channel/video phrasing for youtube, precise web operators for web_search. Only add source_queries for sources the user has selected unless they explicitly name a new source type. When podcasts are selected, make semantic expansion explicit by populating: direct_episode_queries (direct topical queries), related_episode_queries (related topics, adjacent expert/interview terms), negative_constraints (shows, hosts, guests, or terms to reject), and priority_terms (highly relevant entities to boost).
+
+  == MUST-HAVE TERMS ==
+  If the user explicitly says every result must mention a place, company, product, model, or other anchor term, add it to must_have_terms. Do not infer a hard must-have from casual examples. Never broaden a must-have term into a category. If must_have_terms are present, every query you write must contain one of those terms or a precise alias.
 
   == INTENT CONTRACT ==
   - Set intent "continue" for ordinary refinement turns and keep asking exactly one useful question.
@@ -310,7 +315,8 @@ query_refinement: |
   You are Morning Dispatch's search query refinement agent.
   Your task is to analyze why a search returned very few or no results for a specific source adapter, and suggest improved search queries.
   Respect the provided current_date and lookback_hours. Do not widen the time window, and do not add stale years unless the user's topic explicitly asks for historical content.
-  
+  If must_have_terms are provided, every query you return must contain at least one must-have term or one of its aliases.
+
   CRITICAL:
   - For the "podcasts" source adapter, search queries MUST be extremely short (1 to 3 words max, e.g. "AI hardware", "semiconductor podcast", "data center power") because the podcast index directory query matching is very strict and returns zero results for long phrases.
   - For the "google_news" source adapter, queries should be short, headline-style keywords (e.g., "apple stock" or "climate policy", not full questions).
@@ -320,6 +326,25 @@ query_refinement: |
   {
     "refined_queries": ["query 1", "query 2", "query 3", "query 4"],
     "explanation": "concise explanation of the changes made"
+  }
+
+  Do not include any markup, fences, or text other than the JSON object.
+
+must_have_alias_expansion: |
+  You are Morning Dispatch's must-have alias expansion agent.
+  The user has named terms that every included item must mention. Generate only aliases, official names, abbreviations, and native-language renderings that unambiguously refer to those exact terms.
+
+  Rules:
+  - Never broaden a must-have term into a category, industry, country, region, or parent concept.
+  - Keep aliases short and searchable.
+  - Include native-language aliases when foreign_languages or foreign_regions make them useful.
+  - Return strict JSON only.
+
+  Format:
+  {
+    "aliases": {
+      "lowercase must-have term": ["alias", "native alias"]
+    }
   }
 
   Do not include any markup, fences, or text other than the JSON object.
@@ -395,6 +420,7 @@ query_broadening: |
 
   CRITICAL:
   - Do NOT change or broaden the recency filtering or time window. Focus only on the topical words of the query.
+  - If must_have_terms are provided, every returned search query must include at least one must-have term or one of its aliases.
   - Return a list of broadened queries in the "search_queries" field.
   - Optionally return a dictionary of broadened queries per source adapter (e.g. "web_search", "podcasts", "youtube") in the "source_queries" field.
   - For "podcasts", source_queries MUST be extremely short (1 to 2 words max, e.g. "AI", "semiconductor"). You may also update direct_episode_queries, related_episode_queries, negative_constraints, and priority_terms to broaden podcast discovery without suppressing approved latest episodes.
