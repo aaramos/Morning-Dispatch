@@ -16,6 +16,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from backend.agents.digestor.base import NormalizedPayload
+from backend.agents.librarian.date_text import normalize_date_string
 
 logger = logging.getLogger(__name__)
 
@@ -592,13 +593,15 @@ def _extract_published_at(soup: BeautifulSoup) -> str | None:
             if normalized:
                 return normalized
     body_text = soup.body.get_text(" ", strip=True) if soup.body else ""
-    visible_date = _normalize_date_text(body_text[:5000])
+    # Disallow relative phrasing in the broad body scan: "posted 2 days ago" in
+    # page chrome must not be mistaken for the article's publish date.
+    visible_date = _normalize_date_text(body_text[:5000], allow_relative=False)
     if visible_date:
         return visible_date
     return None
 
 
-def _normalize_date_text(value: str) -> str | None:
+def _normalize_date_text(value: str, *, allow_relative: bool = True) -> str | None:
     """Pull a recognizable date out of byline text and return it as ISO `YYYY-MM-DD`.
 
     Returns None when no valid date is present, so callers can keep scanning
@@ -630,7 +633,9 @@ def _normalize_date_text(value: str) -> str | None:
     day_first = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(20\d{2})\b", text)
     if day_first and day_first.group(2).lower() in _MONTHS:
         return _iso_or_none(day_first.group(3), _MONTHS[day_first.group(2).lower()], day_first.group(1))
-    return None
+    # Fall back to the shared parser for non-English Latin month names and
+    # English relative phrasing ("19 ago 2025", "10 months ago").
+    return normalize_date_string(text, allow_relative=allow_relative)
 
 
 def _iso_or_none(year: int | str, month: int | str, day: int | str) -> str | None:
