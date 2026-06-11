@@ -21,7 +21,6 @@ from backend.agents.discovery.types import (
     SourceAdapterContext,
     TopicProfile,
 )
-from backend.agents.discovery.web_search import SearchHit
 from backend.app.db import database
 from backend.app.main import create_app
 from backend.app.services import email_delivery, explore, refinement, refinement_session
