@@ -5,11 +5,10 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 from typing import Any, Protocol
 
-import httpx
-
 from backend.agents.discovery.types import AdapterUnavailable
 from backend.agents.librarian.date_text import normalize_date_string
 from backend.app.core.config import get_settings
+from backend.app.core.http_pool import shared_async_client
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +101,10 @@ class TavilyBackend:
         if days is not None and _use_news_vertical(vertical, days):
             payload["days"] = max(1, int(days))
             payload["topic"] = "news"
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(self.endpoint, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        client = shared_async_client(purpose="web_search", timeout=self.timeout_seconds)
+        response = await client.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
 
         results = data.get("results") if isinstance(data, dict) else None
         if not isinstance(results, list):
@@ -164,10 +163,10 @@ class BraveBackend:
         if freshness:
             params["freshness"] = freshness
         headers = {"X-Subscription-Token": self.api_key, "Accept": "application/json"}
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.get(self.endpoint, params=params, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        client = shared_async_client(purpose="web_search", timeout=self.timeout_seconds)
+        response = await client.get(self.endpoint, params=params, headers=headers, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
 
         results = data.get("web", {}).get("results") if isinstance(data, dict) else None
         if not isinstance(results, list):
@@ -227,10 +226,10 @@ class SerpAPIBackend:
         tbs = _serpapi_tbs(days)
         if tbs:
             params["tbs"] = tbs
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.get(self.endpoint, params=params)
-            response.raise_for_status()
-            data = response.json()
+        client = shared_async_client(purpose="web_search", timeout=self.timeout_seconds)
+        response = await client.get(self.endpoint, params=params, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
 
         results = data.get("organic_results") if isinstance(data, dict) else None
         if not isinstance(results, list):
@@ -299,10 +298,10 @@ class SerperBackend:
         }
         is_news = _use_news_vertical(vertical, days)
         endpoint = "https://google.serper.dev/news" if is_news else self.endpoint
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(endpoint, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        client = shared_async_client(purpose="web_search", timeout=self.timeout_seconds)
+        response = await client.post(endpoint, json=payload, headers=headers, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
 
         results_key = "news" if is_news else "organic"
         results = data.get(results_key) if isinstance(data, dict) else None

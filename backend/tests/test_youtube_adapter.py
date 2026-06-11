@@ -68,7 +68,7 @@ def test_search_youtube_429_maps_to_clean_rate_limit_message(monkeypatch, tmp_pa
             return FakeResponse()
 
     _runtime(monkeypatch, tmp_path)
-    monkeypatch.setattr(youtube.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(youtube, "shared_async_client", lambda **_kwargs: FakeClient())
 
     with pytest.raises(AdapterUnavailable) as exc:
         asyncio.run(youtube.search_youtube(api_key="secret-key", query="local AI", limit=3))
@@ -152,7 +152,7 @@ def test_search_youtube_maps_videos_and_records_quota(monkeypatch, tmp_path) -> 
 
     _runtime(monkeypatch, tmp_path)
     database.init_database()
-    monkeypatch.setattr(youtube.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(youtube, "shared_async_client", lambda **_kwargs: FakeClient())
 
     result = asyncio.run(youtube.search_youtube(api_key="key", query="local AI", limit=2))
 

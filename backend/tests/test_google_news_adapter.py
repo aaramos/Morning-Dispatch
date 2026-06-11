@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
-import time
 import pytest
 from datetime import datetime, UTC, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-from bs4 import BeautifulSoup
 
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.discovery import google_news
@@ -19,7 +14,6 @@ from backend.agents.discovery.types import SourceAdapterContext, TopicProfile, C
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.librarian import articles
 from backend.agents.librarian.articles import ArticleFetchResult
-from backend.app.core.config import get_settings
 from backend.app.db import database
 
 
@@ -109,7 +103,7 @@ def test_fetch_google_news_success(monkeypatch, tmp_path) -> None:
         async def get(self, url: str, **kwargs) -> FakeResponse:
             return FakeResponse(sample_rss)
 
-    monkeypatch.setattr(google_news.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(google_news, "shared_async_client", lambda **_kwargs: FakeAsyncClient())
 
     hits = asyncio.run(google_news.fetch_google_news("Apple CPU", limit=2))
 
@@ -152,7 +146,7 @@ def test_fetch_google_news_retry_429(monkeypatch, tmp_path) -> None:
                 return FakeResponse("", 429)
             return FakeResponse("""<?xml version="1.0" encoding="UTF-8"?><rss><channel><item><title>A</title><link>L</link></item></channel></rss>""", 200)
 
-    monkeypatch.setattr(google_news.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(google_news, "shared_async_client", lambda **_kwargs: FakeAsyncClient())
     # speed up test by mocking sleep
     async def mock_sleep(seconds: float) -> None:
         pass
@@ -192,7 +186,7 @@ def test_decode_google_news_url_success(monkeypatch, tmp_path) -> None:
     proxy_url = f"https://news.google.com/articles/{guid}"
     target_url = "https://verified-publisher.com/story"
 
-    redirect_html = f"""<html>
+    redirect_html = """<html>
       <body>
         <div data-n-a-sg="sig-123" data-n-a-ts="1780000000" />
       </body>
@@ -224,7 +218,7 @@ def test_decode_google_news_url_success(monkeypatch, tmp_path) -> None:
             assert "sig-123" in data["f.req"]
             return FakeResponse(batch_response_text)
 
-    monkeypatch.setattr(google_news.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(google_news, "shared_async_client", lambda **_kwargs: FakeAsyncClient())
 
     decoded = asyncio.run(google_news.decode_google_news_url(proxy_url))
     assert decoded == target_url
@@ -241,7 +235,7 @@ def test_decode_google_news_url_sync_success(monkeypatch, tmp_path) -> None:
     proxy_url = f"https://news.google.com/articles/{guid}"
     target_url = "https://verified-publisher-sync.com/story"
 
-    redirect_html = f"""<html>
+    redirect_html = """<html>
       <body>
         <div data-n-a-sg="sig-555" data-n-a-ts="1780000000" />
       </body>

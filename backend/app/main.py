@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.agents.model.client import aclose_shared_model_clients
+from backend.app.core.http_pool import aclose_shared_clients
 from backend.app.api.admin import router as admin_router
 from backend.app.api.routes import delivery_router, router as api_router
 from backend.app.db.database import init_database
@@ -29,6 +30,7 @@ async def lifespan(_: FastAPI):
         await stop_scheduler()
         await explore.stop_build_queue()
         await aclose_shared_model_clients()
+        await aclose_shared_clients()
 
 
 def create_app() -> FastAPI:

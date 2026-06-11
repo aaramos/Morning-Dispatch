@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from backend.agents.discovery.types import AdapterUnavailable, RecencyWeighting
+from backend.app.core.http_pool import shared_async_client
 from backend.app.db import database
 
 YOUTUBE_SEARCH_ENDPOINT = "https://www.googleapis.com/youtube/v3/search"
@@ -76,30 +77,31 @@ async def search_youtube(
     if published_after:
         params["publishedAfter"] = published_after
     quota_units = 100
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        search_response = await client.get(YOUTUBE_SEARCH_ENDPOINT, params=params)
-        _raise_for_youtube_error(search_response)
-        search_response.raise_for_status()
-        search_data = search_response.json()
+    client = shared_async_client(purpose="youtube", timeout=10.0)
+    search_response = await client.get(YOUTUBE_SEARCH_ENDPOINT, params=params, timeout=10.0)
+    _raise_for_youtube_error(search_response)
+    search_response.raise_for_status()
+    search_data = search_response.json()
 
-        video_ids = _video_ids(search_data)
-        if not video_ids:
-            database.record_youtube_quota(quota_units)
-            return YouTubeSearchResult(videos=(), quota_units=quota_units)
+    video_ids = _video_ids(search_data)
+    if not video_ids:
+        database.record_youtube_quota(quota_units)
+        return YouTubeSearchResult(videos=(), quota_units=quota_units)
 
-        videos_response = await client.get(
-            YOUTUBE_VIDEOS_ENDPOINT,
-            params={
-                "key": api_key,
-                "part": "snippet,contentDetails",
-                "id": ",".join(video_ids),
-                "maxResults": str(len(video_ids)),
-            },
-        )
-        quota_units += 1
-        _raise_for_youtube_error(videos_response)
-        videos_response.raise_for_status()
-        videos_data = videos_response.json()
+    videos_response = await client.get(
+        YOUTUBE_VIDEOS_ENDPOINT,
+        params={
+            "key": api_key,
+            "part": "snippet,contentDetails",
+            "id": ",".join(video_ids),
+            "maxResults": str(len(video_ids)),
+        },
+        timeout=10.0,
+    )
+    quota_units += 1
+    _raise_for_youtube_error(videos_response)
+    videos_response.raise_for_status()
+    videos_data = videos_response.json()
 
     database.record_youtube_quota(quota_units)
     return YouTubeSearchResult(videos=tuple(_parse_videos(videos_data, order=video_ids)), quota_units=quota_units)
