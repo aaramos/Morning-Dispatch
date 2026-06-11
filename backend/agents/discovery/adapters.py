@@ -1272,8 +1272,11 @@ class RedditSourceAdapter:
                     logger.warning("Exception fetching comments RSS for post %s: %s", post_id, exc)
                     return "", None
 
-        # Run initial fetch
-        async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=None) as client:
+        # Run initial fetch. The client-level timeout is a safety net so one stuck
+        # connection cannot hold the stage's asyncio.gather open indefinitely (P9);
+        # individual reddit requests pass a stricter per-request timeout.
+        reddit_timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=reddit_timeout) as client:
             subreddit_tasks = [fetch_subreddit_rss(client, sub) for sub in targets.subreddits]
             search_tasks = [fetch_search_via_web(q) for q in targets.search_queries]
 
@@ -1404,7 +1407,7 @@ class RedditSourceAdapter:
 
             if refined_queries:
                 refined_queries = refined_queries[:3]
-                async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=None) as client:
+                async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=reddit_timeout) as client:
                     ref_search_tasks = [fetch_search_via_web(q) for q in refined_queries]
                     ref_results = await asyncio.gather(*ref_search_tasks, return_exceptions=True)
 

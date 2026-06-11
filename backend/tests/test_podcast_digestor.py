@@ -377,9 +377,13 @@ def test_episode_first_search_and_resolve_flow(monkeypatch, tmp_path):
 
 
 def test_resolve_feed_url_via_rss_autodiscovery(monkeypatch):
+    from backend.agents.digestor import podcast_resolution
+
     async def fake_discover_podcasts(*args, **kwargs):
         return []
-    monkeypatch.setattr(podcast, "discover_podcasts", fake_discover_podcasts)
+    # _resolve_feed_url lives in podcast_resolution (re-exported by podcast), so
+    # its Podcast Index lookup must be patched where it is looked up.
+    monkeypatch.setattr(podcast_resolution, "discover_podcasts", fake_discover_podcasts)
 
     class MockClient:
         async def get(self, url, *args, **kwargs):
