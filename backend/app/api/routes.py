@@ -231,7 +231,7 @@ async def explore_source_status() -> dict[str, Any]:
 @router.get("/explore/explorations")
 def explorations(limit: int = Query(default=25, ge=1, le=200)) -> list[dict[str, Any]]:
     database.purge_expired_deleted_explorations()
-    return database.list_explorations(limit=limit)
+    return database.list_explorations(limit=limit, summary_only=True)
 
 
 @router.get("/explore/scheduled-topic-profiles")
