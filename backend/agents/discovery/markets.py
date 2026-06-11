@@ -83,16 +83,26 @@ class MarketSnapshot:
         movement = _movement_sentence(self)
         news = "; ".join(str(item.get("title") or "") for item in self.recent_news[:3] if item.get("title"))
         multiples = []
-        if self.pe_trailing: multiples.append(f"PE (Trailing): {self.pe_trailing:.1f}")
-        if self.pe_forward: multiples.append(f"PE (Forward): {self.pe_forward:.1f}")
-        if self.peg_ratio: multiples.append(f"PEG: {self.peg_ratio:.2f}")
-        if self.price_to_book: multiples.append(f"PB: {self.price_to_book:.2f}")
-        if self.ev_ebitda: multiples.append(f"EV/EBITDA: {self.ev_ebitda:.1f}")
-        if self.debt_to_equity: multiples.append(f"Debt/Equity: {self.debt_to_equity:.1f}")
-        if self.profit_margin: multiples.append(f"Profit Margin: {self.profit_margin * 100:.1f}%")
-        if self.operating_margin: multiples.append(f"Operating Margin: {self.operating_margin * 100:.1f}%")
-        if self.beta: multiples.append(f"Beta: {self.beta:.2f}")
-        if self.short_percent_of_float: multiples.append(f"Short Float: {self.short_percent_of_float * 100:.1f}%")
+        if self.pe_trailing:
+            multiples.append(f"PE (Trailing): {self.pe_trailing:.1f}")
+        if self.pe_forward:
+            multiples.append(f"PE (Forward): {self.pe_forward:.1f}")
+        if self.peg_ratio:
+            multiples.append(f"PEG: {self.peg_ratio:.2f}")
+        if self.price_to_book:
+            multiples.append(f"PB: {self.price_to_book:.2f}")
+        if self.ev_ebitda:
+            multiples.append(f"EV/EBITDA: {self.ev_ebitda:.1f}")
+        if self.debt_to_equity:
+            multiples.append(f"Debt/Equity: {self.debt_to_equity:.1f}")
+        if self.profit_margin:
+            multiples.append(f"Profit Margin: {self.profit_margin * 100:.1f}%")
+        if self.operating_margin:
+            multiples.append(f"Operating Margin: {self.operating_margin * 100:.1f}%")
+        if self.beta:
+            multiples.append(f"Beta: {self.beta:.2f}")
+        if self.short_percent_of_float:
+            multiples.append(f"Short Float: {self.short_percent_of_float * 100:.1f}%")
 
         multiples_text = " Multiples: " + ", ".join(multiples) + "." if multiples else ""
         upside = f"Target price: {self.target_mean_price:.2f} ({self.implied_upside_pct:+.1f}% upside)." if self.target_mean_price and self.implied_upside_pct else ""

@@ -40,7 +40,6 @@ def build_issue_snapshot(
     configured_source_count: int,
     results: list[ArticleFetchResult],
 ) -> str:
-    body_count = payload_count
     visible_results = [result for result in results if result.tier != "dropped"]
     fetched = [result for result in visible_results if result.fetched]
     fallback = [result for result in visible_results if not result.fetched]
