@@ -1784,6 +1784,11 @@ def confirm_strategy_refinement(session_id: str, payload: dict[str, Any]) -> dic
 
 def _profile_for_strategy_review(base_profile: dict[str, Any], payload_profile: Any, *, models: Any) -> dict[str, Any]:
     merged = dict(base_profile)
+    payload_selection = (
+        _source_selection_dict(payload_profile.get("source_selection"))
+        if isinstance(payload_profile, dict) and isinstance(payload_profile.get("source_selection"), dict)
+        else None
+    )
     if isinstance(payload_profile, dict):
         for key in (
             "topic_id",
@@ -1813,7 +1818,36 @@ def _profile_for_strategy_review(base_profile: dict[str, Any], payload_profile: 
         ):
             if key in payload_profile:
                 merged[key] = payload_profile.get(key)
-    return _apply_models(_coerce_profile(merged), models)
+    coerced = _coerce_profile(merged)
+    if payload_selection is not None:
+        coerced["source_selection"] = payload_selection
+    return _apply_models(_prune_unselected_source_fields(coerced), models)
+
+
+def _prune_unselected_source_fields(profile: dict[str, Any]) -> dict[str, Any]:
+    selection = _source_selection_dict(profile.get("source_selection"))
+    selected_sources = {source for source, enabled in selection.items() if enabled}
+    if not selected_sources:
+        return {
+            **profile,
+            "source_queries": {},
+            "requested_sources": [],
+            "source_selection": selection,
+        }
+    return {
+        **profile,
+        "source_queries": {
+            source: queries
+            for source, queries in _clean_source_queries(profile.get("source_queries")).items()
+            if source in selected_sources
+        },
+        "requested_sources": [
+            source
+            for source in _normalize_requested_sources(profile.get("requested_sources"))
+            if str(source.get("adapter") or "") in selected_sources
+        ],
+        "source_selection": selection,
+    }
 
 
 def _proposal_was_resolved(profile: dict[str, Any], proposal_fingerprint: str) -> bool:

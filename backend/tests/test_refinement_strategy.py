@@ -176,6 +176,46 @@ def test_podcast_semantic_fields_survive_patch_coercion_review_and_preview():
     assert podcast_plan["priority_terms"] == ["OpenAI", "Anthropic"]
 
 
+def test_strategy_review_drops_stale_queries_for_unselected_sources():
+    profile = refinement._coerce_profile(
+        _profile(
+            source_selection={"web_search": True, "markets": True},
+            source_queries={
+                "web_search": ["Mexico City taco walking route"],
+                "markets": ["AAPL"],
+            },
+            requested_sources=[
+                {"adapter": "markets", "ref": "AAPL"},
+                {"adapter": "web_search", "ref": "local Spanish-language food blogs"},
+            ],
+        )
+    )
+
+    reviewed = refinement._profile_for_strategy_review(
+        profile,
+        {
+            **profile,
+            "source_selection": {"web_search": True, "markets": False},
+        },
+        models={},
+    )
+
+    assert reviewed["source_selection"]["markets"] is False
+    assert "markets" not in reviewed["source_queries"]
+    assert reviewed["source_queries"] == {"web_search": ["Mexico City taco walking route"]}
+    assert reviewed["requested_sources"] == [
+        {"adapter": "web_search", "ref": "local Spanish-language food blogs"}
+    ]
+    prompt = refinement._build_strategy_refinement_prompt(
+        profile=reviewed,
+        instruction=refinement._pre_build_strategy_review_instruction(reviewed),
+        task="Review the current search strategy immediately before the brief build.",
+    )
+    prompt_body = json.loads(prompt)
+    assert "markets" not in prompt_body["current_profile"]["source_queries"]
+    assert prompt_body["current_profile"]["selected_sources"] == ["web_search"]
+
+
 def test_coerce_profile_rewrites_stale_year_queries_for_recent_strategy():
     current_year = refinement.datetime.now(refinement.UTC).year
     profile = refinement._coerce_profile(

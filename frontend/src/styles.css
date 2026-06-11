@@ -112,53 +112,11 @@ a {
   padding: 0;
 }
 
-.active-digest-row {
-  width: 100%;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 16px;
-  min-height: 74px;
-  padding: 0 32px;
-  border: 0;
-  border-bottom: 1px solid #d8d7cf;
-  background: #ffffff;
-  color: #1d1d1b;
-}
-
-.active-digest-row strong {
-  font-size: 0.95rem;
-  overflow-wrap: anywhere;
-}
-
-.active-digest-link {
-  justify-self: end;
-  border: 0;
-  background: transparent;
-  color: #8a8983;
-  font-weight: 750;
-  text-decoration: underline;
-  padding: 0;
-  text-align: right;
-}
-
 .live-dot {
   width: 12px;
   height: 12px;
   border-radius: 50%;
   background: #25a87c;
-}
-
-.recent-block {
-  padding: 30px 32px 80px;
-}
-
-.recent-block .active-digest-row {
-  min-height: 58px;
-  margin-bottom: 12px;
-  padding: 12px 20px;
-  border: 1px solid #c8c7bf;
-  border-radius: 8px;
 }
 
 .section-header-row {
@@ -180,86 +138,6 @@ a {
   font-weight: 850;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-}
-
-.recent-list {
-  display: grid;
-  gap: 12px;
-  justify-items: stretch;
-}
-
-.recent-pill-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-}
-
-.recent-pill {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 14px;
-  width: 100%;
-  min-height: 52px;
-  padding: 12px 20px;
-  border: 1px solid #c8c7bf;
-  border-radius: 999px;
-  background: #ffffff;
-  color: #1d1d1b;
-  text-align: left;
-}
-
-.recent-pill > span:first-child {
-  width: 18px;
-  text-align: center;
-}
-
-.recent-pill strong {
-  font-size: 0.95rem;
-  line-height: 1.2;
-  font-weight: 800;
-  overflow-wrap: anywhere;
-}
-
-.recent-pill em {
-  justify-self: end;
-  color: #92918b;
-  font-size: 0.9rem;
-  font-style: normal;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
-.recent-pill b {
-  padding: 4px 12px;
-  border-radius: 999px;
-  background: #dcecfb;
-  color: #174d80;
-  font-size: 0.85rem;
-}
-
-.recent-delete {
-  min-height: 44px;
-  padding: 0 16px;
-  border-color: #d9bbb7;
-  background: #fff8f6;
-  color: #8d251c;
-}
-
-.undo-note {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid #d8d7cf;
-  border-radius: 8px;
-  background: #fffdf5;
-  color: #4f4d47;
-  font-size: 0.92rem;
 }
 
 .composer {
@@ -2484,8 +2362,7 @@ label {
   }
 
   .dispatch-header,
-  .admin-header,
-  .active-digest-row {
+  .admin-header {
     padding-left: 18px;
     padding-right: 18px;
   }
@@ -2512,7 +2389,6 @@ label {
     display: flex;
   }
 
-  .active-digest-row,
   .confirm-grid,
   .content-limit-grid,
   .pipeline-limit-grid,
@@ -2574,32 +2450,6 @@ label {
   .filter-matrix-row {
     grid-template-columns: 1fr;
     gap: 4px;
-  }
-
-  .active-digest-link {
-    justify-self: start;
-    text-align: left;
-  }
-
-  .recent-block {
-    padding: 22px 18px 56px;
-  }
-
-  .recent-pill-row {
-    grid-template-columns: 1fr;
-  }
-
-  .recent-delete {
-    justify-self: end;
-  }
-
-  .recent-pill {
-    grid-template-columns: auto minmax(0, 1fr) auto;
-  }
-
-  .recent-pill b {
-    grid-column: 2 / -1;
-    justify-self: start;
   }
 
   .composer textarea {
@@ -3044,31 +2894,9 @@ label {
   font-weight: 600;
 }
 
-.active-digest-row {
-  background: var(--bg-frame);
-  border-bottom: 1px solid var(--border-color);
-  min-height: 80px;
-}
-
-.active-digest-row strong {
-  font-weight: 650;
-  color: var(--text-primary);
-}
-
-.active-digest-link {
-  color: var(--accent);
-  font-weight: 700;
-  text-decoration-thickness: 1.5px;
-  text-underline-offset: 4px;
-}
-
 .live-dot {
   background: var(--accent);
   box-shadow: 0 0 0 4px var(--accent-light);
-}
-
-.recent-block {
-  padding: 40px 32px 60px;
 }
 
 .section-kicker {
@@ -3077,45 +2905,6 @@ label {
   font-weight: 700;
   font-size: 0.76rem;
   letter-spacing: 0.08em;
-}
-
-.recent-pill {
-  border: 1px solid var(--border-color);
-  border-radius: 8px; /* rectangular with soft corners instead of capsule pill */
-  padding: 16px 20px;
-  background: var(--bg-card);
-  transition: all 0.2s ease;
-}
-
-.recent-pill:hover {
-  border-color: var(--accent);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.02);
-}
-
-.recent-pill em {
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-  font-size: 0.78rem;
-  font-weight: 600;
-}
-
-.recent-pill b {
-  font-family: var(--font-mono);
-  border-radius: 4px;
-  background: var(--accent-light);
-  color: var(--accent);
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  padding: 4px 8px;
-}
-
-.recent-delete {
-  border-radius: 8px;
-  border: 1px solid #fca5a5;
-  background: #fef2f2;
-  color: #991b1b;
-  font-weight: 600;
 }
 
 .composer {

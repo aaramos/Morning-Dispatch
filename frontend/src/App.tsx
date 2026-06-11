@@ -418,10 +418,6 @@ type DigestLibraryItem =
   | { kind: "topic"; topic: TopicProfileResponse }
   | { kind: "legacy"; digest: Digest };
 
-type HomeRecentItem =
-  | { kind: "exploration"; exploration: Exploration; topic: TopicProfileResponse | null; digest: boolean }
-  | { kind: "topic"; topic: TopicProfileResponse; digest: boolean };
-
 type ConfirmationDraft = {
   scope: string;
   depth: "practitioner" | "informed-generalist";
@@ -1090,8 +1086,6 @@ function DispatchApp() {
   const [deliveryConfigured, setDeliveryConfigured] = useState(false);
   const [emailSendReady, setEmailSendReady] = useState(false);
   const [briefEmailRecipient, setBriefEmailRecipient] = useState("");
-  const [homeDeleteUndo, setHomeDeleteUndo] = useState<{ explorationId: string; title: string; until: string | null } | null>(null);
-  const [recentExpanded, setRecentExpanded] = useState(() => loadSessionValue("dispatch.recentExpanded", false));
   const [schedulePreset, setSchedulePreset] = useState<SchedulePreset>("daily");
   const [scheduleTime, setScheduleTime] = useState("08:00");
   const [emailOnSchedule, setEmailOnSchedule] = useState(false);
@@ -1135,38 +1129,17 @@ function DispatchApp() {
   const activeRefinementTurns = useRef(0);
   const refinementAnswerQueue = useRef<string[]>([]);
   const strategyRefinementQueue = useRef<string[]>([]);
+  const buildRequestQueue = useRef(0);
   const [queuedRefinementTurns, setQueuedRefinementTurns] = useState(0);
+  const [queuedBuildRequests, setQueuedBuildRequests] = useState(0);
   const buildBriefRef = useRef<() => void>(() => undefined);
   const [autoBuildRequest, setAutoBuildRequest] = useState(0);
   const recencyOverrideRef = useRef<Pick<ConfirmationDraft, "recency_weighting" | "lookback_hours"> | null>(null);
 
-  const topicById = useMemo(() => new Map(allTopics.map((topic) => [topic.topic_id, topic])), [allTopics]);
-  const activeDigest = scheduledTopics[0] ?? null;
   const scheduledDeliveryFailures = useMemo(
     () => deliveryFailuresFromStatus(adminStatus, scheduledTopics),
     [adminStatus, scheduledTopics],
   );
-  const homeRecentItems = useMemo<HomeRecentItem[]>(() => {
-    const topicIdsWithExplorations = new Set(recentExplorations.map((item) => item.topic_id));
-    const digestTopicIds = new Set(scheduledTopics.map((topic) => topic.topic_id));
-    const explorationItems: HomeRecentItem[] = recentExplorations.map((exploration) => ({
-      kind: "exploration",
-      exploration,
-      topic: topicById.get(exploration.topic_id) ?? null,
-      digest: digestTopicIds.has(exploration.topic_id),
-    }));
-    const unbuiltTopicItems: HomeRecentItem[] = allTopics
-      .filter((topic) => !topic.profile.archived && !topic.profile.deleted)
-      .filter((topic) => !topicIdsWithExplorations.has(topic.topic_id))
-      .map((topic) => ({
-        kind: "topic",
-        topic,
-        digest: digestTopicIds.has(topic.topic_id),
-      }));
-    return [...explorationItems, ...unbuiltTopicItems]
-      .sort((a, b) => homeRecentDate(b) - homeRecentDate(a))
-      .slice(0, 5);
-  }, [allTopics, recentExplorations, scheduledTopics, topicById]);
   const selectedEnabledSources = useMemo(
     () => enabledSourceSelection(sourceSelection, sourceStatus),
     [sourceSelection, sourceStatus],
@@ -1182,7 +1155,7 @@ function DispatchApp() {
   ).trim();
   const sourceLocked = flow === "building";
   const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
-  const canBuild = buildInterest.length > 0 && !busy;
+  const canBuild = buildInterest.length > 0;
   const updateDraft = useCallback((nextDraft: ConfirmationDraft) => {
     if (nextDraft.sourceScopeTouched) {
       recencyOverrideRef.current = {
@@ -1279,10 +1252,6 @@ function DispatchApp() {
   }, [flow, statement]);
 
   useEffect(() => {
-    window.sessionStorage.setItem("dispatch.recentExpanded", JSON.stringify(recentExpanded));
-  }, [recentExpanded]);
-
-  useEffect(() => {
     if (!session) return;
     setDraft((current) => draftWithStickyRecency(session.profile, defaultControls.content_limits, current));
     setForeignRegionsDraft(session.profile.foreign_regions ?? []);
@@ -1367,6 +1336,19 @@ function DispatchApp() {
     if (!next) return null;
     setQueuedStrategyRefinementTurns(strategyRefinementQueue.current.length);
     return next;
+  }
+
+  function queueBuildRequest() {
+    buildRequestQueue.current += 1;
+    setQueuedBuildRequests(buildRequestQueue.current);
+    setMessage("Build brief queued. It will start when the current AI turn finishes.");
+  }
+
+  function shiftQueuedBuildRequest(): boolean {
+    if (buildRequestQueue.current <= 0) return false;
+    buildRequestQueue.current = Math.max(0, buildRequestQueue.current - 1);
+    setQueuedBuildRequests(buildRequestQueue.current);
+    return true;
   }
 
   function updateSearchQuery(target: QueryEditTarget, nextValue: string | null) {
@@ -2001,6 +1983,33 @@ function DispatchApp() {
     };
   });
 
+  function requestBuildBrief() {
+    if (!canBuild) return;
+    if (busy || streaming || activeRefinementTurns.current > 0 || strategyStreaming || strategyPreparingProposal) {
+      queueBuildRequest();
+      return;
+    }
+    void buildBrief();
+  }
+
+  useEffect(() => {
+    const canProcessBuildQueue = (
+      queuedBuildRequests > 0
+      && canBuild
+      && !busy
+      && !streaming
+      && activeRefinementTurns.current === 0
+      && !strategyStreaming
+      && !strategyPreparingProposal
+    );
+    if (!canProcessBuildQueue) return;
+    const timer = window.setTimeout(() => {
+      if (!shiftQueuedBuildRequest()) return;
+      buildBriefRef.current();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [busy, canBuild, queuedBuildRequests, strategyPreparingProposal, strategyStreaming, streaming]);
+
   useEffect(() => {
     if (!autoBuildRequest) return;
     if (flow !== "confirm" || busy || streaming) return;
@@ -2186,87 +2195,6 @@ function DispatchApp() {
   function openBrief(record = exploration) {
     const path = record ? briefPath(record) : null;
     openPath(path);
-  }
-
-  async function deleteHomeExploration(item: Extract<HomeRecentItem, { kind: "exploration" }>) {
-    const title = homeRecentTitle(item);
-    setBusy(true);
-    try {
-      const result = await api<{ exploration: Exploration; undo_available_until?: string | null }>(
-        `/api/explore/explorations/${item.exploration.exploration_id}`,
-        { method: "DELETE" },
-      );
-      setRecentExplorations((current) => current.filter((record) => record.exploration_id !== item.exploration.exploration_id));
-      if (exploration?.exploration_id === item.exploration.exploration_id) {
-        resetForNewBrief();
-      }
-      await loadHome();
-      setHomeDeleteUndo({
-        explorationId: item.exploration.exploration_id,
-        title,
-        until: result.undo_available_until ?? result.exploration.delete_after ?? null,
-      });
-      setMessage("Brief deleted. You can undo for 7 days.");
-    } catch (error) {
-      setMessage(errorMessage(error, "Could not delete brief"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function restoreHomeExploration() {
-    if (!homeDeleteUndo) return;
-    setBusy(true);
-    try {
-      await api(`/api/explore/explorations/${homeDeleteUndo.explorationId}/restore`, { method: "POST" });
-      setHomeDeleteUndo(null);
-      await loadHome();
-      setMessage("Brief restored");
-    } catch (error) {
-      setMessage(errorMessage(error, "Could not restore brief"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function openHomeRecentItem(item: HomeRecentItem) {
-    if (item.kind === "topic") {
-      loadTopicForConfirmation(item.topic);
-      return;
-    }
-    if (item.exploration.status === "queued" || item.exploration.status === "running") {
-      setExploration(item.exploration);
-      setTopicProfile(item.topic);
-      if (item.topic) {
-        setStatement(item.topic.statement);
-        recencyOverrideRef.current = null;
-        setDraft(draftFromProfile(item.topic.profile, defaultControls.content_limits));
-        setSourceSelection(sourceSelectionFromRecord(item.topic.profile.source_selection));
-      }
-      setFlow("building");
-      setMessage(item.exploration.status === "queued" ? "Brief is queued..." : "Brief is still building...");
-      try {
-        const { exploration: finished, html } = await waitForBriefReady(item.exploration.exploration_id);
-        setExploration(finished);
-        setBriefHtml(html);
-        await loadHome();
-        setFlow("ready");
-        setMessage(finished.progress.built_with_issues ? "Brief ready with issues" : "Brief ready");
-        openBrief(finished);
-      } catch (error) {
-        setMessage(errorMessage(error, "Could not refresh the building brief"));
-      }
-      return;
-    }
-    if (briefPath(item.exploration)) {
-      openBrief(item.exploration);
-      return;
-    }
-    if (item.topic) {
-      loadTopicForConfirmation(item.topic);
-      return;
-    }
-    setMessage("This brief is not ready yet");
   }
 
   function loadTopicForConfirmation(topic: TopicProfileResponse) {
@@ -2585,70 +2513,6 @@ function DispatchApp() {
   void refineSearchStrategy;
   void confirmStrategyRefinement;
 
-  const recentBriefsBlock =
-    homeRecentItems.length || activeDigest ? (
-      <div className="recent-block">
-        <div className="section-header-row">
-          <p className="section-kicker">Recent Briefs</p>
-          <DisclosureButton
-            expanded={recentExpanded}
-            label={recentExpanded ? "Hide" : "Show"}
-            onToggle={() => setRecentExpanded((current) => !current)}
-          />
-        </div>
-        {recentExpanded ? (
-          <>
-            {activeDigest ? (
-              <div className="active-digest-row">
-                <span className="live-dot" />
-                <strong>{profileName(activeDigest)}</strong>
-                <button
-                  type="button"
-                  className="active-digest-link"
-                  onClick={() => activeDigest.latest_exploration && openBrief(activeDigest.latest_exploration)}
-                  disabled={!activeDigest.latest_exploration}
-                >
-                  Last ran: {formatDateTime(activeDigest.latest_exploration?.finished_at ?? activeDigest.latest_exploration?.started_at)}
-                </button>
-              </div>
-            ) : null}
-            <div className="recent-list">
-              {homeRecentItems.map((item) => (
-                <div className="recent-pill-row" key={homeRecentKey(item)}>
-                  <button className="recent-pill" onClick={() => void openHomeRecentItem(item)}>
-                    <span>{homeRecentIcon(item)}</span>
-                    <strong>{homeRecentTitle(item)}</strong>
-                    <em>{homeRecentMeta(item)}</em>
-                    {item.digest ? <b>digest</b> : homeRecentBadge(item) ? <b>{homeRecentBadge(item)}</b> : null}
-                  </button>
-                  {item.kind === "exploration" ? (
-                    <button
-                      type="button"
-                      className="recent-delete"
-                      onClick={() => void deleteHomeExploration(item)}
-                      disabled={busy}
-                      aria-label={`Delete ${homeRecentTitle(item)}`}
-                    >
-                      Delete
-                    </button>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-            {homeDeleteUndo ? (
-              <div className="undo-note">
-                <span>
-                  Deleted "{homeDeleteUndo.title}".
-                  {homeDeleteUndo.until ? ` Undo until ${formatDateTime(homeDeleteUndo.until)}.` : " Undo is available for 7 days."}
-                </span>
-                <button type="button" className="secondary-action" onClick={() => void restoreHomeExploration()} disabled={busy}>Undo</button>
-              </div>
-            ) : null}
-          </>
-        ) : null}
-      </div>
-    ) : null;
-
   return (
     <main className="dispatch-page">
       <section className="dispatch-frame">
@@ -2683,6 +2547,7 @@ function DispatchApp() {
               progressNow={progressNow}
               gmailCandidates={gmailCandidates}
               queuedRefinementTurns={queuedRefinementTurns}
+              queuedBuildRequests={queuedBuildRequests}
               onAnswerChange={setAnswer}
               onSend={() => void answerRefinement(false)}
               onGmailApprove={(approvedSenders, instructions) => {
@@ -2706,7 +2571,7 @@ function DispatchApp() {
               sourceLocked={sourceLocked}
               onSourceToggle={updateSource}
               onSearchQueryEdit={updateSearchQuery}
-              onBuild={() => void buildBrief()}
+              onBuild={requestBuildBrief}
               onEnsurePodcastTopicId={ensurePodcastTopicId}
               canSubmitInterest={canSubmitInterest}
               onSubmitInterest={(event) => {
@@ -2762,7 +2627,6 @@ function DispatchApp() {
               onSchedule={() => void scheduleBrief()}
             />
           ) : null}
-          {recentBriefsBlock}
         </section>
       </section>
       <p className="screen-reader-status" aria-live="polite">{message}</p>
@@ -3050,6 +2914,7 @@ function RefinementPanel(props: {
   progressNow: number;
   gmailCandidates: GmailCandidatePayload | null;
   queuedRefinementTurns: number;
+  queuedBuildRequests: number;
   onAnswerChange: (value: string) => void;
   onSend: () => void;
   onGmailApprove: (approvedSenders: string[], instructions: string) => void;
@@ -3220,6 +3085,32 @@ function RefinementPanel(props: {
                   </div>
                 </div>
               ) : null}
+              {props.queuedBuildRequests > 0 ? (
+                <>
+                  <div className="chat-turn user pending">
+                    <div className="chat-avatar me">You</div>
+                    <div className="chat-bubble2">Build brief requested.</div>
+                  </div>
+                  <div className="chat-turn assistant status-turn">
+                    <div className="chat-avatar ai">M</div>
+                    <div className="chat-refinement-status" role="status" aria-live="polite">
+                      <span className="typing-dots small" aria-hidden="true">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                      <div>
+                        <strong>Build queued</strong>
+                        <small>
+                          {props.queuedBuildRequests === 1
+                            ? "I’ll start the brief as soon as the current turn finishes."
+                            : `${props.queuedBuildRequests} build requests are waiting for the current turn to finish.`}
+                        </small>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              ) : null}
             </>
           )}
         </div>
@@ -3309,7 +3200,6 @@ function RefinementPanel(props: {
                     className="primary-action build-brief-action"
                     type="button"
                     onClick={props.onBuild}
-                    disabled={props.busy}
                   >
                     Build brief
                   </button>
@@ -3362,7 +3252,7 @@ function RefinementPanel(props: {
                   </span>
                   <span style={{ flex: 1 }} />
                   <RecencyControl value={props.draft.lookback_hours} onChange={updateDraftRecency} compact />
-                  <button type="button" className="primary-action strategy-confirm-action" onClick={props.onBuild} disabled={props.busy}>
+                  <button type="button" className="primary-action strategy-confirm-action" onClick={props.onBuild}>
                     Build brief
                   </button>
                 </div>
@@ -3994,7 +3884,7 @@ function ConfirmationPanel(props: {
           type="button"
           className="primary-action build-brief-action"
           onClick={props.onBuild}
-          disabled={!props.canBuild || props.busy || contentLimitErrors.length > 0}
+          disabled={!props.canBuild || contentLimitErrors.length > 0}
         >
           {props.busy ? "Working..." : props.pendingStrategy ? "Build with proposed strategy" : "Build brief"}
         </button>
@@ -7954,45 +7844,6 @@ function sourceSelectionFromRecord(selection: Record<string, boolean> | undefine
 
 function profileName(topic: TopicProfileResponse): string {
   return topic.profile.scope || topic.statement || "Untitled brief";
-}
-
-function homeRecentKey(item: HomeRecentItem): string {
-  if (item.kind === "topic") return `topic-${item.topic.topic_id}`;
-  return `exploration-${item.exploration.exploration_id}`;
-}
-
-function homeRecentTitle(item: HomeRecentItem): string {
-  if (item.kind === "topic") return profileName(item.topic);
-  return item.topic ? profileName(item.topic) : item.exploration.progress.brief?.title ?? "Brief";
-}
-
-function homeRecentDate(item: HomeRecentItem): number {
-  if (item.kind === "topic") return dateValue(item.topic.updated_at ?? item.topic.created_at);
-  return dateValue(item.exploration.finished_at ?? item.exploration.started_at);
-}
-
-function homeRecentMeta(item: HomeRecentItem): string {
-  if (item.kind === "topic") return relativeDate(item.topic.updated_at ?? item.topic.created_at);
-  if (item.exploration.status === "queued") return "queued";
-  if (item.exploration.status === "running") return "building";
-  if (item.exploration.status === "failed") return "failed";
-  return relativeDate(item.exploration.finished_at ?? item.exploration.started_at);
-}
-
-function homeRecentBadge(item: HomeRecentItem): string | null {
-  if (item.kind === "topic") return "plan";
-  if (item.exploration.status === "queued") return "queued";
-  if (item.exploration.status === "running") return "building";
-  if (item.exploration.status === "failed") return "failed";
-  return null;
-}
-
-function homeRecentIcon(item: HomeRecentItem): string {
-  if (item.kind === "topic") return "◇";
-  if (item.exploration.status === "queued") return "◌";
-  if (item.exploration.status === "running") return "◌";
-  if (item.exploration.status === "failed") return "!";
-  return "⌕";
 }
 
 function explorationLibraryName(item: ExplorationLibraryItem): string {
