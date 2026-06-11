@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,14 +15,43 @@ class ModelCatalogError(RuntimeError):
     pass
 
 
-async def catalog_status(settings: Settings) -> dict[str, Any]:
+_CATALOG_CACHE: dict[str, tuple[float, list[dict[str, Any]] | None, str | None]] = {}
+_CATALOG_TTL_SECONDS = 20.0
+
+
+def reset_catalog_cache() -> None:
+    _CATALOG_CACHE.clear()
+
+
+async def _cached_available_models(settings: Settings) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Fetch the model list, memoizing both success and failure for a short TTL.
+
+    Keyed by the resolved base URL so a changed base URL misses the cache. Only the
+    network result is cached; callers layer fresh settings (selected model, etc.)
+    on top of it.
+    """
+    base_url = (settings.model_base_url or "").rstrip("/")
+    cached = _CATALOG_CACHE.get(base_url)
+    if cached is not None and time.monotonic() - cached[0] < _CATALOG_TTL_SECONDS:
+        return cached[1], cached[2]
+
     try:
-        models = await fetch_available_models(settings)
+        models: list[dict[str, Any]] | None = await fetch_available_models(settings)
+        error = None
     except ModelCatalogError as exc:
+        models = None
+        error = str(exc)
+    _CATALOG_CACHE[base_url] = (time.monotonic(), models, error)
+    return models, error
+
+
+async def catalog_status(settings: Settings) -> dict[str, Any]:
+    models, error = await _cached_available_models(settings)
+    if models is None:
         return {
             "available": False,
             "models": [],
-            "error": str(exc),
+            "error": error,
             "selected_model": settings.librarian_model,
             "selected_local_model": settings.librarian_model,
             "base_url": settings.model_base_url,
@@ -29,7 +59,7 @@ async def catalog_status(settings: Settings) -> dict[str, Any]:
                 "local": {
                     "available": False,
                     "models": [],
-                    "error": str(exc),
+                    "error": error,
                     "base_url": settings.model_base_url,
                     "selected_model": settings.librarian_model,
                 },
