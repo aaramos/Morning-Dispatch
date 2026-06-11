@@ -6,7 +6,7 @@ import os
 import sys
 import base64
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from backend.agents.digestor import gmail as gmail_direct
 from backend.agents.digestor.base import NormalizedPayload, pii_filter, utc_now
+from backend.agents.librarian.date_text import parse_iso_datetime
 from backend.app.core.config import get_settings
 from backend.db.queries import upsert_watermark
 
@@ -359,16 +360,10 @@ def _remote_html_links(html_body: str) -> list[gmail_direct.ExtractedLink]:
 def _remote_message_published_at(value: Any) -> str | None:
     if not value:
         return None
-    text = str(value)
-    try:
-        if len(text) == 10 and text[4] == "-" and text[7] == "-":
-            return datetime.fromisoformat(text).replace(tzinfo=UTC).isoformat(timespec="seconds")
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC).isoformat(timespec="seconds")
-    except ValueError:
-        return None
+    # Covers both the bare `YYYY-MM-DD` (midnight UTC) and full ISO datetime
+    # forms the hosted Gmail MCP emits.
+    parsed = parse_iso_datetime(str(value))
+    return parsed.isoformat(timespec="seconds") if parsed else None
 
 
 def _remote_mcp_enabled() -> bool:

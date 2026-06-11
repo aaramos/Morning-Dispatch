@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Iterable
 
 from backend.agents.librarian.articles import ArticleFetchResult
+from backend.agents.librarian.date_text import parse_iso_datetime
 from backend.agents.librarian.text_utils import fallback_text, keyword_set
 
 
@@ -276,17 +277,14 @@ def _recency_score(published_at: str | None, recency_weighting: str = "recent") 
         if recency_weighting == "all_available":
             return 0.5
         return 0.3
-    try:
-        parsed = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        age_hours = max(0.0, (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds() / 3600)
-    except ValueError:
+    parsed = parse_iso_datetime(published_at)
+    if parsed is None:
         if recency_weighting == "breaking":
             return 0.1
         if recency_weighting == "all_available":
             return 0.5
         return 0.3
+    age_hours = max(0.0, (datetime.now(UTC) - parsed).total_seconds() / 3600)
     if recency_weighting == "all_available":
         return 0.5  # Flat — no age penalty when browsing archives
     if recency_weighting == "breaking":

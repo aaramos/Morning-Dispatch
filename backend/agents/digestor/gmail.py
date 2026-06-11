@@ -7,7 +7,6 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parseaddr
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -15,6 +14,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from backend.agents.digestor.base import NormalizedPayload, pii_filter, utc_now
+from backend.agents.librarian.date_text import parse_iso_datetime, parse_rfc2822_datetime
 from backend.db.queries import get_watermark, upsert_watermark
 
 SCOPES = [
@@ -410,13 +410,8 @@ def message_published_at(message: dict[str, Any]) -> str | None:
     raw_date = header_value(message.get("payload", {}), "Date")
     if not raw_date:
         return None
-    try:
-        parsed = parsedate_to_datetime(raw_date)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC).isoformat(timespec="seconds")
-    except (TypeError, ValueError):
-        return None
+    parsed = parse_rfc2822_datetime(raw_date)
+    return parsed.isoformat(timespec="seconds") if parsed else None
 
 
 def _after_timestamp(db_path: str, digest_id: str, source_key: str, lookback_hours: int) -> int:
@@ -433,10 +428,11 @@ def _after_timestamp(db_path: str, digest_id: str, source_key: str, lookback_hou
 
 
 def _timestamp_from_iso(value: str) -> int:
-    normalized = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
+        # Callers (e.g. _latest_iso) rely on invalid input raising, not returning a
+        # sentinel — keep the original fromisoformat contract.
+        raise ValueError(f"invalid ISO timestamp: {value!r}")
     return int(parsed.timestamp())
 
 

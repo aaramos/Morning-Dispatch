@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from backend.agents.discovery.types import AdapterUnavailable, TopicProfile
+from backend.agents.librarian.date_text import parse_iso_datetime, parse_rfc2822_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -320,13 +321,7 @@ def fetch_google_news_rss(ticker_symbol: str, company_name: str) -> list[dict[st
                 if " - " in title_text:
                     clean_title = title_text.rsplit(" - ", 1)[0]
 
-                published_at = None
-                if pub_date_text:
-                    try:
-                        from email.utils import parsedate_to_datetime
-                        published_at = parsedate_to_datetime(pub_date_text)
-                    except Exception:
-                        pass
+                published_at = parse_rfc2822_datetime(pub_date_text) if pub_date_text else None
 
                 from backend.app.core.config import get_settings
                 unfurl_enabled = getattr(get_settings(), "google_news_unfurl_links", True)
@@ -623,11 +618,7 @@ def _published_at(item: dict[str, Any]) -> datetime | None:
     if isinstance(raw, (int, float)):
         return datetime.fromtimestamp(raw, tz=UTC)
     if isinstance(raw, str) and raw:
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return parse_iso_datetime(raw)
     return None
 
 
