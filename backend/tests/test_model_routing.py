@@ -6,7 +6,7 @@ import httpx
 from httpx._content import IteratorByteStream
 
 from backend.agents.model import client as model_client_module
-from backend.app.core.config import get_settings
+from backend.app.core.config import get_settings, reset_settings_cache
 from backend.app.services import model_routing
 
 
@@ -49,6 +49,8 @@ def test_routes_can_set_per_agent_local_model(monkeypatch, tmp_path):
     assert payload["model_routes"]["editorial"]["provider"] == "local"
     assert payload["model_routes"]["editorial"]["model"] == "Gemma4-Fast"
 
+    # Drop the TTL-cached Settings so the saved routes are visible immediately.
+    reset_settings_cache()
     resolution = model_routing.client_for_agent("editorial", settings=get_settings(), items=[])
     assert resolution.client is not None
     assert resolution.client.config.provider == "local"
@@ -79,6 +81,7 @@ def test_save_model_api_key_writes_secret(monkeypatch, tmp_path):
     key_path = runtime / "secrets" / "model" / "api_key"
     assert key_path.read_text(encoding="utf-8") == "sk-local-123"
     # A freshly loaded Settings should pick the key up from disk.
+    reset_settings_cache()
     assert get_settings().model_api_key == "sk-local-123"
 
 

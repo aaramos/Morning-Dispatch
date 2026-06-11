@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from backend.agents.digestor.gmail import required_scopes
 from backend.agents.digestor.podcast import discover_podcasts
-from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings
+from backend.app.core.config import Settings, ensure_runtime_dirs, get_settings, reset_settings_cache
 from backend.app.db import database
 from backend.app.services import (
     email_delivery,
@@ -420,6 +420,7 @@ async def select_model(payload: ModelSelectionPayload) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Select a model currently available on the local server")
 
     model_catalog.save_selected_model(settings, selected_model)
+    reset_settings_cache()
     updated_settings = _settings()
     return {
         "provider": "local",
@@ -434,6 +435,7 @@ async def select_model(payload: ModelSelectionPayload) -> dict[str, Any]:
 async def restore_default_models() -> dict[str, Any]:
     settings = _settings()
     model_catalog.restore_default_models(settings)
+    reset_settings_cache()
     updated_settings = _settings()
     return {
         "models": {"local": updated_settings.librarian_model},
@@ -444,7 +446,11 @@ async def restore_default_models() -> dict[str, Any]:
 @router.post("/model/routes")
 def save_model_routes(payload: ModelRoutesPayload) -> dict[str, Any]:
     routes_payload = {agent: route.model_dump() for agent, route in payload.routes.items()}
-    return model_routing.save_routes(_settings(), routes_payload)
+    model_routing.save_routes(_settings(), routes_payload)
+    # save_routes computed its status against the pre-write cached Settings;
+    # rebuild so the response reflects the routes that were just saved.
+    reset_settings_cache()
+    return model_routing.routes_status(_settings())
 
 
 @router.post("/model/api-key")
@@ -453,12 +459,14 @@ def save_model_api_key(payload: ModelApiKeyPayload) -> dict[str, Any]:
         model_routing.save_model_api_key(_settings(), payload.api_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    reset_settings_cache()
     return model_routing.routes_status(_settings())
 
 
 @router.delete("/model/api-key")
 def delete_model_api_key() -> dict[str, Any]:
     model_routing.clear_model_api_key(_settings())
+    reset_settings_cache()
     return model_routing.routes_status(_settings())
 
 
@@ -516,6 +524,7 @@ def save_podcast_credentials(payload: PodcastCredentialsPayload) -> dict[str, An
     settings = _settings()
     _write_secret_text(settings.secrets_dir / "podcastindex" / "api_key", api_key)
     _write_secret_text(settings.secrets_dir / "podcastindex" / "api_secret", api_secret)
+    reset_settings_cache()
     refreshed_settings = _settings()
     digests = [scheduler.decorate_digest_overview(overview) for overview in database.list_digest_overviews()]
     return _podcast_status(refreshed_settings, digests)
@@ -528,6 +537,7 @@ def save_fred_credentials(payload: FredCredentialsPayload) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="FRED API key is required")
     settings = _settings()
     _write_secret_text(settings.secrets_dir / "fred" / "api_key", api_key)
+    reset_settings_cache()
     refreshed_settings = _settings()
     return secret_health.status(refreshed_settings)
 

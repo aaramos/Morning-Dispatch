@@ -3618,6 +3618,11 @@ def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> 
     monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_USE_MODEL", "true")
     monkeypatch.setenv("MORNING_DISPATCH_MODEL_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_LIBRARIAN_MODEL", "global-brief")
+    # init_database() already populated the settings TTL cache; drop it so the
+    # env vars patched above are visible to the code under test.
+    from backend.app.core.config import reset_settings_cache
+
+    reset_settings_cache()
 
     profile = TopicProfile.from_dict(
         {
