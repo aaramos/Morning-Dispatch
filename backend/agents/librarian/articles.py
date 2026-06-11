@@ -122,22 +122,48 @@ async def fetch_articles_for_payloads(
     return deduped
 
 
+_DIRECT_SOURCE_META: dict[str, tuple[str, str, float, str]] = {
+    # source_type: (section, content_type, default_score, quality_metadata_key)
+    "gmail": ("Newsletter Content", "newsletter", 0.80, ""),
+    "reddit_thread": ("Legacy Discussion", "reddit_thread", 0.65, "thread_quality_score"),
+    "reddit_post": ("Legacy Discussion", "reddit_thread", 0.65, "thread_quality_score"),
+    "podcast_episode": ("Podcast Signals", "podcast", 0.65, "episode_quality_score"),
+    "youtube_video": ("YouTube Videos", "video", 0.65, "youtube_quality_score"),
+    "collection_chunk": ("Collections", "collection", 0.65, "collection_quality_score"),
+    "market_snapshot": ("Markets", "market", 0.65, "market_quality_score"),
+    "sec_filing": ("SEC Filings", "sec_filing", 0.85, ""),
+    "fred_series": ("Macro Indicators", "fred_series", 0.88, ""),
+}
+
+# Historical behavior: the quality-score lookup tries every known quality key in
+# this order regardless of source_type (not just the type's own key), so a payload
+# carrying an unexpected quality key still scores the same as before the table
+# refactor. The per-type key in _DIRECT_SOURCE_META documents the intended owner.
+_QUALITY_SCORE_KEYS = (
+    "episode_quality_score",
+    "thread_quality_score",
+    "youtube_quality_score",
+    "collection_quality_score",
+    "market_quality_score",
+)
+
+
 def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[ArticleFetchResult]:
     results: list[ArticleFetchResult] = []
     for payload in payloads:
-        if payload.source_type not in {"gmail", "reddit_thread", "reddit_post", "podcast_episode", "youtube_video", "collection_chunk", "market_snapshot", "sec_filing", "fred_series"} or not payload.original_url:
+        if payload.source_type not in _DIRECT_SOURCE_META or not payload.original_url:
             continue
+        section, content_type, default_score, _quality_key = _DIRECT_SOURCE_META[payload.source_type]
         canonical_url = canonicalize_url(payload.original_url)
         title = _payload_title(payload) or payload.source_name or "Direct source"
         text = _clean_text(payload.raw_text)
-        is_reddit = payload.source_type in ("reddit_thread", "reddit_post")
-        is_podcast = payload.source_type == "podcast_episode"
-        is_youtube = payload.source_type == "youtube_video"
-        is_collection = payload.source_type == "collection_chunk"
-        is_market = payload.source_type == "market_snapshot"
-        is_sec = payload.source_type == "sec_filing"
-        is_fred = payload.source_type == "fred_series"
-        is_gmail = payload.source_type == "gmail"
+        payload_metadata = payload.metadata or {}
+        link_score = float(
+            next(
+                (payload_metadata[key] for key in _QUALITY_SCORE_KEYS if payload_metadata.get(key)),
+                default_score,
+            )
+        )
         results.append(
             ArticleFetchResult(
                 payload=payload,
@@ -149,48 +175,9 @@ def direct_article_results(payloads: Iterable[NormalizedPayload]) -> list[Articl
                 excerpt=_truncate(text, 520),
                 domain=_domain(canonical_url),
                 status="fetched",
-                link_score=float(
-                    (payload.metadata or {}).get("episode_quality_score")
-                    or (payload.metadata or {}).get("thread_quality_score")
-                    or (payload.metadata or {}).get("youtube_quality_score")
-                    or (payload.metadata or {}).get("collection_quality_score")
-                    or (payload.metadata or {}).get("market_quality_score")
-                    or (0.80 if is_gmail else 0.85 if is_sec else 0.88 if is_fred else 0.65)
-                ),
-                section=(
-                    "Newsletter Content"
-                    if is_gmail
-                    else "Podcast Signals"
-                    if is_podcast
-                    else "YouTube Videos"
-                    if is_youtube
-                    else "Collections"
-                    if is_collection
-                    else "Markets"
-                    if is_market
-                    else "SEC Filings"
-                    if is_sec
-                    else "Macro Indicators"
-                    if is_fred
-                    else "Legacy Discussion"
-                ),
-                content_type=(
-                    "newsletter"
-                    if is_gmail
-                    else "podcast"
-                    if is_podcast
-                    else "video"
-                    if is_youtube
-                    else "collection"
-                    if is_collection
-                    else "market"
-                    if is_market
-                    else "sec_filing"
-                    if is_sec
-                    else "fred_series"
-                    if is_fred
-                    else "reddit_thread"
-                ),
+                link_score=link_score,
+                section=section,
+                content_type=content_type,
                 metadata=_direct_result_metadata(payload),
             )
         )
