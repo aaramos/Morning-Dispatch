@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian import articles
 
@@ -394,3 +396,97 @@ def test_score_link_candidate_newsletter_redirect():
 
     score_custom = articles.score_link_candidate("https://link.mail.beehiiv.com/ss/c/another-hash", "another generic text")
     assert score_custom >= 0.55
+
+
+@pytest.mark.parametrize(
+    ("source_type", "section", "content_type", "default_score"),
+    [
+        ("gmail", "Newsletter Content", "newsletter", 0.80),
+        ("reddit_thread", "Legacy Discussion", "reddit_thread", 0.65),
+        ("reddit_post", "Legacy Discussion", "reddit_thread", 0.65),
+        ("podcast_episode", "Podcast Signals", "podcast", 0.65),
+        ("youtube_video", "YouTube Videos", "video", 0.65),
+        ("collection_chunk", "Collections", "collection", 0.65),
+        ("market_snapshot", "Markets", "market", 0.65),
+        ("sec_filing", "SEC Filings", "sec_filing", 0.85),
+        ("fred_series", "Macro Indicators", "fred_series", 0.88),
+    ],
+)
+def test_direct_article_results_source_table(source_type, section, content_type, default_score):
+    payload = NormalizedPayload(
+        source_type=source_type,
+        source_name="direct source",
+        original_url="https://example.com/direct-item",
+        raw_text="Direct payload body text for table-driven mapping checks.",
+    )
+
+    results = articles.direct_article_results([payload])
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.status == "fetched"
+    assert result.section == section
+    assert result.content_type == content_type
+    assert result.link_score == pytest.approx(default_score)
+
+
+def test_direct_article_results_table_covers_every_mapped_source_type():
+    table_types = set(articles._DIRECT_SOURCE_META)
+    assert table_types == {
+        "gmail",
+        "reddit_thread",
+        "reddit_post",
+        "podcast_episode",
+        "youtube_video",
+        "collection_chunk",
+        "market_snapshot",
+        "sec_filing",
+        "fred_series",
+    }
+
+
+def test_direct_article_results_prefers_quality_score_metadata():
+    payload = NormalizedPayload(
+        source_type="podcast_episode",
+        source_name="podcast feed",
+        original_url="https://example.com/episode",
+        raw_text="Episode summary text.",
+        metadata={"episode_quality_score": 0.91},
+    )
+
+    results = articles.direct_article_results([payload])
+
+    assert results[0].link_score == pytest.approx(0.91)
+
+
+def test_direct_article_results_quality_chain_accepts_any_known_key():
+    # Behavior preserved from the pre-table implementation: the score chain tries
+    # every known quality key regardless of source_type.
+    payload = NormalizedPayload(
+        source_type="gmail",
+        source_name="newsletter@example.com",
+        original_url="https://example.com/newsletter",
+        raw_text="Newsletter body.",
+        metadata={"thread_quality_score": 0.42},
+    )
+
+    results = articles.direct_article_results([payload])
+
+    assert results[0].link_score == pytest.approx(0.42)
+
+
+def test_direct_article_results_skips_unmapped_or_urlless_payloads():
+    unmapped = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="newsletter@example.com",
+        original_url="https://example.com/article",
+        raw_text="Link payload handled by the fetch path instead.",
+    )
+    urlless = NormalizedPayload(
+        source_type="gmail",
+        source_name="newsletter@example.com",
+        original_url="",
+        raw_text="Direct payload without a URL.",
+    )
+
+    assert articles.direct_article_results([unmapped, urlless]) == []
