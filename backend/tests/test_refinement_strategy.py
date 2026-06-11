@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from backend.app.services import refinement
+from backend.app.services import refinement, refinement_session
 
 
 def _profile(**overrides):
@@ -393,7 +393,7 @@ def test_add_this_to_strategy_updates_executable_queries_deterministically():
 
 def test_apply_agent_update_ignores_model_ready_without_user_confirmation(monkeypatch):
     # Keep the second model pass inert so the test never touches the network.
-    monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)
+    monkeypatch.setattr(refinement_session, "_critique_search_plan", lambda profile: profile)
 
     profile = refinement._coerce_profile(_profile())
     agent_update = {
