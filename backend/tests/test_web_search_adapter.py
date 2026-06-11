@@ -78,7 +78,7 @@ def test_search_web_uses_tavily_payload_shape(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_TAVILY_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "tavily")
-    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: FakeClient())
 
     results = asyncio.run(web_search.search_web("local AI", limit=3))
 
@@ -119,7 +119,7 @@ def test_search_web_uses_tavily_aliases(monkeypatch, tmp_path, provider_alias: s
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_TAVILY_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", provider_alias)
-    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: FakeClient())
 
     results = asyncio.run(web_search.search_web("local AI", limit=3))
 
@@ -167,7 +167,7 @@ def test_search_web_prefers_configured_provider_order(monkeypatch, tmp_path) -> 
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_TAVILY_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_BRAVE_API_KEY", "brave-key")
-    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: FakeClient())
 
     results = asyncio.run(web_search.search_web("local AI", limit=2))
 
@@ -217,7 +217,7 @@ def test_search_web_uses_brave_aliases(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_BRAVE_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "brave")
-    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: FakeClient())
 
     results = asyncio.run(web_search.search_web("local AI", limit=2))
 
@@ -267,7 +267,7 @@ def test_search_web_uses_serpapi_aliases(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_SERPAPI_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "serp-api")
-    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: FakeClient())
 
     results = asyncio.run(web_search.search_web("local AI", limit=2))
 
@@ -317,7 +317,7 @@ def test_search_web_uses_serper_aliases(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_SERPER_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "serper")
-    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: FakeClient())
 
     results = asyncio.run(web_search.search_web("local AI", limit=2))
 
@@ -558,7 +558,7 @@ def test_search_web_trims_long_provider_queries(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("MORNING_DISPATCH_TAVILY_API_KEY", "test-key")
     monkeypatch.setenv("MORNING_DISPATCH_WEB_SEARCH_PROVIDER", "tavily")
-    monkeypatch.setattr(web_search.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: FakeClient())
 
     asyncio.run(web_search.search_web("Mexico City travel " * 80, limit=3))
 

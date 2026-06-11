@@ -42,7 +42,7 @@ def _capturing_client(captured: dict, payload: dict):
         async def __aexit__(self, *_args) -> None:
             return None
 
-        async def post(self, url, *, json=None, headers=None):  # noqa: A002
+        async def post(self, url, *, json=None, headers=None, timeout=None):  # noqa: A002
             captured["url"] = url
             captured["json"] = json
             return _FakeResponse(payload)
@@ -55,11 +55,8 @@ def _capturing_client(captured: dict, payload: dict):
 
 def test_serper_uses_organic_endpoint_with_tbs_for_organic_vertical(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(
-        web_search.httpx,
-        "AsyncClient",
-        _capturing_client(captured, {"organic": [{"title": "T", "link": "https://e.mx/a", "snippet": "s"}]}),
-    )
+    client_cls = _capturing_client(captured, {"organic": [{"title": "T", "link": "https://e.mx/a", "snippet": "s"}]})
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: client_cls())
     backend = web_search.SerperBackend(api_key="k")
     hits = asyncio.run(backend.search("tacos cdmx", 10, language="es", days=180, vertical="organic"))
 
@@ -71,11 +68,8 @@ def test_serper_uses_organic_endpoint_with_tbs_for_organic_vertical(monkeypatch)
 
 def test_serper_uses_news_endpoint_for_news_vertical(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(
-        web_search.httpx,
-        "AsyncClient",
-        _capturing_client(captured, {"news": [{"title": "T", "link": "https://e.com/a", "snippet": "s"}]}),
-    )
+    client_cls = _capturing_client(captured, {"news": [{"title": "T", "link": "https://e.com/a", "snippet": "s"}]})
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: client_cls())
     backend = web_search.SerperBackend(api_key="k")
     asyncio.run(backend.search("breaking", 10, days=1, vertical="news"))
 
@@ -84,11 +78,8 @@ def test_serper_uses_news_endpoint_for_news_vertical(monkeypatch) -> None:
 
 def test_serper_auto_vertical_preserves_news_when_bounded(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(
-        web_search.httpx,
-        "AsyncClient",
-        _capturing_client(captured, {"news": []}),
-    )
+    client_cls = _capturing_client(captured, {"news": []})
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: client_cls())
     backend = web_search.SerperBackend(api_key="k")
     asyncio.run(backend.search("q", 10, days=30, vertical="auto"))
 
@@ -98,11 +89,8 @@ def test_serper_auto_vertical_preserves_news_when_bounded(monkeypatch) -> None:
 
 def test_tavily_omits_news_topic_for_organic_vertical(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(
-        web_search.httpx,
-        "AsyncClient",
-        _capturing_client(captured, {"results": []}),
-    )
+    client_cls = _capturing_client(captured, {"results": []})
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: client_cls())
     backend = web_search.TavilyBackend(api_key="k")
     asyncio.run(backend.search("q", 5, days=180, vertical="organic"))
 
@@ -112,11 +100,8 @@ def test_tavily_omits_news_topic_for_organic_vertical(monkeypatch) -> None:
 
 def test_tavily_keeps_news_topic_for_auto_vertical(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(
-        web_search.httpx,
-        "AsyncClient",
-        _capturing_client(captured, {"results": []}),
-    )
+    client_cls = _capturing_client(captured, {"results": []})
+    monkeypatch.setattr(web_search, "shared_async_client", lambda **_kwargs: client_cls())
     backend = web_search.TavilyBackend(api_key="k")
     asyncio.run(backend.search("q", 5, days=7, vertical="auto"))
 

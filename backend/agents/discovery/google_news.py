@@ -18,6 +18,7 @@ import feedparser
 from bs4 import BeautifulSoup
 
 from backend.app.core.config import get_settings
+from backend.app.core.http_pool import shared_async_client
 
 logger = logging.getLogger(__name__)
 
@@ -91,9 +92,9 @@ async def fetch_google_news(
         response.raise_for_status()
         return response
     
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        response = await make_request(client)
-        
+    client = shared_async_client(purpose="google_news", timeout=timeout, follow_redirects=True)
+    response = await make_request(client)
+
     feed = feedparser.parse(response.text)
     hits = []
     
@@ -364,12 +365,9 @@ async def decode_google_news_url(
             _write_decode_negative_cache(guid, "decode_exception")
         return None
 
-    decoded_url = None
     if client is None:
-        async with httpx.AsyncClient(follow_redirects=True) as local_client:
-            decoded_url = await _do_decode(local_client)
-    else:
-        decoded_url = await _do_decode(client)
+        client = shared_async_client(purpose="google_news", timeout=timeout, follow_redirects=True)
+    decoded_url = await _do_decode(client)
 
     if decoded_url:
         _write_decode_cache(guid, decoded_url)
