@@ -11,29 +11,55 @@ from dataclasses import dataclass, replace, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 import httpx
-from bs4 import BeautifulSoup
 
 from backend.agents.agentic import AgentDecision
 from backend.agents.digestor.base import NormalizedPayload, pii_filter
+from backend.agents.digestor.podcast_http import (
+    REQUEST_TIMEOUT_SECONDS,
+    USER_AGENT,
+    _apple_url_from_itunes_id,
+    _audio_path as _audio_path,
+    _clean_html,
+    _clean_text,
+    _download_audio,
+    _download_transcript_text,
+    _flatten_json_transcript as _flatten_json_transcript,
+    _lookup_apple_podcast_url,
+    _normalize_title as _normalize_title,
+    _normalize_url_for_match,
+    _nullable_str as _nullable_str,
+    aclose_shared_podcast_clients as aclose_shared_podcast_clients,
+    discover_podcasts,
+    shared_podcast_client as shared_podcast_client,
+)
+from backend.agents.digestor.podcast_resolution import (
+    _extract_show_name_from_hit_title as _extract_show_name_from_hit_title,
+    _feed_url_from_search_hit,
+    _match_episode_in_feed,
+    _resolve_feed_url,
+    get_cached_resolution,
+    set_cached_resolution,
+)
 from backend.agents.librarian.text_utils import keyword_set
 from backend.app.core.config import get_settings
 from backend.app.db import database
 from backend.db.queries import get_watermark, upsert_watermark
 import json
 
+if TYPE_CHECKING:
+    from backend.agents.discovery.types import TopicProfile
+
 logger = logging.getLogger(__name__)
 
 MAX_PODCAST_EPISODES = 8
 MAX_DISCOVERED_FEEDS = 8
 MAX_DISCOVERY_LANES = 8
-REQUEST_TIMEOUT_SECONDS = 20
 MIN_EPISODE_SCORE = 0.22
-USER_AGENT = "MorningDispatch/0.1 (+https://tailnet.local)"
 # Podcast namespace that carries <podcast:transcript> elements (Podcasting 2.0).
 PODCAST_NS = "https://podcastindex.org/namespace/1.0"
 # Hard ceiling for a single audio transcription so one slow episode cannot block
@@ -532,49 +558,6 @@ async def _timed_fetch_feed_episodes(
     return episodes, _elapsed_ms(started_at)
 
 
-async def discover_podcasts(query: str, *, limit: int = 8) -> list[dict[str, Any]]:
-    settings = get_settings()
-    key = settings.podcastindex_api_key
-    secret = settings.podcastindex_api_secret
-    if not key or not secret or not query.strip():
-        return []
-
-    auth_date = str(int(time.time()))
-    authorization = hashlib.sha1(f"{key}{secret}{auth_date}".encode("utf-8")).hexdigest()
-    headers = {
-        "User-Agent": USER_AGENT,
-        "X-Auth-Date": auth_date,
-        "X-Auth-Key": key,
-        "Authorization": authorization,
-    }
-    params = {"q": query.strip(), "max": max(1, min(limit, 25))}
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True, headers=headers) as client:
-        response = await client.get("https://api.podcastindex.org/api/1.0/search/byterm", params=params)
-        response.raise_for_status()
-        data = response.json()
-
-    feeds = data.get("feeds") if isinstance(data, dict) else []
-    results = []
-    for feed in feeds if isinstance(feeds, list) else []:
-        feed_url = str(feed.get("url") or "").strip()
-        if not feed_url:
-            continue
-        results.append(
-            {
-                "type": "podcast_rss",
-                "title": str(feed.get("title") or "Podcast").strip(),
-                "feed_url": feed_url,
-                "site_url": feed.get("link"),
-                "author": feed.get("author"),
-                "description": _clean_html(str(feed.get("description") or ""))[:600],
-                "aggregator": "podcastindex",
-                "itunes_id": _nullable_str(feed.get("itunesId") or feed.get("itunes_id")),
-                "apple_podcasts_url": _apple_url_from_itunes_id(feed.get("itunesId") or feed.get("itunes_id")),
-            }
-        )
-    return results
-
-
 def _within_staleness(published_at: str | None, staleness_days: int) -> bool:
     """True only when a parseable publish date falls within the staleness window.
 
@@ -918,16 +901,6 @@ async def _discover_sources_from_web(queries: list[str], digest_interest: str) -
     return list(discovered.values())[:MAX_DISCOVERED_FEEDS]
 
 
-def _feed_url_from_search_hit(url: str) -> str:
-    parsed = urlparse(str(url or ""))
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return ""
-    lowered = url.lower()
-    if any(marker in lowered for marker in ("rss", "feed", ".xml", "podcast.xml")):
-        return url
-    return ""
-
-
 def _podcast_title_from_search_hit(title: str, url: str) -> str:
     clean_title = re.sub(r"\s*[-|•]\s*(apple podcasts|spotify|podcast addict|listen notes|podcasts?)\s*$", "", str(title or ""), flags=re.I).strip()
     if clean_title and len(clean_title.split()) <= 12:
@@ -1238,22 +1211,6 @@ def _should_transcribe(episode: PodcastEpisode, source: dict[str, Any], score: f
     return score >= float(source.get("transcribe_threshold") or 0.34)
 
 
-async def _download_audio(episode: PodcastEpisode) -> Path:
-    if not episode.audio_url:
-        raise ValueError("Episode has no audio URL")
-    path = _audio_path(episode)
-    if path.exists() and path.stat().st_size > 0:
-        return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    async with httpx.AsyncClient(timeout=None, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-        async with client.stream("GET", episode.audio_url) as response:
-            response.raise_for_status()
-            with path.open("wb") as handle:
-                async for chunk in response.aiter_bytes():
-                    handle.write(chunk)
-    return path
-
-
 def _run_transcription(
     audio_path: Path,
     transcript_path: Path,
@@ -1277,59 +1234,6 @@ def _run_transcription(
     if not transcript_path.exists():
         raise RuntimeError("Transcription command did not create a transcript")
     return transcript_path.read_text(encoding="utf-8", errors="replace")
-
-
-async def _download_transcript_text(url: str) -> str:
-    """Fetch a publisher transcript URL and normalize it to plain text."""
-    try:
-        async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={"User-Agent": USER_AGENT},
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            body = response.text
-            content_type = str(response.headers.get("content-type", "")).lower()
-    except Exception as exc:
-        logger.info("Podcast transcript fetch failed for %s: %s", url, exc)
-        return ""
-    lowered = url.lower()
-    if "html" in content_type or lowered.endswith((".html", ".htm")):
-        return _clean_html(body)
-    if "json" in content_type or lowered.endswith(".json"):
-        try:
-            return _clean_text(_flatten_json_transcript(json.loads(body)))
-        except (ValueError, TypeError):
-            return ""
-    # SRT / VTT / plain text: drop cue indexes, timestamps, and WEBVTT headers.
-    lines: list[str] = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.upper().startswith("WEBVTT"):
-            continue
-        if "-->" in stripped:
-            continue
-        if stripped.isdigit():
-            continue
-        lines.append(stripped)
-    return _clean_text(" ".join(lines))
-
-
-def _flatten_json_transcript(data: Any) -> str:
-    """Extract spoken text from common JSON transcript shapes (segments[].body/text)."""
-    segments = data.get("segments") if isinstance(data, dict) else data
-    if not isinstance(segments, list):
-        return ""
-    parts: list[str] = []
-    for segment in segments:
-        if isinstance(segment, dict):
-            text = segment.get("body") or segment.get("text") or segment.get("transcript")
-            if text:
-                parts.append(str(text))
-        elif isinstance(segment, str):
-            parts.append(segment)
-    return " ".join(parts)
 
 
 def _episode_payload_text(episode: PodcastEpisode, text: str, transcript_source: str) -> str:
@@ -1394,88 +1298,9 @@ def _source_apple_url(source: dict[str, Any]) -> str | None:
     return _apple_url_from_itunes_id(source.get("itunes_id") or source.get("itunesId"))
 
 
-async def _lookup_apple_podcast_url(
-    client: httpx.AsyncClient,
-    episode: PodcastEpisode,
-    source: dict[str, Any],
-) -> str | None:
-    query = str(source.get("title") or episode.show_name or "").strip()
-    if not query:
-        return None
-    try:
-        response = await client.get(
-            "https://itunes.apple.com/search",
-            params={
-                "term": query,
-                "media": "podcast",
-                "entity": "podcast",
-                "country": "US",
-                "limit": 10,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        logger.info("Apple Podcasts lookup failed for %s: %s", episode.show_name, exc)
-        return None
-
-    results = data.get("results") if isinstance(data, dict) else []
-    if not isinstance(results, list):
-        return None
-    feed_url = _normalize_url_for_match(episode.feed_url)
-    show_name = _normalize_title(episode.show_name)
-    fallback_url: str | None = None
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        collection_url = str(result.get("collectionViewUrl") or "").strip()
-        if collection_url.startswith(("https://podcasts.apple.com/", "https://itunes.apple.com/")):
-            fallback_url = fallback_url or collection_url
-        result_feed_url = _normalize_url_for_match(str(result.get("feedUrl") or ""))
-        result_name = _normalize_title(str(result.get("collectionName") or ""))
-        if collection_url and (result_feed_url == feed_url or result_name == show_name):
-            return collection_url
-    return fallback_url
-
-
-def _apple_url_from_itunes_id(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in {"0", "-1"}:
-        return None
-    if not text.isdigit():
-        return None
-    return f"https://podcasts.apple.com/podcast/id{text}"
-
-
-def _nullable_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _normalize_url_for_match(value: str) -> str:
-    parsed = urlparse(value.strip())
-    if not parsed.scheme or not parsed.netloc:
-        return value.strip().rstrip("/")
-    path = parsed.path.rstrip("/")
-    return f"{parsed.netloc.lower()}{path}"
-
-
-def _normalize_title(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
-
-
 def _source_key(feed_url: str) -> str:
     digest = hashlib.sha1(feed_url.encode("utf-8")).hexdigest()[:16]
     return f"podcast:{digest}"
-
-
-def _audio_path(episode: PodcastEpisode) -> Path:
-    suffix = Path(urlparse(episode.audio_url or "").path).suffix or ".mp3"
-    return get_settings().data_dir / "podcast-audio" / f"{episode.episode_id}{suffix}"
 
 
 def _transcript_path(episode: PodcastEpisode) -> Path:
@@ -1575,15 +1400,6 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _clean_html(value: str) -> str:
-    soup = BeautifulSoup(value or "", "html.parser")
-    return _clean_text(soup.get_text(" ", strip=True))
-
-
-def _clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
-
-
 def _discovery_query(digest_interest: str) -> str:
     from backend.agents.librarian.text_utils import tokens, STOPWORDS
     seen = set()
@@ -1627,12 +1443,9 @@ async def _episode_first_search_and_resolve(
     deadline: float | None = None,
 ) -> list[PodcastEpisode]:
     from backend.agents.discovery.web_search import lookback_to_days, search_web, SearchHit
-    from backend.agents.discovery.types import TopicProfile
     from backend.app.db.database import (
         get_cached_podcast_discovery,
         set_cached_podcast_discovery,
-        get_cached_podcast_resolution,
-        set_cached_podcast_resolution,
     )
     days = lookback_to_days(lookback_hours)
 
@@ -1834,7 +1647,7 @@ async def _episode_first_search_and_resolve(
 
     async def resolve_one(hit: Any, http_client: httpx.AsyncClient) -> PodcastEpisode | None:
         url_norm = _normalize_url_for_match(hit.url)
-        cached_res = get_cached_podcast_resolution(url_norm)
+        cached_res = get_cached_resolution(url_norm)
 
         if cached_res is not None:
             feed_url = cached_res.get("feed_url")
@@ -1846,12 +1659,12 @@ async def _episode_first_search_and_resolve(
 
         if not feed_url:
             # Cache failure for 1 hour (3600 seconds)
-            set_cached_podcast_resolution(url_norm, None, None, None, 3600)
+            set_cached_resolution(url_norm, None, None, None, 3600)
             return None
 
         # Cache success for 7 days (604800 seconds)
         if cached_res is None:
-            set_cached_podcast_resolution(url_norm, feed_url, None, None, 7 * 24 * 3600)
+            set_cached_resolution(url_norm, feed_url, None, None, 7 * 24 * 3600)
 
         diagnostics["feed_resolved"] += 1
 
@@ -1911,7 +1724,7 @@ async def _episode_first_search_and_resolve(
                 apple_url = await _lookup_apple_podcast_url(http_client, matched_ep, {"title": matched_ep.show_name})
             if apple_url:
                 # Update resolution cache with the apple_url
-                set_cached_podcast_resolution(url_norm, feed_url, None, apple_url, 7 * 24 * 3600)
+                set_cached_resolution(url_norm, feed_url, None, apple_url, 7 * 24 * 3600)
 
         if apple_url:
             matched_ep = replace(matched_ep, apple_podcasts_url=apple_url)
@@ -1970,7 +1783,6 @@ async def _screen_episodes_with_agent(
     deadline: float | None = None,
 ) -> list[Any]:
     from backend.app.services import model_routing
-    from backend.agents.discovery.types import TopicProfile
     from backend.app.core.prompt_loader import load_prompt
     settings = get_settings()
     try:
@@ -2107,124 +1919,6 @@ async def _screen_episodes_with_agent(
     return kept
 
 
-async def _resolve_feed_url(
-    client: httpx.AsyncClient,
-    url: str,
-    title: str,
-    decisions: list[AgentDecision],
-) -> str | None:
-    if "podcasts.apple.com" in url or "itunes.apple.com" in url:
-        match = re.search(r"/id(\d+)", url)
-        if match:
-            itunes_id = match.group(1)
-            try:
-                response = await client.get(
-                    "https://itunes.apple.com/lookup",
-                    params={"id": itunes_id},
-                )
-                response.raise_for_status()
-                data = response.json()
-                results = data.get("results", [])
-                if results and isinstance(results[0], dict):
-                    feed_url = results[0].get("feedUrl")
-                    if feed_url:
-                        decisions.append(
-                            _decision(
-                                target=title,
-                                decision="resolved",
-                                action="itunes_lookup",
-                                confidence=0.95,
-                                reason=f"Resolved RSS feed from Apple iTunes ID {itunes_id}.",
-                                metadata={"feed_url": feed_url},
-                            )
-                        )
-                        return feed_url
-            except Exception as exc:
-                logger.info("iTunes lookup failed for ID %s: %s", itunes_id, exc)
-
-    show_name = _extract_show_name_from_hit_title(title)
-    if show_name:
-        try:
-            results = await discover_podcasts(show_name, limit=3)
-            if results:
-                feed_url = results[0].get("feed_url")
-                if feed_url:
-                    decisions.append(
-                        _decision(
-                            target=title,
-                            decision="resolved",
-                            action="podcast_index_lookup",
-                            confidence=0.85,
-                            reason=f"Resolved RSS feed from Podcast Index show search for '{show_name}'.",
-                            metadata={"feed_url": feed_url},
-                        )
-                    )
-                    return feed_url
-        except Exception as exc:
-            logger.info("Podcast Index lookup failed for show '%s': %s", show_name, exc)
-
-    try:
-        response = await client.get(url, timeout=10.0)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        for link in soup.find_all("link", rel="alternate"):
-            link_type = str(link.get("type") or "").lower()
-            link_href = str(link.get("href") or "").strip()
-            if ("rss" in link_type or "xml" in link_type) and link_href:
-                from urllib.parse import urljoin
-                feed_url = urljoin(url, link_href)
-                decisions.append(
-                    _decision(
-                        target=title,
-                        decision="resolved",
-                        action="rss_autodiscovery",
-                        confidence=0.88,
-                        reason="Resolved RSS feed via autodiscovery link on page.",
-                        metadata={"feed_url": feed_url},
-                    )
-                )
-                return feed_url
-    except Exception as exc:
-        logger.info("RSS Autodiscovery failed for URL %s: %s", url, exc)
-
-    if show_name:
-        web_query = f"{show_name} podcast RSS feed"
-        try:
-            from backend.agents.discovery.web_search import lookback_to_days, search_web
-            days = lookback_to_days(24 * 365)
-            hits = await search_web(web_query, limit=3, days=days)
-            for hit in hits:
-                feed_url = _feed_url_from_search_hit(hit.url)
-                if feed_url:
-                    decisions.append(
-                        _decision(
-                            target=title,
-                            decision="resolved",
-                            action="rss_web_search",
-                            confidence=0.80,
-                            reason=f"Resolved RSS feed via web search for '{show_name} RSS feed'.",
-                            metadata={"feed_url": feed_url},
-                        )
-                    )
-                    return feed_url
-        except Exception as exc:
-            logger.info("RSS web search fallback failed for show '%s': %s", show_name, exc)
-
-    return None
-
-
-def _extract_show_name_from_hit_title(title: str) -> str:
-    cleaned = re.sub(r"\s*[-|•:|]\s*(apple podcasts|spotify|podcast addict|listen notes|podcasts?|youtube)\s*$", "", title, flags=re.I).strip()
-    for sep in ("|", "-", "•", ":"):
-        if sep in cleaned:
-            parts = cleaned.split(sep)
-            for part in parts:
-                p = part.strip()
-                if "episode" not in p.lower() and "interview" not in p.lower() and len(p.split()) <= 5 and len(p) > 2:
-                    return p
-    return cleaned
-
-
 def _latest_in_window_episode(
     episodes: list[PodcastEpisode], lookback_hours: int
 ) -> PodcastEpisode | None:
@@ -2237,61 +1931,3 @@ def _latest_in_window_episode(
     if not in_window:
         return None
     return max(in_window, key=lambda ep: ep.published_at or "")
-
-
-def _match_episode_in_feed(episodes: list[PodcastEpisode], hit: Any) -> PodcastEpisode | None:
-    cand_url = _normalize_url_for_match(hit.url).lower()
-    for ep in episodes:
-        if ep.episode_url:
-            ep_url_norm = _normalize_url_for_match(ep.episode_url).lower()
-            if ep_url_norm in cand_url or cand_url in ep_url_norm:
-                return ep
-        if ep.audio_url:
-            ep_audio_norm = _normalize_url_for_match(ep.audio_url).lower()
-            if ep_audio_norm in cand_url or cand_url in ep_audio_norm:
-                return ep
-
-    # Try Szymkiewicz-Simpson token overlap matching
-    from backend.agents.librarian.text_utils import keyword_set
-    cand_tokens = keyword_set(hit.title)
-    if cand_tokens:
-        for ep in episodes:
-            ep_tokens = keyword_set(ep.title)
-            if not ep_tokens:
-                continue
-            overlap = len(cand_tokens & ep_tokens) / max(1, min(len(cand_tokens), len(ep_tokens)))
-            if overlap >= 0.65:
-                return ep
-
-    # Fallback to normalized subtitle/substring matching (Issue 4)
-    def clean_title_for_soft_match(t: str, show_name: str | None = None) -> str:
-        t_clean = t.lower()
-        if show_name:
-            # Strip show name suffix/prefix
-            sn = show_name.lower()
-            t_clean = re.sub(rf"\b{re.escape(sn)}\b", "", t_clean)
-        # Strip common podcast markers & episode numbering patterns
-        t_clean = re.sub(r"\b(episode|ep|show)\s*\d+\b", "", t_clean)
-        t_clean = re.sub(r"[^\w\s]", " ", t_clean)
-        return " ".join(t_clean.split())
-
-    for ep in episodes:
-        cand_clean = clean_title_for_soft_match(hit.title, ep.show_name)
-        ep_clean = clean_title_for_soft_match(ep.title, ep.show_name)
-        if not cand_clean or not ep_clean:
-            continue
-        # Check substring containment
-        if cand_clean in ep_clean or ep_clean in cand_clean:
-            return ep
-        # Cleaned token overlap
-        cand_clean_tokens = set(cand_clean.split())
-        ep_clean_tokens = set(ep_clean.split())
-        # Filter short/worthless tokens
-        cand_clean_tokens = {tok for tok in cand_clean_tokens if len(tok) > 2}
-        ep_clean_tokens = {tok for tok in ep_clean_tokens if len(tok) > 2}
-        if cand_clean_tokens and ep_clean_tokens:
-            overlap = len(cand_clean_tokens & ep_clean_tokens) / max(1, min(len(cand_clean_tokens), len(ep_clean_tokens)))
-            if overlap >= 0.75:
-                return ep
-
-    return None
