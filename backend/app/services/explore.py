@@ -28,7 +28,7 @@ from backend.agents.discovery.must_have import (
     must_have_reason,
 )
 from backend.agents.digestor.base import NormalizedPayload
-from backend.app.services import brief_settings, email_delivery, mcp_status, model_routing
+from backend.app.services import brief_settings, email_delivery, model_routing
 from backend.app.services.source_window import (  # noqa: F401 — re-exported for tests/adapters
     _DATE_METADATA_KEYS,
     _STRICT_SOURCE_WINDOW_TYPES,
@@ -214,10 +214,6 @@ def save_podcast_subscriptions(topic_id: str, shows: list[dict[str, Any]]) -> di
 
 async def source_status() -> dict[str, Any]:
     settings = get_settings()
-    try:
-        mcp = await mcp_status.status(settings)
-    except Exception:
-        mcp = {}
     web_enabled = bool(
         settings.web_search_tavily_api_key
         or settings.web_search_brave_api_key
@@ -430,10 +426,12 @@ async def run_discovery(
             "discovery": result.to_dict(),
         }
     except BuildCancelled as exc:
+        exploration_id = str(exploration["exploration_id"])
+        progress: dict[str, Any] = {}
         progress["cancel_requested"] = True
         progress["error"] = str(exc) or "Build stopped by user."
         _set_pipeline_stage(progress, "done", "failed")
-        _persist_progress(exploration_id, progress)
+        _persist_progress(exploration_id, progress, flush=True)
         database.update_exploration_status(
             exploration_id,
             status="failed",
