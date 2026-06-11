@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 from typing import Any
 import pytest
 
@@ -122,6 +121,7 @@ def test_explore_retry_logic(monkeypatch, tmp_path) -> None:
         persist: Any,
         threshold: float = 0.45,
         low_yield: bool = False,
+        **kwargs: Any,
     ):
         digest_core_runs.append({
             "threshold": threshold,
@@ -135,7 +135,7 @@ def test_explore_retry_logic(monkeypatch, tmp_path) -> None:
             # High yield
             return [article1, article2, article3]
 
-    async def mock_broaden_queries(profile: TopicProfile) -> TopicProfile:
+    async def mock_broaden_queries(profile: TopicProfile, **kwargs: Any) -> TopicProfile:
         broaden_calls.append(profile)
         # Update queries to simulate broadening
         return explore.replace(profile, search_queries=("AI capex",))

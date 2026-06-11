@@ -1119,6 +1119,7 @@ def test_scheduled_run_promotes_kept_sources(monkeypatch, tmp_path) -> None:
             inference_run_id: str,
             progress: dict[str, object],
             persist: object,
+            **_kwargs: object,
     ) -> list[ArticleFetchResult]:
         return fetched_articles
 
@@ -1225,6 +1226,7 @@ def test_scheduled_run_promotes_deduped_sources(monkeypatch, tmp_path) -> None:
             inference_run_id: str,
             progress: dict[str, object],
             persist: object,
+            **_kwargs: object,
     ) -> list[ArticleFetchResult]:
         return fetched_articles
 
@@ -1746,6 +1748,7 @@ def test_explore_progress_includes_exclusion_reasons(monkeypatch, tmp_path) -> N
             inference_run_id: str,
             progress: dict[str, Any],
             persist: object,
+            **_kwargs: Any,
     ) -> list[ArticleFetchResult]:
         return []
 

@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from email.utils import parsedate_to_datetime
-import hashlib
 import json
 from pathlib import Path
 import logging
 import re
 from time import monotonic
 from typing import Any
-import inspect
 
 from backend.agents.brief_quality import apply_brief_quality_checks
 from backend.agents.critic import apply_critic_repairs
@@ -32,13 +28,50 @@ from backend.agents.discovery.must_have import (
     must_have_reason,
 )
 from backend.agents.digestor.base import NormalizedPayload
-from backend.app.services import brief_settings, email_delivery, mcp_status, model_routing
+from backend.app.services import brief_settings, email_delivery, model_routing
+from backend.app.services.source_window import (  # noqa: F401 — re-exported for tests/adapters
+    _DATE_METADATA_KEYS,
+    _STRICT_SOURCE_WINDOW_TYPES,
+    _adapter_from_payload_type,
+    _adjudicate_dates_before_source_window_filter,
+    _apply_source_window_filter,
+    _article_published_at,
+    _article_text_or_url_date,
+    _date_from_text,
+    _date_from_url,
+    _foreign_language_coverage_notes,
+    _parse_datetime_hint,
+    _reserve_sort_key,
+    _revive_out_of_window,
+    _served_undated_items_from_results,
+)
+from backend.app.services.exploration_progress import (  # noqa: F401 — re-exported for tests
+    _PIPELINE_STAGES,
+    _discard_progress_persist_state,
+    _init_reasoning_bucket,
+    _initial_progress,
+    _persist_progress,
+    _persist_progress_async,
+    _persistable_progress,
+    _reasoning_flusher,
+    _set_candidate_count,
+    _set_exclusion_reasons,
+    _set_pipeline_stage,
+    _set_source_status,
+)
+from backend.app.services.build_queue import (  # noqa: F401 — re-exported for main.py/routes
+    BuildCancelled,
+    _raise_if_cancelled,
+    _signal_build_queue,
+    cancel_exploration,
+    start_build_queue,
+    stop_build_queue,
+)
 from backend.app.services.brief_strategy import selected_source_labels, summarize_search_strategy
 from backend.app.services.brief_title import tight_brief_title
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
-from backend.agents.librarian.date_text import normalize_date_string
 from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
 from backend.agents.source_audit import apply_source_audit
 from backend.app.core.config import ensure_runtime_dirs, get_settings
@@ -50,12 +83,13 @@ from backend.agents.discovery.markets import markets_available
 
 logger = logging.getLogger(__name__)
 
-_BUILD_QUEUE_TASK: asyncio.Task[None] | None = None
-_BUILD_QUEUE_EVENT: asyncio.Event | None = None
-_PIPELINE_STAGES = ("discovery", "fetch", "summarize", "audit", "rank", "review", "done")
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 250
 _REPORTING_LOG_TIMEOUT_SECONDS = 20
-_STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode", "reddit_post"}
+# Placeholder publishing duration rendered into the brief's stats sidebar so the
+# brief can be rendered ONCE: the real duration is only known after rendering, and
+# is patched over this sentinel's formatted text before the single write (P5).
+# The value is absurd on purpose so its formatted form cannot occur naturally.
+_PUBLISHING_SENTINEL_SECONDS = 987654321.123
 # Source types that require an outbound HTTP article fetch (they compete for the
 # article-fetch budget). Everything else is "direct" — built straight from the
 # discovered payload text — so it must NOT consume the HTTP fetch budget (P1).
@@ -80,135 +114,6 @@ _RESERVED_FETCH_FLOOR = 10
 # stays bounded; this headroom exists purely so recency/audit/editorial attrition
 # can't reduce a source to a single item. Bump this if sources still come up thin.
 _FETCH_OVERSAMPLE = 2
-_DATE_METADATA_KEYS = (
-    "published_at",
-    "published",
-    "publication_date",
-    "date",
-    "pub_date",
-    "created_at",
-    "updated_at",
-    "search_result_date",
-)
-_URL_DATE_RE = re.compile(
-    r"(?:^|[^\d])(?P<year>20\d{2})[/-](?P<month>0?[1-9]|1[0-2])"
-    r"(?:[/-](?P<day>0?[1-9]|[12]\d|3[01]))?(?:[^\d]|$)"
-)
-_TEXT_DATE_RE = re.compile(
-    r"\b(?P<month>January|February|March|April|May|June|July|August|September|October|November|December"
-    r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?"
-    r"\s+(?P<day>0?[1-9]|[12]\d|3[01]),?\s+(?P<year>20\d{2})\b",
-    re.IGNORECASE,
-)
-# Locale numeric dates used by Korean/Japanese/Chinese outlets that never emit
-# English month text or ISO meta (e.g. 2026年4月25日, 2026년 4월 25일, 2026.04.25).
-_CJK_DATE_RE = re.compile(
-    r"(20\d{2})\s*[年년]\s*(1[0-2]|0?[1-9])\s*[月월]\s*(3[01]|[12]\d|0?[1-9])\s*[日일]?"
-)
-_DOTTED_DATE_RE = re.compile(
-    r"(?:^|[^\d])(20\d{2})\.(1[0-2]|0?[1-9])\.(3[01]|[12]\d|0?[1-9])(?:[^\d]|$)"
-)
-_MONTHS = {
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "sept": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
-}
-
-
-class BuildCancelled(RuntimeError):
-    pass
-
-
-async def start_build_queue() -> None:
-    global _BUILD_QUEUE_TASK, _BUILD_QUEUE_EVENT
-    requeued = database.requeue_running_explorations()
-    if requeued:
-        logger.info("Requeued %s interrupted exploration build(s)", requeued)
-    if _BUILD_QUEUE_TASK is None or _BUILD_QUEUE_TASK.done():
-        _BUILD_QUEUE_EVENT = asyncio.Event()
-        _BUILD_QUEUE_TASK = asyncio.create_task(_build_queue_worker())
-    _BUILD_QUEUE_EVENT.set()
-
-
-async def stop_build_queue() -> None:
-    global _BUILD_QUEUE_TASK, _BUILD_QUEUE_EVENT
-    if _BUILD_QUEUE_TASK is None:
-        _BUILD_QUEUE_EVENT = None
-        return
-    _BUILD_QUEUE_TASK.cancel()
-    with suppress(asyncio.CancelledError):
-        await _BUILD_QUEUE_TASK
-    _BUILD_QUEUE_TASK = None
-    _BUILD_QUEUE_EVENT = None
-
-
-def _signal_build_queue() -> None:
-    if _BUILD_QUEUE_EVENT is not None:
-        _BUILD_QUEUE_EVENT.set()
-
-
-def cancel_exploration(exploration_id: str) -> dict[str, Any] | None:
-    return database.cancel_exploration(exploration_id)
-
-
-def _raise_if_cancelled(exploration_id: str) -> None:
-    current = database.get_exploration(exploration_id)
-    if current is None:
-        return
-    progress = current.get("progress") or {}
-    if current.get("status") == "failed" and progress.get("cancel_requested"):
-        raise BuildCancelled(str(progress.get("error") or "Build stopped by user."))
-
-
-async def _build_queue_worker() -> None:
-    while True:
-        if _BUILD_QUEUE_EVENT is None:
-            await asyncio.sleep(0.5)
-            continue
-        await _BUILD_QUEUE_EVENT.wait()
-        _BUILD_QUEUE_EVENT.clear()
-        while True:
-            exploration = database.claim_next_queued_exploration()
-            if exploration is None:
-                break
-            progress = dict(exploration.get("progress") or {})
-            queue_options = dict(progress.get("queue_options") or {})
-            try:
-                raw_lh = queue_options.get("lookback_hours")
-                await _run_exploration(
-                    str(exploration["topic_id"]),
-                    mode=str(exploration.get("mode") or "show_now"),
-                    source_selection=dict(exploration.get("source_selection") or {}),
-                    candidate_limit=int(queue_options.get("candidate_limit") or 250),
-                    lookback_hours=int(raw_lh) if raw_lh is not None else None,
-                    existing_exploration=exploration,
-                )
-            except Exception:
-                logger.exception(
-                    "Queued exploration %s failed",
-                    exploration.get("exploration_id"),
-                )
 
 
 def save_topic_profile(payload: dict[str, Any]) -> dict[str, Any]:
@@ -309,10 +214,6 @@ def save_podcast_subscriptions(topic_id: str, shows: list[dict[str, Any]]) -> di
 
 async def source_status() -> dict[str, Any]:
     settings = get_settings()
-    try:
-        mcp = await mcp_status.status(settings)
-    except Exception:
-        mcp = {}
     web_enabled = bool(
         settings.web_search_tavily_api_key
         or settings.web_search_brave_api_key
@@ -525,16 +426,18 @@ async def run_discovery(
             "discovery": result.to_dict(),
         }
     except BuildCancelled as exc:
+        exploration_id = str(exploration["exploration_id"])
+        progress: dict[str, Any] = {}
         progress["cancel_requested"] = True
         progress["error"] = str(exc) or "Build stopped by user."
         _set_pipeline_stage(progress, "done", "failed")
-        _persist_progress(exploration_id, progress)
+        _persist_progress(exploration_id, progress, flush=True)
         database.update_exploration_status(
             exploration_id,
             status="failed",
         )
         return None
-    except Exception as exc:  # pragma: no cover - important path for production reliability.
+    except Exception:  # pragma: no cover - important path for production reliability.
         logger.exception(
             "Exploration discovery %s failed for topic profile %s",
             exploration["exploration_id"],
@@ -659,16 +562,6 @@ async def run_scheduled(
     )
 
 
-def _accepts_param(func: Any, param_name: str) -> bool:
-    try:
-        sig = inspect.signature(func)
-        if param_name in sig.parameters:
-            return True
-        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    except (TypeError, ValueError):
-        return False
-
-
 async def _run_exploration(
     topic_id: str,
     *,
@@ -712,7 +605,7 @@ async def _run_exploration(
 
     registry = default_source_registry()
     _set_pipeline_stage(progress, "discovery", "running")
-    _persist_progress(exploration_id, progress)
+    await _persist_progress_async(exploration_id, progress, flush=True)
     try:
         current_profile = profile
         low_yield_mode = False
@@ -732,19 +625,15 @@ async def _run_exploration(
                 _persist_progress(exploration_id, progress)
 
             _set_pipeline_stage(progress, "discovery", "running")
-            _persist_progress(exploration_id, progress)
-            # 1. Run DiscoveryRunner with inspect signature check
+            await _persist_progress_async(exploration_id, progress, flush=True)
             runner = DiscoveryRunner(registry)
-            run_kwargs = {
-                "profile": current_profile,
-                "source_selection": merged_selection,
-                "context": context,
-                "on_adapter_status": on_adapter_status,
-            }
-            if _accepts_param(runner.run, "low_yield"):
-                run_kwargs["low_yield"] = low_yield_mode
-
-            discovery = await runner.run(**run_kwargs)
+            discovery = await runner.run(
+                current_profile,
+                source_selection=merged_selection,
+                context=context,
+                on_adapter_status=on_adapter_status,
+                low_yield=low_yield_mode,
+            )
             _raise_if_cancelled(exploration_id)
             _set_pipeline_stage(progress, "discovery", "done")
             _set_exclusion_reasons(progress, discovery.exclusions)
@@ -760,7 +649,7 @@ async def _run_exploration(
                     *list(progress.get("source_filter_notes") or []),
                     *foreign_notes,
                 ]
-            _persist_progress(exploration_id, progress)
+            await _persist_progress_async(exploration_id, progress, flush=True)
 
             for status in discovery.statuses:
                 _set_source_status(progress, status)
@@ -778,7 +667,7 @@ async def _run_exploration(
             )
             stage_seconds = {"discovery": round(monotonic() - started_at, 3)}
             _set_pipeline_stage(progress, "fetch", "running")
-            _persist_progress(exploration_id, progress)
+            await _persist_progress_async(exploration_id, progress, flush=True)
 
             stage_started = monotonic()
             _raise_if_cancelled(exploration_id)
@@ -792,24 +681,20 @@ async def _run_exploration(
             stage_seconds["fetching"] = round(monotonic() - stage_started, 3)
             if source_fetch_budgets:
                 progress["source_fetch_budgets"] = source_fetch_budgets
-                _persist_progress(exploration_id, progress)
+                await _persist_progress_async(exploration_id, progress)
 
-            # 2. Run _adjudicate_dates_before_source_window_filter with inspect signature check
-            adjudicate_kwargs = {
-                "profile": current_profile,
-                "article_results": fetched_articles,
-                "lookback_hours": lookback_hours,
-                "inference_run_id": exploration_id,
-                "max_candidates": pipeline_limits["date_adjudication_candidates"],
-            }
-            if _accepts_param(_adjudicate_dates_before_source_window_filter, "low_yield"):
-                adjudicate_kwargs["low_yield"] = low_yield_mode
-
-            fetched_articles, date_review_summary = await _adjudicate_dates_before_source_window_filter(**adjudicate_kwargs)
+            fetched_articles, date_review_summary = await _adjudicate_dates_before_source_window_filter(
+                current_profile,
+                fetched_articles,
+                lookback_hours=lookback_hours,
+                inference_run_id=exploration_id,
+                max_candidates=pipeline_limits["date_adjudication_candidates"],
+                low_yield=low_yield_mode,
+            )
             _raise_if_cancelled(exploration_id)
             if date_review_summary:
                 progress["source_date_review"] = date_review_summary
-                _persist_progress(exploration_id, progress)
+                await _persist_progress_async(exploration_id, progress)
             fetched_articles, source_window_issues, recency_reserve = _apply_source_window_filter(
                 current_profile,
                 fetched_articles,
@@ -832,32 +717,27 @@ async def _run_exploration(
                     *source_window_issues,
                 ]
             _set_pipeline_stage(progress, "fetch", "done")
-            _persist_progress(exploration_id, progress)
+            await _persist_progress_async(exploration_id, progress, flush=True)
 
             stage_started = monotonic()
             _raise_if_cancelled(exploration_id)
 
-            # 3. Run _run_digest_core with inspect signature check
-            digest_kwargs = {
-                "profile": current_profile,
-                "payloads": payloads,
-                "fetched_articles": fetched_articles,
-                "lookback_hours": lookback_hours,
-                "inference_run_id": exploration_id,
-                "progress": progress,
-                "persist": lambda: _persist_progress(exploration_id, progress),
-            }
-            if _accepts_param(_run_digest_core, "threshold"):
-                digest_kwargs["threshold"] = threshold
-            if _accepts_param(_run_digest_core, "low_yield"):
-                digest_kwargs["low_yield"] = low_yield_mode
-            if _accepts_param(_run_digest_core, "recency_reserve"):
-                digest_kwargs["recency_reserve"] = recency_reserve
-
-            article_results = await _run_digest_core(**digest_kwargs)
+            article_results = await _run_digest_core(
+                profile=current_profile,
+                payloads=payloads,
+                fetched_articles=fetched_articles,
+                lookback_hours=lookback_hours,
+                inference_run_id=exploration_id,
+                progress=progress,
+                persist=lambda: _persist_progress(exploration_id, progress),
+                persist_flush=lambda: _persist_progress_async(exploration_id, progress, flush=True),
+                threshold=threshold,
+                low_yield=low_yield_mode,
+                recency_reserve=recency_reserve,
+            )
             _raise_if_cancelled(exploration_id)
             stage_seconds["editorial"] = _elapsed_stage_seconds(stage_started)
-            _persist_progress(exploration_id, progress)
+            await _persist_progress_async(exploration_id, progress, flush=True)
 
             # Check yield to see if it is low content yield
             included_count = sum(1 for r in article_results if r.tier != "dropped")
@@ -908,15 +788,15 @@ async def _run_exploration(
                         "message": f"Initial run yielded low content ({included_count} item(s)). Retrying with broadened search strategy...",
                         "action": queue_action or "build",
                     }
-                _persist_progress(exploration_id, progress)
+                await _persist_progress_async(exploration_id, progress, flush=True)
 
                 # 1. Broaden search queries using LLM-assisted helper. When specific
                 # sources came up empty, scope the broadening to those lanes (P3).
-                broaden_kwargs: dict[str, Any] = {}
-                if starved_sources and _accepts_param(broaden_queries_with_agent, "starved_sources"):
-                    broaden_kwargs["starved_sources"] = starved_sources
                 before_repair = current_profile
-                current_profile = await broaden_queries_with_agent(current_profile, **broaden_kwargs)
+                current_profile = await broaden_queries_with_agent(
+                    current_profile,
+                    starved_sources=starved_sources,
+                )
                 _record_strategy_repair(
                     progress,
                     before=before_repair,
@@ -927,7 +807,7 @@ async def _run_exploration(
                     target_yield=target_yield,
                     starved_sources=starved_sources,
                 )
-                _persist_progress(exploration_id, progress)
+                await _persist_progress_async(exploration_id, progress)
 
                 # 2. Relax filtering settings
                 low_yield_mode = True
@@ -935,7 +815,7 @@ async def _run_exploration(
 
                 # Reset pipeline stages and rerun
                 progress["pipeline"] = {stage: "pending" for stage in _PIPELINE_STAGES}
-                _persist_progress(exploration_id, progress)
+                await _persist_progress_async(exploration_id, progress, flush=True)
                 continue
 
             break
@@ -980,7 +860,7 @@ async def _run_exploration(
             "action": queue_action or "build",
         }
         _set_candidate_count(progress, len(payloads))
-        _persist_progress(exploration_id, progress)
+        await _persist_progress_async(exploration_id, progress, flush=True)
 
         stage_started = monotonic()
         _raise_if_cancelled(exploration_id)
@@ -1004,6 +884,13 @@ async def _run_exploration(
             return stats
 
         digest_stats = build_stats()
+        _apply_model_health_to_progress(progress, digest_stats)
+        # Render ONCE (P5): the publishing duration can only be known after the
+        # render, so the stats sidebar is rendered with a sentinel stage value and
+        # the measured duration is patched into the HTML afterwards, instead of
+        # rendering and writing the whole brief a second time.
+        digest_stats["stage_seconds"]["publishing"] = _PUBLISHING_SENTINEL_SECONDS
+        sentinel_text = database._format_stage_duration(_PUBLISHING_SENTINEL_SECONDS)
         html = database.render_ingested_issue(
             title,
             snapshot,
@@ -1016,23 +903,11 @@ async def _run_exploration(
             newsletter_payloads=newsletter_source_notes,
             source_selection=merged_selection,
         )
-        brief_ref = _write_exploration_brief(exploration_id, html)
         stage_seconds["publishing"] = _elapsed_stage_seconds(stage_started)
-        # Re-build stats and re-render so the just-measured publishing duration is
-        # reflected in the brief's stats sidebar.
-        digest_stats = build_stats()
-        _apply_model_health_to_progress(progress, digest_stats)
-        html = database.render_ingested_issue(
-            title,
-            snapshot,
-            payloads,
-            article_results,
-            lookback_hours,
-            generated_at=database.utc_now(),
-            issue_id=exploration_id,
-            digest_stats=digest_stats,
-            newsletter_payloads=newsletter_source_notes,
-            source_selection=merged_selection,
+        digest_stats["stage_seconds"]["publishing"] = stage_seconds["publishing"]
+        html = html.replace(
+            sentinel_text,
+            database._format_stage_duration(stage_seconds["publishing"]),
         )
         brief_ref = _write_exploration_brief(exploration_id, html)
         database.record_served_undated_items(
@@ -1050,7 +925,7 @@ async def _run_exploration(
         if progress.get("requested_source_issues"):
             progress["built_with_issues"] = True
         _set_pipeline_stage(progress, "done", "done")
-        _persist_progress(exploration_id, progress)
+        await _persist_progress_async(exploration_id, progress, flush=True)
 
         _raise_if_cancelled(exploration_id)
         completed = database.update_exploration_status(
@@ -1076,12 +951,14 @@ async def _run_exploration(
         )
         _set_pipeline_stage(progress, "done", "failed")
         progress["error"] = str(exc)
-        _persist_progress(exploration_id, progress)
+        await _persist_progress_async(exploration_id, progress, flush=True)
         database.update_exploration_status(
             exploration_id,
             status="failed",
         )
         raise
+    finally:
+        _discard_progress_persist_state(exploration_id)
 
 
 def _apply_model_health_to_progress(progress: dict[str, Any], stats: dict[str, Any]) -> None:
@@ -1552,26 +1429,6 @@ def _select_fetch_payloads_for_budget(
     return payloads, budgets
 
 
-def _adapter_from_payload_type(source_type: str, metadata: dict[str, Any] | None = None) -> str:
-    metadata = metadata or {}
-    if source_type == "gmail_link":
-        if metadata.get("search_query") or metadata.get("search_provider"):
-            if metadata.get("search_provider") == "google_news_rss":
-                return "google_news"
-            return "web_search"
-        return "gmail"
-    return {
-        "gmail": "gmail",
-        "podcast_episode": "podcasts",
-        "youtube_video": "youtube",
-        "foreign_web": "foreign_media",
-        "market_snapshot": "markets",
-        "collection_chunk": "collections",
-        "web_search": "web_search",
-        "reddit_post": "reddit",
-    }.get(source_type, "")
-
-
 def _promote_explore_sources(
     *,
     topic_id: str,
@@ -1814,10 +1671,20 @@ async def _run_digest_core(
     inference_run_id: str,
     progress: dict[str, Any],
     persist: Callable[[], None],
+    persist_flush: Callable[[], Awaitable[None]] | None = None,
     threshold: float = 0.45,
     low_yield: bool = False,
     recency_reserve: list[ArticleFetchResult] | None = None,
 ) -> list[ArticleFetchResult]:
+    async def flush_progress() -> None:
+        # Stage-boundary persistence: route the DB write off the event loop when
+        # an async flusher was provided (P4); fall back to the sync persist for
+        # callers (tests) that only pass the simple callback.
+        if persist_flush is not None:
+            await persist_flush()
+        else:
+            persist()
+
     digest = {
         "id": profile.topic_id,
         "name": _brief_title(profile),
@@ -1827,7 +1694,7 @@ async def _run_digest_core(
         "recency_weighting": profile.recency_weighting,
     }
     _set_pipeline_stage(progress, "summarize", "running")
-    persist()
+    await flush_progress()
 
     enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
     enriched_articles = database.apply_feedback_to_candidates(profile.topic_id, enriched_articles)
@@ -1835,7 +1702,7 @@ async def _run_digest_core(
 
     _set_pipeline_stage(progress, "summarize", "done")
     _set_pipeline_stage(progress, "rank", "running")
-    persist()
+    await flush_progress()
 
     settings = get_settings()
     pipeline_limits = brief_settings.pipeline_limits_for_profile(settings, profile)
@@ -1871,7 +1738,7 @@ async def _run_digest_core(
         "status": "running",
         "message": "Auditing candidate sources for freshness, fit, and source quality.",
     }
-    persist()
+    await flush_progress()
     audit_client = model_routing.client_for_agent(
         "source_audit",
         settings=settings,
@@ -1903,12 +1770,12 @@ async def _run_digest_core(
         ]
         progress["built_with_issues"] = True
     _set_pipeline_stage(progress, "audit", "done" if audit_summary.get("status") != "failed" else "failed")
-    persist()
+    await flush_progress()
     _init_reasoning_bucket(progress, "editorial", persist)
     _init_reasoning_bucket(progress, "critic", persist)
     _set_pipeline_stage(progress, "rank", "done")
     _set_pipeline_stage(progress, "review", "running")
-    persist()
+    await flush_progress()
 
     flush_reasoning = _reasoning_flusher(progress, persist)
 
@@ -2197,502 +2064,6 @@ def _apply_source_floors(
     return updated
 
 
-async def _adjudicate_dates_before_source_window_filter(
-    profile: TopicProfile,
-    article_results: list[ArticleFetchResult],
-    *,
-    lookback_hours: int | None,
-    inference_run_id: str,
-    max_candidates: int | None,
-    low_yield: bool = False,
-) -> tuple[list[ArticleFetchResult], dict[str, Any]]:
-    if lookback_hours is None:
-        return article_results, {}
-    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
-    at_risk_indexes = _source_window_date_adjudication_indexes(profile, article_results, cutoff)
-    if not at_risk_indexes:
-        return article_results, {
-            "status": "skipped",
-            "candidate_count": 0,
-            "message": "No articles needed AI date review before source-window filtering.",
-        }
-
-    limit = max(1, min(int(max_candidates or len(at_risk_indexes)), len(at_risk_indexes)))
-    # Round-robin selection by lane/adapter to prevent lane monopolization (P0-3)
-    grouped: dict[str, list[int]] = {}
-    for index in at_risk_indexes:
-        adapter = _adapter_from_payload_type(
-            article_results[index].payload.source_type,
-            article_results[index].payload.metadata,
-        )
-        grouped.setdefault(adapter, []).append(index)
-    
-    selected_indexes: list[int] = []
-    adapters = sorted(grouped.keys())
-    pointers = {adapter: 0 for adapter in adapters}
-    while len(selected_indexes) < limit:
-        added = False
-        for adapter in adapters:
-            ptr = pointers[adapter]
-            if ptr < len(grouped[adapter]):
-                selected_indexes.append(grouped[adapter][ptr])
-                pointers[adapter] += 1
-                added = True
-                if len(selected_indexes) >= limit:
-                    break
-        if not added:
-            break
-    selected_results = [article_results[index] for index in selected_indexes]
-    settings = get_settings()
-    audit_client = model_routing.client_for_agent(
-        "source_audit",
-        settings=settings,
-        items=selected_results,
-        model_override=profile.models.get("brief"),
-    ).client
-    reviewed_results, _decisions, audit_summary = await apply_source_audit(
-        profile,
-        selected_results,
-        lookback_hours=lookback_hours,
-        model_client=audit_client,
-        inference_run_id=inference_run_id,
-        max_candidates=limit,
-        low_yield=low_yield,
-    )
-    updated = list(article_results)
-    resolved_count = 0
-    for original_index, reviewed in zip(selected_indexes, reviewed_results, strict=False):
-        if _article_published_at(reviewed) is not None and _article_published_at(article_results[original_index]) is None:
-            resolved_count += 1
-        updated[original_index] = reviewed
-
-    status = str(audit_summary.get("status") or "completed")
-    return updated, {
-        "status": status,
-        "candidate_count": len(selected_indexes),
-        "at_risk_count": len(at_risk_indexes),
-        "resolved_count": resolved_count,
-        "excluded_count": int(audit_summary.get("excluded_count") or 0),
-        "message": (
-            "AI reviewed ambiguous dates before source-window filtering."
-            if status not in {"failed", "fallback"}
-            else "AI date review could not fully complete before source-window filtering."
-        ),
-        "summary": str(audit_summary.get("summary") or "").strip(),
-        "issues": list(audit_summary.get("issues") or []),
-    }
-
-
-def _source_window_date_adjudication_indexes(
-    profile: TopicProfile,
-    article_results: list[ArticleFetchResult],
-    cutoff: datetime,
-) -> list[int]:
-    indexes: list[int] = []
-    for index, result in enumerate(article_results):
-        if result.tier == "dropped" or not result.fetched:
-            continue
-        if _article_published_at(result) is not None:
-            continue
-        reason = _source_window_rejection_reason(profile, result, cutoff)
-        if reason:
-            indexes.append(index)
-    return indexes
-
-
-def _apply_source_window_filter(
-    profile: TopicProfile,
-    article_results: list[ArticleFetchResult],
-    *,
-    lookback_hours: int | None,
-) -> tuple[list[ArticleFetchResult], list[dict[str, str]], list[ArticleFetchResult]]:
-    """Split fetched items into in-window keepers and an out-of-window reserve.
-
-    Items that fail the recency window are NOT discarded (P0): they are demoted
-    into a reserve pool so a selected source that has zero in-window survivors can
-    still surface a minimal, clearly-labeled fallback item via _apply_source_floors,
-    rather than rendering an empty section.
-    """
-    if lookback_hours is None:
-        kept: list[ArticleFetchResult] = []
-        issues: list[dict[str, str]] = []
-        for result in article_results:
-            if result.tier == "dropped":
-                continue
-            if _is_strict_undated_result(result):
-                item_key = _undated_item_key(result)
-                if database.has_served_undated_item(profile.topic_id, item_key):
-                    reason = "Undated item was already shown once and is hidden from future editions."
-                    issues.append(
-                        {
-                            "source_name": _source_window_issue_name(result),
-                            "source": _source_label_for_result(result),
-                            "item": _source_window_issue_name(result),
-                            "item_url": str(
-                                result.final_url
-                                or result.original_url
-                                or result.payload.original_url
-                                or ""
-                            ).strip(),
-                            "reason": reason,
-                        }
-                    )
-                    continue
-                kept.append(_mark_undated_once(result))
-            else:
-                kept.append(result)
-        return kept, issues, []
-    cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
-    kept: list[ArticleFetchResult] = []
-    issues: list[dict[str, str]] = []
-    reserve: list[ArticleFetchResult] = []
-    for result in article_results:
-        reason = _source_window_rejection_reason(profile, result, cutoff)
-        if reason:
-            issues.append(
-                {
-                    "source_name": _source_window_issue_name(result),
-                    "source": _source_label_for_result(result),
-                    "item": _source_window_issue_name(result),
-                    "item_url": str(result.final_url or result.original_url or result.payload.original_url or "").strip(),
-                    "reason": reason,
-                }
-            )
-            if result.fetched:
-                reserve.append(_mark_out_of_window(result, reason))
-            continue
-        kept.append(_mark_undated_once(result) if _is_strict_undated_result(result) else result)
-    return kept, issues, reserve
-
-
-def _mark_out_of_window(result: ArticleFetchResult, reason: str) -> ArticleFetchResult:
-    """Tag a recency-rejected (but fetched) item for last-resort floor revival."""
-    metadata = {
-        **dict(result.metadata or {}),
-        "out_of_window": True,
-        "out_of_window_reason": reason,
-        "date_status": "out_of_window",
-    }
-    freshness = _article_published_at(result) or _article_text_or_url_date(result)
-    if freshness is not None:
-        metadata["out_of_window_published_at"] = freshness.isoformat()
-    return replace(result, tier="dropped", metadata=metadata)
-
-
-def _reserve_sort_key(result: ArticleFetchResult) -> tuple[str, float]:
-    metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    published = str(metadata.get("out_of_window_published_at") or "")
-    return (published, float(result.link_score or 0.0))
-
-
-def _revive_out_of_window(result: ArticleFetchResult) -> ArticleFetchResult:
-    """Promote a reserve item into the brief with an honest out-of-window note."""
-    metadata = {
-        **dict(result.metadata or {}),
-        "served_once": True,
-        "served_once_note": "Outside the requested window — shown as a fallback.",
-        "served_once_key": _undated_item_key(result),
-    }
-    return replace(result, tier="main", metadata=metadata)
-
-
-def _source_window_rejection_reason(profile: TopicProfile, result: ArticleFetchResult, cutoff: datetime) -> str:
-    source_type = str(result.payload.source_type or "")
-
-    # Check URL date hint first. URL dates are highly specific and indicate the original path publication date.
-    # If the URL date hint is older than the cutoff, reject it even if metadata says it was updated recently.
-    for value in (result.final_url, result.original_url, result.payload.original_url):
-        url_date = _date_from_url(value)
-        if url_date is not None and url_date < cutoff:
-            return f"URL date hint places it outside the requested source window ({_format_window_cutoff(cutoff)} or newer required)."
-
-    published = _article_published_at(result)
-    if published is not None:
-        if published < cutoff:
-            return f"Published outside the requested source window ({_format_window_cutoff(cutoff)} or newer required)."
-        return ""
-
-    # If no published date, check general text date hints (which may be less precise, e.g. body text dates)
-    hinted_date = _article_text_or_url_date(result)
-    if hinted_date is not None:
-        if hinted_date < cutoff:
-            return f"Date hints place it outside the requested source window ({_format_window_cutoff(cutoff)} or newer required)."
-        return ""
-
-    if source_type in _STRICT_SOURCE_WINDOW_TYPES:
-        item_key = _undated_item_key(result)
-        if database.has_served_undated_item(profile.topic_id, item_key):
-            return "Undated item was already shown once and is hidden from future editions."
-        return "Date is missing for this strict source, so it is excluded under the bounded window."
-    return ""
-
-
-def _source_label_for_result(result: ArticleFetchResult) -> str:
-    source_type = str(result.payload.source_type or "")
-    if source_type == "gmail":
-        return "Gmail"
-    if source_type == "gmail_link":
-        metadata = result.payload.metadata or {}
-        if metadata.get("search_query") or metadata.get("search_provider"):
-            if metadata.get("search_provider") == "google_news_rss":
-                return "Google News"
-            return "Web Search"
-        return "Gmail"
-    if source_type == "podcast_episode":
-        return "Podcast"
-    if source_type == "youtube_video":
-        return "YouTube"
-    if source_type == "reddit_post":
-        return "Reddit"
-    if source_type == "market_snapshot":
-        return "Markets"
-    if source_type == "foreign_web":
-        return "Foreign Media"
-    return "Web"
-
-
-def _is_strict_undated_result(result: ArticleFetchResult) -> bool:
-    return (
-        str(result.payload.source_type or "") in _STRICT_SOURCE_WINDOW_TYPES
-        and _article_published_at(result) is None
-        and _article_text_or_url_date(result) is None
-    )
-
-
-def _mark_undated_once(result: ArticleFetchResult) -> ArticleFetchResult:
-    metadata = {
-        **dict(result.metadata or {}),
-        "date_status": "unknown",
-        "served_once": True,
-        "served_once_note": "Date unknown; shown once.",
-        "served_once_key": _undated_item_key(result),
-    }
-    return replace(result, metadata=metadata)
-
-
-def _served_undated_items_from_results(article_results: list[ArticleFetchResult]) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
-    for result in article_results:
-        if result.tier == "dropped":
-            continue
-        metadata = result.metadata if isinstance(result.metadata, dict) else {}
-        if metadata.get("served_once") is not True:
-            continue
-        items.append(
-            {
-                "item_key": str(metadata.get("served_once_key") or _undated_item_key(result)),
-                "title": result.title,
-                "source_name": result.payload.source_name,
-                "url": _result_identity_url(result),
-            }
-        )
-    return items
-
-
-def _undated_item_key(result: ArticleFetchResult) -> str:
-    identity = "|".join(
-        part
-        for part in (
-            _result_identity_url(result),
-            result.canonical_url or "",
-            result.title,
-            result.payload.source_name,
-        )
-        if part
-    )
-    return hashlib.sha1(identity.encode("utf-8")).hexdigest()
-
-
-def _result_identity_url(result: ArticleFetchResult) -> str:
-    return str(result.canonical_url or result.final_url or result.original_url or result.payload.original_url or "").strip()
-
-
-def _article_published_at(result: ArticleFetchResult) -> datetime | None:
-    values: list[Any] = [result.payload.published_at]
-    for metadata in (result.payload.metadata, result.metadata):
-        if not isinstance(metadata, dict):
-            continue
-        for key in _DATE_METADATA_KEYS:
-            values.append(metadata.get(key))
-    for value in values:
-        parsed = _parse_datetime_hint(value)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _article_text_or_url_date(result: ArticleFetchResult) -> datetime | None:
-    for value in (result.final_url, result.original_url, result.payload.original_url):
-        parsed = _date_from_url(value)
-        if parsed is not None:
-            return parsed
-    text_sample = " ".join(
-        part
-        for part in (
-            result.title,
-            result.excerpt,
-            result.editor_summary,
-            result.payload.raw_text,
-        )
-        if part
-    )
-    return _date_from_text(text_sample[:4000])
-
-
-def _parse_datetime_hint(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, (int, float)):
-        parsed = datetime.fromtimestamp(float(value), tz=UTC)
-    else:
-        text = str(value or "").strip()
-        if not text:
-            return None
-        parsed = _parse_datetime_string(text)
-        if parsed is None:
-            return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
-
-
-def _parse_datetime_string(text: str) -> datetime | None:
-    cleaned = text.strip()
-    if not cleaned:
-        return None
-    with suppress(ValueError):
-        normalized = cleaned.replace("Z", "+00:00")
-        return datetime.fromisoformat(normalized)
-    with suppress(Exception):
-        parsed = parsedate_to_datetime(cleaned)
-        if parsed is not None:
-            return parsed
-    date_match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", cleaned)
-    if date_match:
-        with suppress(ValueError):
-            return datetime(
-                int(date_match.group(1)),
-                int(date_match.group(2)),
-                int(date_match.group(3)),
-                23,
-                59,
-                59,
-                tzinfo=UTC,
-            )
-    for pattern in ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y"):
-        with suppress(ValueError):
-            return datetime.strptime(cleaned, pattern).replace(hour=23, minute=59, second=59, tzinfo=UTC)
-    return _date_from_text(cleaned)
-
-
-def _date_from_url(value: str | None) -> datetime | None:
-    text = str(value or "")
-    match = _URL_DATE_RE.search(text)
-    if not match:
-        return None
-    year = int(match.group("year"))
-    month = int(match.group("month"))
-    day = int(match.group("day") or 1)
-    hour = 23 if match.group("day") else 0
-    minute = 59 if match.group("day") else 0
-    second = 59 if match.group("day") else 0
-    with suppress(ValueError):
-        return datetime(year, month, day, hour, minute, second, tzinfo=UTC)
-    return None
-
-
-def _date_from_text(value: str | None) -> datetime | None:
-    text = str(value or "")
-    match = _TEXT_DATE_RE.search(text)
-    if match:
-        month = _MONTHS.get(match.group("month").lower())
-        if month is not None:
-            with suppress(ValueError):
-                return datetime(
-                    int(match.group("year")),
-                    month,
-                    int(match.group("day")),
-                    23,
-                    59,
-                    59,
-                    tzinfo=UTC,
-                )
-    for pattern in (_CJK_DATE_RE, _DOTTED_DATE_RE):
-        locale_match = pattern.search(text)
-        if locale_match:
-            with suppress(ValueError):
-                return datetime(
-                    int(locale_match.group(1)),
-                    int(locale_match.group(2)),
-                    int(locale_match.group(3)),
-                    23,
-                    59,
-                    59,
-                    tzinfo=UTC,
-                )
-    # Non-English Latin month names that the English _MONTHS map misses. Relative
-    # phrasing is disabled here because this scans free body/snippet text where
-    # "posted 2 days ago" chrome must not be read as the publish date.
-    shared = normalize_date_string(text, allow_relative=False)
-    if shared:
-        with suppress(ValueError):
-            parsed = datetime.fromisoformat(shared)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(hour=23, minute=59, second=59, tzinfo=UTC)
-            return parsed
-    return None
-
-
-def _foreign_language_coverage_notes(profile: Any, candidates: Any) -> list[dict[str, Any]]:
-    """Surface foreign-media languages that returned nothing this build.
-
-    Reads the persisted language plan and the surviving discovery candidates so
-    an empty Foreign Media section is explained in the Reporting tab (per
-    language) instead of silently rendering blank.
-    """
-    selection = getattr(profile, "source_selection", None) or {}
-    if not (isinstance(selection, dict) and selection.get("foreign_media")):
-        return []
-    plan = getattr(profile, "foreign_language_plan", None) or ()
-    if not plan:
-        return []
-    covered: set[str] = set()
-    for candidate in candidates or ():
-        if getattr(candidate, "adapter", "") != "foreign_media":
-            continue
-        metadata = getattr(candidate.payload, "metadata", None) or {}
-        code = str(metadata.get("source_language") or "").strip().lower()
-        if code:
-            covered.add(code)
-    notes: list[dict[str, Any]] = []
-    for entry in plan:
-        if not isinstance(entry, dict):
-            continue
-        code = str(entry.get("code") or "").strip().lower()
-        if not code or code in covered:
-            continue
-        name = str(entry.get("name") or code).strip() or code
-        notes.append(
-            {
-                "source_name": "Foreign Media",
-                "item": name,
-                "reason": f"No {name} results survived discovery for this brief.",
-            }
-        )
-    return notes
-
-
-def _source_window_issue_name(result: ArticleFetchResult) -> str:
-    title = (result.title or result.payload.source_name or result.original_url or "Source").strip()
-    return title[:120]
-
-
-def _format_window_cutoff(cutoff: datetime) -> str:
-    return cutoff.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
-
-
 def _newsletter_source_notes_for_brief(
     payloads: list[NormalizedPayload],
     article_results: list[ArticleFetchResult],
@@ -2750,99 +2121,6 @@ def _write_exploration_brief(exploration_id: str, html: str) -> str:
     path = output_dir / f"exploration-{exploration_id}.html"
     path.write_text(html, encoding="utf-8")
     return str(path)
-
-
-def _initial_progress(
-    source_selection: dict[str, bool],
-    source_names: list[str] | None = None,
-) -> dict[str, Any]:
-    if source_names is None:
-        source_names = sorted(default_source_registry().names())
-    progress_sources = {
-        name: {"status": "disabled", "candidate_count": 0}
-        if not bool(source_selection.get(name, False))
-        else {"status": "pending", "candidate_count": 0}
-        for name in source_names
-    }
-    return {
-        "pipeline": {stage: "pending" for stage in _PIPELINE_STAGES},
-        "sources": progress_sources,
-        "candidate_count": 0,
-        "exclusions": [],
-    }
-
-
-def _set_pipeline_stage(progress: dict[str, Any], stage: str, value: str) -> None:
-    pipeline = dict(progress.get("pipeline", {}))
-    pipeline[stage] = value
-    progress["pipeline"] = pipeline
-
-
-def _set_source_status(progress: dict[str, Any], adapter_status: Any) -> None:
-    sources = dict(progress.get("sources", {}))
-    source_status = {
-        "status": adapter_status.status,
-        "candidate_count": adapter_status.candidate_count,
-        "message": adapter_status.message,
-        "elapsed_ms": adapter_status.elapsed_ms,
-        "timeout_seconds": adapter_status.timeout_seconds,
-    }
-    reason_code = getattr(adapter_status, "reason_code", None)
-    if reason_code:
-        source_status["reason_code"] = reason_code
-    sources[adapter_status.name] = source_status
-    progress["sources"] = sources
-
-
-def _init_reasoning_bucket(progress: dict[str, Any], stage: str, persist: Callable[[], None]) -> None:
-    reasoning = dict(progress.get("reasoning", {}))
-    if reasoning.get(stage) is None:
-        reasoning[stage] = ""
-        progress["reasoning"] = reasoning
-        persist()
-
-
-def _reasoning_flusher(progress: dict[str, Any], persist: Callable[[], None]) -> Callable[[str], Callable[[str], None]]:
-    from time import monotonic
-
-    state: dict[str, dict[str, Any]] = {
-        "editorial": {"len": 0, "last_flush": monotonic()},
-        "critic": {"len": 0, "last_flush": monotonic()},
-    }
-
-    def _make_callback(stage: str) -> Callable[[str], None]:
-        def _callback(chunk: str) -> None:
-            if not chunk:
-                return
-            reasoning = dict(progress.get("reasoning", {}))
-            current = str(reasoning.get(stage, ""))
-            current += chunk
-            reasoning[stage] = current
-            progress["reasoning"] = reasoning
-            now = monotonic()
-            state_info = state.get(stage)
-            if state_info is None:
-                state[stage] = {"len": len(current), "last_flush": now}
-                persist()
-                return
-            if len(current) - int(state_info["len"]) >= 240 or now - float(state_info["last_flush"]) >= 0.35:
-                state_info["len"] = len(current)
-                state_info["last_flush"] = now
-                persist()
-
-        return _callback
-
-    return _make_callback
-
-
-def _set_candidate_count(progress: dict[str, Any], value: int) -> None:
-    progress["candidate_count"] = value
-
-
-def _set_exclusion_reasons(progress: dict[str, Any], reasons: Any) -> None:
-    if not reasons:
-        return
-    progress["exclusions"] = list(reasons)
 
 
 def _set_requested_source_issues(progress: dict[str, Any], issues: list[dict[str, str]]) -> None:
@@ -3359,24 +2637,6 @@ def _source_scope_label(lookback_hours: int | None) -> str:
         days = hours // 24
         return "last 24 hours" if days == 1 else f"last {days} days"
     return "last hour" if hours == 1 else f"last {hours} hours"
-
-
-def _persist_progress(exploration_id: str, progress: dict[str, Any]) -> None:
-    database.update_exploration_progress(
-        exploration_id,
-        progress=_persistable_progress(progress),
-    )
-
-
-def _persistable_progress(progress: dict[str, Any]) -> dict[str, Any]:
-    """Return the public JSON-safe progress payload.
-
-    Internal pipeline bundles such as ``_intermediates`` can contain dataclass
-    instances used by in-process reporting. They should never be written to the
-    exploration progress JSON that powers the UI.
-    """
-
-    return {key: value for key, value in dict(progress).items() if not str(key).startswith("_")}
 
 
 def _elapsed_stage_seconds(started_at: float) -> float:
