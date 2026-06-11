@@ -203,6 +203,7 @@ from .feedback import (
 from backend.app.services.brief_renderer import (
     _clean_newsletter_text as _clean_newsletter_text,
     _domain as _domain,
+    _format_stage_duration as _format_stage_duration,
     _nullable_int as _nullable_int,
     _origin_source_label as _origin_source_label,
     _render_foreign_article_modal as _render_foreign_article_modal,
@@ -400,6 +401,7 @@ __all__ = [
     "_url_match_key",
     "_clean_newsletter_text",
     "_domain",
+    "_format_stage_duration",
     "_nullable_int",
     "_origin_source_label",
     "_render_foreign_article_modal",
