@@ -3,14 +3,12 @@ import type { ChangeEvent, FormEvent, ReactNode } from "react";
 
 import {
   api,
-  fetchPodcastShows,
   requestStrategyRefinement,
-  savePodcastShows,
   streamRefinement,
   streamStrategyRefinement,
   streamStrategyReview,
 } from "./lib/api";
-import type { GmailCandidatePayload, PodcastShowCandidate, QueryEditTarget, RefinementStreamBody } from "./lib/api";
+import type { GmailCandidatePayload, QueryEditTarget, RefinementStreamBody } from "./lib/api";
 import {
   adminTabOptions,
   briefControlBounds,
@@ -19,7 +17,6 @@ import {
   defaultPipelineLimits,
   defaultSourceSelection,
   defaultSourceSelectionForControls,
-  foreignRegionOptions,
   pipelineLimitFields,
   scaleContentLimits,
   schedulePresets,
@@ -48,7 +45,6 @@ import type {
   RefinementProgress,
   RefinementProgressPhase,
   RefinementSession,
-  RecencyUnit,
   SchedulePreset,
   ScheduledDeliveryFailure,
   SortMode,
@@ -57,127 +53,27 @@ import type {
   SourceStatus,
   SourceStatusResponse,
   StrategyPreview,
-  SystemLimitGroup,
   TopicProfile,
   TopicProfileResponse,
 } from "./lib/types";
 import { clearInterestDraft, interestDraftTtlMs, loadInterestDraft, loadSessionValue, saveInterestDraft } from "./lib/drafts";
-
-function PodcastShowPicker(props: { ensureTopicId: () => Promise<string | null> }) {
-  const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const [savedNote, setSavedNote] = useState("");
-  const [candidates, setCandidates] = useState<PodcastShowCandidate[]>([]);
-  const [selected, setSelected] = useState<Record<string, boolean>>({});
-  const [stalenessDays, setStalenessDays] = useState(60);
-
-  async function loadShows() {
-    setLoading(true);
-    setError("");
-    setSavedNote("");
-    try {
-      const topicId = await props.ensureTopicId();
-      if (!topicId) {
-        setError("Save or build this topic once, then choose shows.");
-        return;
-      }
-      const data = await fetchPodcastShows(topicId);
-      setStalenessDays(data.staleness_days);
-      setCandidates(data.candidates);
-      const initial: Record<string, boolean> = {};
-      for (const candidate of data.candidates) {
-        initial[candidate.feed_url] = Boolean(candidate.subscribed);
-      }
-      setSelected(initial);
-      setOpen(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load podcast shows");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function saveShows() {
-    setSaving(true);
-    setError("");
-    setSavedNote("");
-    try {
-      const topicId = await props.ensureTopicId();
-      if (!topicId) {
-        setError("Save or build this topic once, then choose shows.");
-        return;
-      }
-      const shows = candidates
-        .filter((candidate) => selected[candidate.feed_url])
-        .map((candidate) => ({ feed_url: candidate.feed_url, title: candidate.title }));
-      await savePodcastShows(topicId, shows);
-      setSavedNote(`Saved ${shows.length} show${shows.length === 1 ? "" : "s"}. The brief will summarize each show's latest episode.`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save podcast shows");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  const selectedCount = candidates.filter((candidate) => selected[candidate.feed_url]).length;
-
-  return (
-    <div className="podcast-show-picker">
-      <div className="podcast-show-picker-head">
-        <strong>Podcast shows</strong>
-        <button type="button" onClick={() => void loadShows()} disabled={loading || saving}>
-          {loading ? "Finding shows…" : open ? "Refresh shows" : "Find & choose shows"}
-        </button>
-      </div>
-      {error ? <p className="meta error">{error}</p> : null}
-      {open ? (
-        <div className="podcast-show-body">
-          <p className="meta">
-            Pick the shows to follow. Each build summarizes the latest episode of every show you keep
-            (regardless of topic match); shows with no episode in the last {stalenessDays} days are skipped.
-          </p>
-          <div className="podcast-show-list">
-            {candidates.length === 0 ? (
-              <p className="meta">No candidate shows found yet. Try broadening the interest.</p>
-            ) : (
-              candidates.map((candidate) => (
-                <label className="podcast-show-row" key={candidate.feed_url}>
-                  <input
-                    type="checkbox"
-                    checked={Boolean(selected[candidate.feed_url])}
-                    onChange={(event) =>
-                      setSelected((prev) => ({ ...prev, [candidate.feed_url]: event.target.checked }))
-                    }
-                  />
-                  <span className="podcast-show-copy">
-                    <span className="podcast-show-title">
-                      {candidate.title}
-                      {candidate.stale ? <span className="podcast-show-stale"> · stale</span> : null}
-                    </span>
-                    {candidate.description ? (
-                      <span className="podcast-show-desc">{candidate.description}</span>
-                    ) : null}
-                    {candidate.latest_episode_title ? (
-                      <span className="podcast-show-latest">Latest: {candidate.latest_episode_title}</span>
-                    ) : null}
-                  </span>
-                </label>
-              ))
-            )}
-          </div>
-          <div className="podcast-show-actions">
-            <button type="button" className="secondary-action" onClick={() => void saveShows()} disabled={saving}>
-              {saving ? "Saving…" : `Save ${selectedCount} show${selectedCount === 1 ? "" : "s"}`}
-            </button>
-            {savedNote ? <span className="meta success">{savedNote}</span> : null}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
+import { BuildStartingPanel } from "./components/BuildStartingPanel";
+import { ChatMessageContent } from "./components/ChatMessageContent";
+import { DisclosureButton } from "./components/DisclosureButton";
+import { EditablePlanQuery } from "./components/EditablePlanQuery";
+import { ForeignRegionPicker } from "./components/ForeignRegionPicker";
+import { GmailApprovalCard } from "./components/GmailApprovalCard";
+import { LibraryBuildProgress } from "./components/LibraryBuildProgress";
+import { NumberStepper } from "./components/NumberStepper";
+import { PodcastShowPicker } from "./components/PodcastShowPicker";
+import { QuickRecencyEditor } from "./components/QuickRecencyEditor";
+import { RecencyControl } from "./components/RecencyControl";
+import { ScheduledDeliveryAlert } from "./components/ScheduledDeliveryAlert";
+import { SettingsErrorList } from "./components/SettingsErrorList";
+import { SourceChips } from "./components/SourceChips";
+import { StrategyReviewCard } from "./components/StrategyReviewCard";
+import { SystemLimitsPanel } from "./components/SystemLimitsPanel";
+import { formatSourceLabel, formatStage, isModelDegraded, modelDegradedMessage, progressDetail, progressHeadline } from "./lib/display";
 
 export default function App() {
   if (window.location.pathname === "/admin") {
@@ -1772,119 +1668,6 @@ function DispatchApp() {
   );
 }
 
-function GmailApprovalCard(props: {
-  payload: GmailCandidatePayload;
-  busy: boolean;
-  onApprove: (senders: string[], instructions: string) => void;
-}) {
-  const [selected, setSelected] = useState<Set<string>>(
-    () => new Set(props.payload.candidates.map((c) => c.sender)),
-  );
-  const [extractionRules, setExtractionRules] = useState("");
-
-  function toggle(sender: string) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(sender)) next.delete(sender);
-      else next.add(sender);
-      return next;
-    });
-  }
-
-  const isSubmitDisabled = false;
-
-  return (
-    <div className="gmail-approval-card">
-      <div className="gmail-approval-intro">
-        <p>
-          {props.payload.intro} I need your approval before I read from any inbox sender.
-          Select senders here, or reply below in plain English.
-        </p>
-      </div>
-      {props.payload.candidates.length > 0 ? (
-        <ul className="gmail-sender-list">
-          {props.payload.candidates.map((candidate) => {
-            const isSelected = selected.has(candidate.sender);
-            return (
-              <li
-                key={candidate.sender}
-                className={`gmail-sender-row ${isSelected ? "selected" : ""}`}
-                onClick={() => toggle(candidate.sender)}
-                role="checkbox"
-                aria-checked={isSelected}
-                tabIndex={0}
-                onKeyDown={(e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggle(candidate.sender); } }}
-              >
-                <span className={`gmail-sender-check ${isSelected ? "on" : ""}`}>
-                  {isSelected ? "✓" : ""}
-                </span>
-                <div className="gmail-sender-details">
-                  <strong>{candidate.sender_name || candidate.sender}</strong>
-                  <span className="gmail-sender-email">{candidate.sender_name ? candidate.sender : null}</span>
-                  {candidate.ai_rationale ? (
-                    <span className="gmail-sender-rationale">{candidate.ai_rationale}</span>
-                  ) : null}
-                  <span className="gmail-sender-meta">
-                    {candidate.message_count != null ? `${candidate.message_count} found` : null}
-                    {candidate.subject ? ` · Latest: ${candidate.subject}` : null}
-                  </span>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      ) : (
-        <p className="gmail-no-candidates">
-          No newsletter senders matched that search. Name specific senders below, or confirm with none selected to skip Gmail.
-        </p>
-      )}
-
-      {selected.size > 0 ? (
-        <div style={{ marginTop: "14px", marginBottom: "14px" }} className="gmail-instructions-block">
-          <label style={{ display: "block", marginBottom: "6px", fontSize: "0.88rem", fontWeight: 700, color: "#1d1d1b" }} htmlFor="gmail-rules-textarea">
-            Add extraction instructions for these newsletters (optional):
-          </label>
-          <textarea
-            id="gmail-rules-textarea"
-            style={{ width: "100%", padding: "10px", border: "1px solid #c8c7bf", borderRadius: "8px", fontFamily: "inherit", fontSize: "0.9rem", boxSizing: "border-box" }}
-            value={extractionRules}
-            onChange={(e) => setExtractionRules(e.target.value)}
-            placeholder="e.g. Extract dev tools and ignore sponsorships"
-            rows={3}
-            disabled={false}
-          />
-        </div>
-      ) : null}
-
-      <div className="gmail-approval-actions">
-        <button
-          type="button"
-          className="primary-action"
-          onClick={() => props.onApprove([...selected], extractionRules.trim())}
-          disabled={isSubmitDisabled}
-        >
-          {selected.size > 0
-            ? `Approve ${selected.size} sender${selected.size === 1 ? "" : "s"}`
-            : "Continue without Gmail"}
-        </button>
-        {selected.size > 0 && props.payload.candidates.length > 0 ? (
-          <button
-            type="button"
-            className="secondary-action"
-            onClick={() => props.onApprove([], "")}
-            disabled={false}
-          >
-            Skip Gmail
-          </button>
-        ) : null}
-      </div>
-      <p className="gmail-approval-hint">
-        You can also type things like "approve 2, 3, and 5", "only Tech Brew", "all", or "none" in the same chat box.
-      </p>
-    </div>
-  );
-}
-
 function recencyText(weighting?: string, lookbackHours?: number | null): string {
   if (lookbackHours === null || weighting === "all_available") return "Unlimited";
   if (lookbackHours && lookbackHours > 0) {
@@ -1903,108 +1686,11 @@ function recencyText(weighting?: string, lookbackHours?: number | null): string 
   return weighting ? map[weighting] ?? weighting : "";
 }
 
-function recencyControlValue(lookbackHours: number | null): { unlimited: boolean; amount: number; unit: RecencyUnit } {
-  if (lookbackHours === null) return { unlimited: true, amount: 7, unit: "days" };
-  const hours = Math.max(0, Number(lookbackHours) || 168);
-  const days = Math.max(1, Math.round(hours / 24));
-  if (days > 365 || (days >= 30 && days % 30 === 0)) {
-    return { unlimited: false, amount: Math.min(365, Math.round(days / 30)), unit: "months" };
-  }
-  return { unlimited: false, amount: Math.min(365, days), unit: "days" };
-}
-
-function lookbackHoursFromRecencyControl(amount: number, unit: RecencyUnit, unlimited: boolean): number | null {
-  if (unlimited) return null;
-  const cleanAmount = clampContentLimit(amount, 0, 365);
-  if (unit === "months") return Math.min(262800, cleanAmount * 30 * 24);
-  if (cleanAmount === 0) return 24;
-  return Math.min(262800, cleanAmount * 24);
-}
-
 function sourceScopeFromLookbackHours(lookbackHours: number | null): SourceScope {
   if (lookbackHours === null) return "all_available";
   if (lookbackHours <= 48) return "breaking";
   if (lookbackHours >= 365 * 24) return "last_year";
   return "recent";
-}
-
-function RecencyControl(props: {
-  label?: string;
-  value: number | null;
-  onChange: (lookbackHours: number | null) => void;
-  compact?: boolean;
-}) {
-  const current = recencyControlValue(props.value);
-  const amountMax = 365;
-
-  function update(next: Partial<typeof current>) {
-    const merged = { ...current, ...next };
-    props.onChange(lookbackHoursFromRecencyControl(merged.amount, merged.unit, merged.unlimited));
-  }
-
-  return (
-    <div className={`recency-control ${props.compact ? "compact" : ""}`}>
-      <strong>{props.label ?? "Recency"}</strong>
-      <label className="recency-unlimited-toggle">
-        <input
-          type="checkbox"
-          checked={current.unlimited}
-          onChange={(event) => update({ unlimited: event.target.checked })}
-        />
-        Unlimited
-      </label>
-      <select
-        className="recency-amount-select"
-        value={current.amount}
-        disabled={current.unlimited}
-        onChange={(event) => update({ amount: Number(event.target.value) })}
-      >
-        {Array.from({ length: amountMax }, (_, index) => index + 1).map((amount) => (
-          <option value={amount} key={amount}>{amount}</option>
-        ))}
-      </select>
-      <select
-        value={current.unit}
-        disabled={current.unlimited}
-        onChange={(event) => update({ unit: event.target.value as RecencyUnit })}
-      >
-        <option value="days">Days</option>
-        <option value="months">Months</option>
-      </select>
-    </div>
-  );
-}
-
-function ForeignRegionPicker(props: {
-  selected: string[];
-  onChange: (regions: string[]) => void;
-}) {
-  const selected = new Set(props.selected);
-  return (
-    <div className="foreign-region-picker">
-      <strong>Foreign regions</strong>
-      <div className="foreign-region-row">
-        {foreignRegionOptions.map((region) => {
-          const enabled = selected.has(region.key);
-          return (
-            <button
-              key={region.key}
-              type="button"
-              className={enabled ? "active" : ""}
-              onClick={() => {
-                const next = new Set(selected);
-                if (enabled) next.delete(region.key);
-                else next.add(region.key);
-                props.onChange(Array.from(next));
-              }}
-            >
-              {region.label}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
 }
 
 function RefinementPanel(props: {
@@ -2478,191 +2164,6 @@ function RefinementPanel(props: {
         </div>
       </aside>
     </section>
-  );
-}
-
-function EditablePlanQuery(props: {
-  value: string;
-  label: string;
-  sourceLabel?: string;
-  onChange: (value: string) => void;
-  onDelete: () => void;
-}) {
-  return (
-    <li className="plan-query-row">
-      {props.sourceLabel ? <span className="plan-qsource">{props.sourceLabel}</span> : null}
-      <input
-        className="plan-query-input"
-        aria-label={`Edit ${props.label}`}
-        value={props.value}
-        onChange={(event) => props.onChange(event.target.value)}
-      />
-      <button
-        type="button"
-        className="plan-query-delete"
-        onClick={props.onDelete}
-        aria-label={`Delete ${props.label}`}
-        title="Delete query"
-      >
-        ×
-      </button>
-    </li>
-  );
-}
-
-type GmailCandidateLine = {
-  index: string;
-  name: string;
-  sender: string;
-  count: string;
-  subject: string;
-  rationale?: string;
-};
-
-function ChatMessageContent(props: { content: string }) {
-  const gmailCandidateMessage = parseGmailCandidateMessage(props.content);
-  if (gmailCandidateMessage) {
-    return (
-      <div className="gmail-candidate-message">
-        <p>{gmailCandidateMessage.intro}</p>
-        <ol className="gmail-candidate-list">
-          {gmailCandidateMessage.candidates.map((candidate) => (
-            <li key={`${candidate.index}-${candidate.sender}`}>
-              <div>
-                <strong>{candidate.name}</strong>
-                <span>{candidate.sender}</span>
-              </div>
-              <small>{candidate.count} found · Latest: {candidate.subject}</small>
-              {candidate.rationale ? <small>{candidate.rationale}</small> : null}
-            </li>
-          ))}
-        </ol>
-        <p>{gmailCandidateMessage.prompt}</p>
-      </div>
-    );
-  }
-  return (
-    <>
-      {props.content.split("\n").map((line, index) => (
-        <Fragment key={`${index}-${line.slice(0, 16)}`}>
-          {index > 0 ? <br /> : null}
-          {line}
-        </Fragment>
-      ))}
-    </>
-  );
-}
-
-function parseGmailCandidateMessage(content: string): { intro: string; candidates: GmailCandidateLine[]; prompt: string } | null {
-  const lines = content.split("\n").map((line) => line.trim()).filter(Boolean);
-  const firstCandidateIndex = lines.findIndex((line) => /^\d+\.\s/.test(line));
-  if (firstCandidateIndex < 1) return null;
-  const candidates: GmailCandidateLine[] = [];
-  let promptStart = lines.length;
-  for (let index = firstCandidateIndex; index < lines.length; index += 1) {
-    const match = lines[index].match(
-      /^(\d+)\.\s+(.+?)\s+<([^>]+)>\s+\((\d+)\s+found;\s+latest subject:\s+(.+?)\)(?:\s+[—-]\s+(.+))?$/i,
-    );
-    if (!match) {
-      promptStart = index;
-      break;
-    }
-    candidates.push({
-      index: match[1],
-      name: match[2],
-      sender: match[3],
-      count: match[4],
-      subject: match[5],
-      rationale: match[6],
-    });
-  }
-  if (!candidates.length || !lines[0].includes("found newsletter candidates")) return null;
-  return {
-    intro: lines.slice(0, firstCandidateIndex).join(" "),
-    candidates,
-    prompt: lines.slice(promptStart).join(" "),
-  };
-}
-
-function StrategyReviewCard(props: { preview: StrategyPreview }) {
-  const { preview } = props;
-  const looksAt = preview.looks_at.filter((label) => label.toLowerCase() !== "reddit");
-  const ignores = preview.ignores.filter((label) => label.toLowerCase() !== "reddit");
-  return (
-    <div className="strategy-review-card">
-      {preview.reasoning_summary ? (
-        <p className="strategy-review-summary">{preview.reasoning_summary}</p>
-      ) : null}
-      <div className="strategy-review-row">
-        {looksAt.length ? (
-          <div className="strategy-review-block">
-            <strong>Looks at</strong>
-            <span>{looksAt.join(", ")}</span>
-          </div>
-        ) : null}
-        {ignores.length ? (
-          <div className="strategy-review-block">
-            <strong>Ignores</strong>
-            <span>{ignores.join(", ")}</span>
-          </div>
-        ) : null}
-        {preview.exclusions.length ? (
-          <div className="strategy-review-block">
-            <strong>Avoids</strong>
-            <span>{preview.exclusions.join(", ")}</span>
-          </div>
-        ) : null}
-        {preview.must_have_terms?.length ? (
-          <div className="strategy-review-block">
-            <strong>Must include</strong>
-            <span>
-              {preview.must_have_terms.map((term) => {
-                const aliases = preview.must_have_aliases?.[term.toLowerCase()] ?? [];
-                return aliases.length ? `${term} (${aliases.join(", ")})` : term;
-              }).join(", ")}
-            </span>
-          </div>
-        ) : null}
-      </div>
-      {preview.search_queries.length ? (
-        <div className="strategy-review-block">
-          <strong>Searches it will run</strong>
-          <ul className="strategy-review-queries">
-            {preview.search_queries.map((query) => (
-              <li key={query}>{query}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-      {preview.per_source.some((entry) => entry.approved_senders?.length) ? (
-        <div className="strategy-review-block">
-          <strong>Approved Gmail newsletters</strong>
-          {preview.per_source
-            .filter((entry) => entry.approved_senders?.length)
-            .map((entry) => (
-              <span key={entry.key}>{entry.approved_senders!.join(", ")}</span>
-            ))}
-        </div>
-      ) : null}
-      {preview.per_source.some((entry) => entry.tickers?.length) ? (
-        <div className="strategy-review-block">
-          <strong>Market tickers</strong>
-          <div className="strategy-review-tickers">
-            {preview.per_source
-              .filter((entry) => entry.tickers?.length)
-              .flatMap((entry) => entry.tickers!)
-              .map((ticker) => (
-                <span key={ticker} className="strategy-ticker-chip">{ticker}</span>
-              ))}
-          </div>
-          {preview.per_source
-            .filter((entry) => entry.tickers?.length && entry.note)
-            .map((entry) => (
-              <span key={entry.key} className="strategy-review-note">{entry.note}</span>
-            ))}
-        </div>
-      ) : null}
-    </div>
   );
 }
 
@@ -3550,41 +3051,6 @@ function BriefControlsPanel(props: {
   );
 }
 
-function SystemLimitsPanel(props: { groups: SystemLimitGroup[] }) {
-  return (
-    <div className="system-limits-panel">
-      {props.groups.map((group) => (
-        <section className="system-limit-group" key={group.group}>
-          <h3>{group.group}</h3>
-          <div className="system-limit-grid">
-            {group.items.map((item) => (
-              <article className="system-limit-card" key={`${group.group}-${item.label}`}>
-                <span>{item.label}</span>
-                <strong>{item.value}</strong>
-                {item.note ? <p>{item.note}</p> : null}
-              </article>
-            ))}
-          </div>
-        </section>
-      ))}
-    </div>
-  );
-}
-
-function SettingsErrorList(props: { errors: string[] }) {
-  if (!props.errors.length) return null;
-  return (
-    <div className="settings-error-box" role="alert">
-      <strong>Fix these values before saving:</strong>
-      <ul>
-        {props.errors.map((error) => (
-          <li key={error}>{error}</li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
 function PipelineLimitsPanel(props: {
   limits: PipelineLimitsDraft;
   defaults?: PipelineLimitsDraft;
@@ -3632,38 +3098,6 @@ function PipelineLimitsPanel(props: {
 function clampNumber(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, value));
-}
-
-function NumberStepper(props: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  compact?: boolean;
-  onChange: (value: number) => void;
-}) {
-  const changeValue = (rawValue: string) => {
-    const digits = rawValue.replace(/\D/g, "");
-    props.onChange(digits ? Number(digits) : 0);
-  };
-  return (
-    <label className={props.compact ? "number-stepper compact" : "number-stepper"}>
-      {props.label}
-      <span>
-        <input
-          type="text"
-          inputMode="numeric"
-          pattern="[0-9]*"
-          aria-invalid={props.value < props.min || props.value > props.max}
-          value={props.value}
-          onChange={(event) => changeValue(event.target.value)}
-          onBlur={() => {
-            if (!Number.isFinite(props.value)) props.onChange(0);
-          }}
-        />
-      </span>
-    </label>
-  );
 }
 
 function ProgressPanel(props: {
@@ -3775,28 +3209,6 @@ function ProgressPanel(props: {
         </details>
       ) : null}
       {pipeline.length ? <p className="muted">{formatPipeline(pipeline)}</p> : null}
-    </section>
-  );
-}
-
-function BuildStartingPanel() {
-  return (
-    <section className="progress-panel" role="status" aria-live="polite">
-      <div className="progress-heading">
-        <div>
-          <p className="section-kicker">Starting build</p>
-          <h2>Starting the newsletter build</h2>
-        </div>
-        <span className="status-pill good">Starting</span>
-      </div>
-      <p className="queue-note">Creating the build job. Progress will appear here as soon as the server accepts it.</p>
-      <div className="pipeline-row">
-        {["discovery", "fetch", "summarize", "audit", "rank", "review", "done"].map((stage) => (
-          <span className="pipeline-pill pending" key={stage}>
-            {formatStage(stage)}
-          </span>
-        ))}
-      </div>
     </section>
   );
 }
@@ -4175,38 +3587,6 @@ function ReportingTabContent(props: {
   );
 }
 
-function LibraryBuildProgress(props: { exploration: Exploration }) {
-  const sources = Object.entries(props.exploration.progress.sources ?? {})
-    .filter(([, data]) => data.status !== "disabled")
-    .slice(0, 6);
-  return (
-    <div className="library-progress">
-      <div className="library-progress-top">
-        <strong>{progressHeadline(props.exploration)}</strong>
-        <span>{isModelDegraded(props.exploration) ? "Needs attention" : formatStage(props.exploration.status)}</span>
-      </div>
-      <p>{progressDetail(props.exploration)}</p>
-      <div className="pipeline-row compact">
-        {["discovery", "fetch", "summarize", "audit", "rank", "review", "done"].map((stage) => (
-          <span className={`pipeline-pill ${props.exploration.progress.pipeline?.[stage] ?? "pending"}`} key={stage}>
-            {formatStage(stage)}
-          </span>
-        ))}
-      </div>
-      {sources.length ? (
-        <div className="library-source-row">
-          {sources.map(([source, data]) => (
-            <span key={source}>{formatSourceLabel(source)}: {formatStage(data.status)}</span>
-          ))}
-        </div>
-      ) : null}
-      {isModelDegraded(props.exploration) ? (
-        <p className="warning-text">{modelDegradedMessage(props.exploration)}</p>
-      ) : null}
-    </div>
-  );
-}
-
 function BriefReadyPanel(props: {
   exploration: Exploration;
   issues: ExplorationIssue[];
@@ -4321,38 +3701,6 @@ function SchedulePanel(props: {
         <button type="button" className="primary-action" onClick={props.onSchedule} disabled={props.busy}>Schedule</button>
       </div>
     </section>
-  );
-}
-
-function SourceChips(props: {
-  selection: Record<SourceKey, boolean>;
-  status: SourceStatusResponse | null;
-  locked: boolean;
-  onToggle: (source: SourceKey) => void;
-}) {
-  return (
-    <div className="source-chips">
-      {sourceOptions.map((source) => {
-        const status = props.status?.sources[source.key];
-        const enabled = status?.enabled ?? false;
-        const selected = Boolean(props.selection[source.key] && enabled);
-        return (
-          <button
-            type="button"
-            key={source.key}
-            className={`source-chip ${selected ? "selected" : ""} ${enabled ? "" : "disabled"}`}
-            onClick={() => props.onToggle(source.key)}
-            disabled={props.locked}
-            aria-pressed={selected}
-            data-source-state={selected ? "selected" : enabled ? "available" : "disabled"}
-            title={enabled ? source.label : status?.reason ?? "Setup required"}
-          >
-            <span>{source.icon}</span>
-            {source.label}
-          </button>
-        );
-      })}
-    </div>
   );
 }
 
@@ -6415,30 +5763,6 @@ function SecretHealthPanel(props: {
   );
 }
 
-function ScheduledDeliveryAlert(props: { failures: ScheduledDeliveryFailure[] }) {
-  if (!props.failures.length) return null;
-  return (
-    <div className="delivery-alert" role="alert">
-      <div>
-        <p className="section-kicker">Email delivery paused</p>
-        <strong>Scheduled brief email failed.</strong>
-        <p>
-          I will keep building scheduled briefs, but I will not keep trying to send email for the failed schedule
-          until you reconnect Gmail or save the schedule again.
-        </p>
-      </div>
-      <ul>
-        {props.failures.slice(0, 4).map((failure) => (
-          <li key={failure.topic_id}>
-            <span>{failure.name}</span>
-            <em>{failure.error}</em>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
 function deliveryFailuresFromStatus(
   status: AdminStatus | null,
   topics: TopicProfileResponse[] = [],
@@ -6560,39 +5884,6 @@ function DigestScheduleEditor(props: {
       <button type="button" onClick={props.onSave} disabled={props.busy}>Save</button>
       <button type="button" className="ghost-action" onClick={props.onCancel} disabled={props.busy}>Cancel</button>
     </div>
-  );
-}
-
-function QuickRecencyEditor(props: {
-  draft: EditingRecencyDraft;
-  busy: boolean;
-  onDraftChange: (draft: EditingRecencyDraft) => void;
-  onSave: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div className="inline-recency-editor">
-      <div className="schedule-editor-heading">
-        <strong>Recency window</strong>
-        <span>This saved window is used by rebuilds and scheduled digest runs.</span>
-      </div>
-      <RecencyControl
-        value={props.draft.lookbackHours}
-        onChange={(lookbackHours) => props.onDraftChange({ ...props.draft, lookbackHours })}
-        compact
-      />
-      <button type="button" onClick={props.onSave} disabled={props.busy}>Save recency</button>
-      <button type="button" className="ghost-action" onClick={props.onCancel} disabled={props.busy}>Cancel</button>
-    </div>
-  );
-}
-
-function DisclosureButton(props: { expanded: boolean; label: string; onToggle: () => void }) {
-  return (
-    <button type="button" className="disclosure-button" onClick={props.onToggle} aria-expanded={props.expanded}>
-      <span>{props.expanded ? "▾" : "▸"}</span>
-      {props.label}
-    </button>
   );
 }
 
@@ -6981,18 +6272,6 @@ function digestLibraryDate(item: DigestLibraryItem): number {
   return dateValue(item.digest.updated_at ?? item.digest.created_at);
 }
 
-function formatSourceLabel(source: string): string {
-  if (source === "web_search") return "Web";
-  if (source === "foreign_media") return "Foreign Media";
-  if (source === "gmail") return "Gmail";
-  if (source === "podcasts") return "Podcast";
-  if (source === "youtube") return "YouTube";
-  if (source === "collections") return "Collections";
-  if (source === "markets") return "Markets";
-  if (source === "google_news") return "Google News";
-  return source.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
 function gmailLookbackLabel(hours: number | undefined): string {
   const value = Number(hours || 0);
   if (!Number.isFinite(value) || value < 1) return "Default window";
@@ -7024,54 +6303,6 @@ function formatPipeline(pipeline: Array<[string, string]>): string {
   const failed = pipeline.find(([, status]) => status === "failed");
   if (failed) return `${formatStage(failed[0])} failed`;
   return "Ready";
-}
-
-function progressHeadline(exploration: Exploration): string {
-  if (exploration.status === "queued") return "Waiting its turn";
-  if (exploration.status === "failed") return "Build failed";
-  if (isModelDegraded(exploration)) return "Brief built with AI issues";
-  const running = Object.entries(exploration.progress.pipeline ?? {}).find(([, status]) => status === "running");
-  if (!running) return exploration.status === "complete" ? "Brief ready" : "Preparing build";
-  const labels: Record<string, string> = {
-    discovery: "Discovering sources",
-    fetch: "Fetching source content",
-    summarize: "Enriching and translating items",
-    audit: "Auditing source fit",
-    rank: "Ranking the complete set",
-    review: "Reviewing the brief",
-    done: "Rendering the brief",
-  };
-  return labels[running[0]] ?? `${formatStage(running[0])} running`;
-}
-
-function progressDetail(exploration: Exploration): string {
-  if (exploration.status === "queued") {
-    return exploration.progress.queue?.message ?? "Queued behind another brief. It will start automatically.";
-  }
-  if (exploration.status === "failed") return exploration.progress.error ?? "The build stopped before the brief was ready.";
-  if (isModelDegraded(exploration)) return modelDegradedMessage(exploration);
-  if (exploration.progress.source_audit?.message) return exploration.progress.source_audit.message;
-  if (exploration.progress.source_audit?.summary) return exploration.progress.source_audit.summary;
-  const candidateCount = exploration.progress.candidate_count ?? 0;
-  const running = Object.entries(exploration.progress.pipeline ?? {}).find(([, status]) => status === "running")?.[0];
-  if (running === "discovery") return "Searching every selected source from scratch.";
-  if (running === "fetch") return `Fetching full content for ${candidateCount || "the discovered"} candidate items.`;
-  if (running === "summarize") return "Cleaning, summarizing, and translating usable source material.";
-  if (running === "audit") return "Checking whether the retrieved sources match the requested strategy.";
-  if (running === "rank") return "Comparing all candidates together before choosing the lead stories.";
-  if (running === "review") return "The critic is checking quality, cuts, and adherence before publish.";
-  if (running === "done") return "Writing the finished brief HTML.";
-  return "Preparing the full rebuild pipeline.";
-}
-
-function isModelDegraded(exploration: Exploration): boolean {
-  if (exploration.progress.model_health?.status === "degraded") return true;
-  const stats = exploration.progress.brief?.stats;
-  const modelCalls = Number(stats?.model_call_count ?? 0);
-  const modelSuccesses = Number(stats?.model_success_count ?? 0);
-  const modelFailures = Number(stats?.model_failure_count ?? 0);
-  const includedArticles = Number(stats?.included_article_count ?? 0);
-  return modelCalls > 0 && (modelSuccesses === 0 || (modelFailures > 0 && includedArticles === 0));
 }
 
 function hasActionableBuildIssues(exploration: Exploration): boolean {
@@ -7113,22 +6344,6 @@ function isActionableIssue(issue: ExplorationIssue): boolean {
   const reason = issue.reason.trim().toLowerCase();
   return source === "source audit" || source === "ai review" || reason.startsWith("audit could not complete");
 }
-
-function modelDegradedMessage(exploration: Exploration): string {
-  if (exploration.progress.model_health?.message) return exploration.progress.model_health.message;
-  const stats = exploration.progress.brief?.stats;
-  const modelCalls = Number(stats?.model_call_count ?? 0);
-  const modelSuccesses = Number(stats?.model_success_count ?? 0);
-  if (modelCalls > 0 && modelSuccesses === 0) {
-    return "AI review did not complete; the brief was built with fallback checks.";
-  }
-  return "The brief finished, but AI review had failures. Rebuild after the model service is healthy.";
-}
-
-function formatStage(value: string): string {
-  return value.split("_").filter(Boolean).map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(" ");
-}
-
 
 function formatDateTime(value: string | null | undefined): string {
   if (!value) return "Never";
