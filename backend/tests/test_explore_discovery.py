@@ -825,6 +825,40 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         }
 
 
+def test_update_topic_profile_recency(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
+        created = client.post(
+            "/api/explore/topic-profiles",
+            json={
+                "statement": "Track release notes for analytics tools",
+                "scope": "Tool release notes and tutorials",
+                "lookback_hours": 168,
+                "source_selection": {"web_search": True, "youtube": True},
+            },
+        )
+        topic_id = created.json()["topic_id"]
+
+        updated = client.post(
+            f"/api/explore/topic-profiles/{topic_id}/recency",
+            json={"lookback_hours": 24},
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["profile"]["lookback_hours"] == 24
+        assert updated.json()["profile"]["recency_weighting"] == "breaking"
+
+        unlimited = client.post(
+            f"/api/explore/topic-profiles/{topic_id}/recency",
+            json={"lookback_hours": None},
+        )
+
+        assert unlimited.status_code == 200
+        assert unlimited.json()["profile"]["lookback_hours"] is None
+        assert unlimited.json()["profile"]["recency_weighting"] == "all_available"
+
+
 def test_rebuild_preserves_topic_profile_lookback(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()

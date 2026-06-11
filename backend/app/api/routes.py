@@ -170,6 +170,11 @@ class TopicProfileContentLimitsUpdate(BaseModel):
     pipeline_limits: dict[str, Any] = Field(default_factory=dict)
 
 
+class TopicProfileRecencyUpdate(BaseModel):
+    lookback_hours: int | None = Field(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
+    recency_weighting: Literal["breaking", "recent", "last_year", "all_available"] | None = None
+
+
 class PodcastShowRef(BaseModel):
     feed_url: str = Field(min_length=1, max_length=2000)
     title: str = Field(default="Podcast", max_length=400)
@@ -468,6 +473,35 @@ def schedule_topic_profile(topic_id: str, payload: TopicProfileSchedule) -> dict
     return database.upsert_topic_profile(profile)
 
 
+@router.post("/explore/topic-profiles/{topic_id}/recency")
+def update_topic_profile_recency(topic_id: str, payload: TopicProfileRecencyUpdate) -> dict[str, Any]:
+    record = database.get_topic_profile(topic_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Topic profile not found")
+    lookback_hours = payload.lookback_hours
+    profile = {
+        **record["profile"],
+        "topic_id": topic_id,
+        "statement": record["statement"],
+        "lookback_hours": lookback_hours,
+        "recency_weighting": payload.recency_weighting or _recency_weighting_from_lookback(lookback_hours),
+    }
+    try:
+        return explore.save_topic_profile(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _recency_weighting_from_lookback(lookback_hours: int | None) -> str:
+    if lookback_hours is None:
+        return "all_available"
+    if lookback_hours <= 48:
+        return "breaking"
+    if lookback_hours >= 365 * 24:
+        return "last_year"
+    return "recent"
+
+
 def _clean_recipient_emails(values: list[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -498,8 +532,9 @@ def update_topic_profile_content_limits(topic_id: str, payload: TopicProfileCont
         profile["pipeline_limits"] = brief_settings.normalize_pipeline_limits(payload.pipeline_limits)
     elif record["profile"].get("pipeline_limits"):
         profile["pipeline_limits"] = brief_settings.normalize_pipeline_limits(record["profile"].get("pipeline_limits"))
-    if payload.lookback_hours is not None:
+    if "lookback_hours" in payload.model_fields_set:
         profile["lookback_hours"] = payload.lookback_hours
+        profile["recency_weighting"] = _recency_weighting_from_lookback(payload.lookback_hours)
     try:
         return explore.save_topic_profile(profile)
     except ValueError as exc:

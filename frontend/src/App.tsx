@@ -397,6 +397,11 @@ type EditingDigestDraft = {
   newRecipient: string;
 };
 
+type EditingRecencyDraft = {
+  topicId: string;
+  lookbackHours: number | null;
+};
+
 type LibraryResponse = {
   explorations: Exploration[];
   deleted_explorations: Exploration[];
@@ -5596,6 +5601,7 @@ function AdminApp() {
   const [explorationSort, setExplorationSort] = useState<SortMode>(() => loadSessionValue("admin.explorationSort", "recent"));
   const [digestSort, setDigestSort] = useState<SortMode>(() => loadSessionValue("admin.digestSort", "recent"));
   const [editingDigest, setEditingDigest] = useState<EditingDigestDraft | null>(null);
+  const [editingRecency, setEditingRecency] = useState<EditingRecencyDraft | null>(null);
   const [editingAdvancedSettings, setEditingAdvancedSettings] = useState<{
     topic: TopicProfileResponse;
     controls: BriefControlsDraft;
@@ -6284,6 +6290,7 @@ function AdminApp() {
   function startEditingDigest(topic: TopicProfileResponse) {
     const config = topic.profile.schedule_config ?? {};
     const recipients = digestRecipients(topic, status?.delivery?.email.recipient_email ?? "");
+    setEditingRecency(null);
     setEditingDigest({
       topicId: topic.topic_id,
       preset: ((topic.schedule ?? "daily") as SchedulePreset),
@@ -6293,6 +6300,36 @@ function AdminApp() {
       newRecipient: "",
     });
     setMessage("Editing schedule");
+  }
+
+  function startEditingRecency(topic: TopicProfileResponse) {
+    setEditingDigest(null);
+    setEditingRecency({
+      topicId: topic.topic_id,
+      lookbackHours: lookbackHoursForBuild(topic.profile, undefined, defaultControlsDraft.lookback_hours),
+    });
+    setMessage("Editing recency");
+  }
+
+  async function saveTopicRecency(topic: TopicProfileResponse) {
+    if (!editingRecency || editingRecency.topicId !== topic.topic_id) return;
+    setBusy(true);
+    try {
+      const saved = await api<TopicProfileResponse>(`/api/explore/topic-profiles/${topic.topic_id}/recency`, {
+        method: "POST",
+        body: JSON.stringify({
+          lookback_hours: editingRecency.lookbackHours,
+          recency_weighting: sourceScopeFromLookbackHours(editingRecency.lookbackHours),
+        }),
+      });
+      setEditingRecency(null);
+      await loadAdmin();
+      setMessage(`Recency updated to ${topicRecencyLabel(saved, defaultControlsDraft.lookback_hours)}`);
+    } catch (error) {
+      setMessage(errorMessage(error, "Could not update recency"));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function saveDigestSchedule(topic: TopicProfileResponse) {
@@ -6733,14 +6770,27 @@ function AdminApp() {
                   <article className="library-row" key={`topic-${item.topic.topic_id}`}>
                     <div>
                       <strong>{profileName(item.topic)}</strong>
-                      <small>Ready to build · {formatDateTime(item.topic.updated_at ?? item.topic.created_at)} · {formatSourceSelection(item.topic.profile.source_selection)}</small>
+                      <small>
+                        Ready to build · {formatDateTime(item.topic.updated_at ?? item.topic.created_at)} · {formatSourceSelection(item.topic.profile.source_selection)}
+                        {" · "}{topicRecencyLabel(item.topic, defaultControlsDraft.lookback_hours)}
+                      </small>
                     </div>
                     <div className="button-row">
                       <button type="button" className="secondary-action" onClick={() => openAdvancedSettings(item.topic)} disabled={busy}>Advanced Settings</button>
+                      <button type="button" className="secondary-action" onClick={() => startEditingRecency(item.topic)} disabled={busy}>Recency</button>
                       <button type="button" className="secondary-action" onClick={() => refineTopicFromAdmin(item.topic)} disabled={busy}>Refine</button>
                       <button type="button" className="secondary-action" onClick={() => void buildTopicFromAdmin(item.topic)} disabled={busy}>Build brief</button>
                       <button type="button" className="secondary-action destructive" onClick={() => void deleteTopicFromAdmin(item.topic)} disabled={busy}>Delete</button>
                     </div>
+                    {editingRecency?.topicId === item.topic.topic_id ? (
+                      <QuickRecencyEditor
+                        draft={editingRecency}
+                        busy={busy}
+                        onDraftChange={setEditingRecency}
+                        onSave={() => void saveTopicRecency(item.topic)}
+                        onCancel={() => setEditingRecency(null)}
+                      />
+                    ) : null}
                   </article>
                 );
               }
@@ -6749,7 +6799,10 @@ function AdminApp() {
                 <article className="library-row" key={item.exploration.exploration_id}>
                   <div>
                     <strong>{explorationLibraryName(item)}</strong>
-                    <small>{formatDateTime(item.exploration.finished_at ?? item.exploration.started_at)} · {formatSourceSelection(item.exploration.source_selection)}</small>
+                    <small>
+                      {formatDateTime(item.exploration.finished_at ?? item.exploration.started_at)} · {formatSourceSelection(item.exploration.source_selection)}
+                      {item.topic ? ` · ${topicRecencyLabel(item.topic, defaultControlsDraft.lookback_hours)}` : ""}
+                    </small>
                     {isModelDegraded(item.exploration) ? (
                       <p className="warning-text">Built with AI issues.</p>
                     ) : hasActionableBuildIssues(item.exploration) && item.exploration.status === "complete" ? (
@@ -6776,6 +6829,7 @@ function AdminApp() {
                       </button>
                     ) : null}
                     <button type="button" className="secondary-action" onClick={() => item.topic && openAdvancedSettings(item.topic)} disabled={busy || !item.topic}>Advanced Settings</button>
+                    <button type="button" className="secondary-action" onClick={() => item.topic && startEditingRecency(item.topic)} disabled={busy || !item.topic}>Recency</button>
                     <button type="button" className="secondary-action" onClick={() => refineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void cloneAndRefineFromAdmin(item.exploration)} disabled={busy || item.exploration.status === "queued" || item.exploration.status === "running"}>Clone and refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildFromAdmin(item.exploration)} disabled={busy}>Rebuild</button>
@@ -6807,6 +6861,15 @@ function AdminApp() {
                       onRemoveRecipient={removeDigestRecipient}
                       onSave={() => void saveDigestSchedule(item.topic!)}
                       onCancel={() => setEditingDigest(null)}
+                    />
+                  ) : null}
+                  {item.topic && editingRecency?.topicId === item.topic.topic_id ? (
+                    <QuickRecencyEditor
+                      draft={editingRecency}
+                      busy={busy}
+                      onDraftChange={setEditingRecency}
+                      onSave={() => void saveTopicRecency(item.topic!)}
+                      onCancel={() => setEditingRecency(null)}
                     />
                   ) : null}
                   {item.exploration.status === "complete" ? (
@@ -6907,6 +6970,7 @@ function AdminApp() {
                     <small>
                       {topic.profile.status === "paused" ? "Paused" : formatStage(topic.schedule ?? "daily")}
                       {topic.profile.status === "paused" ? "" : ` · next ${formatDateTime(topic.next_run_at)}`}
+                      {" · "}{topicRecencyLabel(topic, defaultControlsDraft.lookback_hours)}
                     </small>
                   </div>
                   <div className="button-row">
@@ -6927,6 +6991,7 @@ function AdminApp() {
                     <button type="button" className="secondary-action" onClick={() => topic.latest_exploration && refineFromAdmin(topic.latest_exploration)} disabled={busy || !topic.latest_exploration || topic.latest_exploration.status === "queued" || topic.latest_exploration.status === "running"}>Refine</button>
                     <button type="button" className="secondary-action" onClick={() => void rebuildDigest(topic)} disabled={busy}>Rebuild</button>
                     <button type="button" className="secondary-action" onClick={() => startEditingDigest(topic)} disabled={busy}>Edit schedule</button>
+                    <button type="button" className="secondary-action" onClick={() => startEditingRecency(topic)} disabled={busy}>Recency</button>
                     <button type="button" className="secondary-action" onClick={() => void pauseDigest(topic)} disabled={busy || topic.profile.status === "paused"}>Pause</button>
                     <button type="button" className="secondary-action" onClick={() => void archiveDigest(topic)} disabled={busy}>Archive</button>
                     <button type="button" className="secondary-action destructive" onClick={() => void deleteDigest(topic)} disabled={busy}>Delete</button>
@@ -6943,6 +7008,15 @@ function AdminApp() {
                       onRemoveRecipient={removeDigestRecipient}
                       onSave={() => void saveDigestSchedule(topic)}
                       onCancel={() => setEditingDigest(null)}
+                    />
+                  ) : null}
+                  {editingRecency?.topicId === topic.topic_id ? (
+                    <QuickRecencyEditor
+                      draft={editingRecency}
+                      busy={busy}
+                      onDraftChange={setEditingRecency}
+                      onSave={() => void saveTopicRecency(topic)}
+                      onCancel={() => setEditingRecency(null)}
                     />
                   ) : null}
                 </article>
@@ -7487,6 +7561,30 @@ function DigestScheduleEditor(props: {
   );
 }
 
+function QuickRecencyEditor(props: {
+  draft: EditingRecencyDraft;
+  busy: boolean;
+  onDraftChange: (draft: EditingRecencyDraft) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="inline-recency-editor">
+      <div className="schedule-editor-heading">
+        <strong>Recency window</strong>
+        <span>This saved window is used by rebuilds and scheduled digest runs.</span>
+      </div>
+      <RecencyControl
+        value={props.draft.lookbackHours}
+        onChange={(lookbackHours) => props.onDraftChange({ ...props.draft, lookbackHours })}
+        compact
+      />
+      <button type="button" onClick={props.onSave} disabled={props.busy}>Save recency</button>
+      <button type="button" className="ghost-action" onClick={props.onCancel} disabled={props.busy}>Cancel</button>
+    </div>
+  );
+}
+
 function DisclosureButton(props: { expanded: boolean; label: string; onToggle: () => void }) {
   return (
     <button type="button" className="disclosure-button" onClick={props.onToggle} aria-expanded={props.expanded}>
@@ -7638,6 +7736,11 @@ function sourceScopeFromProfile(profile: TopicProfile): SourceScope {
     return "recent";
   }
   return normalizeSourceScope(profile.recency_weighting);
+}
+
+function topicRecencyLabel(topic: TopicProfileResponse, defaultLookbackHours = defaultBriefControls.lookback_hours): string {
+  const lookback = lookbackHoursForBuild(topic.profile, undefined, defaultLookbackHours);
+  return recencyText(sourceScopeFromLookbackHours(lookback), lookback);
 }
 
 function lookbackHoursFromSourceScope(sourceScope: SourceScope): number | null {
