@@ -721,3 +721,22 @@ export const schedulePresets: Array<{ value: SchedulePreset; label: string }> = 
   { value: "monthly", label: "Monthly" },
 ];
 export const adminTabOptions: AdminTab[] = ["status", "sources", "library", "settings", "models", "metrics", "reporting"];
+
+export type GmailAllowlistAction = "approve" | "reject" | "remove";
+
+export type GmailSenderRecord = {
+  sender: string;
+  sender_name?: string | null;
+  state: "approved" | "candidate" | "rejected";
+  reason?: string | null;
+  source?: string | null;
+  message_count?: number;
+  last_seen_at?: string | null;
+};
+
+export type GmailAllowlistResponse = {
+  summary: { sender_count: number; approved_count: number; candidate_count: number; rejected_count: number };
+  approved: GmailSenderRecord[];
+  candidates: GmailSenderRecord[];
+  rejected: GmailSenderRecord[];
+};
