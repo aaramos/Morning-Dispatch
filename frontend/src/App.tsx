@@ -145,6 +145,7 @@ function DispatchApp() {
   const [queuedRefinementTurns, setQueuedRefinementTurns] = useState(0);
   const [queuedBuildRequests, setQueuedBuildRequests] = useState(0);
   const buildBriefRef = useRef<() => void>(() => undefined);
+  const backgroundBuildRef = useRef<{ id: string; status: Exploration["status"] } | null>(null);
   const [autoBuildRequest, setAutoBuildRequest] = useState(0);
   const recencyOverrideRef = useRef<Pick<ConfirmationDraft, "recency_weighting" | "lookback_hours"> | null>(null);
 
@@ -212,11 +213,9 @@ function DispatchApp() {
     return { phase: "starting", startedAt: refinementFallbackStartedAt, label: "Refining" };
   }, [refinementFallbackStartedAt, refinementProgress, refinementWorking]);
 
-  const loadHome = useCallback(async () => {
-    const [sources, explorations, scheduled, , admin, settings] = await Promise.all([
+  const loadStatics = useCallback(async () => {
+    const [sources, , admin, settings] = await Promise.all([
       api<SourceStatusResponse>("/api/explore/source-status").catch(() => null),
-      api<Exploration[]>("/api/explore/explorations?limit=25").catch(() => []),
-      api<TopicProfileResponse[]>("/api/explore/scheduled-topic-profiles").catch(() => []),
       api<TopicProfileResponse[]>("/api/explore/topic-profiles").catch(() => []),
       api<AdminStatus>("/api/admin/status").catch(() => null),
       api<BriefSettingsResponse>("/api/admin/brief-settings").catch(() => null),
@@ -224,8 +223,6 @@ function DispatchApp() {
     if (sources) setSourceStatus(sources);
     if (admin) setAdminStatus(admin);
     if (settings) setBriefSettings(settings);
-    setRecentExplorations(explorations);
-    setScheduledTopics(scheduled);
     const email = admin?.delivery?.email;
     const configured = Boolean(email?.enabled && email.recipient_email && email.gmail_send_ready !== false);
     const sendReady = Boolean(email?.gmail_send_ready);
@@ -235,6 +232,33 @@ function DispatchApp() {
     setEmailOnSchedule(configured);
   }, []);
 
+  const loadBuildState = useCallback(async (refreshStaticsOnCompletion = false) => {
+    const [explorations, scheduled] = await Promise.all([
+      api<Exploration[]>("/api/explore/explorations?limit=25").catch(() => []),
+      api<TopicProfileResponse[]>("/api/explore/scheduled-topic-profiles").catch(() => []),
+    ]);
+    setRecentExplorations(explorations);
+    setScheduledTopics(scheduled);
+
+    const previous = backgroundBuildRef.current;
+    const active = explorations.find((item) => item.status === "queued" || item.status === "running") ?? null;
+    const previousNow = previous
+      ? explorations.find((item) => item.exploration_id === previous.id) ?? null
+      : null;
+    const previousFinished = Boolean(
+      previous
+      && (!previousNow || previousNow.status === "complete" || previousNow.status === "failed"),
+    );
+    backgroundBuildRef.current = active ? { id: active.exploration_id, status: active.status } : null;
+    if (refreshStaticsOnCompletion && previousFinished) {
+      await loadStatics();
+    }
+  }, [loadStatics]);
+
+  const loadHome = useCallback(async () => {
+    await Promise.all([loadStatics(), loadBuildState()]);
+  }, [loadBuildState, loadStatics]);
+
   useEffect(() => {
     void loadHome();
   }, [loadHome]);
@@ -242,10 +266,10 @@ function DispatchApp() {
   useEffect(() => {
     if (!backgroundBuild) return;
     const timer = window.setInterval(() => {
-      void loadHome();
+      void loadBuildState(true);
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [backgroundBuild, loadHome]);
+  }, [backgroundBuild, loadBuildState]);
 
   useEffect(() => {
     if (flow !== "idle") return;
@@ -1257,6 +1281,7 @@ function DispatchApp() {
       setSourceSelection((current) => ({ ...current, [key]: true }));
       setEnableSource(null);
     }
+    await loadStatics();
   }
 
   async function saveWebKey() {
@@ -1663,9 +1688,6 @@ function DispatchApp() {
 
 
 void ConfirmationPanel;
-
-
-
 
 
 
