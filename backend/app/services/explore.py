@@ -38,6 +38,7 @@ from backend.app.services.brief_title import tight_brief_title
 from backend.agents.editor import prepare_issue_articles
 from backend.agents.editorial_decisions import apply_editorial_decisions
 from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles_for_payloads
+from backend.agents.librarian.date_text import normalize_date_string
 from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
 from backend.agents.source_audit import apply_source_audit
 from backend.app.core.config import ensure_runtime_dirs, get_settings
@@ -752,6 +753,12 @@ async def _run_exploration(
                 progress["source_filter_notes"] = [
                     *list(progress.get("source_filter_notes") or []),
                     *discovery.notes,
+                ]
+            foreign_notes = _foreign_language_coverage_notes(current_profile, discovery.candidates)
+            if foreign_notes:
+                progress["source_filter_notes"] = [
+                    *list(progress.get("source_filter_notes") or []),
+                    *foreign_notes,
                 ]
             _persist_progress(exploration_id, progress)
 
@@ -2625,7 +2632,56 @@ def _date_from_text(value: str | None) -> datetime | None:
                     59,
                     tzinfo=UTC,
                 )
+    # Non-English Latin month names that the English _MONTHS map misses. Relative
+    # phrasing is disabled here because this scans free body/snippet text where
+    # "posted 2 days ago" chrome must not be read as the publish date.
+    shared = normalize_date_string(text, allow_relative=False)
+    if shared:
+        with suppress(ValueError):
+            parsed = datetime.fromisoformat(shared)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(hour=23, minute=59, second=59, tzinfo=UTC)
+            return parsed
     return None
+
+
+def _foreign_language_coverage_notes(profile: Any, candidates: Any) -> list[dict[str, Any]]:
+    """Surface foreign-media languages that returned nothing this build.
+
+    Reads the persisted language plan and the surviving discovery candidates so
+    an empty Foreign Media section is explained in the Reporting tab (per
+    language) instead of silently rendering blank.
+    """
+    selection = getattr(profile, "source_selection", None) or {}
+    if not (isinstance(selection, dict) and selection.get("foreign_media")):
+        return []
+    plan = getattr(profile, "foreign_language_plan", None) or ()
+    if not plan:
+        return []
+    covered: set[str] = set()
+    for candidate in candidates or ():
+        if getattr(candidate, "adapter", "") != "foreign_media":
+            continue
+        metadata = getattr(candidate.payload, "metadata", None) or {}
+        code = str(metadata.get("source_language") or "").strip().lower()
+        if code:
+            covered.add(code)
+    notes: list[dict[str, Any]] = []
+    for entry in plan:
+        if not isinstance(entry, dict):
+            continue
+        code = str(entry.get("code") or "").strip().lower()
+        if not code or code in covered:
+            continue
+        name = str(entry.get("name") or code).strip() or code
+        notes.append(
+            {
+                "source_name": "Foreign Media",
+                "item": name,
+                "reason": f"No {name} results survived discovery for this brief.",
+            }
+        )
+    return notes
 
 
 def _source_window_issue_name(result: ArticleFetchResult) -> str:

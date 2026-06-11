@@ -661,6 +661,7 @@ async def astream_refinement(
         canonical_terms, canonical_aliases = await expand_must_have_aliases(patched)
         patched["must_have_terms"] = canonical_terms
         patched["must_have_aliases"] = canonical_aliases
+        patched["foreign_language_plan"] = await _ensure_foreign_language_plan(patched)
         pre_critique = _diagnostics_query_snapshot(patched)
         patched = _critique_search_plan(patched)
         patched["refinement_diagnostics"] = _enrich_diagnostics(
@@ -749,6 +750,32 @@ async def expand_must_have_aliases(profile: dict[str, Any]) -> tuple[list[str], 
     aliases = _clean_must_have_aliases(payload.get("aliases"), terms=terms) if isinstance(payload, dict) else {}
     merged_aliases = {**existing, **aliases}
     return _canonicalize_must_have(terms, merged_aliases)
+
+
+async def _ensure_foreign_language_plan(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Generate and persist the foreign-media language plan at confirm time.
+
+    Building the plan here (instead of lazily mid-build) removes a model call
+    from the discovery hot path, makes the native queries reviewable in the
+    strategy preview, and keeps the result deterministic across builds. Fails
+    open to whatever plan already exists so a model hiccup never blocks confirm.
+    """
+    existing = profile.get("foreign_language_plan")
+    existing_list = list(existing) if isinstance(existing, (list, tuple)) else []
+    selection = profile.get("source_selection")
+    foreign_selected = bool(isinstance(selection, dict) and selection.get("foreign_media"))
+    if not foreign_selected or existing_list:
+        return existing_list
+    try:
+        from backend.agents.discovery.foreign_media import foreign_language_plan_for_profile
+        from backend.agents.discovery.types import TopicProfile
+
+        topic_profile = TopicProfile.from_dict(profile)
+        plan = await foreign_language_plan_for_profile(topic_profile)
+        return [dict(entry) for entry in plan]
+    except Exception as exc:  # pragma: no cover - provider/model failures must not block confirm
+        logger.warning("Foreign language plan generation failed: %s", exc)
+        return existing_list
 
 
 async def _astream_gmail_discovery(

@@ -18,6 +18,25 @@ logger = logging.getLogger(__name__)
 
 MAX_FOREIGN_LANGUAGES = 10
 DEFAULT_RESULTS_PER_LANGUAGE = 20
+# How many of the refinement-written native queries to fan out per language, on
+# top of the plan's own native_query.
+_QUERIES_PER_LANGUAGE = 6
+# Per-search hit cap; results are merged + deduped to DEFAULT_RESULTS_PER_LANGUAGE.
+_PER_QUERY_LIMIT = 10
+# Bounds concurrent provider calls so the fan-out stays within the 40s timeout.
+_FOREIGN_SEARCH_CONCURRENCY = 4
+# Country code TLDs that indicate genuinely-local coverage for a language, used
+# only as a small positive score nudge (never an exclusion).
+LANGUAGE_LOCAL_TLDS: dict[str, tuple[str, ...]] = {
+    "es": (".mx", ".com.mx", ".ar", ".com.ar", ".co", ".com.co", ".cl", ".pe", ".com.pe", ".es"),
+    "pt": (".br", ".com.br", ".pt"),
+    "fr": (".fr", ".ca"),
+    "de": (".de", ".at", ".ch"),
+    "it": (".it",),
+    "nl": (".nl", ".be"),
+    "pl": (".pl",),
+    "tr": (".tr", ".com.tr"),
+}
 NON_FOREIGN_MEDIA_LANGUAGE_CODES = {"en"}
 SCRIPT_RE = {
     "ko": re.compile(r"[\uac00-\ud7af]"),
@@ -149,29 +168,66 @@ class ForeignMediaSourceAdapter:
         if not plan:
             return []
 
-        per_language_limit = DEFAULT_RESULTS_PER_LANGUAGE
+        language_queries = _language_query_plan(profile, plan)
+        if not language_queries:
+            return []
+
         days = lookback_to_days(context.lookback_hours)
-        results = await asyncio.gather(
-            *(
-                search_web(str(item["native_query"]), limit=per_language_limit, language=str(item["code"]), days=days)
-                for item in plan
-                if str(item.get("native_query") or "").strip()
-            ),
-            return_exceptions=True,
-        )
+        # Native travel/guide queries are evergreen; the news index returns almost
+        # nothing for them. Use organic search (recency still bounded by the date
+        # restrict + downstream window) unless the brief is explicitly breaking.
+        vertical = "news" if profile.recency_weighting == "breaking" else "organic"
+        semaphore = asyncio.Semaphore(_FOREIGN_SEARCH_CONCURRENCY)
+
+        async def _run_search(query_text: str, language_code: str) -> Any:
+            async with semaphore:
+                try:
+                    return await search_web(
+                        query_text,
+                        limit=_PER_QUERY_LIMIT,
+                        language=language_code,
+                        days=days,
+                        vertical=vertical,
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate one query's failure
+                    # Note: Exception (not BaseException) so CancelledError still
+                    # propagates and the runner's wait_for timeout can cancel us.
+                    return exc
 
         candidates: list[Candidate] = []
-        for item, result in zip([entry for entry in plan if str(entry.get("native_query") or "").strip()], results, strict=False):
-            if isinstance(result, BaseException):
-                logger.info("Foreign media search failed for %s: %s", item.get("code"), result)
-                continue
-            language_code = str(item["code"])
-            language_name = str(item["name"])
-            for rank, hit in enumerate(result[:per_language_limit], start=1):
-                if not hit.url:
+        for entry, queries in language_queries:
+            language_code = str(entry["code"])
+            language_name = str(entry["name"])
+            native_query = str(entry.get("native_query") or (queries[0] if queries else ""))
+
+            search_results = await asyncio.gather(*(_run_search(q, language_code) for q in queries))
+
+            # Merge every query's hits for this language and dedupe by URL before
+            # applying the per-language candidate cap.
+            merged_hits: list[Any] = []
+            seen_urls: set[str] = set()
+            failures = 0
+            for result in search_results:
+                if isinstance(result, BaseException):
+                    failures += 1
+                    logger.info("Foreign media search failed for %s: %s", language_code, result)
                     continue
+                for hit in result:
+                    url = str(getattr(hit, "url", "") or "").strip()
+                    if not url:
+                        continue
+                    key = url.casefold()
+                    if key in seen_urls:
+                        continue
+                    seen_urls.add(key)
+                    merged_hits.append(hit)
+
+            kept = 0
+            excluded = 0
+            for rank, hit in enumerate(merged_hits[:DEFAULT_RESULTS_PER_LANGUAGE], start=1):
                 quality = _foreign_media_quality(hit, language_code)
                 if quality["decision"] == "exclude":
+                    excluded += 1
                     logger.info(
                         "Foreign media result excluded for %s: %s (%s)",
                         language_code,
@@ -202,12 +258,12 @@ class ForeignMediaSourceAdapter:
                             published_at=hit.published_at,
                             metadata={
                                 "link_quality_score": score,
-                                "search_query": item["native_query"],
+                                "search_query": native_query,
                                 "search_provider": hit.provider,
                                 "source_language": language_code,
                                 "source_language_name": language_name,
-                                "language_reason": item.get("reason") or item.get("rationale") or "",
-                                "native_entity_terms": list(item.get("native_entity_terms") or []),
+                                "language_reason": entry.get("reason") or entry.get("rationale") or "",
+                                "native_entity_terms": list(entry.get("native_entity_terms") or []),
                                 "needs_translation": True,
                                 "original_search_title": _repair_text_encoding(hit.title),
                                 "original_search_summary": _repair_text_encoding(hit.snippet),
@@ -218,10 +274,71 @@ class ForeignMediaSourceAdapter:
                         reason=f"Native-language {language_name} web result. {quality['reason']}",
                     )
                 )
+                kept += 1
+
+            logger.info(
+                "Foreign media %s: %d queries -> %d hits, kept %d, excluded %d, failures %d",
+                language_code,
+                len(queries),
+                len(merged_hits),
+                kept,
+                excluded,
+                failures,
+            )
         return candidates
 
     async def fetch(self, candidate: Candidate) -> NormalizedPayload:
         return candidate.payload
+
+
+def _foreign_source_queries(profile: TopicProfile) -> list[str]:
+    """Native queries the refinement agent wrote for the foreign-media lane."""
+    raw = (profile.source_queries or {}).get("foreign_media") or ()
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for query in raw:
+        value = " ".join(str(query or "").split()).strip()
+        key = value.casefold()
+        if value and key not in seen:
+            cleaned.append(value)
+            seen.add(key)
+    return cleaned
+
+
+def _language_query_plan(
+    profile: TopicProfile,
+    plan: tuple[dict[str, Any], ...],
+) -> list[tuple[dict[str, Any], list[str]]]:
+    """Build the per-language query fan-out: each language's plan native_query
+    plus the refinement-written foreign source_queries, deduped and anchored to
+    any must-have terms. The refinement queries are attached to the primary
+    (first) language, since they are written in that language; additional
+    languages still search with their own native_query.
+    """
+    from backend.agents.discovery.query_refiner import enforce_must_have_on_queries
+
+    foreign_queries = _foreign_source_queries(profile)
+    result: list[tuple[dict[str, Any], list[str]]] = []
+    for index, entry in enumerate(plan):
+        queries: list[str] = []
+        seen: set[str] = set()
+
+        def _add(value: str) -> None:
+            text = " ".join(str(value or "").split()).strip()
+            key = text.casefold()
+            if text and key not in seen:
+                queries.append(text)
+                seen.add(key)
+
+        _add(str(entry.get("native_query") or ""))
+        if index == 0:
+            for query in foreign_queries[:_QUERIES_PER_LANGUAGE]:
+                _add(query)
+
+        anchored = enforce_must_have_on_queries(profile, queries)
+        if anchored:
+            result.append((entry, anchored))
+    return result
 
 
 async def foreign_language_plan_for_profile(profile: TopicProfile) -> tuple[dict[str, Any], ...]:
@@ -523,6 +640,9 @@ def _foreign_media_quality(hit: Any, language_code: str) -> dict[str, Any]:
         return _quality_result("include", "Japanese local-domain source", score_adjustment=0.05)
     if _contains_expected_script(language_code, combined):
         return _quality_result("include", "native-script coverage")
+    local_tlds = LANGUAGE_LOCAL_TLDS.get(language_code, ())
+    if local_tlds and any(host == tld.lstrip(".") or host.endswith(tld) for tld in local_tlds):
+        return _quality_result("include", "country-local domain", score_adjustment=0.05)
     return _quality_result("include", "accepted foreign-media result", score_adjustment=-0.04)
 
 

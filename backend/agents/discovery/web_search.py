@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from urllib.parse import urlparse
 from typing import Any, Protocol
@@ -7,7 +8,26 @@ from typing import Any, Protocol
 import httpx
 
 from backend.agents.discovery.types import AdapterUnavailable
+from backend.agents.librarian.date_text import normalize_date_string
 from backend.app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+def _use_news_vertical(vertical: str | None, days: int | None) -> bool:
+    """Decide whether a search should target a news index.
+
+    ``organic`` never uses news; ``news`` always does. ``auto`` preserves the
+    historical behavior of treating any bounded lookback as news-shaped — the
+    foreign-media lane opts into ``organic`` explicitly because its native
+    queries are evergreen and absent from news indexes.
+    """
+    value = str(vertical or "auto").strip().lower()
+    if value == "news":
+        return True
+    if value == "organic":
+        return False
+    return days is not None
 
 
 @dataclass(frozen=True)
@@ -37,7 +57,15 @@ def _repair_text_encoding(value: Any) -> str:
 class WebSearchBackend(Protocol):
     name: str
 
-    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        language: str | None = None,
+        days: int | None = None,
+        vertical: str = "auto",
+    ) -> list[SearchHit]:
         ...
 
 
@@ -48,7 +76,15 @@ class TavilyBackend:
     name: str = "tavily"
     endpoint: str = "https://api.tavily.com/search"
 
-    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        language: str | None = None,
+        days: int | None = None,
+        vertical: str = "auto",
+    ) -> list[SearchHit]:
         clean_query = _clean_query(query)
         if not clean_query:
             return []
@@ -61,7 +97,9 @@ class TavilyBackend:
             "include_answer": False,
             "include_raw_content": False,
         }
-        if days is not None:
+        # Tavily only honors `days` under the news topic; for organic searches we
+        # omit both and rely on the downstream recency window instead.
+        if days is not None and _use_news_vertical(vertical, days):
             payload["days"] = max(1, int(days))
             payload["topic"] = "news"
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
@@ -102,11 +140,21 @@ class BraveBackend:
     name: str = "brave"
     endpoint: str = "https://api.search.brave.com/res/v1/web/search"
 
-    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        language: str | None = None,
+        days: int | None = None,
+        vertical: str = "auto",
+    ) -> list[SearchHit]:
         clean_query = _clean_query(query)
         if not clean_query:
             return []
 
+        # Brave's web endpoint has no separate news vertical; the freshness filter
+        # applies identically regardless of `vertical`.
         params = {
             "q": clean_query,
             "count": max(1, min(limit, 25)),
@@ -152,11 +200,21 @@ class SerpAPIBackend:
     name: str = "serpapi"
     endpoint: str = "https://serpapi.com/search.json"
 
-    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        language: str | None = None,
+        days: int | None = None,
+        vertical: str = "auto",
+    ) -> list[SearchHit]:
         clean_query = _clean_query(query)
         if not clean_query:
             return []
 
+        # SerpAPI's google engine returns organic results with a tbs date filter;
+        # `vertical` is accepted for interface parity but does not switch indexes.
         params = {
             "q": clean_query,
             "engine": "google",
@@ -210,7 +268,15 @@ class SerperBackend:
     name: str = "serper"
     endpoint: str = "https://google.serper.dev/search"
 
-    async def search(self, query: str, limit: int, *, language: str | None = None, days: int | None = None) -> list[SearchHit]:
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        language: str | None = None,
+        days: int | None = None,
+        vertical: str = "auto",
+    ) -> list[SearchHit]:
         clean_query = _clean_query(query)
         if not clean_query:
             return []
@@ -221,6 +287,8 @@ class SerperBackend:
         }
         if language:
             payload["hl"] = language
+        # The organic endpoint honors the same tbs date restrict as news, so we
+        # keep recency bounded even when serving evergreen organic results.
         tbs = _serpapi_tbs(days)
         if tbs:
             payload["tbs"] = tbs
@@ -229,7 +297,7 @@ class SerperBackend:
             "X-API-KEY": self.api_key,
             "Content-Type": "application/json",
         }
-        is_news = days is not None
+        is_news = _use_news_vertical(vertical, days)
         endpoint = "https://google.serper.dev/news" if is_news else self.endpoint
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(endpoint, json=payload, headers=headers)
@@ -268,7 +336,13 @@ class SerperBackend:
 
 def _clean_hit_date(value: Any) -> str | None:
     text = str(value or "").strip()
-    return text or None
+    if not text:
+        return None
+    # Providers emit locale ("19 ago 2025") and relative ("10 months ago") dates,
+    # especially for foreign-language and organic results. Normalize to ISO when
+    # possible so downstream recency filtering can read the date; otherwise keep
+    # the raw string so a later body-text scan can still attempt to parse it.
+    return normalize_date_string(text) or text
 
 
 def _normalize_url(value: str) -> str:
@@ -411,13 +485,38 @@ def lookback_to_days(lookback_hours: int | None) -> int | None:
     return days if days <= 365 else None
 
 
-async def search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None) -> list[SearchHit]:
+async def search_web(
+    query: str,
+    *,
+    limit: int,
+    language: str | None = None,
+    days: int | None = None,
+    vertical: str = "auto",
+) -> list[SearchHit]:
     providers = _providers_from_config()
     errors: list[str] = []
+    any_success = False
     for backend in providers:
         try:
-            return await backend.search(query=query, limit=limit, language=language, days=days)
+            hits = await backend.search(
+                query=query, limit=limit, language=language, days=days, vertical=vertical
+            )
         except Exception as exc:
             errors.append(f"{backend.name}: {exc}")
             continue
+        any_success = True
+        logger.info(
+            "web search provider %s returned %d hits (vertical=%s, days=%s) for %r",
+            backend.name,
+            len(hits),
+            vertical,
+            days,
+            query[:80],
+        )
+        # An empty result is a retriable signal, not an answer — fall through to
+        # the next configured provider before giving up on the query.
+        if hits:
+            return hits
+    if any_success:
+        return []
     raise AdapterUnavailable("Web search failed across configured providers: " + "; ".join(errors))
