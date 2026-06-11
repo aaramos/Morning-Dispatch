@@ -325,6 +325,8 @@ class WebSearchSourceAdapter:
                 "search_query": query,
                 "search_query_rank": query_index + 1,
                 "search_provider": hit.provider,
+                "title": hit.title or hit.url,
+                "link_text": hit.title or hit.url,
             }
             if is_refined:
                 metadata["is_refined_query"] = True

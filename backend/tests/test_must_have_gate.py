@@ -9,6 +9,8 @@ from backend.agents.discovery import query_refiner
 from backend.agents.discovery.registry import SourceRegistry
 from backend.agents.discovery.runner import DiscoveryRunner
 from backend.agents.discovery.types import Candidate, CostProfile, SourceAdapterContext, TopicProfile
+from backend.agents.librarian.articles import ArticleFetchResult
+from backend.app.services.explore import _enforce_inclusion_limits
 
 
 def _runtime(monkeypatch, tmp_path) -> None:
@@ -65,6 +67,42 @@ def _candidate(
             metadata={"title": title or item_id},
         ),
         score=0.9,
+    )
+
+
+def _article(
+    *,
+    item_id: str,
+    title: str,
+    text: str = "",
+    excerpt: str = "",
+    source_type: str = "web_search",
+    status: str = "fetched",
+    tier: str = "main",
+    link_score: float = 0.9,
+    payload_metadata: dict | None = None,
+    metadata: dict | None = None,
+) -> ArticleFetchResult:
+    payload = NormalizedPayload(
+        id=item_id,
+        source_type=source_type,
+        source_name=title,
+        raw_text=text,
+        original_url=f"https://example.com/{item_id}",
+        metadata={"title": title, **dict(payload_metadata or {})},
+    )
+    return ArticleFetchResult(
+        payload=payload,
+        original_url=payload.original_url or "",
+        final_url=payload.original_url,
+        title=title,
+        text=text,
+        excerpt=excerpt,
+        domain="example.com",
+        status=status,
+        link_score=link_score,
+        tier=tier,
+        metadata=dict(metadata or {}),
     )
 
 
@@ -126,7 +164,7 @@ def test_must_have_gate_matches_accented_aliases_for_foreign_media(monkeypatch, 
     assert result.exclusions == ()
 
 
-def test_must_have_gate_exempts_requested_sources_markets_and_empty_shells(monkeypatch, tmp_path) -> None:
+def test_must_have_gate_defers_only_empty_shells(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
     profile = TopicProfile.from_dict(
         {
@@ -166,9 +204,10 @@ def test_must_have_gate_exempts_requested_sources_markets_and_empty_shells(monke
         )
     )
 
-    assert {candidate.payload.id for candidate in result.candidates} >= {"requested", "empty"}
+    assert {candidate.payload.id for candidate in result.candidates} == {"empty"}
+    assert any(entry["candidate_id"] == "requested" and entry["excluded_by"] == ["must_have"] for entry in result.exclusions)
+    assert any(entry["candidate_id"] == "market" and entry["excluded_by"] == ["must_have"] for entry in result.exclusions)
     assert any(entry["candidate_id"] == "drop" and entry["excluded_by"] == ["must_have"] for entry in result.exclusions)
-    assert not any(entry["candidate_id"] == "market" and entry["excluded_by"] == ["must_have"] for entry in result.exclusions)
 
 
 def test_topic_profile_round_trips_must_have_terms_and_aliases() -> None:
@@ -421,3 +460,90 @@ def test_funnel_guardrail_diagnostics_note_silent(monkeypatch, tmp_path):
     )
     assert len(result_b.notes) == 0
 
+
+def test_final_must_have_gate_drops_observed_mexico_city_leaks() -> None:
+    profile = TopicProfile.from_dict({
+        "statement": "Solo trip to Mexico City",
+        "scope": "Mexico City, CDMX, Ciudad de México food and walking routes",
+        "must_have_terms": ["Mexico City"],
+        "must_have_aliases": {"mexico city": ["CDMX", "Ciudad de México"]},
+        "source_selection": {"web_search": True},
+        "content_limits": {"per_source": {"web_search": 20}},
+    })
+    results = [
+        _article(item_id="egypt", title="Tips for Avoiding Scams in Egypt", text="Cairo tourist scam safety advice."),
+        _article(item_id="singapore", title="Travel Dilemma: Singapore vs. Malaysia for a 4-Day Trip", text="Penang street food and Kuala Lumpur logistics."),
+        _article(item_id="tokyo", title="I Take Skillcations on My Own", text="A kintsugi workshop in Tokyo changed solo travel."),
+        _article(item_id="colombia", title="First Colombia Trip Itinerary Feedback", text="Bogota and Medellin itinerary feedback."),
+        _article(item_id="cdmx", title="Walking through Roma and Condesa CDMX", text="Street food route through Roma Norte."),
+        _article(item_id="ciudad", title="Street food in Ciudad de Mexico", text="Comida callejera en Ciudad de Mexico."),
+    ]
+
+    final = _enforce_inclusion_limits(profile, results)
+
+    included_titles = [result.title for result in final if result.tier != "dropped"]
+    assert included_titles == [
+        "Walking through Roma and Condesa CDMX",
+        "Street food in Ciudad de Mexico",
+    ]
+    dropped = {result.payload.id: result for result in final if result.tier == "dropped"}
+    assert set(dropped) >= {"egypt", "singapore", "tokyo", "colombia"}
+    assert all(result.metadata["must_have_rejection_reason"] == "Missing required term(s): Mexico City." for result in dropped.values())
+    matches = {
+        result.payload.id: result.metadata.get("must_have_matches")
+        for result in final
+        if result.tier != "dropped"
+    }
+    assert matches["cdmx"][0]["alias"] == "cdmx"
+    assert matches["ciudad"][0]["alias"] == "ciudad de mexico"
+
+
+def test_must_have_source_floor_does_not_revive_nonmatching_dropped_item() -> None:
+    profile = TopicProfile.from_dict({
+        "statement": "Solo trip to Mexico City",
+        "scope": "Mexico City travel",
+        "must_have_terms": ["Mexico City"],
+        "source_selection": {"web_search": True},
+    })
+    off_topic = _article(
+        item_id="source-floor",
+        title="General solo travel packing advice",
+        text="Packing tips for August trips and food tours.",
+        tier="dropped",
+        link_score=0.99,
+    )
+
+    final = _enforce_inclusion_limits(profile, [off_topic])
+
+    assert len(final) == 1
+    assert final[0].tier == "dropped"
+
+
+def test_must_have_drops_low_yield_context_and_fetch_failed_fallback_without_anchor() -> None:
+    profile = TopicProfile.from_dict({
+        "statement": "Solo trip to Mexico City",
+        "scope": "Mexico City travel",
+        "must_have_terms": ["Mexico City"],
+        "must_have_aliases": {"mexico city": ["CDMX", "Ciudad de México"]},
+        "source_selection": {"web_search": True},
+    })
+    low_yield_context = _article(
+        item_id="context",
+        title="Solo travel safety checklist",
+        text="Useful context for a first solo trip, food, and walking routes.",
+        metadata={"source_audit_decision": "include_as_context"},
+    )
+    fetch_failed = _article(
+        item_id="unresolved",
+        title="Yahoo travel tips for summer",
+        text="",
+        excerpt="HTTP 429",
+        status="error",
+        tier="lower_confidence",
+        link_score=0.95,
+    )
+
+    final = _enforce_inclusion_limits(profile, [low_yield_context, fetch_failed])
+
+    assert all(result.tier == "dropped" for result in final)
+    assert all(result.metadata["must_have_rejected"] is True for result in final)

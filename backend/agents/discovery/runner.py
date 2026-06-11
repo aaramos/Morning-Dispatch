@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import unicodedata
 from dataclasses import replace
 from collections.abc import Callable
 from time import perf_counter
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from backend.agents.discovery.must_have import (
+    candidate_must_have_evaluation,
+    must_have_alias_sets,
+    must_have_reason,
+)
 from backend.agents.librarian.text_utils import keyword_set
 from backend.agents.discovery.registry import SourceRegistry
 from backend.agents.discovery.types import (
@@ -20,7 +24,6 @@ from backend.agents.discovery.types import (
     SourceAdapter,
     SourceAdapterContext,
     TopicProfile,
-    fold_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -577,8 +580,7 @@ def _matches_exclusion(candidate: Candidate, exclusions: set[str]) -> bool:
 
 
 def _apply_must_have(profile: TopicProfile, candidates: list[Candidate]) -> tuple[list[Candidate], list[dict[str, Any]]]:
-    alias_sets = _must_have_alias_sets(profile)
-    if not alias_sets:
+    if not must_have_alias_sets(profile):
         return candidates, []
 
     kept: list[Candidate] = []
@@ -587,10 +589,11 @@ def _apply_must_have(profile: TopicProfile, candidates: list[Candidate]) -> tupl
         if _candidate_exempt_from_must_have(candidate, profile):
             kept.append(candidate)
             continue
-        missed = _candidate_missed_must_have_terms(candidate, alias_sets)
-        if not missed:
+        evaluation = candidate_must_have_evaluation(profile, candidate)
+        if evaluation.passed:
             kept.append(candidate)
             continue
+        missed = list(evaluation.missed_terms)
         dropped.append(
             {
                 "adapter": candidate.adapter,
@@ -604,79 +607,17 @@ def _apply_must_have(profile: TopicProfile, candidates: list[Candidate]) -> tupl
                 "metadata": dict(candidate.payload.metadata or {}),
                 "excluded_by": ["must_have"],
                 "missed_terms": missed,
-                "reason": f"Missing required term(s): {', '.join(missed)}.",
+                "reason": must_have_reason(evaluation),
             }
         )
 
     return kept, dropped
 
 
-def _must_have_alias_sets(profile: TopicProfile) -> list[tuple[str, set[str]]]:
-    alias_sets: list[tuple[str, set[str]]] = []
-    aliases_by_key = {
-        _fold_text(key): {_fold_text(alias) for alias in aliases if _fold_text(alias)}
-        for key, aliases in (profile.must_have_aliases or {}).items()
-    }
-    for term in profile.must_have_terms:
-        anchor = str(term or "").strip()
-        folded_anchor = _fold_text(anchor)
-        if not folded_anchor:
-            continue
-        term_aliases = {folded_anchor, *aliases_by_key.get(folded_anchor, set())}
-        term_aliases = {alias for alias in term_aliases if alias}
-        
-        merged_into_existing = False
-        for idx, (existing_anchor, existing_set) in enumerate(alias_sets):
-            if folded_anchor in existing_set:
-                existing_set.update(term_aliases)
-                merged_into_existing = True
-                break
-        if not merged_into_existing:
-            alias_sets.append((anchor, term_aliases))
-    return alias_sets
-
-
 def _candidate_exempt_from_must_have(candidate: Candidate, profile: TopicProfile) -> bool:
-    # Market rows are structured ticker/price records; forcing keyword anchors on
-    # their sparse text would incorrectly remove requested market snapshots.
-    if candidate.adapter == "markets":
-        return True
-    if _is_candidate_from_requested_source(candidate, profile):
-        return True
     # If the adapter produced no meaningful text yet, leave the item for later
-    # fetch/audit stages rather than guessing from an empty shell.
+    # fetch/final stages rather than guessing from an empty shell.
     return not _candidate_has_judgeable_topic_text(candidate)
-
-
-def _candidate_missed_must_have_terms(candidate: Candidate, alias_sets: list[tuple[str, set[str]]]) -> list[str]:
-    haystack = _fold_text(_candidate_must_have_text(candidate))
-    missed: list[str] = []
-    for anchor, aliases in alias_sets:
-        if not any(alias and alias in haystack for alias in aliases):
-            missed.append(anchor)
-    return missed
-
-
-def _candidate_must_have_text(candidate: Candidate) -> str:
-    metadata = {
-        key: value
-        for key, value in candidate.payload.metadata.items()
-        if str(key).lower() not in {"search_query"}
-    }
-    fields = [
-        candidate.payload.source_name,
-        candidate.payload.source_type,
-        candidate.payload.raw_text,
-        candidate.reason,
-    ]
-    for key, value in metadata.items():
-        fields.extend(_flatten_metadata_value(key))
-        fields.extend(_flatten_metadata_value(value))
-    return " ".join(str(value) for value in fields if value)
-
-
-def _fold_text(value: object) -> str:
-    return fold_text(value)
 
 
 def _flatten_metadata_value(value: object) -> list[str]:

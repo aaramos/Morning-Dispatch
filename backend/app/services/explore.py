@@ -25,6 +25,12 @@ from backend.agents.discovery import (
     TopicProfile,
     default_source_registry,
 )
+from backend.agents.discovery.must_have import (
+    article_result_must_have_evaluation,
+    must_have_enabled,
+    must_have_evidence,
+    must_have_reason,
+)
 from backend.agents.digestor.base import NormalizedPayload
 from backend.app.services import brief_settings, email_delivery, mcp_status, model_routing
 from backend.app.services.brief_strategy import selected_source_labels, summarize_search_strategy
@@ -802,6 +808,12 @@ async def _run_exploration(
                 fetched_articles,
                 lookback_hours=lookback_hours,
             )
+            fetched_articles, must_have_fetch_summary = _apply_must_have_article_gate(
+                current_profile,
+                fetched_articles,
+                stage="post_fetch",
+            )
+            _record_must_have_summary(progress, "post_fetch", must_have_fetch_summary)
             progress["source_window"] = {
                 "status": "completed",
                 "source_scope": _source_scope_label(lookback_hours),
@@ -1931,7 +1943,7 @@ async def _run_digest_core(
     if librarian_client is not None:
         database.cache_model_enrichments(article_results, model_name=_model_client_name(librarian_client, settings.librarian_model))
     final_results = _enforce_inclusion_limits(
-        profile, article_results, recency_reserve=recency_reserve or []
+        profile, article_results, recency_reserve=recency_reserve or [], progress=progress
     )
 
     progress["_intermediates"] = {
@@ -1961,12 +1973,126 @@ def _source_inclusion_limit(profile: TopicProfile, adapter: str) -> int:
     return max_allowed
 
 
+def _apply_must_have_article_gate(
+    profile: TopicProfile,
+    results: list[ArticleFetchResult],
+    *,
+    stage: str,
+) -> tuple[list[ArticleFetchResult], dict[str, Any]]:
+    summary: dict[str, Any] = {
+        "enabled": must_have_enabled(profile),
+        "stage": stage,
+        "checked_count": 0,
+        "matched_count": 0,
+        "excluded_count": 0,
+        "missed_terms": {},
+    }
+    if not summary["enabled"]:
+        return results, summary
+
+    updated: list[ArticleFetchResult] = []
+    missed_counts: dict[str, int] = {}
+    for result in results:
+        if result.tier == "dropped":
+            updated.append(result)
+            continue
+        summary["checked_count"] += 1
+        evaluation = article_result_must_have_evaluation(profile, result)
+        if evaluation.passed:
+            summary["matched_count"] += 1
+            updated.append(_mark_must_have_match(result, evaluation, stage=stage))
+            continue
+        summary["excluded_count"] += 1
+        for term in evaluation.missed_terms:
+            missed_counts[term] = missed_counts.get(term, 0) + 1
+        updated.append(_drop_for_must_have(result, evaluation, stage=stage))
+    summary["missed_terms"] = missed_counts
+    return updated, summary
+
+
+def _mark_must_have_match(
+    result: ArticleFetchResult,
+    evaluation: Any,
+    *,
+    stage: str,
+) -> ArticleFetchResult:
+    evidence = must_have_evidence(evaluation)
+    if not evidence:
+        return result
+    metadata = {
+        **dict(result.metadata or {}),
+        "must_have_matches": evidence,
+        "must_have_match_stage": stage,
+    }
+    return replace(result, metadata=metadata)
+
+
+def _drop_for_must_have(
+    result: ArticleFetchResult,
+    evaluation: Any,
+    *,
+    stage: str,
+) -> ArticleFetchResult:
+    reason = must_have_reason(evaluation) or "Missing required must-have term."
+    metadata = {
+        **dict(result.metadata or {}),
+        "must_have_rejected": True,
+        "must_have_rejection_stage": stage,
+        "must_have_rejection_reason": reason,
+        "must_have_missed_terms": list(evaluation.missed_terms),
+    }
+    return replace(result, tier="dropped", metadata=metadata)
+
+
+def _result_satisfies_must_have(profile: TopicProfile, result: ArticleFetchResult) -> bool:
+    if not must_have_enabled(profile):
+        return True
+    return article_result_must_have_evaluation(profile, result).passed
+
+
+def _record_must_have_summary(
+    progress: dict[str, Any] | None,
+    stage: str,
+    summary: dict[str, Any],
+) -> None:
+    if progress is None or not summary.get("enabled"):
+        return
+    bucket = dict(progress.get("must_have") or {})
+    bucket[stage] = {
+        "checked_count": int(summary.get("checked_count") or 0),
+        "matched_count": int(summary.get("matched_count") or 0),
+        "excluded_count": int(summary.get("excluded_count") or 0),
+        "missed_terms": dict(summary.get("missed_terms") or {}),
+    }
+    progress["must_have"] = bucket
+    excluded_count = int(summary.get("excluded_count") or 0)
+    if excluded_count <= 0:
+        return
+    missed_terms = dict(summary.get("missed_terms") or {})
+    missed_label = ", ".join(f"{term}: {count}" for term, count in sorted(missed_terms.items()))
+    reason = f"Must-have gate removed {excluded_count} item(s) at {stage.replace('_', ' ')}."
+    if missed_label:
+        reason = f"{reason} Misses: {missed_label}."
+    issue = {"source_name": "Must-Have Gate", "reason": reason}
+    notes = list(progress.get("source_filter_notes") or [])
+    if issue not in notes:
+        notes.append(issue)
+        progress["source_filter_notes"] = notes
+
+
 def _enforce_inclusion_limits(
     profile: TopicProfile,
     results: list[ArticleFetchResult],
     *,
     recency_reserve: list[ArticleFetchResult] | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> list[ArticleFetchResult]:
+    results, must_have_summary = _apply_must_have_article_gate(
+        profile,
+        results,
+        stage="final",
+    )
+    _record_must_have_summary(progress, "final", must_have_summary)
     counts: dict[str, int] = {}
     updated: list[ArticleFetchResult] = []
     for r in results:
@@ -1985,7 +2111,14 @@ def _enforce_inclusion_limits(
     # Generalized per-source floor (item 3): every active source that produced
     # candidates is guaranteed a minimum number of slots in the brief, reviving
     # its best dropped (loosely related) items when nothing survived review.
-    return _apply_source_floors(profile, updated, recency_reserve=recency_reserve or [])
+    updated = _apply_source_floors(profile, updated, recency_reserve=recency_reserve or [])
+    updated, post_floor_summary = _apply_must_have_article_gate(
+        profile,
+        updated,
+        stage="final",
+    )
+    _record_must_have_summary(progress, "final_post_floor", post_floor_summary)
+    return updated
 
 
 def _apply_source_floors(
@@ -2029,6 +2162,8 @@ def _apply_source_floors(
                 continue
             if (r.metadata or {}).get("out_of_window"):
                 continue
+            if not _result_satisfies_must_have(profile, r):
+                continue
             if r.link_score >= brief_settings.SOURCE_FLOOR_SCORE_THRESHOLD:
                 revival.append((r.link_score, index))
         revival.sort(key=lambda item: item[0], reverse=True)
@@ -2042,7 +2177,11 @@ def _apply_source_floors(
         # source genuinely returned nothing usable inside the window.
         if remaining > 0 and active + len(in_window_take) == 0:
             pool = sorted(
-                reserve_by_adapter.get(adapter, []),
+                [
+                    item
+                    for item in reserve_by_adapter.get(adapter, [])
+                    if _result_satisfies_must_have(profile, item)
+                ],
                 key=_reserve_sort_key,
                 reverse=True,
             )

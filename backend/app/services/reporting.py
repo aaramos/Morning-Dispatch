@@ -130,6 +130,21 @@ def _article_title(result: ArticleFetchResult, *, fallback: str = "Source item")
     return _candidate_title_from_payload(result.payload, fallback=fallback)
 
 
+def _must_have_rejection_reason(result: ArticleFetchResult) -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return str(metadata.get("must_have_rejection_reason") or "").strip()
+
+
+def _must_have_reporting_stage(result: ArticleFetchResult, *, fallback: str) -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    stage = str(metadata.get("must_have_rejection_stage") or "").strip()
+    if stage == "post_fetch":
+        return "fetch"
+    if stage:
+        return "inclusion"
+    return fallback
+
+
 def _source_issue_adapter(source_name: Any) -> str:
     normalized = re.sub(r"\s+", " ", str(source_name or "").strip().lower())
     return SOURCE_ISSUE_ADAPTERS.get(normalized, normalized.replace(" ", "_"))
@@ -345,8 +360,8 @@ def compile_reporting_data(
             if any(cand["stages"].values()):
                 continue
             if result.status != "fetched":
-                reason = result.error or f"Failed to fetch content ({result.status})."
-                set_reason_at_stage(cand_id, "fetch", reason)
+                reason = _must_have_rejection_reason(result) or result.error or f"Failed to fetch content ({result.status})."
+                set_reason_at_stage(cand_id, _must_have_reporting_stage(result, fallback="fetch"), reason)
 
     # 6. Add pre-ranking quality audit drops
     enriched_ids = {r.payload.id for r in enriched_articles}
@@ -360,7 +375,10 @@ def compile_reporting_data(
         if any(cand["stages"].values()):
             continue
 
-        if cand_id not in enriched_ids:
+        must_have_reason = _must_have_rejection_reason(result)
+        if must_have_reason:
+            set_reason_at_stage(cand_id, _must_have_reporting_stage(result, fallback="fetch"), must_have_reason)
+        elif cand_id not in enriched_ids:
             set_reason_at_stage(
                 cand_id, "audit", "Failed pre-ranking quality audit (noisy title, domain, or body text)."
             )
@@ -450,6 +468,7 @@ def compile_reporting_data(
 
     # 9. Add inclusion limits drops
     final_ids = {r.payload.id for r in final_results if r.tier != "dropped"}
+    final_by_id = {r.payload.id: r for r in final_results}
     for result in after_critic:
         if result.tier == "dropped":
             continue
@@ -461,10 +480,13 @@ def compile_reporting_data(
             continue
 
         if cand_id not in final_ids:
+            final_result = final_by_id.get(cand_id)
+            must_have_reason = _must_have_rejection_reason(final_result) if final_result is not None else ""
             set_reason_at_stage(
                 cand_id,
-                "inclusion",
-                "Exceeded source-specific capacity limit (YouTube/Podcast capped at 20; Gmail/Markets/Web/Foreign capped at 40).",
+                _must_have_reporting_stage(final_result, fallback="inclusion") if final_result is not None else "inclusion",
+                must_have_reason
+                or "Exceeded source-specific capacity limit (YouTube/Podcast capped at 20; Gmail/Markets/Web/Foreign capped at 40).",
             )
 
     return list(candidates_by_id.values())
