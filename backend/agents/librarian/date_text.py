@@ -13,8 +13,17 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 
-__all__ = ["month_from_token", "parse_relative_date", "normalize_date_string"]
+__all__ = [
+    "month_from_token",
+    "parse_relative_date",
+    "normalize_date_string",
+    "parse_iso_datetime",
+    "parse_rfc2822_datetime",
+    "parse_datetime",
+    "date_from_url",
+]
 
 
 def _fold(token: str) -> str:
@@ -202,3 +211,105 @@ def normalize_date_string(value: str, *, allow_relative: bool = True, now: datet
     if dotted:
         return _iso_or_none(dotted.group(1), dotted.group(2), dotted.group(3))
     return None
+
+
+def _to_utc(parsed: datetime) -> datetime:
+    """Coerce a datetime to timezone-aware UTC (naive values are assumed UTC)."""
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def parse_iso_datetime(value: object) -> datetime | None:
+    """Parse an ISO 8601 date/datetime string to a timezone-aware UTC datetime.
+
+    Accepts the trailing ``Z`` suffix that :func:`datetime.fromisoformat` rejects
+    on older corpora, date-only strings (midnight UTC), and naive datetimes
+    (assumed UTC). Returns None when the string is not strict ISO 8601.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return _to_utc(parsed)
+
+
+def parse_rfc2822_datetime(value: object) -> datetime | None:
+    """Parse an RFC 2822 date string (email/RSS ``pubDate``) to aware UTC.
+
+    Naive results (e.g. the ``-0000`` unknown-zone convention) are assumed UTC.
+    Returns None when the string is not RFC 2822.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed is None:  # pre-3.10 parsedate_to_datetime returns None on failure
+        return None
+    return _to_utc(parsed)
+
+
+def parse_datetime(
+    value: object,
+    *,
+    allow_relative: bool = True,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Best-effort parse of any provider date value to a timezone-aware UTC datetime.
+
+    Tries, in order: datetime passthrough, numeric epoch seconds, ISO 8601
+    (with/without ``Z``), RFC 2822, then the locale/relative text forms handled
+    by :func:`normalize_date_string` (resolved to midnight UTC when date-only).
+
+    Set ``allow_relative=False`` when scanning free body text, where page chrome
+    like "posted 2 days ago" must not become a publish date.
+    """
+    if isinstance(value, datetime):
+        return _to_utc(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    parsed = parse_iso_datetime(value)
+    if parsed is not None:
+        return parsed
+    parsed = parse_rfc2822_datetime(value)
+    if parsed is not None:
+        return parsed
+    normalized = normalize_date_string(str(value or ""), allow_relative=allow_relative, now=now)
+    if normalized is None:
+        return None
+    # The ISO-datetime passthrough can keep a comma decimal separator that
+    # fromisoformat rejects; normalize it before the final conversion.
+    return parse_iso_datetime(normalized.replace(",", "."))
+
+
+# Full URL-embedded dates only: `/2026/06/10/` path segments and `2026-06-10`
+# slug fragments. Year/month-only paths (`/2026/06/`) are archive pages, not
+# article dates, so they are deliberately not matched.
+_URL_SLASH_DATE_RE = re.compile(r"/(20\d{2})/(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])(?:[/?#]|$)")
+_URL_ISO_DATE_RE = re.compile(r"(?:^|[^\d])(20\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])(?:[^\d]|$)")
+
+
+def date_from_url(url: object) -> str | None:
+    """Extract an article date embedded in a URL path as ISO ``YYYY-MM-DD``.
+
+    Recognizes `/2026/06/10/` style path segments and `2026-06-10` slug
+    fragments. Returns None when no full year-month-day date is present.
+    """
+    text = str(url or "")
+    if not text:
+        return None
+    match = _URL_SLASH_DATE_RE.search(text) or _URL_ISO_DATE_RE.search(text)
+    if not match:
+        return None
+    return _iso_or_none(match.group(1), match.group(2), match.group(3))

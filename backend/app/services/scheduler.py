@@ -6,6 +6,7 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from backend.agents.librarian.date_text import parse_iso_datetime
 from backend.app.core.config import get_settings
 from backend.app.db import database
 from backend.app.services import digest_runner, email_delivery, explore
@@ -261,13 +262,7 @@ def _latest_run_time(latest_run: dict[str, Any] | None) -> datetime | None:
     raw_value = latest_run.get("completed_at") or latest_run.get("run_at")
     if not raw_value:
         return None
-    try:
-        parsed = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    return parse_iso_datetime(str(raw_value))
 
 
 def _latest_exploration_time(latest_run: dict[str, Any] | None) -> datetime | None:
@@ -276,13 +271,7 @@ def _latest_exploration_time(latest_run: dict[str, Any] | None) -> datetime | No
     raw_value = latest_run.get("finished_at") or latest_run.get("started_at")
     if not raw_value:
         return None
-    try:
-        parsed = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    return parse_iso_datetime(str(raw_value))
 
 
 def _running_key(kind: str, resource_id: str) -> str:

@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from backend.agents.discovery.types import AdapterUnavailable, TopicProfile
+from backend.agents.librarian.date_text import parse_iso_datetime, parse_rfc2822_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -82,16 +83,26 @@ class MarketSnapshot:
         movement = _movement_sentence(self)
         news = "; ".join(str(item.get("title") or "") for item in self.recent_news[:3] if item.get("title"))
         multiples = []
-        if self.pe_trailing: multiples.append(f"PE (Trailing): {self.pe_trailing:.1f}")
-        if self.pe_forward: multiples.append(f"PE (Forward): {self.pe_forward:.1f}")
-        if self.peg_ratio: multiples.append(f"PEG: {self.peg_ratio:.2f}")
-        if self.price_to_book: multiples.append(f"PB: {self.price_to_book:.2f}")
-        if self.ev_ebitda: multiples.append(f"EV/EBITDA: {self.ev_ebitda:.1f}")
-        if self.debt_to_equity: multiples.append(f"Debt/Equity: {self.debt_to_equity:.1f}")
-        if self.profit_margin: multiples.append(f"Profit Margin: {self.profit_margin * 100:.1f}%")
-        if self.operating_margin: multiples.append(f"Operating Margin: {self.operating_margin * 100:.1f}%")
-        if self.beta: multiples.append(f"Beta: {self.beta:.2f}")
-        if self.short_percent_of_float: multiples.append(f"Short Float: {self.short_percent_of_float * 100:.1f}%")
+        if self.pe_trailing:
+            multiples.append(f"PE (Trailing): {self.pe_trailing:.1f}")
+        if self.pe_forward:
+            multiples.append(f"PE (Forward): {self.pe_forward:.1f}")
+        if self.peg_ratio:
+            multiples.append(f"PEG: {self.peg_ratio:.2f}")
+        if self.price_to_book:
+            multiples.append(f"PB: {self.price_to_book:.2f}")
+        if self.ev_ebitda:
+            multiples.append(f"EV/EBITDA: {self.ev_ebitda:.1f}")
+        if self.debt_to_equity:
+            multiples.append(f"Debt/Equity: {self.debt_to_equity:.1f}")
+        if self.profit_margin:
+            multiples.append(f"Profit Margin: {self.profit_margin * 100:.1f}%")
+        if self.operating_margin:
+            multiples.append(f"Operating Margin: {self.operating_margin * 100:.1f}%")
+        if self.beta:
+            multiples.append(f"Beta: {self.beta:.2f}")
+        if self.short_percent_of_float:
+            multiples.append(f"Short Float: {self.short_percent_of_float * 100:.1f}%")
 
         multiples_text = " Multiples: " + ", ".join(multiples) + "." if multiples else ""
         upside = f"Target price: {self.target_mean_price:.2f} ({self.implied_upside_pct:+.1f}% upside)." if self.target_mean_price and self.implied_upside_pct else ""
@@ -320,13 +331,7 @@ def fetch_google_news_rss(ticker_symbol: str, company_name: str) -> list[dict[st
                 if " - " in title_text:
                     clean_title = title_text.rsplit(" - ", 1)[0]
 
-                published_at = None
-                if pub_date_text:
-                    try:
-                        from email.utils import parsedate_to_datetime
-                        published_at = parsedate_to_datetime(pub_date_text)
-                    except Exception:
-                        pass
+                published_at = parse_rfc2822_datetime(pub_date_text) if pub_date_text else None
 
                 from backend.app.core.config import get_settings
                 unfurl_enabled = getattr(get_settings(), "google_news_unfurl_links", True)
@@ -623,11 +628,7 @@ def _published_at(item: dict[str, Any]) -> datetime | None:
     if isinstance(raw, (int, float)):
         return datetime.fromtimestamp(raw, tz=UTC)
     if isinstance(raw, str) and raw:
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return parse_iso_datetime(raw)
     return None
 
 
