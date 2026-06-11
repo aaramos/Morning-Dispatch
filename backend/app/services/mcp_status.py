@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import httpx
@@ -10,16 +11,33 @@ from backend.app.core.secret_redaction import redact_secret_text
 
 GMAIL_FETCH_TOOL = "gmail__gmail_fetch_newsletters"
 
+_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_STATUS_TTL_SECONDS = 20.0
+
+
+def reset_status_cache() -> None:
+    _STATUS_CACHE.clear()
+
 
 async def status(settings: Settings) -> dict[str, Any]:
     if not settings.model_base_url:
         return _unavailable("oMLX base URL is not configured.")
 
+    base_url = settings.model_base_url.rstrip("/")
+    cached = _STATUS_CACHE.get(base_url)
+    if cached is not None and time.monotonic() - cached[0] < _STATUS_TTL_SECONDS:
+        return cached[1]
+
+    result = await _probe_status(settings, base_url)
+    _STATUS_CACHE[base_url] = (time.monotonic(), result)
+    return result
+
+
+async def _probe_status(settings: Settings, base_url: str) -> dict[str, Any]:
     headers = {}
     if settings.model_api_key:
         headers["Authorization"] = f"Bearer {settings.model_api_key}"
 
-    base_url = settings.model_base_url.rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=min(settings.model_timeout_seconds, 8.0)) as client:
             servers_response, tools_response = await asyncio.gather(

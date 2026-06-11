@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 from backend.app.core.config import Settings
@@ -109,3 +110,59 @@ def test_mcp_status_degrades_when_omlx_unreachable(monkeypatch, tmp_path):
     assert payload["available"] is False
     assert payload["gmail"]["connected"] is False
     assert "Could not reach" in payload["error"]
+
+
+def test_mcp_status_memoizes_within_ttl(monkeypatch, tmp_path):
+    instances = []
+
+    class CountingAsyncClient(FakeAsyncClient):
+        def __init__(self, *args, **kwargs):
+            instances.append(self)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_status.httpx, "AsyncClient", CountingAsyncClient)
+
+    first = asyncio.run(mcp_status.status(settings(tmp_path)))
+    second = asyncio.run(mcp_status.status(settings(tmp_path)))
+
+    assert len(instances) == 1
+    assert second == first
+
+    mcp_status.reset_status_cache()
+    asyncio.run(mcp_status.status(settings(tmp_path)))
+    assert len(instances) == 2
+
+
+def test_mcp_status_memoizes_unavailable_results(monkeypatch, tmp_path):
+    calls = []
+
+    class CountingFailingAsyncClient(FailingAsyncClient):
+        def __init__(self, *args, **kwargs):
+            calls.append(self)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_status.httpx, "AsyncClient", CountingFailingAsyncClient)
+
+    first = asyncio.run(mcp_status.status(settings(tmp_path)))
+    second = asyncio.run(mcp_status.status(settings(tmp_path)))
+
+    assert len(calls) == 1
+    assert first["available"] is False
+    assert second == first
+
+
+def test_mcp_status_changed_base_url_misses_cache(monkeypatch, tmp_path):
+    instances = []
+
+    class CountingAsyncClient(FakeAsyncClient):
+        def __init__(self, *args, **kwargs):
+            instances.append(self)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_status.httpx, "AsyncClient", CountingAsyncClient)
+
+    asyncio.run(mcp_status.status(settings(tmp_path)))
+    other = replace(settings(tmp_path), model_base_url="http://other.local/v1")
+    asyncio.run(mcp_status.status(other))
+
+    assert len(instances) == 2
