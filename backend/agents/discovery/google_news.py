@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import json
 import time
 import hashlib
@@ -10,7 +9,6 @@ import urllib.parse
 import email.utils
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 from datetime import datetime, UTC, timedelta
 
 import httpx
