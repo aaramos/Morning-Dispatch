@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import unicodedata
 from dataclasses import replace
@@ -19,7 +20,10 @@ from backend.agents.discovery.types import (
     SourceAdapter,
     SourceAdapterContext,
     TopicProfile,
+    fold_text,
 )
+
+logger = logging.getLogger(__name__)
 from backend.app.services import brief_settings
 
 _SECRET_QUERY_RE = re.compile(r"(?i)([?&](?:key|api_key|apikey|token|access_token|client_secret)=)([^&\s'\"<>]+)")
@@ -206,7 +210,35 @@ class DiscoveryRunner:
         statuses = [status for _candidates, status in results]
         all_raw_candidates = [candidate for adapter_candidates, _status in results for candidate in adapter_candidates]
         candidates, exclusions = _apply_exclusions(profile, all_raw_candidates)
+
+        # Count non-exempt candidates that enter the must-have gate
+        non_exempt_count = sum(1 for c in candidates if not _candidate_exempt_from_must_have(c, profile))
+
         candidates, must_have_exclusions = _apply_must_have(profile, candidates)
+
+        rejected_count = len(must_have_exclusions)
+        notes = []
+        if non_exempt_count > 0 and rejected_count >= 20 and (rejected_count / non_exempt_count) > 0.60:
+            from collections import Counter
+            miss_counter = Counter()
+            for exc in must_have_exclusions:
+                for term in exc.get("missed_terms", []):
+                    miss_counter[term] += 1
+            
+            msg = f"Warning: Must-have gate rejected {rejected_count} of {non_exempt_count} non-exempt candidates ({ (rejected_count / non_exempt_count) * 100:.1f}%). Misses: {', '.join(f'{k}: {v}' for k, v in sorted(miss_counter.items()))}"
+            logger.warning(
+                "Aggressive must-have gate: rejected %d of %d non-exempt candidates (%.1f%%). Miss counts: %s",
+                rejected_count,
+                non_exempt_count,
+                (rejected_count / non_exempt_count) * 100,
+                dict(miss_counter),
+            )
+            notes.append({
+                "source_name": "Must-Have Gate",
+                "item": "Diagnostics Note",
+                "reason": msg,
+            })
+
         candidates, relevance_exclusions = _apply_topic_relevance(profile, candidates, low_yield=low_yield)
 
         from backend.agents.discovery.query_refiner import screen_candidates
@@ -285,6 +317,7 @@ class DiscoveryRunner:
             candidates=tuple(candidates),
             statuses=tuple([*statuses, *excluded_statuses]),
             exclusions=tuple([*exclusions, *must_have_exclusions, *relevance_exclusions, *screening_exclusions, *limit_exclusions]),
+            notes=tuple(notes),
         )
 
     async def _run_adapter(
@@ -570,6 +603,7 @@ def _apply_must_have(profile: TopicProfile, candidates: list[Candidate]) -> tupl
                 "link_text": candidate.payload.metadata.get("link_text"),
                 "metadata": dict(candidate.payload.metadata or {}),
                 "excluded_by": ["must_have"],
+                "missed_terms": missed,
                 "reason": f"Missing required term(s): {', '.join(missed)}.",
             }
         )
@@ -588,8 +622,17 @@ def _must_have_alias_sets(profile: TopicProfile) -> list[tuple[str, set[str]]]:
         folded_anchor = _fold_text(anchor)
         if not folded_anchor:
             continue
-        aliases = {folded_anchor, *aliases_by_key.get(folded_anchor, set())}
-        alias_sets.append((anchor, {alias for alias in aliases if alias}))
+        term_aliases = {folded_anchor, *aliases_by_key.get(folded_anchor, set())}
+        term_aliases = {alias for alias in term_aliases if alias}
+        
+        merged_into_existing = False
+        for idx, (existing_anchor, existing_set) in enumerate(alias_sets):
+            if folded_anchor in existing_set:
+                existing_set.update(term_aliases)
+                merged_into_existing = True
+                break
+        if not merged_into_existing:
+            alias_sets.append((anchor, term_aliases))
     return alias_sets
 
 
@@ -633,8 +676,7 @@ def _candidate_must_have_text(candidate: Candidate) -> str:
 
 
 def _fold_text(value: object) -> str:
-    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
-    return "".join(char for char in text if not unicodedata.combining(char))
+    return fold_text(value)
 
 
 def _flatten_metadata_value(value: object) -> list[str]:

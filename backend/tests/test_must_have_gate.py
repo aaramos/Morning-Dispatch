@@ -240,3 +240,184 @@ def test_enforce_must_have_on_queries_preserves_alias_hits() -> None:
         "CDMX tacos",
         "bike routes Mexico City",
     ]
+
+
+def test_canonicalize_must_have_incident_data():
+    from backend.app.services.refinement import _canonicalize_must_have
+    terms = ["Mexico City", "CDMX", "Ciudad de México"]
+    aliases = {
+        "mexico city": ["CDMX"],
+        "cdmx": ["Ciudad de México", "DF"],
+    }
+    canonical_terms, canonical_aliases = _canonicalize_must_have(terms, aliases)
+    assert canonical_terms == ["Mexico City"]
+    assert "mexico city" in canonical_aliases
+    assert set(canonical_aliases["mexico city"]) == {"CDMX", "Ciudad de México", "DF"}
+
+
+def test_canonicalize_must_have_distinct_anchors():
+    from backend.app.services.refinement import _canonicalize_must_have
+    terms = ["Tesla", "Battery"]
+    aliases = {
+        "tesla": ["TSLA", "Elon Musk"],
+        "battery": ["cells", "pack"],
+    }
+    canonical_terms, canonical_aliases = _canonicalize_must_have(terms, aliases)
+    assert set(canonical_terms) == {"Tesla", "Battery"}
+    assert canonical_aliases["tesla"] == ["TSLA", "Elon Musk"]
+    assert canonical_aliases["battery"] == ["cells", "pack"]
+
+
+def test_canonicalize_must_have_accent_case_folding():
+    from backend.app.services.refinement import _canonicalize_must_have
+    terms = ["Caffè", "caffe"]
+    canonical_terms, canonical_aliases = _canonicalize_must_have(terms, {})
+    assert canonical_terms == ["Caffè"]
+
+
+def test_canonicalize_must_have_symmetric_pollution():
+    from backend.app.services.refinement import _canonicalize_must_have
+    terms = ["CDMX", "Mexico City"]
+    aliases = {"mexico city": ["CDMX"]}
+    canonical_terms, canonical_aliases = _canonicalize_must_have(terms, aliases)
+    assert canonical_terms == ["CDMX"]
+    assert "cdmx" in canonical_aliases
+    assert "Mexico City" in canonical_aliases["cdmx"]
+
+
+def test_merge_agent_profile_patch_synonym_folding():
+    from backend.app.services.refinement import _merge_agent_profile_patch
+    profile = {
+        "must_have_terms": ["Mexico City"],
+        "must_have_aliases": {"mexico city": ["CDMX", "Ciudad de México"]}
+    }
+    patch = {
+        "must_have_terms": ["Ciudad de México"],
+        "must_have_aliases": {"ciudad de méxico": ["DF"]}
+    }
+    updated = _merge_agent_profile_patch(profile, patch)
+    assert updated["must_have_terms"] == ["Mexico City"]
+    assert "mexico city" in updated["must_have_aliases"]
+    assert set(updated["must_have_aliases"]["mexico city"]) == {"CDMX", "Ciudad de México", "DF"}
+
+
+def test_expand_must_have_aliases_returns_canonicalized(monkeypatch):
+    from backend.app.services.refinement import expand_must_have_aliases
+    class FakeClient:
+        async def complete_json(self, **kwargs):
+            return {"aliases": {"cdmx": ["Ciudad de México", "Mexico City", "DF"]}}
+
+    monkeypatch.setattr(
+        query_refiner.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: SimpleNamespace(client=FakeClient()),
+    )
+    profile = {
+        "must_have_terms": ["Mexico City", "CDMX"],
+        "must_have_aliases": {}
+    }
+    terms, aliases = asyncio.run(expand_must_have_aliases(profile))
+    assert terms == ["Mexico City"]
+    assert set(aliases["mexico city"]) == {"CDMX", "Ciudad de México", "DF"}
+
+
+def test_expand_must_have_aliases_fail_open(monkeypatch):
+    from backend.app.services.refinement import expand_must_have_aliases
+    monkeypatch.setattr(
+        query_refiner.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: SimpleNamespace(client=None),
+    )
+    profile = {
+        "must_have_terms": ["Mexico City", "CDMX"],
+        "must_have_aliases": {"mexico city": ["CDMX"]}
+    }
+    terms, aliases = asyncio.run(expand_must_have_aliases(profile))
+    assert terms == ["Mexico City"]
+    assert set(aliases["mexico city"]) == {"CDMX"}
+
+
+def test_runner_verbatim_poisoned_profile_regression(monkeypatch, tmp_path):
+    _runtime(monkeypatch, tmp_path)
+    profile = TopicProfile.from_dict({
+        "statement": "Mexico City testing",
+        "scope": "Mexico City news",
+        "must_have_terms": ["Mexico City", "CDMX", "Ciudad de México"],
+        "must_have_aliases": {
+            "mexico city": ["CDMX"],
+            "cdmx": ["Ciudad de México"],
+        }
+    })
+    
+    keep = _candidate("web_search", item_id="keep", title="CDMX news", text="CDMX local update.")
+    
+    result = asyncio.run(
+        DiscoveryRunner(SourceRegistry([FakeAdapter("web_search", [keep])])).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="must-have-regression", candidate_limit=10),
+        )
+    )
+    
+    assert [candidate.payload.id for candidate in result.candidates] == ["keep"]
+
+
+def test_funnel_guardrail_diagnostics_note_triggers(monkeypatch, tmp_path):
+    _runtime(monkeypatch, tmp_path)
+    profile = TopicProfile.from_dict({
+        "statement": "Test profile",
+        "scope": "Test scope",
+        "must_have_terms": ["TargetTerm"],
+    })
+    
+    candidates = []
+    for i in range(20):
+        candidates.append(_candidate("web_search", item_id=f"miss-{i}", text="No target term here."))
+    for i in range(5):
+        candidates.append(_candidate("web_search", item_id=f"keep-{i}", text="Here is TargetTerm."))
+        
+    result = asyncio.run(
+        DiscoveryRunner(SourceRegistry([FakeAdapter("web_search", candidates)])).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="must-have-guardrail-trigger", candidate_limit=50),
+        )
+    )
+    
+    assert len(result.notes) == 1
+    note = result.notes[0]
+    assert note["source_name"] == "Must-Have Gate"
+    assert "Warning: Must-have gate rejected 20 of 25" in note["reason"]
+    exclusions = [e for e in result.exclusions if e.get("excluded_by") == ["must_have"]]
+    assert len(exclusions) == 20
+    assert all(exc["missed_terms"] == ["TargetTerm"] for exc in exclusions)
+
+
+def test_funnel_guardrail_diagnostics_note_silent(monkeypatch, tmp_path):
+    _runtime(monkeypatch, tmp_path)
+    profile = TopicProfile.from_dict({
+        "statement": "Test profile",
+        "scope": "Test scope",
+        "must_have_terms": ["TargetTerm"],
+    })
+    
+    candidates_a = [_candidate("web_search", item_id=f"miss-{i}", text="No target term.") for i in range(19)]
+    result_a = asyncio.run(
+        DiscoveryRunner(SourceRegistry([FakeAdapter("web_search", candidates_a)])).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="must-have-silent-a", candidate_limit=50),
+        )
+    )
+    assert len(result_a.notes) == 0
+
+    candidates_b = []
+    for i in range(20):
+        candidates_b.append(_candidate("web_search", item_id=f"miss-{i}", text="No target term."))
+    for i in range(20):
+        candidates_b.append(_candidate("web_search", item_id=f"keep-{i}", text="TargetTerm is here."))
+    result_b = asyncio.run(
+        DiscoveryRunner(SourceRegistry([FakeAdapter("web_search", candidates_b)])).run(
+            profile,
+            context=SourceAdapterContext(exploration_id="must-have-silent-b", candidate_limit=50),
+        )
+    )
+    assert len(result_b.notes) == 0
+

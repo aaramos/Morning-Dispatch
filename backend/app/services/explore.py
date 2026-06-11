@@ -205,6 +205,15 @@ async def _build_queue_worker() -> None:
 
 
 def save_topic_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    from backend.app.services.refinement import _canonicalize_must_have
+    raw_terms = list(payload.get("must_have_terms") or [])
+    raw_aliases = dict(payload.get("must_have_aliases") or {})
+    canonical_terms, canonical_aliases = _canonicalize_must_have(raw_terms, raw_aliases)
+    
+    payload = dict(payload)
+    payload["must_have_terms"] = canonical_terms
+    payload["must_have_aliases"] = canonical_aliases
+
     profile = TopicProfile.from_dict(payload)
     return database.upsert_topic_profile(profile.to_dict())
 
@@ -733,6 +742,11 @@ async def _run_exploration(
             _set_pipeline_stage(progress, "discovery", "done")
             _set_exclusion_reasons(progress, discovery.exclusions)
             _set_requested_source_issues(progress, _build_source_issues(current_profile, discovery, merged_selection))
+            if getattr(discovery, "notes", None):
+                progress["source_filter_notes"] = [
+                    *list(progress.get("source_filter_notes") or []),
+                    *discovery.notes,
+                ]
             _persist_progress(exploration_id, progress)
 
             for status in discovery.statuses:

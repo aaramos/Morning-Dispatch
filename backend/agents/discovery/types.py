@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -247,6 +248,7 @@ class DiscoveryResult:
     candidates: tuple[Candidate, ...]
     statuses: tuple[AdapterStatus, ...]
     exclusions: tuple[dict[str, Any], ...] = ()
+    notes: tuple[dict[str, Any], ...] = ()
 
     def payloads(self) -> list[NormalizedPayload]:
         return [candidate.payload for candidate in self.candidates]
@@ -258,6 +260,7 @@ class DiscoveryResult:
             "candidates": [candidate.to_dict() for candidate in self.candidates],
             "statuses": [status.to_dict() for status in self.statuses],
             "exclusions": [dict(exclusion) for exclusion in self.exclusions],
+            "notes": [dict(note) for note in self.notes],
         }
 
 
@@ -461,3 +464,8 @@ def _optional_model_name(value: Any) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+def fold_text(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    return "".join(char for char in text if not unicodedata.combining(char))

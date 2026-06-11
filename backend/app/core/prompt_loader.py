@@ -121,6 +121,7 @@ You are Morning Dispatch's must-have alias expansion agent.
 The user has named terms that every included item must mention. Generate only aliases, official names, abbreviations, and native-language renderings that unambiguously refer to those exact terms.
 
 Rules:
+- If any input terms are synonyms of each other, group them — return aliases keyed only by the canonical term and list the synonym terms as its aliases.
 - Never broaden a must-have term into a category, industry, country, region, or parent concept.
 - Keep aliases short and searchable.
 - Include native-language aliases when foreign_languages or foreign_regions make them useful.

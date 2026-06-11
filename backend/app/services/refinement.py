@@ -11,7 +11,7 @@ from typing import Any
 
 from backend.agents.discovery.language_support import trusted_language_options
 from backend.agents.discovery.markets import normalize_market_query_tickers, resolve_tickers_from_text
-from backend.agents.discovery.types import DEFAULT_EXPLORE_SOURCE_SELECTION
+from backend.agents.discovery.types import DEFAULT_EXPLORE_SOURCE_SELECTION, fold_text
 from backend.agents.digestor.gmail import NewsletterCandidate, discover_newsletter_candidates
 from backend.agents.librarian.text_utils import keyword_set
 from backend.agents.model import ModelClient
@@ -658,7 +658,9 @@ async def astream_refinement(
 
     if ready:
         patched = _fill_defaults(patched)
-        patched["must_have_aliases"] = await expand_must_have_aliases(patched)
+        canonical_terms, canonical_aliases = await expand_must_have_aliases(patched)
+        patched["must_have_terms"] = canonical_terms
+        patched["must_have_aliases"] = canonical_aliases
         pre_critique = _diagnostics_query_snapshot(patched)
         patched = _critique_search_plan(patched)
         patched["refinement_diagnostics"] = _enrich_diagnostics(
@@ -702,14 +704,14 @@ async def astream_refinement(
     yield {"type": "done", "session": response, "ready": ready, "trigger_build": ready}
 
 
-async def expand_must_have_aliases(profile: dict[str, Any]) -> dict[str, list[str]]:
+async def expand_must_have_aliases(profile: dict[str, Any]) -> tuple[list[str], dict[str, list[str]]]:
     terms = _string_list(profile.get("must_have_terms"), limit=6)
     if not terms:
-        return {}
+        return [], {}
     existing = _clean_must_have_aliases(profile.get("must_have_aliases"), terms=terms)
     term_keys = {term.casefold() for term in terms}
     if term_keys and term_keys.issubset(existing.keys()):
-        return existing
+        return _canonicalize_must_have(terms, existing)
 
     settings = get_settings()
     try:
@@ -717,9 +719,9 @@ async def expand_must_have_aliases(profile: dict[str, Any]) -> dict[str, list[st
         client = resolution.client
     except Exception as exc:  # pragma: no cover - routing varies by deployment
         logger.warning("Could not route must-have alias expansion: %s", exc)
-        return existing
+        return _canonicalize_must_have(terms, existing)
     if client is None:
-        return existing
+        return _canonicalize_must_have(terms, existing)
 
     languages = []
     for item in _normalize_foreign_language_plan(profile.get("foreign_language_plan")):
@@ -743,9 +745,10 @@ async def expand_must_have_aliases(profile: dict[str, Any]) -> dict[str, list[st
         )
     except Exception as exc:  # pragma: no cover - provider failures should not disable the gate
         logger.warning("Must-have alias expansion failed: %s", exc)
-        return existing
+        return _canonicalize_must_have(terms, existing)
     aliases = _clean_must_have_aliases(payload.get("aliases"), terms=terms) if isinstance(payload, dict) else {}
-    return {**existing, **aliases}
+    merged_aliases = {**existing, **aliases}
+    return _canonicalize_must_have(terms, merged_aliases)
 
 
 async def _astream_gmail_discovery(
@@ -2518,15 +2521,26 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
             updated[key] = _string_list(patch.get(key), limit=20)
         else:
             updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
-    if "must_have_terms" in patch:
-        updated["must_have_terms"] = _merge_string_lists(updated.get("must_have_terms"), patch.get("must_have_terms"), limit=6)
-        updated["must_have_answered"] = True
-    if "must_have_aliases" in patch:
-        terms = _string_list(updated.get("must_have_terms"), limit=6)
-        updated["must_have_aliases"] = {
-            **_clean_must_have_aliases(updated.get("must_have_aliases"), terms=terms),
-            **_clean_must_have_aliases(patch.get("must_have_aliases"), terms=terms),
-        }
+    has_terms_patch = "must_have_terms" in patch
+    has_aliases_patch = "must_have_aliases" in patch
+    if has_terms_patch or has_aliases_patch:
+        merged_terms = updated.get("must_have_terms")
+        if has_terms_patch:
+            merged_terms = _merge_string_lists(updated.get("must_have_terms"), patch.get("must_have_terms"), limit=6)
+            updated["must_have_answered"] = True
+        
+        terms_limit = _string_list(merged_terms, limit=6)
+        
+        old_aliases = _clean_must_have_aliases(updated.get("must_have_aliases"), terms=terms_limit)
+        new_aliases = {}
+        if has_aliases_patch:
+            new_aliases = _clean_must_have_aliases(patch.get("must_have_aliases"), terms=terms_limit)
+            
+        merged_aliases = {**old_aliases, **new_aliases}
+        
+        canonical_terms, canonical_aliases = _canonicalize_must_have(terms_limit, merged_aliases)
+        updated["must_have_terms"] = canonical_terms
+        updated["must_have_aliases"] = canonical_aliases
     if "keywords" in patch:
         keywords = _string_list(patch.get("keywords"), limit=16)
         if keywords:
@@ -3394,15 +3408,18 @@ def _apply_answer(profile: dict[str, Any], field: str, answer: str) -> dict[str,
             updated["must_have_terms"] = []
             updated["must_have_aliases"] = {}
         else:
-            updated["must_have_terms"] = [
+            raw_terms = [
                 part.strip(" .")
                 for part in re.split(r"[,;\n]", answer)
                 if part.strip(" .")
             ][:6]
-            updated["must_have_aliases"] = _clean_must_have_aliases(
+            raw_aliases = _clean_must_have_aliases(
                 updated.get("must_have_aliases"),
-                terms=_string_list(updated.get("must_have_terms"), limit=6),
+                terms=_string_list(raw_terms, limit=6),
             )
+            canonical_terms, canonical_aliases = _canonicalize_must_have(raw_terms, raw_aliases)
+            updated["must_have_terms"] = canonical_terms
+            updated["must_have_aliases"] = canonical_aliases
     elif field == "requested_sources":
         updated["requested_sources_answered"] = True
     return _coerce_profile(_merge_requested_source_hints(updated, answer))
@@ -3556,15 +3573,23 @@ def _coerce_model_field_updates(
         lowered = str(raw_answer).strip().lower()
         if isinstance(terms, list):
             cleaned = [str(item).strip(" .") for item in terms if str(item).strip(" .")][:6]
+            raw_aliases = _clean_must_have_aliases(parsed.get("must_have_aliases"), terms=cleaned)
+            canonical_terms, canonical_aliases = _canonicalize_must_have(cleaned, raw_aliases)
             return {
-                "must_have_terms": cleaned,
-                "must_have_aliases": _clean_must_have_aliases(parsed.get("must_have_aliases"), terms=cleaned),
+                "must_have_terms": canonical_terms,
+                "must_have_aliases": canonical_aliases,
                 "must_have_answered": True,
             }
         if lowered in {"no", "none", "nothing", "nope", "n/a", "skip"} or "nothing" in lowered:
             return {"must_have_terms": [], "must_have_aliases": {}, "must_have_answered": True}
         if raw_answer.strip():
-            return {"must_have_terms": [raw_answer.strip(" .")], "must_have_answered": True}
+            raw_terms = [raw_answer.strip(" .")]
+            canonical_terms, canonical_aliases = _canonicalize_must_have(raw_terms, {})
+            return {
+                "must_have_terms": canonical_terms,
+                "must_have_aliases": canonical_aliases,
+                "must_have_answered": True,
+            }
 
     return None
 
@@ -3653,6 +3678,8 @@ def _build_refinement_prompt(*, field: str, answer: str, profile: dict[str, Any]
     if field == "must_have":
         return (
             "Return strict JSON with must_have_terms and optional must_have_aliases.\n"
+            "Every entry in must_have_terms must be a DISTINCT required concept (logical AND); "
+            "synonyms, abbreviations, and translations must go in must_have_aliases, never as additional terms.\n"
             'Example response: {"must_have_terms": ["Mexico City"], "must_have_aliases": {"mexico city": ["CDMX", "Ciudad de México"]}}.\n'
             'If there is no required anchor term, return {"must_have_terms": [], "must_have_aliases": {}}.\n'
             "Only include terms the user explicitly confirms every item must mention.\n"
@@ -4479,8 +4506,11 @@ def _sanitize_bounded_recency_query_years(profile: dict[str, Any]) -> dict[str, 
     updated["direct_episode_queries"] = clean_list(profile.get("direct_episode_queries"), limit=16)
     updated["related_episode_queries"] = clean_list(profile.get("related_episode_queries"), limit=16)
     updated["priority_terms"] = clean_list(profile.get("priority_terms"), limit=16)
-    updated["must_have_terms"] = clean_list(profile.get("must_have_terms"), limit=6)
-    updated["must_have_aliases"] = _clean_must_have_aliases(profile.get("must_have_aliases"), terms=updated["must_have_terms"])
+    raw_must_have_terms = clean_list(profile.get("must_have_terms"), limit=6)
+    raw_must_have_aliases = _clean_must_have_aliases(profile.get("must_have_aliases"), terms=raw_must_have_terms)
+    canonical_terms, canonical_aliases = _canonicalize_must_have(raw_must_have_terms, raw_must_have_aliases)
+    updated["must_have_terms"] = canonical_terms
+    updated["must_have_aliases"] = canonical_aliases
     source_queries = {}
     for source, queries in _clean_source_queries(profile.get("source_queries")).items():
         source_queries[source] = clean_list(queries, limit=20)
@@ -4876,3 +4906,94 @@ def _generic_requested_ref(adapter: str, ref: str) -> bool:
         "market",
     }
     return normalized in generic_refs
+
+
+def _canonicalize_must_have(
+    terms: list[str],
+    aliases: dict[str, list[str]],
+) -> tuple[list[str], dict[str, list[str]]]:
+    # 1. Clean terms to remove duplicates/empty strings (using folded comparison)
+    cleaned_terms = []
+    seen_folded = set()
+    for t in terms:
+        t_str = str(t or "").strip()
+        if not t_str:
+            continue
+        f = fold_text(t_str)
+        if f not in seen_folded:
+            cleaned_terms.append(t_str)
+            seen_folded.add(f)
+
+    # Map folded key -> original aliases list
+    input_aliases_folded: dict[str, list[str]] = {}
+    for k, vals in (aliases or {}).items():
+        fk = fold_text(k)
+        if fk:
+            input_aliases_folded.setdefault(fk, []).extend(vals)
+
+    anchors = []
+    for t in cleaned_terms:
+        f = fold_text(t)
+        initial_aliases = input_aliases_folded.get(f, [])
+        folded_aliases = {fold_text(a) for a in initial_aliases if fold_text(a)}
+        anchors.append({
+            "original": t,
+            "folded": f,
+            "aliases": list(initial_aliases),
+            "folded_aliases": folded_aliases,
+            "absorbed_by": None,
+        })
+
+    # Synonym-aware merging of anchors
+    for i in range(len(anchors)):
+        anchor_i = anchors[i]
+        if anchor_i["absorbed_by"] is not None:
+            continue
+
+        f_i = anchor_i["folded"]
+
+        for j in range(i):
+            anchor_j = anchors[j]
+            if anchor_j["absorbed_by"] is not None:
+                continue
+
+            f_j = anchor_j["folded"]
+
+            # Merge if synonym matches in either direction
+            if (f_i in anchor_j["folded_aliases"]) or (f_j in anchor_i["folded_aliases"]):
+                anchor_i["absorbed_by"] = f_j
+
+                # Merge i's original name and aliases into j
+                new_aliases = [anchor_i["original"]] + anchor_i["aliases"]
+                seen_in_j = {fold_text(a) for a in anchor_j["aliases"]}
+                seen_in_j.add(f_j)
+
+                for a in new_aliases:
+                    fa = fold_text(a)
+                    if fa and fa not in seen_in_j:
+                        anchor_j["aliases"].append(a)
+                        anchor_j["folded_aliases"].add(fa)
+                        seen_in_j.add(fa)
+                break
+
+    # Build final canonical result
+    folded_surviving = {a["folded"] for a in anchors if a["absorbed_by"] is None}
+    final_terms = []
+    final_aliases = {}
+
+    for anchor in anchors:
+        if anchor["absorbed_by"] is None:
+            final_terms.append(anchor["original"])
+            key = anchor["original"].casefold()
+            
+            clean_aliases = []
+            seen_alias_folded = set()
+            for alias in anchor["aliases"]:
+                fa = fold_text(alias)
+                if fa and fa not in folded_surviving and fa not in seen_alias_folded:
+                    clean_aliases.append(alias)
+                    seen_alias_folded.add(fa)
+            if clean_aliases:
+                final_aliases[key] = clean_aliases
+
+    return final_terms, final_aliases

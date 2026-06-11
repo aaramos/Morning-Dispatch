@@ -1082,7 +1082,6 @@ function DispatchApp() {
   const [briefHtml, setBriefHtml] = useState("");
   const [recentExplorations, setRecentExplorations] = useState<Exploration[]>([]);
   const [scheduledTopics, setScheduledTopics] = useState<TopicProfileResponse[]>([]);
-  const [allTopics, setAllTopics] = useState<TopicProfileResponse[]>([]);
   const [deliveryConfigured, setDeliveryConfigured] = useState(false);
   const [emailSendReady, setEmailSendReady] = useState(false);
   const [briefEmailRecipient, setBriefEmailRecipient] = useState("");
@@ -1201,7 +1200,7 @@ function DispatchApp() {
   }, [refinementFallbackStartedAt, refinementProgress, refinementWorking]);
 
   const loadHome = useCallback(async () => {
-    const [sources, explorations, scheduled, topics, admin, settings] = await Promise.all([
+    const [sources, explorations, scheduled, , admin, settings] = await Promise.all([
       api<SourceStatusResponse>("/api/explore/source-status").catch(() => null),
       api<Exploration[]>("/api/explore/explorations?limit=25").catch(() => []),
       api<TopicProfileResponse[]>("/api/explore/scheduled-topic-profiles").catch(() => []),
@@ -1214,7 +1213,6 @@ function DispatchApp() {
     if (settings) setBriefSettings(settings);
     setRecentExplorations(explorations);
     setScheduledTopics(scheduled);
-    setAllTopics(topics);
     const email = admin?.delivery?.email;
     const configured = Boolean(email?.enabled && email.recipient_email && email.gmail_send_ready !== false);
     const sendReady = Boolean(email?.gmail_send_ready);
@@ -2197,22 +2195,6 @@ function DispatchApp() {
     openPath(path);
   }
 
-  function loadTopicForConfirmation(topic: TopicProfileResponse) {
-    clearInterestDraft();
-    recencyOverrideRef.current = null;
-    setRefinementTargetExplorationId(null);
-    setTopicProfile(topic);
-    setSession(null);
-    setExploration(null);
-    setBriefHtml("");
-    setAnswer("");
-    setStatement(topic.statement);
-    setSubmittedInterest(topic.statement);
-    setDraft(draftFromProfile(topic.profile, defaultControls.content_limits));
-    setSourceSelection(sourceSelectionFromRecord(topic.profile.source_selection));
-    setFlow("confirm");
-    setMessage("Saved brief plan loaded");
-  }
 
   function resetForNewBrief() {
     clearInterestDraft();
@@ -3686,6 +3668,9 @@ function ConfirmationPanel(props: {
             onChange={(event) => props.onDraftChange({ ...props.draft, must_have: event.target.value })}
             placeholder="Term every item must mention"
           />
+          <small>
+            Every item must mention ALL of these. Add one entry per concept; synonyms and translations are matched automatically.
+          </small>
         </label>
       </div>
       <SourceChips selection={props.sources} status={props.sourceStatus} locked={false} onToggle={props.onSourceClick} />
@@ -8061,15 +8046,6 @@ function strategyUpdateConfirmation(note: string | undefined, profile: TopicProf
   return "I applied the instruction, but it did not add a visible source query. Review the plan before building.";
 }
 
-function relativeDate(value: string | null | undefined): string {
-  if (!value) return "never";
-  const delta = Date.now() - new Date(value).valueOf();
-  if (Number.isNaN(delta)) return "unknown";
-  const days = Math.floor(delta / 86400000);
-  if (days <= 0) return "today";
-  if (days === 1) return "1d ago";
-  return `${days}d ago`;
-}
 
 function dateValue(value: string | null | undefined): number {
   if (!value) return 0;

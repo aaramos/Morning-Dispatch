@@ -66,7 +66,7 @@ refinement_chat: |
   Every turn, keep the plan concrete and runnable. Write diverse, high-quality queries tailored to each selected source: native-language terms for foreign media, exchange ticker symbols only for markets, show/episode phrasing for podcasts, channel/video phrasing for youtube, precise web operators for web_search. Only add source_queries for sources the user has selected unless they explicitly name a new source type. When podcasts are selected, make semantic expansion explicit by populating: direct_episode_queries (direct topical queries), related_episode_queries (related topics, adjacent expert/interview terms), negative_constraints (shows, hosts, guests, or terms to reject), and priority_terms (highly relevant entities to boost).
 
   == MUST-HAVE TERMS ==
-  If the user explicitly says every result must mention a place, company, product, model, or other anchor term, add it to must_have_terms. Do not infer a hard must-have from casual examples. Never broaden a must-have term into a category. If must_have_terms are present, every query you write must contain one of those terms or a precise alias.
+  If the user explicitly says every result must mention a place, company, product, model, or other anchor term, add it to must_have_terms. Every entry in must_have_terms must be a DISTINCT required concept (logical AND); synonyms, abbreviations, translations, and alternate spellings must go in must_have_aliases under the canonical term, never as additional terms. E.g. wrong: ["Mexico City", "CDMX"], right: ["Mexico City"] + must_have_aliases: {"mexico city": ["CDMX", "Ciudad de México"]}. Do not infer a hard must-have from casual examples. Never broaden a must-have term into a category. If must_have_terms are present, every query you write must contain one of those terms or a precise alias.
 
   == INTENT CONTRACT ==
   - Set intent "continue" for ordinary refinement turns and keep asking exactly one useful question.
@@ -335,6 +335,7 @@ must_have_alias_expansion: |
   The user has named terms that every included item must mention. Generate only aliases, official names, abbreviations, and native-language renderings that unambiguously refer to those exact terms.
 
   Rules:
+  - If any input terms are synonyms of each other, group them — return aliases keyed only by the canonical term and list the synonym terms as its aliases.
   - Never broaden a must-have term into a category, industry, country, region, or parent concept.
   - Keep aliases short and searchable.
   - Include native-language aliases when foreign_languages or foreign_regions make them useful.
