@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from backend.app.core.config import get_settings
+from backend.app.core import config
+from backend.app.core.config import get_settings, reset_settings_cache
 
 
 def test_production_model_defaults(monkeypatch, tmp_path):
@@ -122,4 +123,56 @@ def test_web_search_reuses_serper_shared_search_keys(monkeypatch, tmp_path):
     settings = get_settings()
 
     assert settings.web_search_serper_api_key == "shared-serper-key"
+
+
+def _set_runtime_env(monkeypatch, runtime):
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(runtime / "secrets"))
+    monkeypatch.setenv(
+        "MORNING_DISPATCH_DB_PATH",
+        str(runtime / "data" / "db" / "morning_dispatch.sqlite3"),
+    )
+    monkeypatch.setenv("MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH", str(runtime / "missing-hermes.env"))
+
+
+def test_get_settings_returns_cached_instance_within_ttl(monkeypatch, tmp_path):
+    _set_runtime_env(monkeypatch, tmp_path / "runtime")
+
+    first = get_settings()
+    monkeypatch.setenv("MORNING_DISPATCH_ENV", "production")
+    second = get_settings()
+
+    assert second is first
+    assert second.environment == first.environment
+
+
+def test_reset_settings_cache_forces_rebuild(monkeypatch, tmp_path):
+    _set_runtime_env(monkeypatch, tmp_path / "runtime")
+    monkeypatch.setenv("MORNING_DISPATCH_ENV", "development")
+
+    first = get_settings()
+    monkeypatch.setenv("MORNING_DISPATCH_ENV", "production")
+    reset_settings_cache()
+    second = get_settings()
+
+    assert second is not first
+    assert second.environment == "production"
+
+
+def test_get_settings_rebuilds_after_ttl_expiry(monkeypatch, tmp_path):
+    _set_runtime_env(monkeypatch, tmp_path / "runtime")
+
+    first = get_settings()
+    assert config._SETTINGS_CACHE is not None
+    cached_at, cached_settings = config._SETTINGS_CACHE
+    assert cached_settings is first
+    # Backdate the cache entry past the TTL; the next call must rebuild.
+    config._SETTINGS_CACHE = (cached_at - config._SETTINGS_TTL_SECONDS - 1.0, cached_settings)
+    monkeypatch.setenv("MORNING_DISPATCH_ENV", "production")
+
+    second = get_settings()
+
+    assert second is not first
+    assert second.environment == "production"
 

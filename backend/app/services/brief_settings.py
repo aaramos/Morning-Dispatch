@@ -15,7 +15,7 @@ from backend.agents.librarian.articles import (
 )
 from backend.agents.source_audit import MAX_AUDIT_CANDIDATES
 from backend.agents.editorial_decisions import MAX_EDITORIAL_CANDIDATES
-from backend.app.core.config import Settings
+from backend.app.core.config import Settings, reset_settings_cache
 
 MAX_CANDIDATE_BUDGET = 1000
 MAX_LEAD_ITEMS = 20
@@ -311,6 +311,7 @@ def _read_settings_file(settings: Settings) -> dict[str, Any]:
 def _write_settings_file(settings: Settings, payload: dict[str, Any]) -> None:
     settings.brief_settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings.brief_settings_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    reset_settings_cache()
 
 
 def _source_max_limit(source_name: str) -> int:

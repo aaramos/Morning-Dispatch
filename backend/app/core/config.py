@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -218,7 +219,7 @@ def _model_routes_from_runtime(path: Path) -> dict[str, dict[str, object]]:
     return routes
 
 
-def get_settings() -> Settings:
+def _build_settings() -> Settings:
     home_dir = _path_from_env("MORNING_DISPATCH_HOME", Path.home() / ".morning-dispatch")
     data_dir = _path_from_env("MORNING_DISPATCH_DATA_DIR", home_dir / "data")
     secrets_dir = _path_from_env("MORNING_DISPATCH_SECRETS_DIR", home_dir / "secrets")
@@ -387,6 +388,30 @@ def get_settings() -> Settings:
         google_news_serper_fallback=_bool_from_env("MORNING_DISPATCH_GOOGLE_NEWS_SERPER_FALLBACK", True),
         google_news_locale=os.environ.get("MORNING_DISPATCH_GOOGLE_NEWS_LOCALE", "en-US:US").strip(),
     )
+
+
+# Settings construction re-reads env vars, secret files, and model-settings.json.
+# A short TTL cache keeps hot paths (per-article loops, polling endpoints) cheap
+# while still letting on-disk edits (secret files, model-settings.json) take
+# effect within seconds — which the admin UI relies on. Writers in this codebase
+# call reset_settings_cache() for immediate visibility.
+_SETTINGS_CACHE: tuple[float, Settings] | None = None
+_SETTINGS_TTL_SECONDS = 5.0
+
+
+def get_settings() -> Settings:
+    global _SETTINGS_CACHE
+    now = time.monotonic()
+    if _SETTINGS_CACHE is not None and now - _SETTINGS_CACHE[0] < _SETTINGS_TTL_SECONDS:
+        return _SETTINGS_CACHE[1]
+    settings = _build_settings()
+    _SETTINGS_CACHE = (now, settings)
+    return settings
+
+
+def reset_settings_cache() -> None:
+    global _SETTINGS_CACHE
+    _SETTINGS_CACHE = None
 
 
 def ensure_runtime_dirs(settings: Settings) -> None:

@@ -12,7 +12,7 @@ from backend.agents.discovery.runner import _redact_status_message
 from backend.agents.discovery.adapters import YouTubeSourceAdapter
 from backend.agents.discovery.types import AdapterUnavailable, SourceAdapterContext, TopicProfile
 from backend.agents.librarian.articles import ArticleFetchResult, direct_article_results
-from backend.app.core.config import get_settings
+from backend.app.core.config import get_settings, reset_settings_cache
 from backend.app.db import database
 from backend.app.main import create_app
 
@@ -292,6 +292,9 @@ def test_youtube_credentials_enable_source_status(monkeypatch, tmp_path) -> None
         assert saved.status_code == 200
         assert saved.json()["configured"] is True
 
+        # The settings TTL cache would otherwise hide the freshly saved key for
+        # up to 5 seconds; production tolerates that, the test should not wait.
+        reset_settings_cache()
         after = client.get("/api/explore/source-status")
         assert after.status_code == 200
         assert after.json()["sources"]["youtube"]["enabled"] is True
