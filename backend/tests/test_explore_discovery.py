@@ -21,10 +21,9 @@ from backend.agents.discovery.types import (
     SourceAdapterContext,
     TopicProfile,
 )
-from backend.agents.discovery.web_search import SearchHit
 from backend.app.db import database
 from backend.app.main import create_app
-from backend.app.services import email_delivery, explore, refinement
+from backend.app.services import email_delivery, explore, refinement, refinement_session
 
 
 class FakeAdapter:
@@ -2297,8 +2296,8 @@ def test_refinement_agent_does_not_repeat_same_strategy_question(monkeypatch, tm
 def test_strategy_refinement_endpoint_uses_ai_patch(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
-    monkeypatch.setattr(refinement, "_run_refinement_agent", lambda **_kwargs: None)
-    monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)
+    monkeypatch.setattr(refinement_session, "_run_refinement_agent", lambda **_kwargs: None)
+    monkeypatch.setattr(refinement_session, "_critique_search_plan", lambda profile: profile)
 
     class _StrategyRefinementModelClient:
         def __init__(self) -> None:
@@ -2388,7 +2387,7 @@ def test_strategy_refinement_endpoint_uses_ai_patch(monkeypatch, tmp_path) -> No
 def test_strategy_review_proposes_replacement_for_stale_year_queries(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
-    monkeypatch.setattr(refinement, "_critique_search_plan", lambda profile: profile)
+    monkeypatch.setattr(refinement_session, "_critique_search_plan", lambda profile: profile)
     session = database.create_refinement_session(
         statement="Track local AI hardware signals from the last 90 days.",
         profile={
@@ -2830,7 +2829,7 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
 
         return [CandidateRecord()]
 
-    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+    monkeypatch.setattr(refinement_session, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         started = client.post(
@@ -2879,8 +2878,6 @@ def test_gmail_refinement_discovers_and_confirms_newsletter_rules(monkeypatch, t
 def test_gmail_refinement_can_approve_sender_without_extraction_rules(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
 
-    from backend.app.services import refinement
-
     class CandidateRecord:
         sender = "ai@example.com"
         sender_name = "AI Weekly"
@@ -2900,7 +2897,7 @@ def test_gmail_refinement_can_approve_sender_without_extraction_rules(monkeypatc
     async def fake_discover_newsletter_candidates(*_args: Any, **_kwargs: Any) -> list[CandidateRecord]:
         return [CandidateRecord()]
 
-    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+    monkeypatch.setattr(refinement_session, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         started = client.post(
@@ -2947,7 +2944,7 @@ def test_streaming_gmail_approval_prompts_for_next_refinement(monkeypatch, tmp_p
     async def fake_discover_newsletter_candidates(*_args: Any, **_kwargs: Any) -> list[CandidateRecord]:
         return [CandidateRecord()]
 
-    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+    monkeypatch.setattr(refinement_session, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         started = client.post(
@@ -2990,9 +2987,7 @@ def test_gmail_refinement_can_continue_without_gmail_after_empty_scan(monkeypatc
     async def fake_discover_newsletter_candidates(**_kwargs: Any) -> list[Any]:
         return []
 
-    from backend.app.services import refinement
-
-    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+    monkeypatch.setattr(refinement_session, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         started = client.post(
@@ -3027,9 +3022,7 @@ def test_gmail_refinement_pending_step_allows_strategy_correction(monkeypatch, t
     async def fake_discover_newsletter_candidates(**_kwargs: Any) -> list[Any]:
         return []
 
-    from backend.app.services import refinement
-
-    monkeypatch.setattr(refinement, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
+    monkeypatch.setattr(refinement_session, "discover_newsletter_candidates", fake_discover_newsletter_candidates)
 
     with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         started = client.post(
