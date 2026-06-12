@@ -2509,6 +2509,7 @@ label {
 }
 .chat-turn { display: flex; gap: 10px; max-width: 680px; }
 .chat-turn.gmail-approval-turn { max-width: 760px; }
+.chat-turn.podcast-show-turn { max-width: 760px; }
 .chat-turn.status-turn { max-width: 620px; }
 .chat-turn.user { flex-direction: row-reverse; margin-left: auto; }
 .chat-avatar {
@@ -2519,6 +2520,7 @@ label {
 .chat-avatar.me { background: #ece9e1; color: #6c6a63; font-size: 0.62rem; }
 .chat-bubble2 { font-size: 0.95rem; line-height: 1.6; color: #1d1d1b; }
 .chat-bubble2.gmail-chat-bubble { width: min(640px, 100%); }
+.chat-bubble2.podcast-show-chat-bubble { width: min(640px, 100%); }
 .chat-bubble2 p { margin: 0 0 8px; }
 .chat-bubble2 p:last-child { margin-bottom: 0; }
 .chat-turn.user .chat-bubble2 {

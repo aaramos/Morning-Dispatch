@@ -53,6 +53,8 @@ from backend.app.services.profile_patch import (
     _normalize_requested_sources,
     _parse_chat_payload,
     _pending_strategy_refinement,
+    _question_repeats_answered_constraint,
+    _question_was_recently_asked,
     _readiness_reason,
     _recency_from_lookback_hours,
     _search_strategy_question,
@@ -94,6 +96,7 @@ async def astream_refinement(
     foreign_regions: list[str] | None = None,
     recency_weighting: str | None = None,
     lookback_hours: int | None = None,
+    source_scope_touched: bool = False,
 ):
     """AI-led streaming refinement turn.
 
@@ -214,6 +217,16 @@ async def astream_refinement(
             profile["recency_weighting"] = _recency_from_lookback_hours(coerced_lookback)
     elif recency_weighting:
         profile["recency_weighting"] = recency_weighting
+    if source_scope_touched:
+        profile["source_scope_answered"] = True
+    explicit_source_scope = (
+        {
+            "recency_weighting": profile.get("recency_weighting"),
+            "lookback_hours": profile.get("lookback_hours"),
+        }
+        if source_scope_touched
+        else None
+    )
 
     if profile["source_selection"].get("gmail") and not prev_selection.get("gmail"):
         profile["gmail_rules"] = {}
@@ -229,6 +242,7 @@ async def astream_refinement(
     pending_field = session.get("pending_field") or ""
 
     yield {"type": "session", "session_id": session_id}
+    user_build_requested = bool(clean_answer and not just_go_now and _user_requested_build(clean_answer))
 
     # --- Gmail discovery intercept (early check) -----------------------------------
     gmail_enabled = _source_selection_dict(profile.get("source_selection")).get("gmail")
@@ -247,36 +261,37 @@ async def astream_refinement(
 
     if not just_go_now and trigger_gmail_discovery:
         discovery_query = clean_answer or profile.get("statement") or statement or ""
-        gmail_candidates_event = await _astream_gmail_discovery(
-            patched=profile,
-            answer=discovery_query,
-        )
-        if gmail_candidates_event is not None:
-            patched = _coerce_profile(gmail_candidates_event["_patched_profile"])
-            gmail_candidates_event.pop("_patched_profile", None)
-
-            intro = gmail_candidates_event.get("intro", "")
-            messages.append({"role": "assistant", "content": intro})
-
-            updated_gmail = database.update_refinement_session(
-                session_id,
-                profile=patched,
-                messages=messages,
-                pending_field=GMAIL_SENDER_SELECTION_FIELD,
-                turn_count=turn_count,
-                status="active",
-                topic_id=session.get("topic_id"),
+        if not user_build_requested:
+            gmail_candidates_event = await _astream_gmail_discovery(
+                patched=profile,
+                answer=discovery_query,
             )
-            response_gmail = _session_response(updated_gmail) if updated_gmail else None
-            if response_gmail is None:
-                yield {"type": "error", "message": "Failed to persist Gmail discovery step"}
-                return
+            if gmail_candidates_event is not None:
+                patched = _coerce_profile(gmail_candidates_event["_patched_profile"])
+                gmail_candidates_event.pop("_patched_profile", None)
 
-            yield {"type": "token", "text": intro}
-            yield {"type": "plan", "session": response_gmail}
-            yield {**gmail_candidates_event, "type": "gmail_candidates"}
-            yield {"type": "done", "session": response_gmail, "ready": False, "trigger_build": False}
-            return
+                intro = gmail_candidates_event.get("intro", "")
+                messages.append({"role": "assistant", "content": intro})
+
+                updated_gmail = database.update_refinement_session(
+                    session_id,
+                    profile=patched,
+                    messages=messages,
+                    pending_field=GMAIL_SENDER_SELECTION_FIELD,
+                    turn_count=turn_count,
+                    status="active",
+                    topic_id=session.get("topic_id"),
+                )
+                response_gmail = _session_response(updated_gmail) if updated_gmail else None
+                if response_gmail is None:
+                    yield {"type": "error", "message": "Failed to persist Gmail discovery step"}
+                    return
+
+                yield {"type": "token", "text": intro}
+                yield {"type": "plan", "session": response_gmail}
+                yield {**gmail_candidates_event, "type": "gmail_candidates"}
+                yield {"type": "done", "session": response_gmail, "ready": False, "trigger_build": False}
+                return
 
     # --- Gmail sender-approval intercept -------------------------------------------
     # When the previous turn left pending_field=GMAIL_SENDER_SELECTION_FIELD the user
@@ -307,6 +322,19 @@ async def astream_refinement(
 
     # Track the turn the model is responding to (the deterministic fallback re-appends
     # the user message itself, so we only mutate the in-memory copy here).
+    if user_build_requested:
+        messages.append({"role": "user", "content": clean_answer})
+        turn_count += 1
+        async for event in _astream_confirm_build_request(
+            session_id=session_id,
+            session=session,
+            profile=profile,
+            messages=messages,
+            turn_count=turn_count,
+        ):
+            yield event
+        return
+
     if clean_answer and not just_go_now:
         messages.append({"role": "user", "content": clean_answer})
         turn_count += 1
@@ -337,6 +365,7 @@ async def astream_refinement(
 
     task = asyncio.create_task(_run())
     full_text = ""
+    emitted = 0
     error_message: str | None = None
     while True:
         kind, value = await queue.get()
@@ -346,6 +375,11 @@ async def astream_refinement(
         if kind == "end":
             break
         full_text += value or ""
+        visible, _ = _visible_prose(full_text)
+        new = visible[emitted:]
+        if new:
+            emitted += len(new)
+            yield {"type": "token", "text": new}
     await task
 
     if error_message is not None:
@@ -354,6 +388,11 @@ async def astream_refinement(
         return
 
     final_visible, _ = _visible_prose(full_text, final=True)
+    if len(final_visible) > emitted:
+        tail = final_visible[emitted:]
+        if tail:
+            emitted += len(tail)
+            yield {"type": "token", "text": tail}
 
     assistant_text = final_visible.strip()
     patch, ready_flag, intent = _parse_chat_payload(full_text)
@@ -363,6 +402,10 @@ async def astream_refinement(
     ready = intent == "build"
 
     patched = _merge_agent_profile_patch(profile, patch, user_text=_user_authored_text(profile, messages))
+    if explicit_source_scope is not None:
+        patched["recency_weighting"] = explicit_source_scope["recency_weighting"]
+        patched["lookback_hours"] = explicit_source_scope["lookback_hours"]
+        patched["source_scope_answered"] = True
     patched = _seed_profile_with_hints(patched)
     if not str(patched.get("scope") or "").strip():
         patched["scope"] = str(profile.get("statement") or "").strip()
@@ -377,7 +420,13 @@ async def astream_refinement(
         )
         patched["reasoning_summary"] = assistant_text[:600]
         messages.append({"role": "assistant", "content": assistant_text})
-        yield {"type": "token", "text": assistant_text}
+        streamed_visible = final_visible[:emitted].rstrip()
+        if not streamed_visible:
+            yield {"type": "token", "text": assistant_text}
+        elif assistant_text.startswith(streamed_visible):
+            final_tail = assistant_text[len(streamed_visible):]
+            if final_tail.strip():
+                yield {"type": "token", "text": final_tail}
 
     topic_id = session.get("topic_id")
 
@@ -496,6 +545,74 @@ async def astream_refinement(
         return
     yield {"type": "plan", "session": response}
     yield {"type": "done", "session": response, "ready": ready, "trigger_build": ready}
+
+
+def _user_requested_build(answer: str) -> bool:
+    text = " ".join(str(answer or "").casefold().split())
+    if not text:
+        return False
+    if re.search(r"\b(?:do not|don't|dont|never|not yet|no)\s+(?:build|run|start|generate|create|make|proceed)\b", text):
+        return False
+    build_patterns = (
+        r"\bbuild\s+(?:the\s+)?brief\b",
+        r"\b(?:create|generate|make)\s+(?:the\s+)?brief\b",
+        r"\b(?:start|run)\s+(?:the\s+)?(?:brief|build)\b",
+        r"\bgo ahead\s+(?:and\s+)?(?:build|run|start|create|generate|make)\b",
+        r"\b(?:please\s+)?(?:build|run|start)\s+it\b",
+        r"\b(?:let's|lets)\s+(?:build|run|start)\b",
+        r"\b(?:use|respect)\s+(?:this|that|my|the current)\s+.*\b(?:build|brief)\b",
+    )
+    return any(re.search(pattern, text) for pattern in build_patterns)
+
+
+async def _astream_confirm_build_request(
+    *,
+    session_id: str,
+    session: dict[str, Any],
+    profile: dict[str, Any],
+    messages: list[dict[str, str]],
+    turn_count: int,
+):
+    confirmation = "Confirmed. I’ll build using the current search strategy."
+    patched = _fill_defaults(_seed_profile_with_hints(profile))
+    if not str(patched.get("scope") or "").strip():
+        patched["scope"] = str(patched.get("statement") or session.get("statement") or "").strip()
+    canonical_terms, canonical_aliases = await expand_must_have_aliases(patched)
+    patched["must_have_terms"] = canonical_terms
+    patched["must_have_aliases"] = canonical_aliases
+    patched["foreign_language_plan"] = await _ensure_foreign_language_plan(patched)
+    pre_critique = _diagnostics_query_snapshot(patched)
+    patched = refinement_session._critique_search_plan(patched)
+    patched["refinement_diagnostics"] = _enrich_diagnostics(
+        patched,
+        model_profile_patch={},
+        pre_critique=pre_critique,
+        readiness_reason=_readiness_reason(
+            ready_requested=True,
+            just_go_now=True,
+            turn_count=turn_count,
+        ),
+    )
+    patched = _coerce_profile(patched)
+    saved = explore.save_topic_profile(patched)
+    topic_id = str(saved["topic_id"])
+    messages.append({"role": "assistant", "content": confirmation})
+    updated = database.update_refinement_session(
+        session_id,
+        profile=patched,
+        messages=messages,
+        pending_field=None,
+        turn_count=turn_count,
+        status="finalized",
+        topic_id=topic_id,
+    )
+    response = _session_response(updated) if updated else None
+    if response is None:
+        yield {"type": "error", "message": "Failed to persist refinement session"}
+        return
+    yield {"type": "token", "text": confirmation}
+    yield {"type": "plan", "session": response}
+    yield {"type": "done", "session": response, "ready": True, "trigger_build": True}
 
 
 async def expand_must_have_aliases(profile: dict[str, Any]) -> tuple[list[str], dict[str, list[str]]]:
@@ -807,6 +924,11 @@ def _build_refinement_chat_prompt(
                 "markets": "Exchange ticker symbols only (e.g. 'NVDA', '000660.KS'); resolve company names to tickers, one per entry.",
             },
             "already_inferred": _inferred_constraints(profile_snapshot),
+            "question_policy": (
+                "Ask at most one next question. Do not ask about anything already present in already_inferred, "
+                "especially recency, exclusions, selected sources, named companies, locations, or stated constraints. "
+                "If the user asks to build, set intent='build', ready_to_build=true, and respond with a brief confirmation."
+            ),
             "current_date_hint": f"Today is {current_utc} (UTC). Use this when judging freshness windows.",
         },
         ensure_ascii=False,
@@ -866,6 +988,15 @@ def _refinement_reply_with_required_question(
         return cleaned or "Confirmed. I’ll build using the current search strategy."
     strategy_snapshot = _format_strategy_snapshot(profile) if _user_requested_strategy_snapshot(messages) else ""
     if _ends_with_question(cleaned):
+        prefix, question = _split_trailing_question(cleaned)
+        if _is_redundant_refinement_question(question, profile, messages):
+            replacement = _strategy_deepening_question(profile, messages) or _search_strategy_question(profile)
+            if replacement and not _is_redundant_refinement_question(replacement, profile, messages):
+                cleaned = f"{prefix} {replacement}".strip() if prefix else replacement
+            else:
+                cleaned = prefix.strip()
+        if not cleaned:
+            cleaned = _strategy_deepening_question(profile, messages) or _search_strategy_question(profile)
         if strategy_snapshot:
             return f"{cleaned}\n\n{strategy_snapshot}"
         return cleaned
@@ -900,6 +1031,25 @@ def _last_user_message(messages: list[dict[str, str]]) -> str:
         if message.get("role") == "user":
             return str(message.get("content") or "")
     return ""
+
+
+def _split_trailing_question(text: str) -> tuple[str, str]:
+    clean = str(text or "").strip()
+    match = re.search(r"(?s)^(.*?)([^.!?\n][^?\n]*\?)\s*$", clean)
+    if not match:
+        return clean, clean
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _is_redundant_refinement_question(
+    question: str,
+    profile: dict[str, Any],
+    messages: list[dict[str, str]],
+) -> bool:
+    clean = str(question or "").strip()
+    if not clean:
+        return False
+    return _question_repeats_answered_constraint(clean, profile) or _question_was_recently_asked(clean, messages)
 
 
 def _sanitize_recent_visible_text_years(text: str, profile: dict[str, Any]) -> str:

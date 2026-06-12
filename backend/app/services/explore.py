@@ -169,7 +169,7 @@ async def podcast_show_candidates(topic_id: str) -> dict[str, Any] | None:
                     "stale": None,
                 }
             )
-    return {"topic_id": topic_id, "staleness_days": staleness, "candidates": candidates}
+    return {"topic_id": topic_id, "staleness_days": staleness, "queries": queries, "candidates": candidates}
 
 
 def save_podcast_subscriptions(topic_id: str, shows: list[dict[str, Any]]) -> dict[str, Any] | None:

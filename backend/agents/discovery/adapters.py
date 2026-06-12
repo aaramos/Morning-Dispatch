@@ -730,19 +730,20 @@ def _payload_score(metadata: dict[str, Any] | None) -> float:
 
 
 def _podcast_discovery_refs(profile: TopicProfile) -> list[str]:
-    refs = list(_source_plan_refs(profile, "podcasts"))
-    if not refs:
-        if profile.keywords:
-            for kw in profile.keywords[:4]:
-                if len(kw) > 2:
-                    refs.append(kw)
-        refs.extend(_trim_query(query, limit=140) for query in profile.search_queries)
-        if profile.keywords:
-            refs.append(_trim_query(" ".join(profile.keywords[:8]), limit=140))
-        refs.extend(
-            _trim_query(value, limit=140)
-            for value in (profile.scope, profile.statement, profile.query_for_source("podcasts"))
-        )
+    refs: list[str] = []
+    for value in [
+        *profile.direct_episode_queries,
+        *profile.related_episode_queries,
+        *profile.source_queries.get("podcasts", ()),
+        *_source_plan_refs(profile, "podcasts"),
+        *profile.priority_terms,
+        *profile.keywords[:8],
+        *profile.search_queries[:4],
+        profile.query_for_source("podcasts"),
+        profile.scope,
+        profile.statement,
+    ]:
+        refs.extend(_podcast_show_query_variants(value))
     seen: set[str] = set()
     cleaned: list[str] = []
     for ref in refs:
@@ -751,6 +752,44 @@ def _podcast_discovery_refs(profile: TopicProfile) -> list[str]:
             cleaned.append(ref)
             seen.add(key)
     return cleaned[:8]
+
+
+def _podcast_show_query_variants(value: Any) -> list[str]:
+    query = _trim_query(str(value or ""), limit=140)
+    if not query or _looks_like_podcast_instruction_noise(query):
+        return []
+    variants: list[str] = []
+    words = re.findall(r"[\wÀ-ÿ]+", query, flags=re.UNICODE)
+    if 1 <= len(words) <= 7:
+        variants.append(query)
+    lowered = query.casefold()
+    phrase_patterns = (
+        (r"\bmexico city\b|\bcdmx\b", "Mexico City"),
+        (r"\bsolo travel\b", "solo travel"),
+        (r"\bstreet food\b", "street food"),
+        (r"\btacos?\b", "tacos"),
+        (r"\blocal culture\b", "local culture"),
+    )
+    for pattern, phrase in phrase_patterns:
+        if re.search(pattern, lowered):
+            variants.append(phrase)
+    return variants
+
+
+def _looks_like_podcast_instruction_noise(query: str) -> bool:
+    lowered = query.casefold()
+    noise_markers = (
+        "ticker symbol",
+        "foreign media must",
+        "native-language quer",
+        "must use native",
+        "source selection",
+    )
+    if any(marker in lowered for marker in noise_markers):
+        return True
+    if "," in query and len(re.findall(r"[\wÀ-ÿ]+", query, flags=re.UNICODE)) > 6:
+        return True
+    return False
 
 
 def _search_score(value: float) -> float:

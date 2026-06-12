@@ -1263,13 +1263,27 @@ def _strategy_deepening_question(profile: dict[str, Any], messages: list[dict[st
             ],
         )
     if _string_list(profile.get("search_queries")) or _clean_source_queries(profile.get("source_queries")):
+        evidence_already_answered = any(
+            term in text.casefold()
+            for term in (
+                "primary reporting",
+                "expert analysis",
+                "community signal",
+                "community signals",
+                "practical example",
+                "practical examples",
+            )
+        )
+        candidates = [
+            "What kind of evidence should I trust most for this brief: primary reporting, expert analysis, community signal, or practical examples?",
+            "Should the brief prioritize breadth across sources or depth on the strongest few items?",
+            "Looking at this search strategy, what sources, entities, or angles are missing?",
+        ]
+        if evidence_already_answered:
+            candidates = candidates[1:]
         return _first_unasked_question(
             messages,
-            [
-                "What kind of evidence should I trust most for this brief: primary reporting, expert analysis, community signal, or practical examples?",
-                "Should the brief prioritize breadth across sources or depth on the strongest few items?",
-                "Looking at this search strategy, what sources, entities, or angles are missing?",
-            ],
+            candidates,
         )
     return _first_unasked_question(
         messages,

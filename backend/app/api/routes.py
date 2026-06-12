@@ -127,6 +127,7 @@ class RefinementStreamMessage(BaseModel):
     foreign_regions: list[str] = Field(default_factory=list)
     recency_weighting: Literal["breaking", "recent", "last_year", "all_available", "balanced", "evergreen"] | None = None
     lookback_hours: int | None = Field(default=None, ge=1, le=brief_settings.MAX_LOOKBACK_HOURS)
+    source_scope_touched: bool = False
     answer: str = ""
     models: dict[str, Any] = Field(default_factory=dict)
     just_go_now: bool = False
@@ -258,6 +259,7 @@ async def stream_refinement(payload: RefinementStreamMessage) -> StreamingRespon
                 foreign_regions=payload.foreign_regions,
                 recency_weighting=payload.recency_weighting,
                 lookback_hours=payload.lookback_hours,
+                source_scope_touched=payload.source_scope_touched,
                 models=payload.models,
                 answer=payload.answer,
                 just_go_now=payload.just_go_now,

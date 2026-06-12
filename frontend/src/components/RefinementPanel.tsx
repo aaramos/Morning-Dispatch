@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import type { FormEvent } from "react";
 import type { GmailCandidatePayload, QueryEditTarget } from "../lib/api";
 import type { ConfirmationDraft, RefinementProgress, RefinementSession, SourceKey, SourceStatusResponse, TopicProfile } from "../lib/types";
+import { sourceOptions } from "../lib/types";
 import { formatElapsed, recencyText, refinementProgressState, sourceScopeFromLookbackHours, uniqueCleanList } from "../lib/appHelpers";
 import { ChatMessageContent } from "./ChatMessageContent";
 import { EditablePlanQuery } from "./EditablePlanQuery";
@@ -50,26 +51,28 @@ export function RefinementPanel(props: {
   const preview = props.session?.strategy_preview ?? null;
   const finalized = props.flow === "confirm" || props.session?.status === "finalized";
   const generalQueries = preview?.search_queries ?? props.profile?.search_queries ?? [];
-  const marketSource = (preview?.per_source ?? []).find((source) => source.key === "markets");
-  const podcastSource = (preview?.per_source ?? []).find((source) => source.key === "podcasts");
+  const selectedPreviewSources = (preview?.per_source ?? []).filter((source) => props.sourceSelection[source.key]);
+  const marketSource = selectedPreviewSources.find((source) => source.key === "markets");
+  const podcastSource = selectedPreviewSources.find((source) => source.key === "podcasts");
   const tickers = marketSource?.tickers ?? [];
-  const podcastDirectQueries = uniqueCleanList([
+  const podcastsSelected = Boolean(props.sourceSelection.podcasts);
+  const podcastDirectQueries = podcastsSelected ? uniqueCleanList([
     ...(podcastSource?.direct_episode_queries ?? []),
     ...(props.profile?.direct_episode_queries ?? []),
-  ]);
-  const podcastRelatedQueries = uniqueCleanList([
+  ]) : [];
+  const podcastRelatedQueries = podcastsSelected ? uniqueCleanList([
     ...(podcastSource?.related_episode_queries ?? []),
     ...(props.profile?.related_episode_queries ?? []),
-  ]);
-  const podcastPriorityTerms = uniqueCleanList([
+  ]) : [];
+  const podcastPriorityTerms = podcastsSelected ? uniqueCleanList([
     ...(podcastSource?.priority_terms ?? []),
     ...(props.profile?.priority_terms ?? []),
-  ]);
-  const podcastNegativeTerms = uniqueCleanList([
+  ]) : [];
+  const podcastNegativeTerms = podcastsSelected ? uniqueCleanList([
     ...(podcastSource?.negative_constraints ?? []),
     ...(props.profile?.negative_constraints ?? []),
-  ]);
-  const sourceQueries = (preview?.per_source ?? [])
+  ]) : [];
+  const sourceQueries = selectedPreviewSources
     .filter((source) => source.key !== "markets")
     .flatMap((source) => source.queries.map((query, index) => ({
       source: source.source,
@@ -86,6 +89,19 @@ export function RefinementPanel(props: {
     ? refinementProgressState(props.refinementProgress, props.progressNow)
     : null;
   const thinking = props.streaming || Boolean(progressState);
+  const planSourceLabels: Partial<Record<SourceKey, string>> = {
+    web_search: "Web search",
+    foreign_media: "Foreign media",
+    gmail: "Gmail newsletters",
+    podcasts: "Podcasts",
+    collections: "Your collections",
+  };
+  const strategySourcePills = sourceOptions.map((source) => ({
+    key: source.key,
+    label: planSourceLabels[source.key] ?? source.label,
+    enabled: Boolean(props.sourceSelection[source.key]),
+  }));
+  const showStrategySources = props.flow !== "idle" || Boolean(preview);
 
   function updateDraftRecency(lookbackHours: number | null) {
     props.onDraftChange({
@@ -198,6 +214,14 @@ export function RefinementPanel(props: {
                   </div>
                 </div>
               ) : null}
+              {finalized && props.sourceSelection.podcasts && props.onEnsurePodcastTopicId ? (
+                <div className="chat-turn assistant podcast-show-turn">
+                  <div className="chat-avatar ai">M</div>
+                  <div className="chat-bubble2 podcast-show-chat-bubble">
+                    <PodcastShowPicker ensureTopicId={props.onEnsurePodcastTopicId} />
+                  </div>
+                </div>
+              ) : null}
               {props.queuedBuildRequests > 0 ? (
                 <>
                   <div className="chat-turn user pending">
@@ -303,9 +327,6 @@ export function RefinementPanel(props: {
                 {props.sourceSelection.foreign_media ? (
                   <ForeignRegionPicker selected={foreignRegions} onChange={props.onForeignRegionsChange} />
                 ) : null}
-                {props.sourceSelection.podcasts && props.onEnsurePodcastTopicId ? (
-                  <PodcastShowPicker ensureTopicId={props.onEnsurePodcastTopicId} />
-                ) : null}
                 <div className="chat-build-row">
                   <span className="muted-hint">Or type further adjustments above</span>
                   <RecencyControl value={props.draft.lookback_hours} onChange={updateDraftRecency} compact />
@@ -385,15 +406,12 @@ export function RefinementPanel(props: {
             <div className="plan-label">Scope</div>
             <div className={`plan-value ${scopeText ? "" : "empty"}`}>{scopeText || "Being shaped…"}</div>
           </div>
-          {(preview?.looks_at?.length ?? 0) > 0 || (preview?.ignores?.length ?? 0) > 0 ? (
+          {showStrategySources ? (
             <div className="plan-group">
               <div className="plan-label">Sources</div>
               <div className="plan-pillrow">
-                {(preview?.looks_at ?? []).map((label) => (
-                  <span className="plan-pill on" key={`on-${label}`}>{label}</span>
-                ))}
-                {(preview?.ignores ?? []).map((label) => (
-                  <span className="plan-pill" key={`off-${label}`}>{label}</span>
+                {strategySourcePills.map((source) => (
+                  <span className={`plan-pill ${source.enabled ? "on" : ""}`} key={source.key}>{source.label}</span>
                 ))}
               </div>
             </div>

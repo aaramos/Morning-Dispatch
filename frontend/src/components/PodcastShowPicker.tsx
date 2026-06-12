@@ -11,6 +11,7 @@ export function PodcastShowPicker(props: { ensureTopicId: () => Promise<string |
   const [candidates, setCandidates] = useState<PodcastShowCandidate[]>([]);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [stalenessDays, setStalenessDays] = useState(60);
+  const [queries, setQueries] = useState<string[]>([]);
 
   async function loadShows() {
     setLoading(true);
@@ -25,6 +26,7 @@ export function PodcastShowPicker(props: { ensureTopicId: () => Promise<string |
       const data = await fetchPodcastShows(topicId);
       setStalenessDays(data.staleness_days);
       setCandidates(data.candidates);
+      setQueries(data.queries ?? []);
       const initial: Record<string, boolean> = {};
       for (const candidate of data.candidates) {
         initial[candidate.feed_url] = Boolean(candidate.subscribed);
@@ -79,7 +81,10 @@ export function PodcastShowPicker(props: { ensureTopicId: () => Promise<string |
           </p>
           <div className="podcast-show-list">
             {candidates.length === 0 ? (
-              <p className="meta">No candidate shows found yet. Try broadening the interest.</p>
+              <p className="meta">
+                No candidate shows found yet.
+                {queries.length ? ` Tried: ${queries.slice(0, 4).join(", ")}.` : " Try broadening the interest."}
+              </p>
             ) : (
               candidates.map((candidate) => (
                 <label className="podcast-show-row" key={candidate.feed_url}>

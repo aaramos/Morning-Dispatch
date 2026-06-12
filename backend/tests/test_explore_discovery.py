@@ -2064,6 +2064,243 @@ def test_streaming_finalized_refinement_session_accepts_strategy_correction(monk
     )
 
 
+def test_streaming_refinement_preserves_explicit_source_scope(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    class _RecencyChangingStreamingClient:
+        async def complete_response(self, **kwargs: object) -> None:
+            on_token = kwargs["on_token"]
+            assert callable(on_token)
+            on_token(
+                "I have a focused plan. What kind of street-level signals should I prioritize?\n\n"
+                "```json\n"
+                '{"profile_patch":{"scope":"Mexico City solo travel guide","recency_weighting":"recent","lookback_hours":4320,'
+                '"search_queries":["best things to do in Mexico City solo August"]},"ready_to_build":false,"intent":"continue"}'
+                "\n```"
+            )
+
+    monkeypatch.setattr(
+        refinement.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: type("Resolution", (), {"client": _RecencyChangingStreamingClient()})(),
+    )
+
+    events: list[dict[str, Any]] = []
+
+    async def collect_events() -> None:
+        async for event in refinement.astream_refinement(
+            session_id=None,
+            statement="A gritty solo travel guide for Mexico City in August.",
+            source_selection={"web_search": True, "reddit": True},
+            foreign_regions=[],
+            recency_weighting="recent",
+            lookback_hours=8640,
+            source_scope_touched=True,
+            models={},
+            answer="",
+            just_go_now=False,
+        ):
+            events.append(event)
+
+    asyncio.run(collect_events())
+
+    done = next(event for event in reversed(events) if event["type"] == "done")
+    profile = done["session"]["profile"]
+    assert profile["lookback_hours"] == 8640
+    assert profile["recency_weighting"] == "recent"
+    assert profile["source_scope_answered"] is True
+    assert profile["search_queries"] == ["best things to do in Mexico City solo August"]
+
+
+def test_streaming_refinement_emits_incremental_visible_tokens(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    class _ChunkedStreamingClient:
+        async def complete_response(self, **kwargs: object) -> None:
+            on_token = kwargs["on_token"]
+            assert callable(on_token)
+            on_token("I found a stronger direction. ")
+            on_token("What local signal matters most?\n\n")
+            on_token(
+                "```json\n"
+                '{"profile_patch":{"scope":"Mexico City solo travel guide",'
+                '"search_queries":["Mexico City hidden gems solo August"]},"ready_to_build":false,"intent":"continue"}'
+                "\n```"
+            )
+
+    monkeypatch.setattr(
+        refinement.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: type("Resolution", (), {"client": _ChunkedStreamingClient()})(),
+    )
+
+    events: list[dict[str, Any]] = []
+
+    async def collect_events() -> None:
+        async for event in refinement.astream_refinement(
+            session_id=None,
+            statement="A gritty solo travel guide for Mexico City in August.",
+            source_selection={"web_search": True, "reddit": True},
+            foreign_regions=[],
+            recency_weighting="recent",
+            lookback_hours=8640,
+            source_scope_touched=True,
+            models={},
+            answer="",
+            just_go_now=False,
+        ):
+            events.append(event)
+
+    asyncio.run(collect_events())
+
+    token_events = [event for event in events if event["type"] == "token"]
+    assert [event["text"] for event in token_events[:2]] == [
+        "I found a stronger direction. ",
+        "What local signal matters most?\n\n",
+    ]
+    assert all("```" not in str(event["text"]) for event in token_events)
+    assert events.index(token_events[0]) < next(index for index, event in enumerate(events) if event["type"] == "plan")
+
+
+def test_streaming_refinement_build_request_confirms_and_triggers_build(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    class _UnexpectedStreamingClient:
+        async def complete_response(self, **_kwargs: object) -> None:
+            raise AssertionError("free-text build requests should not go back to the model")
+
+    monkeypatch.setattr(
+        refinement.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: type("Resolution", (), {"client": _UnexpectedStreamingClient()})(),
+    )
+
+    session = database.create_refinement_session(
+        statement="A gritty solo travel guide for Mexico City in August.",
+        profile={
+          "statement": "A gritty solo travel guide for Mexico City in August.",
+          "scope": "Mexico City solo travel with street food and neighborhood exploration",
+          "search_queries": ["Mexico City hidden gems solo August"],
+          "source_selection": {"web_search": True, "reddit": True},
+          "recency_weighting": "recent",
+          "lookback_hours": 8640,
+        },
+        messages=[
+            {"role": "assistant", "content": "What kind of evidence should I trust most for this brief?"}
+        ],
+        pending_field="refinement_agent",
+        status="active",
+    )
+
+    events: list[dict[str, Any]] = []
+
+    async def collect_events() -> None:
+        async for event in refinement.astream_refinement(
+            session_id=session["session_id"],
+            statement="A gritty solo travel guide for Mexico City in August.",
+            source_selection={"web_search": True, "reddit": True},
+            foreign_regions=[],
+            recency_weighting="recent",
+            lookback_hours=8640,
+            source_scope_touched=True,
+            models={},
+            answer="build the brief",
+            just_go_now=False,
+        ):
+            events.append(event)
+
+    asyncio.run(collect_events())
+
+    token_text = "".join(str(event["text"]) for event in events if event["type"] == "token")
+    done = next(event for event in reversed(events) if event["type"] == "done")
+    body = done["session"]
+    assert "Confirmed" in token_text
+    assert done["ready"] is True
+    assert done["trigger_build"] is True
+    assert body["status"] == "finalized"
+    assert body["pending_field"] is None
+    assert body["topic_profile"]["profile"]["scope"] == "Mexico City solo travel with street food and neighborhood exploration"
+    assert body["messages"][-2] == {"role": "user", "content": "build the brief"}
+    assert body["messages"][-1]["role"] == "assistant"
+    assert "build using the current search strategy" in body["messages"][-1]["content"]
+    assert not body["messages"][-1]["content"].endswith("?")
+
+
+def test_streaming_refinement_replaces_redundant_recency_question(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    class _RedundantStreamingClient:
+        async def complete_response(self, **kwargs: object) -> None:
+            on_token = kwargs["on_token"]
+            assert callable(on_token)
+            on_token(
+                "Got it. How recent should the source material be?\n\n"
+                "```json\n"
+                '{"profile_patch":{"search_queries":["Mexico City hidden gems solo August"],'
+                '"recency_weighting":"recent","lookback_hours":8640},'
+                '"ready_to_build":false,"intent":"continue"}'
+                "\n```"
+            )
+
+    monkeypatch.setattr(
+        refinement.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: type("Resolution", (), {"client": _RedundantStreamingClient()})(),
+    )
+
+    session = database.create_refinement_session(
+        statement="A gritty solo travel guide for Mexico City in August.",
+        profile={
+            "statement": "A gritty solo travel guide for Mexico City in August.",
+            "scope": "Mexico City solo travel",
+            "search_queries": ["Mexico City hidden gems solo August"],
+            "source_selection": {"web_search": True, "reddit": True},
+            "recency_weighting": "recent",
+            "lookback_hours": 8640,
+            "source_scope_answered": True,
+        },
+        messages=[
+            {"role": "assistant", "content": "What kind of evidence should I trust most for this brief?"},
+            {"role": "user", "content": "community signal and practical examples"},
+        ],
+        pending_field="refinement_agent",
+        status="active",
+    )
+
+    events: list[dict[str, Any]] = []
+
+    async def collect_events() -> None:
+        async for event in refinement.astream_refinement(
+            session_id=session["session_id"],
+            statement="A gritty solo travel guide for Mexico City in August.",
+            source_selection={"web_search": True, "reddit": True},
+            foreign_regions=[],
+            recency_weighting="recent",
+            lookback_hours=8640,
+            source_scope_touched=True,
+            models={},
+            answer="community signal and practical examples",
+            just_go_now=False,
+        ):
+            events.append(event)
+
+    asyncio.run(collect_events())
+
+    done = next(event for event in reversed(events) if event["type"] == "done")
+    assistant_messages = [
+        message["content"]
+        for message in done["session"]["messages"]
+        if message["role"] == "assistant"
+    ]
+    assert "how recent" not in assistant_messages[-1].lower()
+    assert "source material" not in assistant_messages[-1].lower()
+    assert "breadth across sources" in assistant_messages[-1].lower()
+
+
 def test_chat_source_feedback_adds_named_podcast_to_strategy(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
 

@@ -129,6 +129,74 @@ def test_discover_candidate_shows_returns_summaries(monkeypatch) -> None:
     assert all("description" in s for s in shows)
 
 
+def test_podcast_show_refs_ignore_noisy_requested_source_and_use_episode_queries() -> None:
+    profile = TopicProfile.from_dict(
+        {
+            "statement": "Plan a solo trip to Mexico City in August.",
+            "scope": "Mexico City solo travel with street food and neighborhood exploration",
+            "keywords": ["Mexico City", "solo travel", "street food", "tacos"],
+            "direct_episode_queries": ["Mexico City street food guide"],
+            "related_episode_queries": ["solo travel in Mexico"],
+            "source_queries": {
+                "podcasts": [
+                    "Mexico City travel guide episode",
+                    "ticker symbols, foreign media must use native-language queries,",
+                ],
+            },
+            "requested_sources": [
+                {"adapter": "podcasts", "ref": "ticker symbols, foreign media must use native-language queries,"}
+            ],
+            "source_selection": {"podcasts": True},
+        }
+    )
+
+    refs = adapters._podcast_discovery_refs(profile)
+
+    assert refs[:4] == [
+        "Mexico City street food guide",
+        "Mexico City",
+        "street food",
+        "solo travel in Mexico",
+    ]
+    assert all("ticker symbols" not in ref for ref in refs)
+    assert "Mexico City travel guide episode" in refs
+
+
+def test_podcast_show_candidates_returns_queries(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MORNING_DISPATCH_HOME", str(tmp_path / "rt"))
+    monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(tmp_path / "rt" / "data"))
+    monkeypatch.setenv("MORNING_DISPATCH_SECRETS_DIR", str(tmp_path / "rt" / "secrets"))
+    monkeypatch.setenv("MORNING_DISPATCH_DB_PATH", str(tmp_path / "rt" / "data" / "db" / "md.sqlite3"))
+    database.init_database()
+    from backend.app.services import explore
+
+    captured_queries: list[str] = []
+
+    async def fake_discover_candidate_shows(queries, **_kwargs):
+        captured_queries.extend(queries)
+        return []
+
+    monkeypatch.setattr(podcast, "discover_candidate_shows", fake_discover_candidate_shows)
+    saved = explore.save_topic_profile(
+        {
+            "topic_id": "topic-mexico-city",
+            "statement": "Plan a solo trip to Mexico City in August.",
+            "source_selection": {"podcasts": True},
+            "direct_episode_queries": ["Mexico City street food guide"],
+            "requested_sources": [
+                {"adapter": "podcasts", "ref": "ticker symbols, foreign media must use native-language queries,"}
+            ],
+        }
+    )
+
+    result = asyncio.run(explore.podcast_show_candidates(saved["topic_id"]))
+
+    assert result is not None
+    assert result["queries"] == captured_queries
+    assert "Mexico City street food guide" in captured_queries
+    assert all("ticker symbols" not in query for query in captured_queries)
+
+
 # ---------------------------------------------------------------------------
 # Subscription persistence
 # ---------------------------------------------------------------------------

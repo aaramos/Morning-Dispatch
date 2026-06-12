@@ -26,6 +26,7 @@ export type PodcastShowCandidate = {
 export type PodcastShowsResponse = {
   topic_id: string;
   staleness_days: number;
+  queries?: string[];
   candidates: PodcastShowCandidate[];
 };
 
@@ -83,6 +84,7 @@ export type RefinementStreamBody = {
   foreign_regions?: string[];
   recency_weighting?: SourceScope;
   lookback_hours?: number | null;
+  source_scope_touched?: boolean;
   answer?: string;
   models?: Record<string, unknown>;
   just_go_now?: boolean;

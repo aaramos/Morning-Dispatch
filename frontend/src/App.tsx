@@ -31,7 +31,17 @@ import type {
   TopicProfile,
   TopicProfileResponse,
 } from "./lib/types";
-import { clearInterestDraft, interestDraftTtlMs, loadInterestDraft, saveInterestDraft } from "./lib/drafts";
+import type { ActiveConversationSnapshot } from "./lib/drafts";
+import {
+  activeConversationTtlMs,
+  clearActiveConversationDraft,
+  clearInterestDraft,
+  interestDraftTtlMs,
+  loadActiveConversationDraft,
+  loadInterestDraft,
+  saveActiveConversationDraft,
+  saveInterestDraft,
+} from "./lib/drafts";
 import { BuildStartingPanel } from "./components/BuildStartingPanel";
 import { ScheduledDeliveryAlert } from "./components/ScheduledDeliveryAlert";
 import { AdminApp } from "./components/admin/AdminApp";
@@ -73,17 +83,30 @@ export default function App() {
 }
 
 function DispatchApp() {
+  const [restoredConversation] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has("refine_exploration") || params.has("refine_topic")) return null;
+    return loadActiveConversationDraft();
+  });
   const [sourceStatus, setSourceStatus] = useState<SourceStatusResponse | null>(null);
-  const [sourceSelection, setSourceSelection] = useState<Record<SourceKey, boolean>>(defaultSourceSelection);
-  const [statement, setStatement] = useState(() => loadInterestDraft());
-  const [submittedInterest, setSubmittedInterest] = useState("");
-  const [session, setSession] = useState<RefinementSession | null>(null);
-  const [answer, setAnswer] = useState("");
-  const [topicProfile, setTopicProfile] = useState<TopicProfileResponse | null>(null);
-  const [draft, setDraft] = useState<ConfirmationDraft>(emptyDraft());
-  const [flow, setFlow] = useState<FlowState>("idle");
+  const [sourceSelection, setSourceSelection] = useState<Record<SourceKey, boolean>>(
+    () => restoredConversation?.sourceSelection ?? defaultSourceSelection,
+  );
+  const [statement, setStatement] = useState(() => restoredConversation?.statement ?? loadInterestDraft());
+  const [submittedInterest, setSubmittedInterest] = useState(() => restoredConversation?.submittedInterest ?? "");
+  const [session, setSession] = useState<RefinementSession | null>(() => restoredConversation?.session ?? null);
+  const [answer, setAnswer] = useState(() => restoredConversation?.answer ?? "");
+  const [topicProfile, setTopicProfile] = useState<TopicProfileResponse | null>(
+    () => restoredConversation?.topicProfile ?? null,
+  );
+  const [draft, setDraft] = useState<ConfirmationDraft>(() => restoredConversation?.draft ?? emptyDraft());
+  const [flow, setFlow] = useState<FlowState>(() => restoredConversation?.flow ?? "idle");
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("Ready");
+  const [message, setMessage] = useState(() => (
+    restoredConversation
+      ? restoredConversation.flow === "confirm" ? "Conversation restored; confirm the brief setup" : "Conversation restored"
+      : "Ready"
+  ));
   const [enableSource, setEnableSource] = useState<SourceKey | null>(null);
   const [webKey, setWebKey] = useState("");
   const [gmailSecret, setGmailSecret] = useState("");
@@ -103,7 +126,9 @@ function DispatchApp() {
   const [emailOnSchedule, setEmailOnSchedule] = useState(false);
   const [refinementProgress, setRefinementProgress] = useState<RefinementProgress | null>(null);
   const [refinementFallbackStartedAt, setRefinementFallbackStartedAt] = useState(0);
-  const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(null);
+  const [refinementTargetExplorationId, setRefinementTargetExplorationId] = useState<string | null>(
+    () => restoredConversation?.refinementTargetExplorationId ?? null,
+  );
   const [streamingText, setStreamingText] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [strategyStreamingText, setStrategyStreamingText] = useState("");
@@ -114,7 +139,10 @@ function DispatchApp() {
   const [briefSettings, setBriefSettings] = useState<BriefSettingsResponse | null>(null);
   const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
   const [strategyConfirmation, setStrategyConfirmation] = useState("");
-  const [foreignRegionsDraft, setForeignRegionsDraft] = useState<string[]>([]);
+  const [foreignRegionsDraft, setForeignRegionsDraft] = useState<string[]>(
+    () => restoredConversation?.foreignRegionsDraft ?? [],
+  );
+  const [conversationActivityAt, setConversationActivityAt] = useState(() => Date.now());
   const [queuedStrategyRefinementTurns, setQueuedStrategyRefinementTurns] = useState(0);
   const [initialRefineExplorationId] = useState(() => {
     const params = new URLSearchParams(window.location.search);
@@ -147,7 +175,14 @@ function DispatchApp() {
   const buildBriefRef = useRef<() => void>(() => undefined);
   const backgroundBuildRef = useRef<{ id: string; status: Exploration["status"] } | null>(null);
   const [autoBuildRequest, setAutoBuildRequest] = useState(0);
-  const recencyOverrideRef = useRef<Pick<ConfirmationDraft, "recency_weighting" | "lookback_hours"> | null>(null);
+  const recencyOverrideRef = useRef<Pick<ConfirmationDraft, "recency_weighting" | "lookback_hours"> | null>(
+    restoredConversation?.draft.sourceScopeTouched
+      ? {
+        recency_weighting: restoredConversation.draft.recency_weighting,
+        lookback_hours: restoredConversation.draft.lookback_hours,
+      }
+      : null,
+  );
 
   const scheduledDeliveryFailures = useMemo(
     () => deliveryFailuresFromStatus(adminStatus, scheduledTopics),
@@ -170,20 +205,33 @@ function DispatchApp() {
   const canSubmitInterest = (flow === "idle" || flow === "ready") && statement.trim().length > 0 && !busy;
   const canBuild = buildInterest.length > 0;
   const updateDraft = useCallback((nextDraft: ConfirmationDraft) => {
-    if (nextDraft.sourceScopeTouched) {
-      recencyOverrideRef.current = {
-        recency_weighting: nextDraft.recency_weighting,
-        lookback_hours: nextDraft.lookback_hours,
-      };
-    }
-    setDraft(nextDraft);
+    setDraft((current) => {
+      const recencyChanged = (
+        nextDraft.sourceScopeTouched
+        || nextDraft.recency_weighting !== current.recency_weighting
+        || nextDraft.lookback_hours !== current.lookback_hours
+      );
+      if (recencyChanged) {
+        recencyOverrideRef.current = {
+          recency_weighting: nextDraft.recency_weighting,
+          lookback_hours: nextDraft.lookback_hours,
+        };
+      }
+      return nextDraft;
+    });
   }, []);
   const draftWithStickyRecency = useCallback((
     profile: TopicProfile,
     defaults = defaultContentLimits,
     current?: ConfirmationDraft,
   ) => {
-    const override = recencyOverrideRef.current;
+    const currentOverride = current?.sourceScopeTouched
+      ? {
+        recency_weighting: current.recency_weighting,
+        lookback_hours: current.lookback_hours,
+      }
+      : null;
+    const override = currentOverride ?? recencyOverrideRef.current;
     if (!override) return draftFromProfile(profile, defaults, current);
     return draftFromProfile(
       profile,
@@ -212,6 +260,41 @@ function DispatchApp() {
     if (!refinementWorking || !refinementFallbackStartedAt) return null;
     return { phase: "starting", startedAt: refinementFallbackStartedAt, label: "Refining" };
   }, [refinementFallbackStartedAt, refinementProgress, refinementWorking]);
+  const activeConversationSnapshot = useMemo<ActiveConversationSnapshot | null>(() => {
+    if (flow === "building" || flow === "ready" || flow === "schedule") return null;
+    const hasConversation = Boolean(
+      flow === "refining"
+      || flow === "confirm"
+      || session
+      || topicProfile
+      || submittedInterest.trim()
+      || answer.trim(),
+    );
+    if (!hasConversation) return null;
+    return {
+      flow: flow === "confirm" ? "confirm" : "refining",
+      statement,
+      submittedInterest,
+      session,
+      answer,
+      topicProfile,
+      draft,
+      sourceSelection,
+      foreignRegionsDraft,
+      refinementTargetExplorationId,
+    };
+  }, [
+    answer,
+    draft,
+    flow,
+    foreignRegionsDraft,
+    refinementTargetExplorationId,
+    session,
+    sourceSelection,
+    statement,
+    submittedInterest,
+    topicProfile,
+  ]);
 
   const loadStatics = useCallback(async () => {
     const [sources, , admin, settings] = await Promise.all([
@@ -285,6 +368,82 @@ function DispatchApp() {
     saveInterestDraft(statement);
     return () => window.clearTimeout(timer);
   }, [flow, statement]);
+
+  useEffect(() => {
+    if (!activeConversationSnapshot) return;
+    saveActiveConversationDraft(activeConversationSnapshot);
+  }, [activeConversationSnapshot, conversationActivityAt]);
+
+  useEffect(() => {
+    if (!activeConversationSnapshot) return;
+    const persistConversation = () => saveActiveConversationDraft(activeConversationSnapshot);
+    const persistHiddenConversation = () => {
+      if (document.visibilityState === "hidden") persistConversation();
+    };
+    window.addEventListener("pagehide", persistConversation);
+    document.addEventListener("visibilitychange", persistHiddenConversation);
+    return () => {
+      window.removeEventListener("pagehide", persistConversation);
+      document.removeEventListener("visibilitychange", persistHiddenConversation);
+    };
+  }, [activeConversationSnapshot]);
+
+  useEffect(() => {
+    if (!activeConversationSnapshot) return;
+    const markConversationActive = () => setConversationActivityAt(Date.now());
+    window.addEventListener("focus", markConversationActive);
+    window.addEventListener("pointerdown", markConversationActive);
+    window.addEventListener("keydown", markConversationActive);
+    return () => {
+      window.removeEventListener("focus", markConversationActive);
+      window.removeEventListener("pointerdown", markConversationActive);
+      window.removeEventListener("keydown", markConversationActive);
+    };
+  }, [activeConversationSnapshot]);
+
+  useEffect(() => {
+    if (!activeConversationSnapshot) return;
+    if (busy || streaming || activeRefinementProgress || strategyStreaming || strategyPreparingProposal) {
+      setConversationActivityAt(Date.now());
+    }
+  }, [
+    activeConversationSnapshot,
+    activeRefinementProgress,
+    busy,
+    strategyPreparingProposal,
+    strategyStreaming,
+    streaming,
+  ]);
+
+  useEffect(() => {
+    if (!activeConversationSnapshot) return;
+    if (busy || streaming || activeRefinementProgress || strategyStreaming || strategyPreparingProposal) return;
+    const timeRemaining = Math.max(0, activeConversationTtlMs - (Date.now() - conversationActivityAt));
+    const timer = window.setTimeout(() => {
+      clearActiveConversationDraft();
+      clearInterestDraft();
+      recencyOverrideRef.current = null;
+      setStrategyConfirmation("");
+      setRefinementTargetExplorationId(null);
+      setStatement("");
+      setSubmittedInterest("");
+      setSession(null);
+      setTopicProfile(null);
+      setDraft(emptyDraft());
+      setAnswer("");
+      setFlow("idle");
+      setMessage("Conversation cleared after 15 minutes of inactivity");
+    }, timeRemaining);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeConversationSnapshot,
+    activeRefinementProgress,
+    busy,
+    conversationActivityAt,
+    strategyPreparingProposal,
+    strategyStreaming,
+    streaming,
+  ]);
 
   useEffect(() => {
     if (!session) return;
@@ -600,6 +759,7 @@ function DispatchApp() {
         foreign_regions: foreignRegionsDraft,
         recency_weighting: draft.recency_weighting,
         lookback_hours: draft.lookback_hours,
+        source_scope_touched: draft.sourceScopeTouched === true,
         models: {},
       });
     } catch (error) {
@@ -639,6 +799,7 @@ function DispatchApp() {
           foreign_regions: foreignRegionsDraft,
           recency_weighting: draft.recency_weighting,
           lookback_hours: draft.lookback_hours,
+          source_scope_touched: draft.sourceScopeTouched === true,
           answer: justGoNow ? "" : pendingAnswer,
           just_go_now: justGoNow,
           models: {},
@@ -657,6 +818,7 @@ function DispatchApp() {
     busy,
     draft.lookback_hours,
     draft.recency_weighting,
+    draft.sourceScopeTouched,
     foreignRegionsDraft,
     runRefinementStream,
     selectedEnabledSources,
@@ -1234,8 +1396,10 @@ function DispatchApp() {
 
 
   function resetForNewBrief() {
+    clearActiveConversationDraft();
     clearInterestDraft();
     recencyOverrideRef.current = null;
+    setConversationActivityAt(Date.now());
     setStrategyConfirmation("");
     setRefinementTargetExplorationId(null);
     setStatement("");
@@ -1688,10 +1852,6 @@ function DispatchApp() {
 
 
 void ConfirmationPanel;
-
-
-
-
 
 
 
