@@ -21,6 +21,8 @@ def _runtime(monkeypatch, tmp_path) -> None:
         "MORNING_DISPATCH_DB_PATH",
         str(tmp_path / "data" / "db" / "morning_dispatch.sqlite3"),
     )
+    # HTTP is mocked in these tests; skip the real-traffic rate-limit spacing.
+    monkeypatch.setenv("MORNING_DISPATCH_REDDIT_MIN_REQUEST_INTERVAL_SECONDS", "0")
 
 
 # --- Subreddit Cleaner Tests ---
@@ -482,4 +484,78 @@ def test_reddit_adapter_fetches_new_rss_when_bounded(monkeypatch, tmp_path) -> N
     # Verify both hot and new rss feeds were fetched
     assert "https://www.reddit.com/r/python/hot/.rss" in fetched_urls
     assert "https://www.reddit.com/r/python/new/.rss" in fetched_urls
+
+
+def test_reddit_adapter_backfills_throttled_subreddit_via_web(monkeypatch, tmp_path) -> None:
+    """When a subreddit listing is 429-throttled, recover it through web search."""
+    _runtime(monkeypatch, tmp_path)
+
+    from backend.agents.discovery.web_search import SearchHit
+
+    search_queries_seen: list[str] = []
+
+    async def mock_search_web(query: str, limit: int, days: int | None = None) -> list[SearchHit]:
+        search_queries_seen.append(query)
+        return [
+            SearchHit(
+                provider="test",
+                title="Recovered Python thread",
+                url="https://www.reddit.com/r/python/comments/abc123/recovered_thread/",
+                snippet="A throttled thread recovered via web search.",
+                score=0.9,
+                published_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+        ]
+
+    class FakeResponse:
+        def __init__(self, status_code: int, text_content: str) -> None:
+            self.status_code = status_code
+            self._text = text_content
+
+        @property
+        def text(self) -> str:
+            return self._text
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, url: str, **kwargs) -> FakeResponse:
+            # Every reddit.com listing/comment request is throttled.
+            return FakeResponse(status_code=429, text_content="")
+
+    async def mock_expand(*_args) -> Any:
+        return SimpleNamespace(subreddits=["python"], search_queries=[])
+
+    async def mock_refine_queries(*args, **kwargs) -> list[str]:
+        return []
+
+    monkeypatch.setattr(adapters, "expand_reddit_targets", mock_expand)
+    monkeypatch.setattr(adapters, "search_web", mock_search_web)
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        "backend.agents.discovery.query_refiner.refine_queries_for_adapter",
+        mock_refine_queries,
+    )
+
+    adapter = RedditSourceAdapter()
+    candidates = asyncio.run(
+        adapter.query(
+            TopicProfile.from_dict(
+                {"statement": "AI Coding", "scope": "AI Coding", "keywords": ["llm", "agents"]}
+            ),
+            SourceAdapterContext(exploration_id="explore-test", lookback_hours=24),
+        )
+    )
+
+    # The throttled subreddit was recovered via a subreddit-scoped web search.
+    assert len(candidates) == 1
+    assert candidates[0].payload.metadata["subreddit"] == "python"
+    assert any("site:reddit.com/r/python" in q for q in search_queries_seen)
 

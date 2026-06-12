@@ -340,6 +340,35 @@ def test_merge_agent_profile_patch_synonym_folding():
     assert set(updated["must_have_aliases"]["mexico city"]) == {"CDMX", "Ciudad de México", "DF"}
 
 
+def test_merge_agent_profile_patch_drops_inferred_must_have():
+    """The agent must not mint a must-have from the topic subject (regression)."""
+    from backend.app.services.refinement import _merge_agent_profile_patch
+    profile = {"statement": "identify AI related changes to google analytics"}
+    patch = {
+        "must_have_terms": ["Google Analytics"],
+        "must_have_aliases": {"google analytics": ["GA4", "Google Analytics 4"]},
+    }
+    # User text is just the topic statement — no explicit "must mention" demand.
+    updated = _merge_agent_profile_patch(
+        profile, patch, user_text="identify AI related changes to google analytics"
+    )
+    assert updated["must_have_terms"] == []
+    assert updated.get("must_have_aliases", {}) == {}
+    assert not updated.get("must_have_answered")
+
+
+def test_merge_agent_profile_patch_honors_explicit_must_have():
+    """An explicit user demand for a required term is honored and recorded."""
+    from backend.app.services.refinement import _merge_agent_profile_patch
+    profile = {"statement": "AI coding news"}
+    patch = {"must_have_terms": ["Tesla"]}
+    updated = _merge_agent_profile_patch(
+        profile, patch, user_text="every article must mention Tesla"
+    )
+    assert updated["must_have_terms"] == ["Tesla"]
+    assert updated["must_have_answered"] is True
+
+
 def test_expand_must_have_aliases_returns_canonicalized(monkeypatch):
     from backend.app.services.refinement import expand_must_have_aliases
     class FakeClient:

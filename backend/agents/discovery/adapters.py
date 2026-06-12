@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import math
 import time
@@ -17,6 +18,75 @@ logger = logging.getLogger(__name__)
 
 from backend.agents.digestor.gmail import fetch_newsletters
 from backend.agents.digestor.podcast import fetch_podcast_episodes, fetch_subscribed_show_latest
+
+# --- Reddit rate limiting / 429 hardening ---
+# Unauthenticated www.reddit.com aggressively rate-limits and returns HTTP 429.
+# Every reddit.com GET is funneled through a process-wide min-interval limiter so
+# we never burst, and a throttled request is retried a few times with exponential
+# backoff that honors any Retry-After header. This turns transient throttling into
+# a short delay instead of zeroing out the whole Reddit lane.
+_REDDIT_MIN_INTERVAL_SECONDS = 1.0
+_REDDIT_MAX_RETRIES = 3
+_reddit_rate_lock: asyncio.Lock | None = None
+_reddit_rate_lock_loop: asyncio.AbstractEventLoop | None = None
+_reddit_last_request_at = 0.0
+
+
+def _get_reddit_rate_lock() -> asyncio.Lock:
+    """Return a rate-limit lock bound to the running loop.
+
+    The lock must not be created at import time: an asyncio.Lock binds to the
+    first loop that touches it, which breaks under multiple event loops (tests
+    run each adapter call in a fresh asyncio.run loop). Create it lazily and
+    recreate it whenever the running loop changes.
+    """
+    global _reddit_rate_lock, _reddit_rate_lock_loop
+    loop = asyncio.get_running_loop()
+    if _reddit_rate_lock is None or _reddit_rate_lock_loop is not loop:
+        _reddit_rate_lock = asyncio.Lock()
+        _reddit_rate_lock_loop = loop
+    return _reddit_rate_lock
+
+
+async def _reddit_rate_limited_get(client, url, *, headers, timeout):
+    """GET a reddit.com URL, globally spacing requests and retrying on 429.
+
+    Returns the final httpx.Response (which may still be a 429 after exhausting
+    retries) or None if a non-429 request error keeps failing.
+    """
+    global _reddit_last_request_at
+    rate_lock = _get_reddit_rate_lock()
+    min_interval = getattr(
+        get_settings(), "reddit_min_request_interval_seconds", _REDDIT_MIN_INTERVAL_SECONDS
+    )
+    backoff = 2.0
+    for attempt in range(_REDDIT_MAX_RETRIES + 1):
+        async with rate_lock:
+            wait = min_interval - (time.monotonic() - _reddit_last_request_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _reddit_last_request_at = time.monotonic()
+
+        response = await client.get(url, headers=headers, timeout=timeout)
+        if response.status_code != 429:
+            return response
+
+        if attempt >= _REDDIT_MAX_RETRIES:
+            logger.warning("Reddit still 429 after %d retries: %s", attempt, url)
+            return response
+
+        delay = backoff
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except ValueError:
+                pass
+        delay += random.uniform(0.0, 0.75)  # jitter to de-sync concurrent waiters
+        logger.info("Reddit 429 for %s; backing off %.1fs (attempt %d)", url, delay, attempt + 1)
+        await asyncio.sleep(delay)
+        backoff *= 2
+    return None
 
 # Audio-transcription budget for the first podcast discovery pass. Kept well under
 # the adapter's 120s timeout so the lane returns partial results (transcript-feed /
@@ -1104,6 +1174,16 @@ class RedditSourceAdapter:
 
         days = lookback_to_days(context.lookback_hours)
 
+        # Topic query used to recover a subreddit's threads via web search when its
+        # listing is empty/throttled. Prefer concise topic keywords; fall back to an
+        # expanded reddit search query, then the bare statement.
+        _backfill_keywords = [str(k).strip() for k in list(profile.keywords)[:4] if str(k).strip()]
+        backfill_query = " ".join(_backfill_keywords).strip()
+        if not backfill_query:
+            backfill_query = (
+                targets.search_queries[0] if targets.search_queries else str(profile.statement or "")
+            ).strip()
+
         # Requested subreddits for scoring boost
         requested_subs = {
             clean_subreddit_name(src.get("ref") or src.get("source_name"))
@@ -1113,10 +1193,11 @@ class RedditSourceAdapter:
         requested_subs = {s for s in requested_subs if s}
 
         # Shared client and semaphores
-        # Post list fetching semaphore (max 4 concurrent)
-        fetch_semaphore = asyncio.Semaphore(4)
-        # Comment fetching semaphore (max 2 concurrent)
-        comments_semaphore = asyncio.Semaphore(2)
+        # Keep burst concurrency low; the global reddit rate limiter spaces every
+        # request, so a wide fan-out just queues up and risks 429s. Concurrency 2/1
+        # lets the limiter pace listings and comment threads smoothly.
+        fetch_semaphore = asyncio.Semaphore(2)
+        comments_semaphore = asyncio.Semaphore(1)
 
         ua = "MorningDispatchScout/1.0 (contact: scout@morningdispatch.com)"
         headers = {
@@ -1128,16 +1209,20 @@ class RedditSourceAdapter:
 
         async def fetch_subreddit_rss(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
             urls = [f"https://www.reddit.com/r/{sub}/hot/.rss"]
-            if context.lookback_hours is not None:
+            # Only spend a second listing request on /new when the user wants a
+            # tight recency window (<= 48h); for longer windows /hot already
+            # surfaces recent posts and the extra request just burns rate budget.
+            if context.lookback_hours is not None and context.lookback_hours <= 48:
                 urls.append(f"https://www.reddit.com/r/{sub}/new/.rss")
 
             async def fetch_one(url: str) -> list[dict[str, Any]]:
                 async with fetch_semaphore:
                     try:
                         logger.info("Fetching subreddit RSS: %s", url)
-                        response = await client.get(url, headers=headers, timeout=request_timeout)
-                        if response.status_code != 200:
-                            logger.warning("Reddit RSS returned status %d for %s", response.status_code, url)
+                        response = await _reddit_rate_limited_get(client, url, headers=headers, timeout=request_timeout)
+                        if response is None or response.status_code != 200:
+                            status = response.status_code if response is not None else "no response"
+                            logger.warning("Reddit RSS returned status %s for %s", status, url)
                             return []
 
                         feed = feedparser.parse(response.text)
@@ -1191,45 +1276,71 @@ class RedditSourceAdapter:
                         merged[pid] = post
             return list(merged.values())
 
+        def _hits_to_posts(hits: list[Any], *, fallback_sub: str) -> list[dict[str, Any]]:
+            """Parse web-search hits that point at reddit.com threads into post dicts."""
+            posts: list[dict[str, Any]] = []
+            for hit in hits:
+                url = hit.url
+                match = re.search(r"/r/([a-zA-Z0-9_]+)/comments/([a-z0-9]+)/", url)
+                if match:
+                    sub = match.group(1)
+                    post_id = match.group(2)
+                else:
+                    match_short = re.search(r"/comments/([a-z0-9]+)/", url)
+                    if match_short:
+                        sub = fallback_sub
+                        post_id = match_short.group(1)
+                    else:
+                        continue
+
+                posts.append({
+                    "id": post_id,
+                    "title": hit.title,
+                    "selftext": hit.snippet,
+                    "url": url,
+                    "permalink": url,
+                    "score": int(hit.score * 100) if hit.score else 10,
+                    "upvote_ratio": 1.0,
+                    "num_comments": 0,
+                    "flair": None,
+                    "subreddit": sub,
+                    "published_at": hit.published_at,
+                    "is_self": True,
+                    "fetch_mode": "search",
+                })
+            return posts
+
         async def fetch_search_via_web(q: str) -> list[dict[str, Any]]:
             try:
                 logger.info("Searching Reddit via web search: %s", q)
-                query = f"site:reddit.com {q}"
-                hits = await search_web(query, limit=10, days=days)
-                
-                posts = []
-                for hit in hits:
-                    url = hit.url
-                    match = re.search(r"/r/([a-zA-Z0-9_]+)/comments/([a-z0-9]+)/", url)
-                    if match:
-                        sub = match.group(1)
-                        post_id = match.group(2)
-                    else:
-                        match_short = re.search(r"/comments/([a-z0-9]+)/", url)
-                        if match_short:
-                            sub = "reddit"
-                            post_id = match_short.group(1)
-                        else:
-                            continue
-                            
-                    posts.append({
-                        "id": post_id,
-                        "title": hit.title,
-                        "selftext": hit.snippet,
-                        "url": url,
-                        "permalink": url,
-                        "score": int(hit.score * 100) if hit.score else 10,
-                        "upvote_ratio": 1.0,
-                        "num_comments": 0,
-                        "flair": None,
-                        "subreddit": sub,
-                        "published_at": hit.published_at,
-                        "is_self": True,
-                        "fetch_mode": "search",
-                    })
-                return posts
+                hits = await search_web(f"site:reddit.com {q}", limit=10, days=days)
+                return _hits_to_posts(hits, fallback_sub="reddit")
             except Exception as exc:
                 logger.warning("Exception searching Reddit via web for query %s: %s", q, exc)
+                return []
+
+        async def fetch_subreddit_with_backfill(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
+            """Fetch a subreddit's listing, falling back to web search when it comes up empty.
+
+            reddit.com's unauthenticated RSS is frequently 429-throttled, which zeroes a
+            subreddit's listing. When that happens we recover the subreddit's recent
+            threads through the configured web-search providers (Tavily/Brave/Serper),
+            scoping the query to that subreddit so results stay on-topic.
+            """
+            posts = await fetch_subreddit_rss(client, sub)
+            if posts or not backfill_query:
+                return posts
+            try:
+                logger.info("Reddit listing for r/%s empty; backfilling via web search", sub)
+                hits = await search_web(
+                    f"site:reddit.com/r/{sub} {backfill_query}", limit=10, days=days
+                )
+                recovered = _hits_to_posts(hits, fallback_sub=sub)
+                if recovered:
+                    logger.info("Reddit web backfill recovered %d threads for r/%s", len(recovered), sub)
+                return recovered
+            except Exception as exc:
+                logger.warning("Exception backfilling r/%s via web search: %s", sub, exc)
                 return []
 
         async def fetch_comments_for_post(client: httpx.AsyncClient, sub: str, post_id: str) -> tuple[str, str | None]:
@@ -1245,9 +1356,10 @@ class RedditSourceAdapter:
             url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.rss"
             async with comments_semaphore:
                 try:
-                    response = await client.get(url, headers=headers, timeout=request_timeout)
-                    if response.status_code != 200:
-                        logger.warning("Comments RSS returned status %d for post %s, continuing without comments", response.status_code, post_id)
+                    response = await _reddit_rate_limited_get(client, url, headers=headers, timeout=request_timeout)
+                    if response is None or response.status_code != 200:
+                        status = response.status_code if response is not None else "no response"
+                        logger.warning("Comments RSS returned status %s for post %s, continuing without comments", status, post_id)
                         return "", None
 
                     feed = feedparser.parse(response.text)
@@ -1316,7 +1428,7 @@ class RedditSourceAdapter:
         # individual reddit requests pass a stricter per-request timeout.
         reddit_timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
         async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=reddit_timeout) as client:
-            subreddit_tasks = [fetch_subreddit_rss(client, sub) for sub in targets.subreddits]
+            subreddit_tasks = [fetch_subreddit_with_backfill(client, sub) for sub in targets.subreddits]
             search_tasks = [fetch_search_via_web(q) for q in targets.search_queries]
 
             results = await asyncio.gather(*(subreddit_tasks + search_tasks), return_exceptions=True)

@@ -212,6 +212,32 @@ def _models(payload: Any) -> dict[str, str | None]:
     return models
 
 
+# Must-haves are a hard content gate and must be set explicitly by the user, never
+# inferred by the agent from the topic. We only honor an agent-proposed must-have
+# term when the user's own words express a filtering requirement on results. This
+# is deliberately conservative — a missed signal just means the user sets the term
+# in the Confirmation panel instead, whereas a false positive silently gates a brief.
+_MUST_HAVE_INTENT_RE = re.compile(
+    r"(?:"
+    r"must (?:mention|include|contain|reference|name)"
+    r"|(?:every|each|all) (?:result|item|story|article|post|piece|headline|entry)s? "
+    r"(?:must|should|have to|has to|need to|needs to)"
+    r"|(?:results?|items?|stories|articles|posts|headlines) (?:must|should|have to|need to)"
+    r"|only (?:show|include|surface|return)[^.]*\babout\b"
+    r"|only about"
+    r"|has to (?:mention|include|reference)"
+    r"|needs? to (?:mention|include|reference)"
+    r"|require (?:that )?(?:every|each|all|the)"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _user_requested_must_have(user_text: str) -> bool:
+    """True when the user's own text explicitly demands a required term/filter."""
+    return bool(_MUST_HAVE_INTENT_RE.search(str(user_text or "")))
+
+
 def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text: str = "") -> dict[str, Any]:
     updated = dict(profile)
     if not isinstance(patch, dict):
@@ -233,22 +259,42 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
             updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
     has_terms_patch = "must_have_terms" in patch
     has_aliases_patch = "must_have_aliases" in patch
+    existing_terms = _string_list(updated.get("must_have_terms"), limit=6)
+    user_requested = _user_requested_must_have(user_text)
     if has_terms_patch or has_aliases_patch:
-        merged_terms = updated.get("must_have_terms")
-        if has_terms_patch:
-            merged_terms = _merge_string_lists(updated.get("must_have_terms"), patch.get("must_have_terms"), limit=6)
-            updated["must_have_answered"] = True
-        
+        merged_terms = (
+            _merge_string_lists(existing_terms, patch.get("must_have_terms"), limit=6)
+            if has_terms_patch
+            else existing_terms
+        )
         terms_limit = _string_list(merged_terms, limit=6)
-        
+
         old_aliases = _clean_must_have_aliases(updated.get("must_have_aliases"), terms=terms_limit)
         new_aliases = {}
         if has_aliases_patch:
             new_aliases = _clean_must_have_aliases(patch.get("must_have_aliases"), terms=terms_limit)
-            
+
         merged_aliases = {**old_aliases, **new_aliases}
-        
+
         canonical_terms, canonical_aliases = _canonicalize_must_have(terms_limit, merged_aliases)
+
+        # Provenance gate: must-haves are an explicit, user-only content gate. The
+        # agent may EXPAND a term the user already set (synonyms fold into existing
+        # anchors above, enriching their aliases), but it may NOT mint a NEW anchor
+        # from inference. Unless the user explicitly demanded a required term this
+        # turn, restrict the result to anchors the user already had and drop the rest.
+        if user_requested:
+            updated["must_have_answered"] = True
+        else:
+            existing_canonical, _ = _canonicalize_must_have(
+                existing_terms,
+                _clean_must_have_aliases(updated.get("must_have_aliases"), terms=existing_terms),
+            )
+            allowed = {term.casefold() for term in existing_canonical}
+            canonical_terms = [term for term in canonical_terms if term.casefold() in allowed]
+            surviving = {term.casefold() for term in canonical_terms}
+            canonical_aliases = {key: value for key, value in canonical_aliases.items() if key in surviving}
+
         updated["must_have_terms"] = canonical_terms
         updated["must_have_aliases"] = canonical_aliases
     if "keywords" in patch:

@@ -78,6 +78,9 @@ class Settings:
     reddit_fetch_limit_per_source: int = 25
     reddit_fetch_comments: int = 10
     reddit_request_timeout_seconds: float = 10.0
+    # Minimum spacing between outbound reddit.com requests; throttles bursts that
+    # trigger HTTP 429. Set to 0 to disable (e.g. in tests with mocked HTTP).
+    reddit_min_request_interval_seconds: float = 1.0
     google_news_max_queries: int = 5
     google_news_request_delay_seconds: float = 3.0
     google_news_request_timeout_seconds: float = 10.0
@@ -381,6 +384,7 @@ def _build_settings() -> Settings:
         reddit_fetch_limit_per_source=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_LIMIT_PER_SOURCE", 25),
         reddit_fetch_comments=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_COMMENTS", 10),
         reddit_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_REQUEST_TIMEOUT_SECONDS", 10.0),
+        reddit_min_request_interval_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_MIN_REQUEST_INTERVAL_SECONDS", 1.0),
         google_news_max_queries=_int_from_env("MORNING_DISPATCH_GOOGLE_NEWS_MAX_QUERIES", 5),
         google_news_request_delay_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_DELAY_SECONDS", 3.0),
         google_news_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_TIMEOUT_SECONDS", 10.0),
