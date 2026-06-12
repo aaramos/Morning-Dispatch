@@ -1,42 +1,53 @@
-# Morning Dispatch
+# Morning Dispatch 📰
 
-Morning Dispatch is a local-first personal intelligence app. The MVP turns approved Gmail newsletters into AI-curated, newspaper-style HTML digests served on localhost.
+Morning Dispatch is a local-first personal intelligence app. It aggregates Gmail newsletters, web searches, YouTube videos, local text collections, and market ticker snapshots, transforming them into an AI-curated, newspaper-style HTML digest served on localhost and delivered directly to your inbox.
 
-## Current Slice
+---
 
-This scaffold includes:
+## Key Features
 
-- FastAPI backend app
-- SQLite schema for profiles, digests, shared articles, issues, and feedback
-- Basic digest CRUD and manual run endpoints
-- Admin Gmail OAuth screen at `/admin`
-- Admin status screen for Gmail, scheduler, latest runs, and model-cache health
-- Gmail newsletter ingestion from configured sender allowlists
-- Strict newsletter-link filtering and tracking-parameter cleanup
-- Linked-article fetching and readable-text extraction
-- Librarian enrichment with local-model summaries, keywords, content type, and deterministic fallback
-- Persistent cache for local-model article enrichment records
-- Digest-specific article scoring, sectioning, and lead-story selection
-- Optional in-process scheduler for active digests
-- Newspaper-style HTML issue rendering with lead story, topic sections, lower-confidence items, and source notes
-- React/Vite management UI shell
-- Safe config examples with runtime data and secrets outside the project folder
-- Exploration flow for ad hoc topic discovery and on-demand briefs (show-now or schedule)
+- **Gmail Ingestion**: Ingest newsletter content from configured sender allowlists with strict tracker cleanup.
+- **Pluggable Web Discovery**: Integrate Tavily, Brave, or SerpAPI to retrieve discovery-only candidates.
+- **YouTube & Podcast Media lane**: Automatically fetch video transcripts and podcast audio files, serving them with interactive transcript readers and modal players.
+- **Local Text Collections**: Parse and chunk files (`.txt`, `.md`, `.json`, etc.) from local directories.
+- **Market Snapshots**: Select relevant public companies from topics, rendering daily stock performance and sparklines.
+- **AI Librarian (Local-First)**: Enrich and summarize articles with local-model endpoints (e.g. oMLX/Gemma), with deterministic fallbacks if offline.
+- **Interactive Refinement Chat**: Refine your brief interests, search criteria, must-have keywords, and exclusions.
+- **Mobile-Responsive Delivery**: Rendered as a beautiful, premium newspaper-style format, optimized for desktop/mobile browsers, and delivered via Gmail using resolved CSS variables for mail client styling consistency.
 
-The MVP is usable end to end: connect Gmail, run a digest, open the generated issue, and read the ranked article digest over localhost or the configured Tailscale HTTPS URL.
+---
+
+## Screenshots
+
+### 1. Topic Exploration & Refinement Chat
+The interactive Explore panel lets you define your interests in plain English, while the AI assistant critiques and refines specific source queries.
+![Explore & Refinement Panel](Docs/ux-handoff-assets/home-current.png)
+
+### 2. Premium Newspaper-Style Brief
+Curated briefs are rendered in a gorgeous layout featuring lead story cards, importance scoring, custom audio/video players, and a collapsible metadata sidebar.
+![Newspaper-Style Brief](Docs/ux-handoff-assets/brief-current.png)
+
+### 3. Digest Library & Settings Administration
+Access your library of past runs, manage schedules, configure Gmail OAuth tokens, and control API allowances.
+![Digest Library & Admin](Docs/ux-handoff-assets/admin-library-current.png)
+
+---
 
 ## Runtime Layout
 
-The project folder is safe for GitHub. Runtime data and secrets live outside the repo:
+The project folder is clean and safe for version control. All runtime data, database states, and secrets live outside the repository path:
 
 ```text
 ~/.morning-dispatch/data/
 ~/.morning-dispatch/secrets/
 ```
 
-Use absolute paths in `.env`; Docker Compose does not reliably expand `~`.
+---
 
-## Backend
+## Getting Started
+
+### 1. Backend Service Setup
+Ensure Python 3.12+ and `uv` are installed:
 
 ```bash
 uv sync
@@ -45,157 +56,56 @@ MORNING_DISPATCH_SECRETS_DIR=~/.morning-dispatch/secrets \
 uv run uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-## Always-On Local Service
+### 2. Frontend Development
+Run the React/Vite development server (proxies API requests to port 8000):
 
-The local service uses launchd and keeps the backend available behind the existing Tailscale Serve mapping:
+```bash
+npm install
+npm run dev
+```
+
+### 3. Running Tests
+Run the test suite to verify configuration and adapter capabilities:
+
+```bash
+uv run pytest
+```
+
+### 4. Optional Launchd Configuration (Always-On Service)
+You can set up a local daemon to automatically run scheduler checks and update serve mappings behind a Tailscale HTTPS URL:
 
 ```bash
 bash scripts/install_launchd.sh
 ```
 
-It runs `scripts/run_morning_dispatch.sh`, enables scheduled digest checks, runs daily digests at `05:00` Pacific by default, and keeps runtime data under:
+---
 
-```text
-<project>/runtime/
-```
+## Integration Adapters
 
-Useful checks:
-
+### Web Search
+Enable discovery searches by adding one of the following environment keys:
 ```bash
-launchctl print gui/$(id -u)/com.morning-dispatch
-curl http://127.0.0.1:8000/api/health
-curl https://your-machine.ts.net/api/health
-```
-
-## Machine-Local Overrides
-
-Put any values that are specific to your machine in `runtime/local.env` (gitignored). The startup script sources this file before setting defaults. Minimum for Tailscale use:
-
-```bash
-# runtime/local.env  — never committed
-MORNING_DISPATCH_PUBLIC_BASE_URL=https://your-machine.ts.net
-```
-
-## Admin Gmail Login
-
-Open the admin screen at:
-
-```text
-http://127.0.0.1:8000/admin
-```
-
-From there you can upload a Google OAuth client secret JSON file and start the Gmail login. The app stores the resulting Gmail token outside the project folder:
-
-```text
-~/.morning-dispatch/secrets/gmail/gmail_credentials.json
-```
-
-Google OAuth redirect URLs generally need HTTPS unless they are localhost. For Tailscale use, set `MORNING_DISPATCH_PUBLIC_BASE_URL` to the HTTPS MagicDNS URL you registered in Google Cloud, for example via `runtime/local.env`:
-
-```bash
-MORNING_DISPATCH_PUBLIC_BASE_URL=https://your-machine.ts.net
-MORNING_DISPATCH_HOST=0.0.0.0
-```
-
-The admin API accepts requests from loopback and Tailscale client addresses only.
-
-## Local Librarian Model
-
-The Librarian can call an OpenAI-compatible local model endpoint, such as oMLX, for article title cleanup, summaries, keywords, and content type. If the model is unavailable, the digest run falls back to deterministic enrichment instead of failing.
-
-```bash
-MORNING_DISPATCH_LIBRARIAN_USE_MODEL=auto \
-MORNING_DISPATCH_MODEL_BASE_URL=http://127.0.0.1:1234/v1 \
-MORNING_DISPATCH_LIBRARIAN_MODEL="Gemma-4 MTP 6Bit" \
-MORNING_DISPATCH_LIBRARIAN_MODEL_MAX_ITEMS=250 \
-MORNING_DISPATCH_MODEL_CONCURRENCY=1 \
-MORNING_DISPATCH_MODEL_TIMEOUT_SECONDS=90 \
-MORNING_DISPATCH_MODEL_API_KEY=... \
-uv run python -m backend.app.server
-```
-
-## Explore an Interest
-
-Morning Dispatch now supports a second flow for one-off exploration:
-
-- Start with a plain-English statement in the frontend Explore panel.
-- The refinement chat gathers a minimal topic profile (`scope`, `depth`, `recency_weighting`, `exclusions`).
-- Run immediately ("show now") for a rendered brief, then optionally save and mail it.
-- Or save a `topic profile` and schedule it for recurring exploration.
-
-The same digest core does the candidate ranking and brief quality checks, so scheduled and ad-hoc flows stay consistent.
-
-## Web Search Adapter
-
-Discovery can use pluggable web search providers for discovery-only candidates:
-
-- `tavily`
-- `brave`
-- `serpapi`
-
-Configure with environment variables (or equivalent secret files in `${MORNING_DISPATCH_SECRETS_DIR}`):
-
-```bash
-MORNING_DISPATCH_WEB_SEARCH_PROVIDER=auto \
-MORNING_DISPATCH_TAVILY_API_KEY=... \
-MORNING_DISPATCH_BRAVE_API_KEY=... \
+MORNING_DISPATCH_WEB_SEARCH_PROVIDER=auto  # Options: auto, tavily, brave, serpapi
+MORNING_DISPATCH_TAVILY_API_KEY=...
+MORNING_DISPATCH_BRAVE_API_KEY=...
 MORNING_DISPATCH_SERPAPI_API_KEY=...
 ```
 
-`auto` selects the first configured key in this order: `tavily`, `brave`, `serpapi`.
-Setting a specific provider name forces that adapter.
-If no Morning Dispatch key is saved, the app also checks the shared search env file
-(`MORNING_DISPATCH_SHARED_SEARCH_ENV_PATH`, defaults to `~/.hermes/.env`) for names like
-`TAVILY_API_KEY`, `BRAVE_SEARCH_API_KEY`, and `SERPAPI_API_KEY`.
-
-## YouTube Adapter
-
-YouTube can be enabled as an optional source for on-demand briefs. It uses the YouTube Data API for discovery, then only includes videos when a native transcript is available.
-
+### YouTube
+Enable YouTube searches by providing your API key:
 ```bash
-MORNING_DISPATCH_YOUTUBE_API_KEY=... \
-MORNING_DISPATCH_YOUTUBE_MAX_RESULTS=15 \
-MORNING_DISPATCH_YOUTUBE_DURATION_FILTER=medium
+MORNING_DISPATCH_YOUTUBE_API_KEY=...
+MORNING_DISPATCH_YOUTUBE_MAX_RESULTS=15
 ```
 
-You can also paste the API key in Admin -> Sources. YouTube is off by default and only runs when selected for a brief.
-
-## Collections Adapter
-
-Collections is an optional local source for briefs. First slice support indexes text-like files from top-level folders under the Collections root and sends relevant chunks into the shared brief pipeline.
-
+### Local Collections
+Point the app to a directory of text/markdown files to inject local context:
 ```bash
-MORNING_DISPATCH_COLLECTIONS_ROOT=~/Documents/Collections \
-MORNING_DISPATCH_COLLECTIONS_MAX_RESULTS=12 \
-MORNING_DISPATCH_COLLECTIONS_MAX_FILE_BYTES=1000000
+MORNING_DISPATCH_COLLECTIONS_ROOT=~/Documents/Collections
 ```
 
-Create the folder from Admin -> Sources or from the inline source setup card. Add top-level folders inside it, then place `.txt`, `.md`, `.csv`, `.json`, `.yaml`, or `.html` files inside those folders.
-
-## Markets Adapter
-
-Markets is an optional source for public-company context. First slice support runs in Simple mode with free Yahoo Finance data through `yfinance`; no API key is required.
-
+### Markets
+Runs in simple mode using yahoo finance (`yfinance`) out of the box with no API keys required:
 ```bash
-MORNING_DISPATCH_MARKETS_MODE=simple \
-MORNING_DISPATCH_MARKETS_MAX_CORE_COMPANIES=5 \
-MORNING_DISPATCH_MARKETS_MAX_RELATED_COMPANIES=5
-```
-
-The source selects relevant public companies from the topic, fetches recent price movement, market cap, analyst rating, sector, and recent news, then sends company snapshots into the shared brief pipeline.
-
-## Frontend
-
-```bash
-npm --cache .npm-cache install
-npm --cache .npm-cache run dev
-```
-
-The Vite dev server proxies API requests to `http://127.0.0.1:8000`.
-
-## Tests
-
-```bash
-uv run pytest
-npm --cache .npm-cache run build
+MORNING_DISPATCH_MARKETS_MODE=simple
 ```
