@@ -486,7 +486,31 @@ def _email_html(html: str) -> str:
             new_node = BeautifulSoup(details_html, "html.parser").find()
             modal.replace_with(new_node)
 
-    return str(soup)
+    return _resolve_css_variables(str(soup))
+
+
+CSS_VARIABLES = {
+    "--paper": "#ffffff",
+    "--paper-deep": "#fafaf9",
+    "--ink": "#1a1a1a",
+    "--muted": "#6b6b66",
+    "--line": "#eaeae5",
+    "--accent": "#1e3a8a",
+    "--accent-dark": "#172554",
+    "--sidebar": "#f5f5f0",
+    "--shadow": "0 12px 40px rgba(0, 0, 0, .04)",
+    "--display": "'Playfair Display', Georgia, serif",
+    "--body": "'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    "--mono": "'JetBrains Mono', monospace",
+}
+
+
+def _resolve_css_variables(html: str) -> str:
+    import re
+    for var_name, var_value in CSS_VARIABLES.items():
+        pattern = re.compile(rf"var\(\s*{re.escape(var_name)}\s*\)", re.IGNORECASE)
+        html = pattern.sub(var_value, html)
+    return html
 
 
 def _default_recipient_email() -> str:

@@ -361,156 +361,693 @@ def render_ingested_issue(
     }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ width: 100%; max-width: 100%; overflow-x: hidden; }}
-    body {{ margin: 0; font-family: var(--body); color: var(--ink); background: var(--paper-deep); -webkit-font-smoothing: antialiased; }}
-    .brief-shell {{ width: min(1180px, 100%); margin: 0 auto; padding: 40px 24px 80px; }}
-    .brief-masthead {{ display: flex; justify-content: space-between; gap: 18px; align-items: center; border-bottom: 2px solid var(--ink); padding-bottom: 20px; margin-bottom: 36px; }}
-    .masthead-brand {{ font-family: var(--display); font-size: clamp(1.8rem, 4.5vw, 3.2rem); font-weight: 800; line-height: 1; letter-spacing: -0.02em; }}
-    .masthead-meta, .dateline, .section-kicker, .meta {{ font: 700 .7rem/1.4 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
+    body {{
+      margin: 0;
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-family: var(--body);
+      color: #1a1a1a;
+      color: var(--ink);
+      background: #fafaf9;
+      background: var(--paper-deep);
+      -webkit-font-smoothing: antialiased;
+    }}
+    .brief-shell {{
+      max-width: 1180px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 40px 24px 80px;
+    }}
+    .brief-masthead {{
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: center;
+      border-bottom: 2px solid #1a1a1a;
+      border-bottom: 2px solid var(--ink);
+      padding-bottom: 20px;
+      margin-bottom: 36px;
+    }}
+    .masthead-brand {{
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: clamp(1.8rem, 4.5vw, 3.2rem);
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -0.02em;
+    }}
+    .masthead-meta, .dateline, .section-kicker, .meta {{
+      font: 700 .7rem/1.4 'JetBrains Mono', monospace;
+      font: 700 .7rem/1.4 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }}
     .masthead-meta {{ max-width: 48ch; text-align: right; }}
-    .brief-header {{ display: grid; gap: 12px; max-width: 920px; margin-bottom: 36px; }}
-    h1 {{ font-family: var(--display); font-size: 3rem; font-weight: 850; line-height: 1.05; margin: 0; letter-spacing: -0.01em; }}
+    .brief-header {{ display: flex; flex-direction: column; gap: 12px; max-width: 920px; margin-bottom: 36px; }}
+    h1 {{
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: 3rem;
+      font-weight: 850;
+      line-height: 1.05;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }}
     .brief-header h1 {{ display: -webkit-box; max-height: 12rem; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: break-word; word-break: normal; hyphens: auto; }}
-    h2 {{ font-family: var(--display); font-size: clamp(1.6rem, 3.2vw, 2.4rem); line-height: 1.1; margin: 0 0 20px; letter-spacing: -0.01em; }}
-    h3 {{ font-family: var(--display); font-size: clamp(1.25rem, 2.5vw, 1.75rem); line-height: 1.15; margin: 0; letter-spacing: -0.01em; }}
+    h2 {{
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: clamp(1.6rem, 3.2vw, 2.4rem);
+      line-height: 1.1;
+      margin: 0 0 20px;
+      letter-spacing: -0.01em;
+    }}
+    h3 {{
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: clamp(1.25rem, 2.5vw, 1.75rem);
+      line-height: 1.15;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }}
     h1, h2, h3, h4, p, a, .meta, .story-title, .side-value {{ overflow-wrap: anywhere; }}
     a {{ color: inherit; text-decoration-thickness: 1px; text-underline-offset: 4px; transition: color 0.15s ease; }}
-    a:hover {{ color: var(--accent); }}
+    a:hover {{
+      color: #1e3a8a;
+      color: var(--accent);
+    }}
     img, video, iframe, table {{ max-width: 100%; }}
-    .brief-body {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(290px, 340px); gap: 40px; align-items: start; }}
+    .brief-body {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 40px;
+      align-items: start;
+    }}
     .story-column, .brief-sidebar, .lead-block, .story-row, .media-card, .low-conf-row, .newsletter {{ min-width: 0; }}
-    .story-column {{ display: grid; gap: 36px; }}
-    .img-strip {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
-    .strip-frame, .story-thumb, .media-thumb {{ position: relative; overflow: hidden; background: #eaeae0; border: 1px solid var(--line); border-radius: 8px; }}
-    .strip-frame {{ aspect-ratio: 4 / 3; }}
+    .story-column {{
+      flex: 1 1 600px;
+      display: flex;
+      flex-direction: column;
+      gap: 36px;
+    }}
+    .brief-sidebar {{
+      flex: 0 0 340px;
+      min-width: 290px;
+      position: sticky;
+      top: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }}
+    .img-strip {{
+      display: flex;
+      gap: 12px;
+    }}
+    .strip-frame, .story-thumb, .media-thumb {{
+      position: relative;
+      overflow: hidden;
+      background: #eaeae0;
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    .strip-frame {{ flex: 1; aspect-ratio: 4 / 3; }}
     .strip-link {{ display: block; width: 100%; height: 100%; }}
     .strip-frame img, .story-thumb img, .media-thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
-    .fallback-art {{ display: grid; place-items: center; min-height: 100%; color: var(--accent); background: linear-gradient(135deg, #f5f5f0, #eaeae0); }}
+    .fallback-art {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100%;
+      color: #1e3a8a;
+      color: var(--accent);
+      background: linear-gradient(135deg, #f5f5f0, #eaeae0);
+    }}
     .fallback-art svg {{ width: 30px; height: 30px; }}
-    .lead-block {{ display: grid; grid-template-columns: 6px minmax(0, 1fr); gap: 20px; padding: 28px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }}
-    .lead-bar {{ background: var(--accent); border-radius: 3px; }}
-    .lead-content {{ display: grid; gap: 14px; }}
-    .lead-title {{ font-family: var(--display); font-size: clamp(2rem, 4.5vw, 2.8rem); line-height: 1.1; font-weight: 800; letter-spacing: -0.015em; }}
+    .lead-block {{
+      display: flex;
+      gap: 20px;
+      padding: 28px 0;
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid #eaeae5;
+      border-bottom: 1px solid var(--line);
+    }}
+    .lead-bar {{
+      flex: 0 0 6px;
+      background: #1e3a8a;
+      background: var(--accent);
+      border-radius: 3px;
+    }}
+    .lead-content {{
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }}
+    .lead-title {{
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: clamp(2rem, 4.5vw, 2.8rem);
+      line-height: 1.1;
+      font-weight: 800;
+      letter-spacing: -0.015em;
+    }}
     .lead-summary {{ font-size: 1.02rem; line-height: 1.6; margin: 0; color: #333330; }}
     .story-meta, .chip-row, .keywords, .feedback-controls {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
-    .source-type, .score {{ display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font: 700 .62rem/1 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; background: rgba(255, 255, 255, 0.8); }}
-    .source-type.youtube, .source-type.podcast, .source-type.foreign-media, .translation-badge {{ color: var(--accent); border-color: rgba(30, 58, 138, .15); background: rgba(30, 58, 138, .04); }}
+    .source-type, .score {{
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font: 700 .62rem/1 'JetBrains Mono', monospace;
+      font: 700 .62rem/1 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      background: rgba(255, 255, 255, 0.8);
+    }}
+    .source-type.youtube, .source-type.podcast, .source-type.foreign-media, .translation-badge {{
+      color: #1e3a8a;
+      color: var(--accent);
+      border-color: rgba(30, 58, 138, .15);
+      background: rgba(30, 58, 138, .04);
+    }}
     .translation-badge.low, .translation-badge.unavailable {{ color: #b45309; border-color: rgba(180, 83, 9, .15); background: rgba(180, 83, 9, .04); }}
-    .translation-original {{ margin-top: 10px; color: var(--muted); font-size: .84rem; }}
-    .translation-original summary {{ cursor: pointer; font-weight: 700; color: var(--accent); }}
+    .translation-original {{ margin-top: 10px; color: #6b6b66; color: var(--muted); font-size: .84rem; }}
+    .translation-original summary {{
+      cursor: pointer;
+      font-weight: 700;
+      color: #1e3a8a;
+      color: var(--accent);
+    }}
     .translation-original p {{ margin: 8px 0 0; line-height: 1.5; }}
-    .keywords {{ margin-top: 10px; font: 500 .68rem/1.5 var(--mono); color: var(--muted); }}
-    .keywords span {{ border-bottom: 1px dotted var(--line); }}
-    .ranked-section, .top-stories-section, .source-section, .media-section, .lower-confidence {{ border-top: 1px solid var(--line); padding-top: 24px; }}
-    .story-list {{ display: grid; gap: 0; }}
-    .story-row {{ display: grid; grid-template-columns: 48px minmax(0, 1fr) 112px; gap: 20px; padding: 24px 0; border-bottom: 1px solid var(--line); align-items: start; }}
-    .story-num {{ font-family: var(--mono); font-size: 0.9rem; line-height: 1; color: var(--accent); font-weight: 700; background: var(--sidebar); width: 32px; height: 32px; display: inline-grid; place-items: center; border-radius: 6px; border: 1px solid var(--line); }}
-    .story-copy {{ display: grid; gap: 8px; }}
-    .story-title {{ font-family: var(--display); font-size: clamp(1.3rem, 2.2vw, 1.7rem); line-height: 1.15; font-weight: 800; letter-spacing: -0.01em; }}
+    .keywords {{
+      margin-top: 10px;
+      font: 500 .68rem/1.5 'JetBrains Mono', monospace;
+      font: 500 .68rem/1.5 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+    }}
+    .keywords span {{
+      border-bottom: 1px dotted #eaeae5;
+      border-bottom: 1px dotted var(--line);
+    }}
+    .ranked-section, .top-stories-section, .source-section, .media-section, .lower-confidence {{
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      padding-top: 24px;
+    }}
+    .story-list {{ display: flex; flex-direction: column; gap: 0; }}
+    .story-row {{
+      display: flex;
+      gap: 20px;
+      padding: 24px 0;
+      border-bottom: 1px solid #eaeae5;
+      border-bottom: 1px solid var(--line);
+      align-items: start;
+    }}
+    .story-num {{
+      font-family: 'JetBrains Mono', monospace;
+      font-family: var(--mono);
+      font-size: 0.9rem;
+      line-height: 1;
+      color: #1e3a8a;
+      color: var(--accent);
+      font-weight: 700;
+      background: #f5f5f0;
+      background: var(--sidebar);
+      width: 32px;
+      height: 32px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      flex: 0 0 32px;
+    }}
+    .story-copy {{ flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }}
+    .story-title {{
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: clamp(1.3rem, 2.2vw, 1.7rem);
+      line-height: 1.15;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+    }}
     .story-summary, .low-conf-row p, .newsletter p, .youtube-summary p, .podcast-summary p, .podcast-transcript p {{ font-size: .95rem; line-height: 1.6; margin: 0; color: #40403d; }}
-    .market-snapshot {{ background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 20px; box-shadow: var(--shadow); }}
+    .market-snapshot {{
+      background: #ffffff;
+      background: var(--paper);
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, .04);
+      box-shadow: var(--shadow);
+    }}
     .market-snapshot h2 {{ font-size: 1.25rem; margin-bottom: 14px; letter-spacing: -0.01em; }}
-    .market-grid {{ display: grid; gap: 0; }}
-    .market-card {{ display: grid; grid-template-columns: minmax(64px, .55fr) minmax(0, 1fr); gap: 10px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }}
-    .market-symbol {{ display: grid; gap: 3px; }}
-    .market-symbol strong {{ font: 700 0.95rem/1 var(--mono); color: var(--ink); }}
-    .market-symbol span {{ color: var(--muted); font: 700 .54rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: .06em; }}
-    .market-performance {{ display: grid; gap: 5px; min-width: 0; }}
+    .market-grid {{ display: flex; flex-direction: column; gap: 0; }}
+    .market-card {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 12px 0;
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+    }}
+    .market-symbol {{ display: flex; flex-direction: column; gap: 3px; flex: 0 0 80px; }}
+    .market-symbol strong {{
+      font: 700 0.95rem/1 'JetBrains Mono', monospace;
+      font: 700 0.95rem/1 var(--mono);
+      color: #1a1a1a;
+      color: var(--ink);
+    }}
+    .market-symbol span {{
+      color: #6b6b66;
+      color: var(--muted);
+      font: 700 .54rem/1.2 'JetBrains Mono', monospace;
+      font: 700 .54rem/1.2 var(--mono);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }}
+    .market-performance {{ display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1; }}
     .market-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }}
-    .market-price {{ font: 700 .88rem/1 var(--body); }}
-    .market-change {{ font: 700 .65rem/1 var(--mono); }}
+    .market-price {{
+      font: 700 .88rem/1 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 700 .88rem/1 var(--body);
+    }}
+    .market-change {{
+      font: 700 .65rem/1 'JetBrains Mono', monospace;
+      font: 700 .65rem/1 var(--mono);
+    }}
     .market-change.up {{ color: #166534; }}
     .market-change.down {{ color: #991b1b; }}
-    .market-change.flat {{ color: var(--muted); }}
+    .market-change.flat {{
+      color: #6b6b66;
+      color: var(--muted);
+    }}
     .sparkline {{ width: 100%; height: 26px; display: block; overflow: visible; }}
-    .sparkline path {{ fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }}
-    .sparkline .baseline {{ stroke: var(--line); stroke-width: 1; }}
-    .story-thumb {{ aspect-ratio: 1; border-radius: 6px; }}
-    .media-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }}
-    .media-card {{ display: grid; gap: 14px; padding: 20px; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }}
+    .sparkline path {{
+      fill: none;
+      stroke: #1e3a8a;
+      stroke: var(--accent);
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+    .sparkline .baseline {{
+      stroke: #eaeae5;
+      stroke: var(--line);
+      stroke-width: 1;
+    }}
+    .story-thumb {{ flex: 0 0 112px; aspect-ratio: 1; border-radius: 6px; }}
+    .media-grid {{ display: flex; flex-wrap: wrap; gap: 20px; }}
+    .media-card {{
+      flex: 1 1 calc(50% - 10px);
+      min-width: 280px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      padding: 20px;
+      background: #ffffff;
+      background: var(--paper);
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, .04);
+      box-shadow: var(--shadow);
+    }}
     .media-thumb {{ aspect-ratio: 16 / 9; border-radius: 6px; }}
-    .media-title {{ font-family: var(--display); font-size: 1.35rem; line-height: 1.15; font-weight: 800; letter-spacing: -0.01em; }}
-    .media-cta {{ justify-self: start; display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--accent); border-radius: 8px; color: var(--accent); padding: 8px 14px; font: 700 .74rem/1 var(--body); text-decoration: none; transition: all 0.15s ease; }}
-    .media-cta:hover {{ background: var(--accent); color: #ffffff; }}
-    .low-conf-list {{ display: grid; gap: 0; }}
-    .low-conf-row {{ display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--line); opacity: .85; }}
-    .low-conf-row .story-num {{ font-size: 0.85rem; color: var(--muted); background: var(--paper-deep); }}
-    .brief-sidebar {{ position: sticky; top: 24px; display: grid; gap: 20px; }}
-    .side-panel {{ background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 20px; box-shadow: var(--shadow); }}
+    .media-title {{
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: 1.35rem;
+      line-height: 1.15;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+    }}
+    .media-cta {{
+      align-self: flex-start;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid #1e3a8a;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      color: #1e3a8a;
+      color: var(--accent);
+      padding: 8px 14px;
+      font: 700 .74rem/1 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 700 .74rem/1 var(--body);
+      text-decoration: none;
+      transition: all 0.15s ease;
+    }}
+    .media-cta:hover {{
+      background: #1e3a8a;
+      background: var(--accent);
+      color: #ffffff;
+    }}
+    .low-conf-list {{ display: flex; flex-direction: column; gap: 0; }}
+    .low-conf-row {{
+      display: flex;
+      gap: 16px;
+      padding: 18px 0;
+      border-bottom: 1px solid #eaeae5;
+      border-bottom: 1px solid var(--line);
+      opacity: .85;
+    }}
+    .low-conf-row > div:last-child {{ flex: 1; min-width: 0; }}
+    .low-conf-row .story-num {{
+      font-size: 0.85rem;
+      color: #6b6b66;
+      color: var(--muted);
+      background: #fafaf9;
+      background: var(--paper-deep);
+    }}
+    .side-panel {{
+      background: #ffffff;
+      background: var(--paper);
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, .04);
+      box-shadow: var(--shadow);
+    }}
     .side-panel h2 {{ font-size: 1.25rem; margin-bottom: 16px; letter-spacing: -0.01em; }}
-    .side-stats {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
-    .side-stat {{ border-top: 1px solid var(--line); padding-top: 10px; }}
-    .side-stat span {{ display: block; font: 700 .62rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
-    .side-stat strong {{ display: block; margin-top: 4px; font-family: var(--display); font-size: 1.35rem; line-height: 1; font-weight: 800; }}
-    .source-mix {{ margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }}
-    .source-mix h3 {{ margin: 0 0 10px; font: 700 .68rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
-    .source-mix-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--line); }}
+    .side-stats {{ display: flex; flex-wrap: wrap; gap: 14px; }}
+    .side-stat {{
+      flex: 1 1 calc(50% - 7px);
+      min-width: 120px;
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }}
+    .side-stat span {{
+      display: block;
+      font: 700 .62rem/1.3 'JetBrains Mono', monospace;
+      font: 700 .62rem/1.3 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }}
+    .side-stat strong {{
+      display: block;
+      margin-top: 4px;
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-size: 1.35rem;
+      line-height: 1;
+      font-weight: 800;
+    }}
+    .source-mix {{
+      margin-top: 18px;
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+    }}
+    .source-mix h3 {{
+      margin: 0 0 10px;
+      font: 700 .68rem/1.3 'JetBrains Mono', monospace;
+      font: 700 .68rem/1.3 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }}
+    .source-mix-row {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 6px 0;
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+    }}
     .source-mix-row:first-of-type {{ border-top: 0; }}
-    .source-mix-label {{ color: #40403d; font: 600 .78rem/1.3 var(--body); }}
-    .source-mix-count {{ font: 700 .78rem/1 var(--mono); color: var(--ink); }}
-    .side-note {{ margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }}
-    .side-note h3 {{ margin: 0 0 8px; font: 700 .68rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
+    .source-mix-label {{
+      color: #40403d;
+      font: 600 .78rem/1.3 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 600 .78rem/1.3 var(--body);
+    }}
+    .source-mix-count {{
+      font: 700 .78rem/1 'JetBrains Mono', monospace;
+      font: 700 .78rem/1 var(--mono);
+      color: #1a1a1a;
+      color: var(--ink);
+    }}
+    .side-note {{
+      margin-top: 18px;
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+    }}
+    .side-note h3 {{
+      margin: 0 0 8px;
+      font: 700 .68rem/1.3 'JetBrains Mono', monospace;
+      font: 700 .68rem/1.3 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }}
     .side-note p {{ margin: 0; color: #40403d; font-size: .84rem; line-height: 1.5; }}
-    .stage-list {{ margin: 10px 0 0; padding-left: 18px; color: var(--muted); font: 600 .74rem/1.6 var(--body); }}
-    details.source-notes {{ margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; }}
-    details.source-notes summary {{ cursor: pointer; font: 700 .68rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; outline: none; }}
-    .newsletter {{ padding: 16px 0; border-bottom: 1px solid var(--line); }}
+    .stage-list {{
+      margin: 10px 0 0;
+      padding-left: 18px;
+      color: #6b6b66;
+      color: var(--muted);
+      font: 600 .74rem/1.6 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 600 .74rem/1.6 var(--body);
+    }}
+    details.source-notes {{
+      margin-top: 20px;
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
+    }}
+    details.source-notes summary {{
+      cursor: pointer;
+      font: 700 .68rem/1.3 'JetBrains Mono', monospace;
+      font: 700 .68rem/1.3 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      outline: none;
+    }}
+    .newsletter {{
+      padding: 16px 0;
+      border-bottom: 1px solid #eaeae5;
+      border-bottom: 1px solid var(--line);
+    }}
     .newsletter h3 {{ font-size: 1.05rem; line-height: 1.2; margin-top: 6px; font-weight: 700; }}
     .feedback-controls {{ margin-top: 14px; }}
-    .feedback-controls button {{ border: 1px solid var(--line); border-radius: 8px; background: var(--paper); color: var(--accent); padding: 6px 12px; font: 700 .72rem/1 var(--body); cursor: pointer; transition: all 0.15s ease; }}
-    .feedback-controls button:hover {{ background: var(--sidebar); }}
+    .feedback-controls button {{
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      background: var(--paper);
+      color: #1e3a8a;
+      color: var(--accent);
+      padding: 6px 12px;
+      font: 700 .72rem/1 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 700 .72rem/1 var(--body);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }}
+    .feedback-controls button:hover {{
+      background: #f5f5f0;
+      background: var(--sidebar);
+    }}
     .feedback-controls[data-feedback='sent'] button {{ opacity: .55; }}
-    .feedback-state {{ color: var(--muted); font: 700 .68rem var(--mono); text-transform: uppercase; }}
+    .feedback-state {{
+      color: #6b6b66;
+      color: var(--muted);
+      font: 700 .68rem 'JetBrains Mono', monospace;
+      font: 700 .68rem var(--mono);
+      text-transform: uppercase;
+    }}
     .podcast-modal-link, .youtube-modal-link, .newsletter-modal-link {{ color: inherit; text-decoration: none; }}
     .podcast-modal-link:hover, .youtube-modal-link:hover, .newsletter-modal-link:hover {{ text-decoration: underline; }}
     .podcast-modal {{ position: fixed; inset: 0; z-index: 20; display: none; place-items: center; padding: 24px; background: rgba(0, 0, 0, .4); backdrop-filter: blur(4px); }}
-    .podcast-modal:target {{ display: grid; }}
-    .podcast-panel {{ width: min(920px, 100%); max-height: min(86vh, 980px); overflow: auto; background: var(--paper); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 20px 80px rgba(0,0,0,0.12); padding: 32px; }}
-    .podcast-close {{ float: right; border: 1px solid var(--line); border-radius: 8px; background: var(--ink); color: #ffffff; padding: 8px 14px; font: 700 .72rem/1 var(--body); cursor: pointer; text-decoration: none; transition: opacity 0.15s ease; }}
+    .podcast-modal:target {{ display: flex; align-items: center; justify-content: center; }}
+    .podcast-panel {{
+      width: min(920px, 100%);
+      max-height: min(86vh, 980px);
+      overflow: auto;
+      background: #ffffff;
+      background: var(--paper);
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 20px 80px rgba(0,0,0,0.12);
+      padding: 32px;
+    }}
+    .podcast-close {{
+      float: right;
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #1a1a1a;
+      background: var(--ink);
+      color: #ffffff;
+      padding: 8px 14px;
+      font: 700 .72rem/1 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 700 .72rem/1 var(--body);
+      cursor: pointer;
+      text-decoration: none;
+      transition: opacity 0.15s ease;
+    }}
     .podcast-close:hover {{ opacity: 0.9; }}
-    .podcast-brand {{ display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 20px; align-items: center; margin: 14px 0 24px; }}
-    .podcast-art {{ width: 120px; aspect-ratio: 1; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); background: #eaeae0; }}
-    .podcast-art.fallback {{ display: grid; place-items: center; font-family: var(--display); font-weight: 800; font-size: 1.8rem; color: var(--accent); }}
+    .podcast-brand {{ display: flex; gap: 20px; align-items: center; margin: 14px 0 24px; }}
+    .podcast-art {{ width: 120px; aspect-ratio: 1; object-fit: cover; border-radius: 8px; border: 1px solid #eaeae5; border: 1px solid var(--line); background: #eaeae0; }}
+    .podcast-art.fallback {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Playfair Display', Georgia, serif;
+      font-family: var(--display);
+      font-weight: 800;
+      font-size: 1.8rem;
+      color: #1e3a8a;
+      color: var(--accent);
+    }}
     .podcast-panel h3 {{ font-size: clamp(1.6rem, 3.5vw, 2.6rem); line-height: 1.1; margin: 0 0 10px; }}
-    .podcast-actions {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0 20px; font: 700 .72rem var(--body); text-transform: uppercase; letter-spacing: 0.04em; }}
-    .podcast-actions a {{ color: var(--accent); }}
+    .podcast-actions {{
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin: 12px 0 20px;
+      font: 700 .72rem 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 700 .72rem var(--body);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .podcast-actions a {{
+      color: #1e3a8a;
+      color: var(--accent);
+    }}
     .podcast-speed-controls {{ display: flex; gap: 8px; margin: 0 0 20px; align-items: center; flex-wrap: wrap; }}
-    .podcast-speed-controls button {{ border: 1px solid var(--line); border-radius: 6px; background: var(--paper); padding: 6px 10px; font: 700 .7rem var(--body); cursor: pointer; }}
-    .podcast-speed-controls button.active {{ border-color: var(--accent); background: var(--accent); color: #ffffff; }}
+    .podcast-speed-controls button {{
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      background: var(--paper);
+      padding: 6px 10px;
+      font: 700 .7rem 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 700 .7rem var(--body);
+      cursor: pointer;
+    }}
+    .podcast-speed-controls button.active {{
+      border-color: #1e3a8a;
+      border-color: var(--accent);
+      background: #1e3a8a;
+      background: var(--accent);
+      color: #ffffff;
+    }}
     .podcast-player {{ width: 100%; margin: 4px 0 20px; border-radius: 8px; }}
     .youtube-panel {{ width: min(1040px, 100%); }}
-    .youtube-player {{ width: 100%; aspect-ratio: 16 / 9; border-radius: 12px; border: 1px solid var(--line); background: #000000; margin: 8px 0 24px; overflow: hidden; }}
-    .youtube-summary, .podcast-summary, .podcast-transcript, .newsletter-body {{ border-top: 1px solid var(--line); padding-top: 20px; margin-top: 20px; }}
-    .youtube-summary h4, .podcast-summary h4, .podcast-transcript h4, .newsletter-body h4 {{ margin: 0 0 12px; font: 700 .72rem/1.2 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }}
+    .youtube-player {{
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border-radius: 12px;
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      background: #000000;
+      margin: 8px 0 24px;
+      overflow: hidden;
+    }}
+    .youtube-summary, .podcast-summary, .podcast-transcript, .newsletter-body {{
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      padding-top: 20px;
+      margin-top: 20px;
+    }}
+    .youtube-summary h4, .podcast-summary h4, .podcast-transcript h4, .newsletter-body h4 {{
+      margin: 0 0 12px;
+      font: 700 .72rem/1.2 'JetBrains Mono', monospace;
+      font: 700 .72rem/1.2 var(--mono);
+      color: #6b6b66;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }}
     .newsletter-body p {{ margin: 0 0 14px; font-size: .98rem; line-height: 1.65; color: #333330; }}
     .foreign-tabs {{ display: flex; gap: 8px; margin: 16px 0; flex-wrap: wrap; }}
-    .foreign-tabs button {{ border: 1px solid var(--line); border-radius: 8px; background: var(--paper); padding: 8px 12px; font: 700 .72rem/1 var(--body); cursor: pointer; }}
-    .foreign-tabs button.active {{ background: var(--accent); color: #ffffff; border-color: var(--accent); }}
+    .foreign-tabs button {{
+      border: 1px solid #eaeae5;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      background: var(--paper);
+      padding: 8px 12px;
+      font: 700 .72rem/1 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 700 .72rem/1 var(--body);
+      cursor: pointer;
+    }}
+    .foreign-tabs button.active {{
+      background: #1e3a8a;
+      background: var(--accent);
+      color: #ffffff;
+      border-color: #1e3a8a;
+      border-color: var(--accent);
+    }}
     .foreign-view[hidden] {{ display: none; }}
-    .foreign-view {{ border-top: 1px solid var(--line); padding-top: 20px; }}
-    .foreign-status, .foreign-notice, .foreign-provenance {{ color: var(--muted); font: 600 .8rem/1.5 var(--body); }}
+    .foreign-view {{
+      border-top: 1px solid #eaeae5;
+      border-top: 1px solid var(--line);
+      padding-top: 20px;
+    }}
+    .foreign-status, .foreign-notice, .foreign-provenance {{
+      color: #6b6b66;
+      color: var(--muted);
+      font: 600 .8rem/1.5 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 600 .8rem/1.5 var(--body);
+    }}
     .foreign-provenance {{ margin: 8px 0 0; }}
     .foreign-body p {{ margin: 0 0 14px; font-size: .98rem; line-height: 1.65; color: #333330; }}
     body.modal-open {{ overflow: hidden; }}
-    .empty {{ margin-top: 36px; padding: 24px; border: 1px dashed var(--line); border-radius: 12px; font: 1rem var(--body); background: var(--paper); }}
+    .empty {{
+      margin-top: 36px;
+      padding: 24px;
+      border: 1px dashed #eaeae5;
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      font: 1rem 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font: 1rem var(--body);
+      background: #ffffff;
+      background: var(--paper);
+    }}
     @media (max-width: 900px) {{
       .brief-shell {{ padding: 32px 16px 60px; }}
       .brief-header h1 {{ font-size: 2.4rem; line-height: 1.1; max-height: 9.6rem; }}
       .brief-masthead {{ align-items: flex-start; flex-direction: column; }}
       .masthead-meta {{ max-width: none; text-align: left; }}
-      .brief-body, .media-grid, .podcast-brand {{ grid-template-columns: 1fr; }}
+      .brief-body, .media-grid, .podcast-brand {{ flex-direction: column; }}
       .brief-sidebar {{ position: static; }}
-      .market-card {{ grid-template-columns: 1fr; }}
-      .story-row {{ grid-template-columns: 40px minmax(0, 1fr); }}
+      .market-card {{ flex-direction: column; align-items: flex-start; }}
+      .story-row {{ flex-direction: row; }}
       .story-thumb {{ display: none; }}
-      .img-strip {{ grid-template-columns: 1fr; }}
+      .img-strip {{ flex-direction: column; }}
       .strip-frame {{ aspect-ratio: 16 / 9; }}
       .podcast-panel {{ max-height: 90vh; padding: 24px; }}
     }}
     @media (max-width: 480px) {{
       .brief-shell {{ padding-inline: 12px; }}
       .brief-header h1 {{ font-size: 1.85rem; line-height: 1.1; max-height: 7.4rem; }}
-      .lead-block {{ grid-template-columns: 5px minmax(0, 1fr); gap: 16px; }}
-      .side-stats {{ grid-template-columns: 1fr; }}
+      .lead-block {{ gap: 16px; }}
+      .side-stats {{ flex-direction: column; }}
     }}
   </style>
 </head>

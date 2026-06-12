@@ -60,3 +60,29 @@ def test_delivery_error_normalizes_revoked_gmail_token() -> None:
     error = email_delivery._delivery_error(RuntimeError("invalid_grant: Token has been expired or revoked."))
 
     assert error == "Reconnect Gmail in Admin Sources. Google says the saved token has expired or was revoked."
+
+
+def test_email_html_resolves_css_variables() -> None:
+    sample_html = """
+    <html>
+      <head>
+        <style>
+          body { color: var(--ink); background-color: var(--paper-deep); }
+          .accent { color: var(--accent); }
+        </style>
+      </head>
+      <body>
+        <div style="border: 1px solid var(--line); color: var(--ink);">Hello</div>
+      </body>
+    </html>
+    """
+    resolved_html = email_delivery._email_html(sample_html)
+    assert "var(--ink)" not in resolved_html
+    assert "var(--paper-deep)" not in resolved_html
+    assert "var(--accent)" not in resolved_html
+    assert "var(--line)" not in resolved_html
+
+    assert "color: #1a1a1a" in resolved_html
+    assert "background-color: #fafaf9" in resolved_html
+    assert "color: #1e3a8a" in resolved_html
+    assert "border: 1px solid #eaeae5" in resolved_html
