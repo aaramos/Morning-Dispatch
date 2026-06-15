@@ -973,6 +973,11 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
                 "Do not remove existing useful queries unless the instruction asks to narrow or exclude them.",
                 "Specific named sources may be added to requested_sources.",
                 "Foreign media queries must be native-language or idiomatic local-language terms.",
+                "Every search query and source query must be specific and descriptive: each must name a "
+                "concrete entity, organization, person, product, place, or topic. Never emit bare "
+                "stopwords, conjunctions, or generic filler such as \"either\", \"various\", \"things\", "
+                "\"stuff\", \"general\", or \"misc\" — a query made only of such words names nothing "
+                "searchable and will be discarded.",
             ],
         },
         ensure_ascii=False,

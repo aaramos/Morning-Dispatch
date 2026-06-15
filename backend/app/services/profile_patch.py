@@ -526,6 +526,61 @@ def _source_selection_dict(value: Any) -> dict[str, bool]:
     return selected
 
 
+# Bare stopwords / generic filler that carry no search signal. A query made up
+# entirely of these tokens (e.g. "either", "various things", "some stuff") names
+# no concrete entity or topic and only pollutes the search pipeline. We match on
+# this curated set rather than a length heuristic so legitimate short queries —
+# ticker symbols ("AAPL"), proper nouns ("Nvidia"), and foreign-language terms —
+# survive untouched.
+_FILLER_STOPWORDS: frozenset[str] = frozenset(
+    {
+        # articles / conjunctions / determiners
+        "a", "an", "the", "and", "or", "nor", "but", "either", "neither", "both",
+        "any", "all", "some", "each", "every", "no", "none", "such", "same",
+        "other", "another", "this", "that", "these", "those",
+        # pronouns
+        "i", "we", "you", "he", "she", "it", "they", "them", "us", "me", "him",
+        "her", "his", "its", "our", "your", "their", "who", "whom", "whose",
+        # prepositions / particles
+        "of", "to", "in", "on", "at", "by", "for", "with", "from", "as", "into",
+        "onto", "about", "over", "under", "between", "through", "during", "per",
+        # auxiliaries / common verbs
+        "is", "are", "was", "were", "be", "been", "being", "am", "do", "does",
+        "did", "have", "has", "had", "will", "would", "shall", "should", "can",
+        "could", "may", "might", "must", "get", "got", "make", "made",
+        # generic filler nouns / adverbs / quantifiers
+        "thing", "things", "stuff", "various", "etc", "etcetera", "misc",
+        "miscellaneous", "general", "generic", "something", "anything",
+        "everything", "nothing", "someone", "anyone", "everyone", "somewhere",
+        "anywhere", "everywhere", "lot", "lots", "more", "most", "much", "many",
+        "few", "less", "least", "very", "really", "quite", "rather", "just",
+        "only", "also", "too", "so", "then", "than", "now", "here", "there",
+        "where", "when", "why", "how", "what", "which", "while", "because",
+        "if", "else", "not", "yes", "ok", "okay", "thing's", "kind", "sort",
+        "type", "way", "ways", "stuffs",
+    }
+)
+
+# Token splitter that keeps alphanumerics together (so "AAPL", "GPT-4" survive)
+# but strips surrounding punctuation when deciding whether a query is filler.
+_WORD_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _is_filler_query(text: str) -> bool:
+    """True when a query carries no descriptive content and should be dropped.
+
+    A query is filler when, after stripping punctuation, it contains no
+    alphanumeric token, or every token is a bare stopword/generic-filler word.
+    Any token outside the stopword set (a ticker, proper noun, or
+    foreign-language word, none of which appear in the English filler set)
+    keeps the query.
+    """
+    tokens = _WORD_TOKEN_RE.findall(text.casefold())
+    if not tokens:
+        return True
+    return all(token in _FILLER_STOPWORDS for token in tokens)
+
+
 def _string_list(value: Any, *, limit: int = 24) -> list[str]:
     if isinstance(value, str):
         value = [item for item in re.split(r"[,;\n]", value) if item.strip()]
@@ -537,6 +592,8 @@ def _string_list(value: Any, *, limit: int = 24) -> list[str]:
         text = " ".join(str(item or "").split()).strip(" .")
         key = text.lower()
         if not text or key in seen:
+            continue
+        if _is_filler_query(text):
             continue
         cleaned.append(text[:180])
         seen.add(key)
