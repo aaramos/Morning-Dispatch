@@ -1,4 +1,4 @@
-import type { RefinementSession, SourceScope } from "./types";
+import type { RefinementSession, SourceScope, StrategyPreview } from "./types";
 
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -61,6 +61,7 @@ export type GmailCandidatePayload = {
 export type RefinementStreamEvent =
   | { type: "session"; session_id: string }
   | { type: "token"; text: string }
+  | { type: "strategy"; strategy_preview: StrategyPreview }
   | { type: "plan"; session: RefinementSession }
   | { type: "done"; session: RefinementSession; ready: boolean; trigger_build?: boolean }
   | { type: "gmail_candidates" } & GmailCandidatePayload

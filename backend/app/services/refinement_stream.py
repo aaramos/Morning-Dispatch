@@ -62,6 +62,7 @@ from backend.app.services.profile_patch import (
     _session_response,
     _source_selection_dict,
     _strategy_deepening_question,
+    _strategy_preview,
     _string_list,
     _user_authored_text,
     _visible_prose,
@@ -497,6 +498,12 @@ async def astream_refinement(
             yield {**gmail_candidates_event, "type": "gmail_candidates"}
             yield {"type": "done", "session": response_gmail, "ready": False, "trigger_build": False}
             return
+
+    # Reflect the merged strategy in the side panel immediately. This lands before the
+    # finalize path runs its slower alias-expansion / foreign-language / critique model
+    # calls, so query/recency/source edits show up live instead of waiting for the whole
+    # turn (including those extra round-trips) to complete.
+    yield {"type": "strategy", "strategy_preview": _strategy_preview(patched)}
 
     if ready:
         patched = _fill_defaults(patched)

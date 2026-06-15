@@ -673,14 +673,36 @@ function DispatchApp() {
     }
     let live = "";
     let finalSession: RefinementSession | null = null;
+    let liveSessionId = body.session_id ?? null;
     let ready = false;
     let triggerBuild = false;
     let streamError = "";
     try {
       await streamRefinement(body, (event) => {
-        if (event.type === "token") {
+        if (event.type === "session") {
+          liveSessionId = event.session_id;
+        } else if (event.type === "token") {
           live += event.text;
           setStreamingText(live);
+        } else if (event.type === "strategy") {
+          // Reflect strategy edits in the side panel mid-stream, before the turn (and
+          // its slower finalize-time model calls) completes. On the very first turn no
+          // session exists yet, so seed a minimal one that carries just the preview.
+          const preview = event.strategy_preview;
+          setSession((prev) =>
+            prev
+              ? { ...prev, strategy_preview: preview }
+              : {
+                  session_id: liveSessionId ?? "",
+                  statement: body.statement ?? body.answer ?? "",
+                  status: "active",
+                  turn_count: 0,
+                  messages: [],
+                  profile: {} as TopicProfile,
+                  topic_id: null,
+                  strategy_preview: preview,
+                },
+          );
         } else if (event.type === "plan") {
           finalSession = event.session;
         } else if (event.type === "done") {

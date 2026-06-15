@@ -2164,6 +2164,60 @@ def test_streaming_refinement_emits_incremental_visible_tokens(monkeypatch, tmp_
     assert events.index(token_events[0]) < next(index for index, event in enumerate(events) if event["type"] == "plan")
 
 
+def test_streaming_refinement_emits_strategy_snapshot_before_plan(monkeypatch, tmp_path) -> None:
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+
+    class _StrategyChangingStreamingClient:
+        async def complete_response(self, **kwargs: object) -> None:
+            on_token = kwargs["on_token"]
+            assert callable(on_token)
+            on_token("Sharpening the plan. What neighborhood matters most?\n\n")
+            on_token(
+                "```json\n"
+                '{"profile_patch":{"scope":"Mexico City solo travel guide",'
+                '"search_queries":["Mexico City Roma Norte solo travel August"]},'
+                '"ready_to_build":false,"intent":"continue"}'
+                "\n```"
+            )
+
+    monkeypatch.setattr(
+        refinement.model_routing,
+        "client_for_agent",
+        lambda *_args, **_kwargs: type("Resolution", (), {"client": _StrategyChangingStreamingClient()})(),
+    )
+
+    events: list[dict[str, Any]] = []
+
+    async def collect_events() -> None:
+        async for event in refinement.astream_refinement(
+            session_id=None,
+            statement="A gritty solo travel guide for Mexico City in August.",
+            source_selection={"web_search": True, "reddit": True},
+            foreign_regions=[],
+            recency_weighting="recent",
+            lookback_hours=8640,
+            source_scope_touched=True,
+            models={},
+            answer="",
+            just_go_now=False,
+        ):
+            events.append(event)
+
+    asyncio.run(collect_events())
+
+    strategy_events = [event for event in events if event["type"] == "strategy"]
+    assert strategy_events, "expected a live strategy snapshot event"
+    snapshot = strategy_events[0]["strategy_preview"]
+    assert snapshot["search_queries"] == ["Mexico City Roma Norte solo travel August"]
+    assert snapshot["scope"] == "Mexico City solo travel guide"
+    # The live snapshot must land before the end-of-turn plan/done events so the side
+    # panel can update mid-stream instead of waiting for the whole turn.
+    strategy_index = events.index(strategy_events[0])
+    plan_index = next(index for index, event in enumerate(events) if event["type"] == "plan")
+    assert strategy_index < plan_index
+
+
 def test_streaming_refinement_build_request_confirms_and_triggers_build(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
     database.init_database()
