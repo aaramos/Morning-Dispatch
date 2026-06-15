@@ -304,3 +304,69 @@ def test_prepare_issue_articles_keeps_clear_ai_product_story():
 
     assert len(prepared) == 1
     assert prepared[0].tier == "lead"
+
+
+def _ranked(title: str, text: str, *, adjacent: bool = False, link_score: float = 0.9) -> ArticleFetchResult:
+    metadata = {"link_text": title, "parent_subject": "RV newsletter"}
+    if adjacent:
+        metadata["topic_adjacency"] = True
+    payload = NormalizedPayload(
+        source_type="gmail_link",
+        source_name="newsletter@example.com",
+        original_url=f"https://example.com/articles/{title.lower().replace(' ', '-')}",
+        published_at="2026-05-20T12:00:00+00:00",
+        metadata=metadata,
+    )
+    return ArticleFetchResult(
+        payload=payload,
+        original_url=str(payload.original_url),
+        final_url=str(payload.original_url),
+        canonical_url=str(payload.original_url),
+        title=title,
+        text=text,
+        excerpt=text[:240],
+        domain="example.com",
+        status="fetched",
+        link_score=link_score,
+    )
+
+
+def test_adjacent_item_never_outranks_or_leads_core_topic():
+    # The pipeline folds adjacent vocabulary into the ranking interest so tangential
+    # items clear the threshold; the topic_adjacency tag keeps them below core.
+    digest = {
+        "interest": (
+            "Recreational vehicle motorhome travel, ownership, and road trips "
+            "camping towing campgrounds awning accessories"
+        ),
+        "threshold": 0.45,
+    }
+    core = _ranked(
+        "New motorhome models for road trips",
+        (
+            "The recreational vehicle maker unveiled new motorhome models built for long road trips. "
+            "Owners get upgraded touring features for recreational vehicle travel and motorhome ownership."
+        ),
+    )
+    # An adjacent (tangential) item flagged topic_adjacency, with deliberately strong
+    # standalone wording so it would outrank core if the tag were ignored.
+    adjacent = _ranked(
+        "Best camping gear and towing accessories",
+        (
+            "A complete guide to camping gear, towing accessories, and campgrounds. "
+            "Camping accessories, towing setups, awning picks, and campgrounds reviewed in depth."
+        ),
+        adjacent=True,
+    )
+
+    prepared = prepare_issue_articles(digest, [adjacent, core])
+    by_url = {r.title: r for r in prepared}
+
+    # The core story leads; the adjacent item never claims the lead slot.
+    lead = next(r for r in prepared if r.tier == "lead")
+    assert lead.title == core.title
+    assert by_url[adjacent.title].tier != "lead"
+    # Adjacent ranks strictly below core in the ordered list.
+    assert prepared.index(by_url[core.title]) < prepared.index(by_url[adjacent.title])
+    # And it is scored lower by the adjacency penalty.
+    assert by_url[adjacent.title].relevance_score < by_url[core.title].relevance_score

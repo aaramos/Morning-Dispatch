@@ -4076,3 +4076,197 @@ def test_run_show_now_marks_exploration_failed_on_error(monkeypatch, tmp_path) -
     failed = database.get_latest_exploration(topic_id=profile["topic_id"], mode="show_now", status="failed")
     assert failed is not None
     assert failed["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Low-yield recovery: widen the topic target, do NOT relax the gates.
+# ---------------------------------------------------------------------------
+
+def _rv_profile(**overrides: Any) -> TopicProfile:
+    payload = {
+        "statement": "Recreational vehicle motorhome travel",
+        "scope": "Motorhome ownership, recreational vehicle road trips and touring",
+        "adjacent_terms": ["camping", "towing", "campgrounds", "awning", "accessories"],
+    }
+    payload.update(overrides)
+    return TopicProfile.from_dict(payload)
+
+
+def _candidate(adapter: str, ident: str, text: str) -> Candidate:
+    return Candidate(
+        adapter=adapter,
+        payload=NormalizedPayload(
+            source_type="web_search_item",
+            source_name=text[:40],
+            raw_text=text,
+            original_url=f"https://example.com/{ident}",
+            id=ident,
+        ),
+        score=0.7,
+    )
+
+
+def test_low_yield_keeps_adjacent_rejects_unrelated_and_flags_adjacency() -> None:
+    from backend.agents.discovery.runner import _apply_topic_relevance
+
+    profile = _rv_profile()
+    core = _candidate(
+        "web_search",
+        "core",
+        "New motorhome models unveiled with upgraded recreational vehicle features for long road trips.",
+    )
+    adjacent = _candidate(
+        "web_search",
+        "adjacent",
+        "Best camping gear, towing accessories, and campgrounds picks for the season.",
+    )
+    unrelated = _candidate(
+        "web_search",
+        "unrelated",
+        "New lung cancer immunotherapy treatment shows promise in a clinical trial.",
+    )
+
+    kept, dropped = _apply_topic_relevance(
+        profile, [core, adjacent, unrelated], low_yield=True
+    )
+
+    kept_ids = {c.payload.id for c in kept}
+    # Core and adjacent (RV accessories / camping) survive; unrelated lung-cancer rejected.
+    assert kept_ids == {"core", "adjacent"}
+    assert any(d["candidate_id"] == "unrelated" and "low_topic_overlap" in d["excluded_by"] for d in dropped)
+
+    by_id = {c.payload.id: c for c in kept}
+    # Adjacent item is tagged so ranking keeps it below core; core is NOT tagged.
+    assert by_id["adjacent"].payload.metadata.get("topic_adjacency") is True
+    assert not by_id["core"].payload.metadata.get("topic_adjacency")
+
+
+def test_strict_mode_rejects_adjacent_items_that_low_yield_would_keep() -> None:
+    """Outside low-yield the adjacent vocabulary is NOT consulted: a camping-only
+    item that has no core overlap is dropped. This proves low-yield widens the
+    target rather than the bar being permanently lowered."""
+    from backend.agents.discovery.runner import _apply_topic_relevance
+
+    profile = _rv_profile()
+    core = _candidate(
+        "web_search",
+        "core",
+        "New motorhome models unveiled with upgraded recreational vehicle features for road trips.",
+    )
+    adjacent = _candidate(
+        "web_search",
+        "adjacent",
+        "Best camping gear, towing accessories, and campgrounds picks for the season.",
+    )
+
+    kept, dropped = _apply_topic_relevance(profile, [core, adjacent], low_yield=False)
+
+    kept_ids = {c.payload.id for c in kept}
+    assert kept_ids == {"core"}
+    assert any(d["candidate_id"] == "adjacent" for d in dropped)
+
+
+def test_post_fetch_gate_rejects_unrelated_thin_shell_and_flags_adjacent() -> None:
+    """Thin title-only shells that bypassed the discovery gate are re-judged on
+    their fetched full text against the same core+adjacent vocabulary."""
+    profile = _rv_profile()
+
+    def shell(ident: str, title: str, text: str) -> ArticleFetchResult:
+        payload = NormalizedPayload(
+            source_type="web_search_item",
+            source_name=title,
+            original_url=f"https://example.com/{ident}",
+            id=ident,
+            metadata={"topic_relevance_deferred": True},
+        )
+        return ArticleFetchResult(
+            payload=payload,
+            original_url=str(payload.original_url),
+            final_url=str(payload.original_url),
+            title=title,
+            text=text,
+            excerpt=text[:200],
+            domain="example.com",
+            status="fetched",
+        )
+
+    core = shell(
+        "core",
+        "Motorhome recall announced",
+        "The recreational vehicle maker is recalling several motorhome models over a brake defect on road trips.",
+    )
+    adjacent = shell(
+        "adjacent",
+        "Camping gear guide",
+        "A roundup of camping gear, towing accessories, and campgrounds to visit this summer.",
+    )
+    unrelated = shell(
+        "unrelated",
+        "Stock market dips",
+        "Equity indexes fell sharply as investors weighed new inflation data and interest-rate expectations.",
+    )
+
+    updated, summary = explore._apply_post_fetch_topic_relevance(
+        profile, [core, adjacent, unrelated], low_yield=True
+    )
+    by_id = {r.payload.id: r for r in updated}
+
+    assert by_id["core"].tier != "dropped"
+    assert by_id["adjacent"].tier != "dropped"
+    assert by_id["adjacent"].metadata.get("topic_adjacency") is True
+    assert by_id["unrelated"].tier == "dropped"
+    assert summary["dropped_count"] == 1
+    assert summary["adjacent_count"] == 1
+
+
+def test_low_yield_source_audit_prompt_widens_topic_without_relaxing_recency() -> None:
+    """The low-yield audit instruction must enforce topical relevance against the
+    adjacent vocabulary and must NOT tell the model to relax freshness/recency."""
+    from backend.agents import source_audit
+
+    captured: dict[str, str] = {}
+
+    class _FakeClient:
+        async def complete_json(self, *, system: str, prompt: str, max_tokens: int) -> dict[str, Any]:
+            captured["system"] = system
+            return {"results": []}
+
+    profile = _rv_profile()
+    result = ArticleFetchResult(
+        payload=NormalizedPayload(
+            source_type="web_search_item",
+            source_name="Motorhome maker recall",
+            raw_text="A recreational vehicle motorhome recall over a brake defect.",
+            original_url="https://example.com/recall",
+            id="r1",
+        ),
+        original_url="https://example.com/recall",
+        final_url="https://example.com/recall",
+        title="Motorhome maker recall",
+        text="A recreational vehicle motorhome recall over a brake defect.",
+        excerpt="recall",
+        domain="example.com",
+        status="fetched",
+    )
+
+    asyncio.run(
+        source_audit._complete_audit(
+            _FakeClient(),
+            profile,
+            [result],
+            [0],
+            lookback_hours=24,
+            inference_run_id=None,
+            article_id="t",
+            max_tokens=400,
+            compact=False,
+            low_yield=True,
+        )
+    )
+
+    system = captured["system"]
+    assert "Relax your freshness" not in system
+    assert "Do NOT relax freshness" in system
+    # Topical relevance is still enforced and the adjacent vocabulary is surfaced.
+    assert "genuinely unrelated" in system
+    assert "camping" in system

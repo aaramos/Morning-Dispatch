@@ -176,10 +176,11 @@ def test_explore_retry_logic(monkeypatch, tmp_path) -> None:
     assert digest_core_runs[0]["threshold"] == 0.45
     assert digest_core_runs[0]["lookback_hours"] == 48
 
-    # Second attempt (retry): low yield mode and relaxed settings
+    # Second attempt (retry): low-yield recovery WIDENS the topic but does NOT relax
+    # the gates — the relevance threshold and recency window stay strict.
     assert discovery_runs[1]["low_yield"] is True
     assert digest_core_runs[1]["low_yield"] is True
-    assert digest_core_runs[1]["threshold"] == 0.30
+    assert digest_core_runs[1]["threshold"] == 0.45
     # Strict constraint: lookback_hours stays fixed
     assert digest_core_runs[1]["lookback_hours"] == 48
 
@@ -188,26 +189,41 @@ def test_explore_retry_logic(monkeypatch, tmp_path) -> None:
     assert discovery_runs[1]["search_queries"] == ["AI capex"]
 
 
-def test_candidate_matches_topic_low_yield() -> None:
+def test_candidate_matches_topic_widens_target_not_bar() -> None:
+    """Low-yield must WIDEN the topic target (core + adjacent vocabulary), never
+    lower the overlap bar. Returns (matched, adjacency_only)."""
     from backend.agents.discovery.runner import _candidate_matches_topic
 
     topic_tokens = {"semiconductor", "capex", "nvidia", "hardware", "spending"}
-    
-    # Candidate with 1 overlap token ("nvidia") in title
-    cand1 = Candidate(
-        adapter="web_search",
-        payload=NormalizedPayload(
-            source_type="web_search",
-            source_name="Web",
-            original_url="https://example.com/article1",
-            metadata={"title": "Nvidia chip orders"},
-        ),
-    )
-    
-    # When low_yield=False, 1 overlap token is not enough
-    assert _candidate_matches_topic(cand1, topic_tokens, low_yield=False) is False
-    # When low_yield=True, overlap of 1 is accepted
-    assert _candidate_matches_topic(cand1, topic_tokens, low_yield=True) is True
+
+    def cand(ident: str, title: str) -> Candidate:
+        return Candidate(
+            adapter="web_search",
+            payload=NormalizedPayload(
+                source_type="web_search",
+                source_name="Web",
+                original_url=f"https://example.com/{ident}",
+                metadata={"title": title},
+            ),
+        )
+
+    # A single core overlap ("nvidia") is below the strict bar — in BOTH modes.
+    # Low-yield does NOT accept it just because yield is thin (no loosening).
+    cand1 = cand("a1", "Nvidia chip orders")
+    assert _candidate_matches_topic(cand1, topic_tokens, low_yield=False) == (False, False)
+    assert _candidate_matches_topic(cand1, topic_tokens, low_yield=True) == (False, False)
+
+    # With adjacent vocabulary, low-yield matches via the EXPANDED set and flags it
+    # as adjacency-only; strict mode still rejects (the adjacent set is not consulted).
+    adjacent = {"datacenter", "cooling"}
+    cand2 = cand("a2", "Nvidia datacenter cooling upgrade")
+    assert _candidate_matches_topic(cand2, topic_tokens, adjacent, low_yield=True) == (True, True)
+    assert _candidate_matches_topic(cand2, topic_tokens, adjacent, low_yield=False) == (False, False)
+
+    # Two core overlaps clear the strict bar and are tagged as core (not adjacency).
+    cand3 = cand("a3", "Nvidia capex spending surges")
+    assert _candidate_matches_topic(cand3, topic_tokens, low_yield=False) == (True, False)
+    assert _candidate_matches_topic(cand3, topic_tokens, adjacent, low_yield=True) == (True, False)
 
 
 @pytest.mark.anyio
@@ -340,9 +356,17 @@ async def test_source_audit_prompt_relaxation(monkeypatch) -> None:
     
     await apply_source_audit(profile, [article], lookback_hours=24, model_client=FakeClient(), low_yield=True)
     assert len(system_prompts_seen) == 1
-    assert "CRITICAL: We are in a low-yield retrieval mode." in system_prompts_seen[0]
-    
+    low_yield_prompt = system_prompts_seen[0]
+    # New behavior: widen the topic (keep on-topic OR adjacent, reject genuinely
+    # unrelated) WITHOUT relaxing recency.
+    assert "low-yield recovery mode" in low_yield_prompt
+    assert "genuinely unrelated" in low_yield_prompt
+    assert "Do NOT relax freshness" in low_yield_prompt
+    # The old gate-relaxing / recency-relaxing instruction must be gone.
+    assert "Relax your freshness" not in low_yield_prompt
+    assert "EXTREMELY permissive" not in low_yield_prompt
+
     system_prompts_seen.clear()
     await apply_source_audit(profile, [article], lookback_hours=24, model_client=FakeClient(), low_yield=False)
     assert len(system_prompts_seen) == 1
-    assert "CRITICAL: We are in a low-yield retrieval mode." not in system_prompts_seen[0]
+    assert "low-yield recovery mode" not in system_prompts_seen[0]

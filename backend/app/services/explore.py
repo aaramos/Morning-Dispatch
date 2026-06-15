@@ -1681,6 +1681,21 @@ def read_brief_html(exploration_id: str) -> str | None:
         return None
 
 
+def _digest_interest_text(profile: TopicProfile) -> str:
+    """Ranking interest text, with the adjacent vocabulary folded into the POSITIVE
+    portion (before any ``Avoid:`` clause) so the editor scores tangential items on
+    the expanded terms without disturbing exclusion handling."""
+    base = profile.search_text()
+    if not profile.adjacent_terms:
+        return base
+    adjacent = " ".join(profile.adjacent_terms)
+    parts = re.split(r"(\bAvoid:\s*)", base, maxsplit=1)
+    if len(parts) == 3:
+        positive, sep, avoid = parts
+        return f"{positive.strip()} {adjacent} {sep}{avoid}".strip()
+    return f"{base} {adjacent}".strip()
+
+
 async def _run_digest_core(
     *,
     profile: TopicProfile,
@@ -1707,7 +1722,11 @@ async def _run_digest_core(
     digest = {
         "id": profile.topic_id,
         "name": _brief_title(profile),
-        "interest": profile.search_text(),
+        # Fold the adjacent vocabulary into the ranking interest so tangential items
+        # kept by the widened low-yield gate can clear the relevance threshold on the
+        # SAME expanded terms (they are still ranked below core via the topic_adjacency
+        # tag). Recency/threshold are untouched — only the scoring vocabulary widens.
+        "interest": _digest_interest_text(profile),
         "threshold": threshold,
         "content_limits": dict(profile.content_limits),
         "recency_weighting": profile.recency_weighting,

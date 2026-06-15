@@ -109,10 +109,6 @@ def _prepare_result(
     topic_signal = _has_ai_topic_signal(result)
     if topic_signal and result.payload.source_type == "gmail_link":
         relevance = min(1.0, relevance + 0.18)
-    # Low-yield adjacency items are kept but scored below core matches so the ranker
-    # cannot promote a tangential story above on-topic coverage.
-    if _is_topic_adjacent(result):
-        relevance *= 0.6
 
     if _is_approved_podcast_latest(result):
         tier = "main"
@@ -333,11 +329,15 @@ def _top_sections(results: list[ArticleFetchResult]) -> list[str]:
     return [section for section, _count in counts.most_common(4)] or ["noteworthy stories"]
 
 
-def _sort_key(result: ArticleFetchResult, recency_weighting: str = "recent") -> tuple[float, float, float]:
+def _sort_key(result: ArticleFetchResult, recency_weighting: str = "recent") -> tuple[float, float, float, float]:
     fetched = 1.0 if result.fetched else 0.0
+    # Tangential (low-yield adjacency) items rank strictly below core matches:
+    # this tier dominates the score so an adjacent story can never sort above a
+    # core one regardless of its standalone newsworthiness.
+    core_tier = 0.0 if _is_topic_adjacent(result) else 1.0
     score = result.relevance_score if result.relevance_score is not None else 0.0
     recency = _recency_score(result.payload.published_at, recency_weighting)
-    return (fetched, score, recency)
+    return (fetched, core_tier, score, recency)
 
 
 AI_SECTION_MARKERS = (
