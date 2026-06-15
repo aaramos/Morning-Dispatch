@@ -900,6 +900,8 @@ def _pre_build_strategy_review_instruction(profile: dict[str, Any]) -> str:
         "Check source fit: markets must use ticker symbols, foreign media must use native-language queries, "
         "podcasts should use show/episode/topic phrasing likely to find playable audio, YouTube should use video/channel/topic phrasing, "
         "and web search should use current/fresh wording. "
+        "Check spelling: every search term must use the correct, standard spelling of proper nouns, place names, brands, "
+        "products, and people; foreign-language queries must use correct native-language spelling. Correct any misspelled term. "
         "If corrections are needed, return a proposal with profile_patch only; use replace_search_queries or replace_source_queries "
         "when stale or conflicting query lists should be replaced rather than appended. "
         "If the strategy is already consistent with the user's intent, current date, selected sources, and recency window, "
@@ -973,6 +975,9 @@ def _build_strategy_refinement_prompt(*, profile: dict[str, Any], instruction: s
                 "Do not remove existing useful queries unless the instruction asks to narrow or exclude them.",
                 "Specific named sources may be added to requested_sources.",
                 "Foreign media queries must be native-language or idiomatic local-language terms.",
+                "Spell every search term correctly. Use the correct, standard spelling of proper nouns, place names, "
+                "brands, products, and people, and the correct native-language spelling for foreign-language terms. "
+                "Never emit a misspelled term.",
                 "Every search query and source query must be specific and descriptive: each must name a "
                 "concrete entity, organization, person, product, place, or topic. Never emit bare "
                 "stopwords, conjunctions, or generic filler such as \"either\", \"various\", \"things\", "

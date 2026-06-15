@@ -253,10 +253,16 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
     for key in ("subtopics", "search_queries", "exclusions", *PODCAST_STRATEGY_FIELDS):
         if key not in patch:
             continue
-        if key == "search_queries" and (bool(patch.get("replace_search_queries")) or cleanup_requested):
-            updated[key] = _string_list(patch.get(key), limit=20)
+        if key == "search_queries":
+            # Agent-proposed general queries pass through a conservative spelling
+            # normalization so obvious typos never reach the adapters.
+            incoming_queries = _normalize_query_list_spelling(patch.get(key))
+            if bool(patch.get("replace_search_queries")) or cleanup_requested:
+                updated[key] = incoming_queries
+            else:
+                updated[key] = _merge_string_lists(updated.get(key), incoming_queries, limit=20)
         else:
-            updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16 if key != "search_queries" else 20)
+            updated[key] = _merge_string_lists(updated.get(key), patch.get(key), limit=16)
     has_terms_patch = "must_have_terms" in patch
     has_aliases_patch = "must_have_aliases" in patch
     existing_terms = _string_list(updated.get("must_have_terms"), limit=6)
@@ -313,16 +319,18 @@ def _merge_agent_profile_patch(profile: dict[str, Any], patch: Any, *, user_text
         updated["lookback_hours"] = _coerce_lookback_hours(patch.get("lookback_hours"))
 
     if "source_queries" in patch:
+        # Agent-proposed per-source queries are spell-normalized before merging,
+        # skipping the foreign_media and markets lanes inside the helper.
+        incoming_source_queries = _normalize_source_query_spelling(_clean_source_queries(patch.get("source_queries")))
         if bool(patch.get("replace_source_queries")):
-            updated["source_queries"] = _clean_source_queries(patch.get("source_queries"))
+            updated["source_queries"] = incoming_source_queries
         elif cleanup_requested:
             existing = _clean_source_queries(updated.get("source_queries"))
-            incoming = _clean_source_queries(patch.get("source_queries"))
-            for source, queries in incoming.items():
+            for source, queries in incoming_source_queries.items():
                 existing[source] = queries
             updated["source_queries"] = existing
         else:
-            updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), patch.get("source_queries"))
+            updated["source_queries"] = _merge_source_queries(updated.get("source_queries"), incoming_source_queries)
     if "foreign_language_plan" in patch:
         updated["foreign_language_plan"] = _merge_foreign_language_plan(
             updated.get("foreign_language_plan"),
@@ -600,6 +608,122 @@ def _string_list(value: Any, *, limit: int = 24) -> list[str]:
         if len(cleaned) >= limit:
             break
     return cleaned
+
+
+# High-confidence English misspelling → correction map for the lightweight
+# post-validation pass on model-proposed search terms. Kept deliberately small and
+# unambiguous: every entry is a common typo with a single obvious correction, so we
+# never "fix" a real word into the wrong one. Spelling of proper nouns, brands, and
+# people is handled by the prompt instruction, not here, because a dictionary cannot
+# safely distinguish a misspelled name from a deliberate one. Foreign-language tokens
+# are skipped entirely (see _normalize_query_spelling) so native queries are never
+# flagged as misspelled.
+_COMMON_QUERY_MISSPELLINGS: dict[str, str] = {
+    "teh": "the",
+    "adn": "and",
+    "ot": "to",
+    "recieve": "receive",
+    "seperate": "separate",
+    "definately": "definitely",
+    "occured": "occurred",
+    "occurance": "occurrence",
+    "goverment": "government",
+    "governement": "government",
+    "enviroment": "environment",
+    "buisness": "business",
+    "calender": "calendar",
+    "untill": "until",
+    "accross": "across",
+    "neccessary": "necessary",
+    "necesary": "necessary",
+    "publically": "publicly",
+    "managment": "management",
+    "developement": "development",
+    "independant": "independent",
+    "comittee": "committee",
+    "begining": "beginning",
+    "beleive": "believe",
+    "concious": "conscious",
+    "embarass": "embarrass",
+    "existance": "existence",
+    "maintainance": "maintenance",
+    "persistant": "persistent",
+    "priviledge": "privilege",
+    "refered": "referred",
+    "relevent": "relevant",
+    "succesful": "successful",
+    "successfull": "successful",
+    "tommorow": "tomorrow",
+    "tarrif": "tariff",
+    "tarrifs": "tariffs",
+    "semiconducter": "semiconductor",
+    "semiconducters": "semiconductors",
+    "artifical": "artificial",
+    "inteligence": "intelligence",
+    "intelligance": "intelligence",
+    "techology": "technology",
+    "tecnology": "technology",
+    "compeitition": "competition",
+    "competiton": "competition",
+    "annoucement": "announcement",
+    "announcment": "announcement",
+    "earnigs": "earnings",
+    "elecion": "election",
+    "regualtion": "regulation",
+    "regulaton": "regulation",
+}
+
+_QUERY_TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
+
+def _match_case(correction: str, original: str) -> str:
+    if original.isupper() and len(original) > 1:
+        return correction.upper()
+    if original[:1].isupper():
+        return correction[:1].upper() + correction[1:]
+    return correction
+
+
+def _normalize_query_spelling(text: str) -> str:
+    """Conservatively correct obvious English typos in a single search query.
+
+    Only ASCII alphabetic tokens whose lowercase form is in the curated misspelling
+    map are touched, preserving the original capitalization. Any token containing a
+    non-ASCII character (accents, CJK, Cyrillic, etc.) is left untouched so native
+    foreign-language queries are never altered.
+    """
+    if not text or not text.isascii():
+        # A string with any non-ASCII character is treated as foreign-language and
+        # left verbatim; mixing a typo map into it risks corrupting native terms.
+        return text
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        correction = _COMMON_QUERY_MISSPELLINGS.get(token.lower())
+        if not correction:
+            return token
+        return _match_case(correction, token)
+
+    return _QUERY_TOKEN_RE.sub(_replace, text)
+
+
+def _normalize_query_list_spelling(queries: Any) -> list[str]:
+    return [_normalize_query_spelling(q) for q in _string_list(queries, limit=20)]
+
+
+def _normalize_source_query_spelling(source_queries: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Apply the conservative spelling pass to a cleaned source-query map.
+
+    Skips lanes whose queries are intentionally not plain English: foreign_media
+    (native-language) and markets (ticker symbols).
+    """
+    corrected: dict[str, list[str]] = {}
+    for source, queries in source_queries.items():
+        if source in {"foreign_media", "markets"}:
+            corrected[source] = list(queries)
+        else:
+            corrected[source] = [_normalize_query_spelling(q) for q in queries]
+    return corrected
 
 
 def _merge_string_lists(existing: Any, incoming: Any, *, limit: int) -> list[str]:

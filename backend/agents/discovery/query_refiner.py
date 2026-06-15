@@ -12,7 +12,7 @@ from backend.agents.discovery.types import TopicProfile
 from backend.app.core.config import get_settings
 from backend.app.core.prompt_loader import load_prompt
 from backend.app.services import model_routing
-from backend.app.services.profile_patch import _is_filler_query
+from backend.app.services.profile_patch import _is_filler_query, _normalize_query_spelling
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ async def refine_queries_for_adapter(
             # Clean and filter empty queries
             cleaned_queries = []
             for q in refined_queries:
-                q_str = str(q or "").strip()
+                q_str = _normalize_query_spelling(str(q or "").strip())
                 if q_str and not _is_filler_query(q_str) and q_str not in cleaned_queries:
                     cleaned_queries.append(q_str)
             logger.info(
@@ -175,7 +175,7 @@ async def expand_search_strategy(
         existing = {q.strip().lower() for q in base_queries}
         cleaned: list[str] = []
         for q in refined:
-            value = str(q or "").strip()
+            value = _normalize_query_spelling(str(q or "").strip())
             key = value.lower()
             if not value or _is_filler_query(value) or key in existing or key in {c.lower() for c in cleaned}:
                 continue

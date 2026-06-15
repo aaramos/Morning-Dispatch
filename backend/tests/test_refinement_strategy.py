@@ -598,3 +598,68 @@ def test_clean_source_queries_filters_filler_per_source():
     )
 
     assert cleaned == {"web_search": ["Samsung HBM3E yield"]}
+
+
+def test_normalize_query_spelling_corrects_obvious_typos_keeps_proper_nouns():
+    from backend.app.services.profile_patch import _normalize_query_spelling
+
+    # Common English typos are corrected, preserving surrounding capitalization.
+    assert _normalize_query_spelling("AI semiconducter tarrifs") == "AI semiconductor tariffs"
+    assert _normalize_query_spelling("goverment policy") == "government policy"
+    # Correctly-spelled proper nouns, brands, and people are left untouched.
+    assert _normalize_query_spelling("Qualcomm Pyongyang Nvidia roadmap") == "Qualcomm Pyongyang Nvidia roadmap"
+
+
+def test_normalize_query_spelling_leaves_foreign_language_terms_untouched():
+    from backend.app.services.profile_patch import _normalize_query_spelling
+
+    # Any non-ASCII (native-language) query is returned verbatim — never flagged as a typo.
+    assert _normalize_query_spelling("Halbleiter Förderung") == "Halbleiter Förderung"
+    assert _normalize_query_spelling("半導体 政策") == "半導体 政策"
+
+
+def test_agent_patch_spell_corrects_search_and_source_queries():
+    profile = refinement._coerce_profile(
+        _profile(
+            source_selection={"web_search": True, "foreign_media": True, "markets": True},
+            search_queries=[],
+            source_queries={},
+        )
+    )
+
+    patched = refinement._merge_agent_profile_patch(
+        profile,
+        {
+            "replace_search_queries": True,
+            "search_queries": ["semiconducter goverment policy"],
+            "replace_source_queries": True,
+            "source_queries": {
+                "web_search": ["enviroment tarrifs"],
+                "foreign_media": ["enviroment Förderung"],  # foreign lane: leave verbatim
+                "markets": ["NVDA"],
+            },
+        },
+        user_text="",
+    )
+
+    assert patched["search_queries"] == ["semiconductor government policy"]
+    assert patched["source_queries"]["web_search"] == ["environment tariffs"]
+    # Foreign-language and ticker lanes are never spell-normalized.
+    assert patched["source_queries"]["foreign_media"] == ["enviroment Förderung"]
+    assert patched["source_queries"]["markets"] == ["NVDA"]
+
+
+def test_strategy_refinement_prompt_instructs_correct_spelling():
+    from backend.app.services import strategy_refinement
+
+    profile = refinement._coerce_profile(_profile())
+    payload = json.loads(
+        strategy_refinement._build_strategy_refinement_prompt(
+            profile=profile,
+            instruction="add more angles",
+            task="Revise the strategy.",
+        )
+    )
+    constraints_blob = " ".join(payload["constraints"]).lower()
+    assert "spell" in constraints_blob
+    assert "native-language" in constraints_blob
