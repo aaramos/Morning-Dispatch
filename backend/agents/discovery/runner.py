@@ -426,8 +426,11 @@ async def _expand_profile_queries(
                 existing.append(query)
                 seen.add(key)
         source_queries[source] = tuple(existing)
+    # Record the tangential vocabulary these expansion queries introduce so the
+    # low-yield relevance gate can widen its topic target to the SAME terms.
+    adjacent_terms = derive_adjacent_terms(profile, expansions)
     return _sanitize_bounded_recency_queries(
-        replace(profile, source_queries=source_queries),
+        replace(profile, source_queries=source_queries, adjacent_terms=adjacent_terms),
         context.lookback_hours,
     )
 
@@ -677,22 +680,38 @@ def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate], l
     if not any(_candidate_has_judgeable_topic_text(candidate) for candidate in candidates):
         return candidates, []
 
+    adjacent_tokens = _adjacent_tokens(profile)
+
     kept: list[Candidate] = []
     dropped: list[dict[str, Any]] = []
     for candidate in candidates:
-        if not _candidate_has_judgeable_topic_text(candidate):
-            kept.append(candidate)
-            continue
         # Foreign-media results are native-language; the English keyword gate cannot
         # judge them fairly and would silently drop on-topic coverage. Exempt them
-        # here and let the model-based audit judge them on translated text instead.
-        if candidate.adapter == "foreign_media" or candidate.payload.source_type == "foreign_web":
+        # (now and post-fetch) and let the model-based audit judge them on translated
+        # text instead. Requested/promoted sources are likewise exempt by design.
+        exempt_from_topic_gate = (
+            candidate.adapter == "foreign_media"
+            or candidate.payload.source_type == "foreign_web"
+            or _is_candidate_from_requested_source(candidate, profile)
+        )
+        if not _candidate_has_judgeable_topic_text(candidate):
+            # Thin shell (typically a Google News / Web title + URL with no body text
+            # yet): the keyword gate cannot judge it now. Keep it provisionally, but
+            # flag non-exempt shells so the post-fetch re-check judges them on their
+            # fetched full text instead of letting them slip through unchecked.
+            if not exempt_from_topic_gate:
+                _mark_topic_relevance_deferred(candidate)
             kept.append(candidate)
             continue
-        if _is_candidate_from_requested_source(candidate, profile):
+        if exempt_from_topic_gate:
             kept.append(candidate)
             continue
-        if _candidate_matches_topic(candidate, topic_tokens, low_yield=low_yield):
+        matched, adjacency_only = _candidate_matches_topic(
+            candidate, topic_tokens, adjacent_tokens, low_yield=low_yield
+        )
+        if matched:
+            if adjacency_only:
+                _flag_topic_adjacency(candidate)
             kept.append(candidate)
         else:
             dropped.append(
@@ -718,49 +737,171 @@ def _apply_topic_relevance(profile: TopicProfile, candidates: list[Candidate], l
     return candidates, []
 
 
+_GENERIC_TOPIC_TOKENS = {
+    "advice",
+    "advise",
+    "area",
+    "august",
+    "brief",
+    "city",
+    "curate",
+    "general",
+    "good",
+    "interest",
+    "know",
+    "like",
+    "long",
+    "male",
+    "might",
+    "need",
+    "old",
+    "provide",
+    "see",
+    "things",
+    "traveler",
+    "traveling",
+    "well",
+    "year",
+}
+
+
+def filter_topic_tokens(tokens: set[str]) -> set[str]:
+    return {token for token in tokens if token not in _GENERIC_TOPIC_TOKENS and len(token) > 2}
+
+
 def _topic_tokens(profile: TopicProfile) -> set[str]:
-    tokens = keyword_set(profile.discovery_text())
-    generic = {
-        "advice",
-        "advise",
-        "area",
-        "august",
-        "brief",
-        "city",
-        "curate",
-        "general",
-        "good",
-        "interest",
-        "know",
-        "like",
-        "long",
-        "male",
-        "might",
-        "need",
-        "old",
-        "provide",
-        "see",
-        "things",
-        "traveler",
-        "traveling",
-        "well",
-        "year",
+    """Core topic vocabulary drawn from the confirmed interest."""
+    return filter_topic_tokens(keyword_set(profile.discovery_text()))
+
+
+def _adjacent_tokens(profile: TopicProfile) -> set[str]:
+    """Agent-generated tangential vocabulary, excluding anything already core."""
+    if not profile.adjacent_terms:
+        return set()
+    tokens = filter_topic_tokens(keyword_set(" ".join(profile.adjacent_terms)))
+    return tokens - _topic_tokens(profile)
+
+
+def derive_adjacent_terms(profile: TopicProfile, queries: list[str]) -> tuple[str, ...]:
+    """Fold tangential vocabulary from agent-broadened queries into the profile's
+    adjacent-term set. The relevance gate and the new search queries draw from the
+    SAME expanded vocabulary, so low-yield recovery widens the topic target instead
+    of lowering the overlap bar. Returns the merged, deduped adjacent terms."""
+    core = _topic_tokens(profile)
+    adjacent: set[str] = set(profile.adjacent_terms)
+    for query in queries:
+        for token in filter_topic_tokens(keyword_set(str(query or ""))):
+            if token not in core:
+                adjacent.add(token)
+    return tuple(sorted(adjacent))
+
+
+def _flag_topic_adjacency(candidate: Candidate) -> None:
+    """Tag a candidate kept only via the adjacent (tangential) vocabulary so the
+    ranker keeps it below core-topic matches and out of the lead slot."""
+    candidate.payload.metadata = {
+        **dict(candidate.payload.metadata or {}),
+        "topic_adjacency": True,
     }
-    return {token for token in tokens if token not in generic and len(token) > 2}
 
 
-def _candidate_matches_topic(candidate: Candidate, topic_tokens: set[str], low_yield: bool = False) -> bool:
-    candidate_tokens = keyword_set(_candidate_relevance_text(candidate))
-    if not candidate_tokens:
-        return False
-    overlap = candidate_tokens & topic_tokens
-    if low_yield:
-        return len(overlap) >= 1
+# Metadata flag set on thin-shell candidates that bypassed the discovery-time
+# topic-relevance gate purely because they had no judgeable text yet. The fetch
+# stage carries this flag through onto the ArticleFetchResult's payload so the
+# post-fetch re-check (explore._apply_post_fetch_topic_relevance) knows which
+# items to re-judge once their full article text is available.
+TOPIC_RELEVANCE_DEFERRED_KEY = "topic_relevance_deferred"
+
+
+def _mark_topic_relevance_deferred(candidate: Candidate) -> None:
+    candidate.payload.metadata = {
+        **dict(candidate.payload.metadata or {}),
+        TOPIC_RELEVANCE_DEFERRED_KEY: True,
+    }
+
+
+def evaluate_post_fetch_topic_relevance(
+    profile: TopicProfile,
+    text: str,
+    *,
+    low_yield: bool = False,
+) -> tuple[str, bool]:
+    """Re-judge a deferred thin shell on its now-fetched full text.
+
+    Mirrors the discovery-time gate (`_apply_topic_relevance` /
+    `_candidate_matches_topic`) so a candidate is judged against the SAME core +
+    adjacent token set — never stricter or looser. Returns (verdict, adjacency_only):
+
+      - ("skip", False): the gate is inactive for this profile, or the fetched text
+        is still not judgeable; keep the item unchanged.
+      - ("keep", adjacency_only): the text overlaps the topic. adjacency_only is True
+        when it matched only via the expanded (adjacent) vocabulary.
+      - ("drop", False): the fetched text is judgeable but does not overlap the topic.
+    """
+    topic_tokens = _topic_tokens(profile)
+    if len(topic_tokens) < 2:
+        return "skip", False
+    if not _text_has_judgeable_topic_text(text):
+        return "skip", False
+    candidate_tokens = keyword_set(text)
+    matched, adjacency_only = _tokens_match_topic(
+        candidate_tokens,
+        topic_tokens,
+        _adjacent_tokens(profile),
+        low_yield=low_yield,
+    )
+    if matched:
+        return "keep", adjacency_only
+    return "drop", False
+
+
+def _overlap_passes(overlap: set[str], topic_tokens: set[str]) -> bool:
     if len(overlap) >= 2:
         return True
-    if len(overlap) == 1 and len(topic_tokens) <= 4:
-        return True
-    return False
+    return len(overlap) == 1 and len(topic_tokens) <= 4
+
+
+def _candidate_matches_topic(
+    candidate: Candidate,
+    topic_tokens: set[str],
+    adjacent_tokens: set[str] | None = None,
+    low_yield: bool = False,
+) -> tuple[bool, bool]:
+    """Return (matched, adjacency_only).
+
+    Core matches always pass the normal (strict) overlap bar. In low-yield mode we
+    do NOT lower that bar; instead we evaluate a SECOND, equally-strict overlap
+    against the EXPANDED token set (core + agent-generated adjacent vocabulary).
+    A candidate kept only because of the expanded set is flagged adjacency_only so
+    it ranks below core matches.
+    """
+    return _tokens_match_topic(
+        keyword_set(_candidate_relevance_text(candidate)),
+        topic_tokens,
+        adjacent_tokens,
+        low_yield=low_yield,
+    )
+
+
+def _tokens_match_topic(
+    candidate_tokens: set[str],
+    topic_tokens: set[str],
+    adjacent_tokens: set[str] | None = None,
+    low_yield: bool = False,
+) -> tuple[bool, bool]:
+    """Token-level core of the topic-overlap decision shared by discovery-time
+    (`_candidate_matches_topic`) and post-fetch (`evaluate_post_fetch_topic_relevance`)
+    judging, so both stages apply the identical core/adjacent overlap bar."""
+    if not candidate_tokens:
+        return False, False
+    core_overlap = candidate_tokens & topic_tokens
+    if _overlap_passes(core_overlap, topic_tokens):
+        return True, False
+    if low_yield and adjacent_tokens:
+        expanded = topic_tokens | adjacent_tokens
+        if _overlap_passes(candidate_tokens & expanded, expanded):
+            return True, True
+    return False, False
 
 
 def _topic_gate_is_specific(topic_tokens: set[str]) -> bool:
@@ -800,7 +941,14 @@ def _candidate_has_judgeable_topic_text(candidate: Candidate) -> bool:
     for key, value in metadata.items():
         fields.extend(_flatten_metadata_value(key))
         fields.extend(_flatten_metadata_value(value))
-    tokens = keyword_set(" ".join(str(value) for value in fields if value))
+    return _text_has_judgeable_topic_text(" ".join(str(value) for value in fields if value))
+
+
+def _text_has_judgeable_topic_text(text: str) -> bool:
+    """Whether `text` carries enough non-generic vocabulary for the keyword gate to
+    judge it. Shared by discovery-time and post-fetch judging so a shell that was
+    "not judgeable" at discovery uses the identical bar once its full text arrives."""
+    tokens = keyword_set(text)
     generic = {"candidate", "gmail", "item", "newsletter", "signal", "source", "web"}
     return len({token for token in tokens if token not in generic}) >= 3
 
