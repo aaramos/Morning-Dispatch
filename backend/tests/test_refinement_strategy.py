@@ -558,3 +558,43 @@ def test_parse_chat_payload_build_intent_marks_ready():
     assert patch["scope"] == "AI infrastructure"
     assert ready is True
     assert intent == "build"
+
+
+def test_string_list_drops_filler_but_keeps_short_signal_queries():
+    from backend.app.services.profile_patch import _string_list
+
+    cleaned = _string_list(
+        [
+            "either",          # bare conjunction -> drop
+            "various",         # generic quantifier -> drop
+            "things",          # generic filler noun -> drop
+            "various things",  # all-filler phrase -> drop
+            "the",             # bare article -> drop
+            "!!!",             # no alphanumeric content -> drop
+            "AAPL",            # ticker symbol -> keep
+            "Nvidia",          # proper noun -> keep
+            "Bundesliga",      # foreign-language term -> keep
+            "climate things",  # has descriptive token -> keep
+        ]
+    )
+
+    assert "either" not in cleaned
+    assert "various" not in cleaned
+    assert "things" not in cleaned
+    assert "various things" not in cleaned
+    assert "the" not in cleaned
+    assert "!!!" not in cleaned
+    assert cleaned == ["AAPL", "Nvidia", "Bundesliga", "climate things"]
+
+
+def test_clean_source_queries_filters_filler_per_source():
+    from backend.app.services.profile_patch import _clean_source_queries
+
+    cleaned = _clean_source_queries(
+        {
+            "web_search": ["either", "various", "Samsung HBM3E yield"],
+            "youtube": ["things", "stuff"],  # all filler -> source dropped entirely
+        }
+    )
+
+    assert cleaned == {"web_search": ["Samsung HBM3E yield"]}
