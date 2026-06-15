@@ -63,6 +63,10 @@ class TopicProfile:
     keywords: tuple[str, ...] = ()
     search_queries: tuple[str, ...] = ()
     source_queries: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Agent-generated tangential vocabulary (RV -> camping, towing, campgrounds...).
+    # Shared between the broadened search queries and the low-yield relevance gate so
+    # recovery widens the topic target instead of lowering the overlap bar.
+    adjacent_terms: tuple[str, ...] = ()
     foreign_language_plan: tuple[dict[str, Any], ...] = ()
     foreign_regions: tuple[str, ...] = ()
     depth: Depth = "informed-generalist"
@@ -106,6 +110,7 @@ class TopicProfile:
             keywords=tuple(_string_list(payload.get("keywords"))),
             search_queries=tuple(_string_list(payload.get("search_queries"))),
             source_queries=_source_queries(payload.get("source_queries")),
+            adjacent_terms=tuple(_string_list(payload.get("adjacent_terms"))),
             foreign_language_plan=tuple(_dict_list(payload.get("foreign_language_plan"))),
             foreign_regions=tuple(_string_list(payload.get("foreign_regions"))[:16]),
             depth=depth,
@@ -139,6 +144,7 @@ class TopicProfile:
             "keywords": list(self.keywords),
             "search_queries": list(self.search_queries),
             "source_queries": {key: list(value) for key, value in self.source_queries.items()},
+            "adjacent_terms": list(self.adjacent_terms),
             "foreign_language_plan": [dict(item) for item in self.foreign_language_plan],
             "foreign_regions": list(self.foreign_regions),
             "depth": self.depth,

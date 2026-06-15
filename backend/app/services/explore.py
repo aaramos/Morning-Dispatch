@@ -27,6 +27,11 @@ from backend.agents.discovery.must_have import (
     must_have_evidence,
     must_have_reason,
 )
+from backend.agents.discovery.runner import (
+    TOPIC_RELEVANCE_DEFERRED_KEY,
+    derive_adjacent_terms,
+    evaluate_post_fetch_topic_relevance,
+)
 from backend.agents.digestor.base import NormalizedPayload
 from backend.app.services import brief_settings, email_delivery, model_routing
 from backend.app.services.source_window import (  # noqa: F401 — re-exported for tests/adapters
@@ -706,6 +711,17 @@ async def _run_exploration(
                 stage="post_fetch",
             )
             _record_must_have_summary(progress, "post_fetch", must_have_fetch_summary)
+            # Re-apply the topic-relevance gate on FULL fetched text. Thin title-only
+            # shells bypass the discovery-time keyword gate (no judgeable body yet) and
+            # were flagged as deferred; now that their article text exists, judge them
+            # against the SAME core+adjacent vocabulary so unrelated content cannot slip
+            # through unchecked. Recency is untouched here — only topical fit is judged.
+            fetched_articles, topic_relevance_summary = _apply_post_fetch_topic_relevance(
+                current_profile,
+                fetched_articles,
+                low_yield=low_yield_mode,
+            )
+            _record_topic_relevance_summary(progress, topic_relevance_summary)
             progress["source_window"] = {
                 "status": "completed",
                 "source_scope": _source_scope_label(lookback_hours),
@@ -767,7 +783,7 @@ async def _run_exploration(
             if (included_count < target_yield or starved_sources) and attempt < max_attempts:
                 if starved_sources:
                     logger.info(
-                        "Attempt %d did not include final items for source(s): %s. Retrying with broadened per-source queries and relaxed thresholds.",
+                        "Attempt %d did not include final items for source(s): %s. Retrying with broadened per-source queries and a widened (adjacent) topic target; thresholds and recency stay strict.",
                         attempt,
                         ", ".join(starved_sources),
                     )
@@ -778,7 +794,7 @@ async def _run_exploration(
                     }
                 else:
                     logger.info(
-                        "Attempt %d yielded only %d items (target: %d). Retrying with broadened queries and relaxed thresholds.",
+                        "Attempt %d yielded only %d items (target: %d). Retrying with broadened queries and a widened (adjacent) topic target; thresholds and recency stay strict.",
                         attempt,
                         included_count,
                         target_yield,
@@ -809,9 +825,12 @@ async def _run_exploration(
                 )
                 await _persist_progress_async(exploration_id, progress)
 
-                # 2. Relax filtering settings
+                # 2. Enter low-yield recovery. This now WIDENS the topic target (the
+                # relevance gate and audit judge against the broadened/adjacent
+                # vocabulary) rather than relaxing the gates: the relevance threshold
+                # and recency window stay strict, so off-topic and stale content are
+                # still rejected. Adjacent items are tagged so they rank below core.
                 low_yield_mode = True
-                threshold = 0.30
 
                 # Reset pipeline stages and rerun
                 progress["pipeline"] = {stage: "pending" for stage in _PIPELINE_STAGES}
@@ -1884,6 +1903,104 @@ def _apply_must_have_article_gate(
     return updated, summary
 
 
+def _apply_post_fetch_topic_relevance(
+    profile: TopicProfile,
+    results: list[ArticleFetchResult],
+    *,
+    low_yield: bool = False,
+) -> tuple[list[ArticleFetchResult], dict[str, Any]]:
+    """Re-judge thin-shell items that bypassed the discovery-time topic gate.
+
+    Only items flagged ``topic_relevance_deferred`` (a title/URL shell with no
+    judgeable body at discovery) are re-checked here, now that their fetched full
+    text is available. Judging reuses the SAME core+adjacent vocabulary as the
+    discovery gate (`evaluate_post_fetch_topic_relevance`): genuinely off-topic
+    shells are dropped; shells that match only via the adjacent vocabulary are
+    flagged ``topic_adjacency`` so the ranker keeps them below core matches. Recency
+    is never consulted here.
+    """
+    summary: dict[str, Any] = {
+        "checked_count": 0,
+        "kept_count": 0,
+        "adjacent_count": 0,
+        "dropped_count": 0,
+    }
+    updated: list[ArticleFetchResult] = []
+    for result in results:
+        if result.tier == "dropped" or not _topic_relevance_deferred(result):
+            updated.append(result)
+            continue
+        summary["checked_count"] += 1
+        verdict, adjacency_only = evaluate_post_fetch_topic_relevance(
+            profile,
+            _post_fetch_topic_text(result),
+            low_yield=low_yield,
+        )
+        if verdict == "drop":
+            summary["dropped_count"] += 1
+            updated.append(_drop_for_topic_relevance(result))
+            continue
+        if verdict == "keep" and adjacency_only:
+            summary["adjacent_count"] += 1
+            updated.append(_flag_result_topic_adjacency(result))
+            continue
+        summary["kept_count"] += 1
+        updated.append(result)
+    return updated, summary
+
+
+def _topic_relevance_deferred(result: ArticleFetchResult) -> bool:
+    payload_metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    result_metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return bool(
+        payload_metadata.get(TOPIC_RELEVANCE_DEFERRED_KEY)
+        or result_metadata.get(TOPIC_RELEVANCE_DEFERRED_KEY)
+    )
+
+
+def _post_fetch_topic_text(result: ArticleFetchResult) -> str:
+    metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    return " ".join(
+        str(value)
+        for value in (
+            result.title,
+            result.text,
+            result.excerpt,
+            result.editor_summary,
+            metadata.get("link_text"),
+            metadata.get("title"),
+            metadata.get("subject"),
+            result.original_url,
+        )
+        if value
+    )
+
+
+def _flag_result_topic_adjacency(result: ArticleFetchResult) -> ArticleFetchResult:
+    metadata = {**dict(result.metadata or {}), "topic_adjacency": True}
+    return replace(result, metadata=metadata)
+
+
+def _drop_for_topic_relevance(result: ArticleFetchResult) -> ArticleFetchResult:
+    reason = "Filtered after fetch because the full text did not overlap the confirmed topic."
+    metadata = {
+        **dict(result.metadata or {}),
+        "topic_relevance_rejected": True,
+        "topic_relevance_rejection_stage": "post_fetch",
+        "topic_relevance_rejection_reason": reason,
+    }
+    return replace(result, tier="dropped", metadata=metadata)
+
+
+def _record_topic_relevance_summary(
+    progress: dict[str, Any] | None,
+    summary: dict[str, Any],
+) -> None:
+    if progress is None or not summary.get("checked_count"):
+        return
+    progress["post_fetch_topic_relevance"] = dict(summary)
+
+
 def _mark_must_have_match(
     result: ArticleFetchResult,
     evaluation: Any,
@@ -2494,6 +2611,18 @@ async def broaden_queries_with_agent(
                 updates["related_episode_queries"] = tuple(existing_related)
 
         if updates:
+            # Fold the tangential vocabulary these broadened queries introduce into
+            # the profile's adjacent-term set so the low-yield relevance gate widens
+            # its topic target to the SAME terms instead of lowering the bar.
+            adjacent_queries: list[str] = list(cleaned_search)
+            for values in cleaned_source.values():
+                adjacent_queries.extend(values)
+            for raw_values in broadened_podcast_fields.values():
+                if isinstance(raw_values, list):
+                    adjacent_queries.extend(str(q).strip() for q in raw_values if str(q).strip())
+            adjacent_terms = derive_adjacent_terms(profile, adjacent_queries)
+            if adjacent_terms != profile.adjacent_terms:
+                updates["adjacent_terms"] = adjacent_terms
             logger.info("Broadened queries: %s", updates)
             return replace(profile, **updates)
 

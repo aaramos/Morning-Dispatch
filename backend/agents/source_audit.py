@@ -165,13 +165,24 @@ async def _complete_audit(
     prompt = _audit_prompt(profile, result_list, candidates, lookback_hours, compact=compact)
     system_prompt = load_prompt("source_audit")
     if low_yield:
+        adjacent_terms = _profile_adjacent_terms(profile)
+        adjacent_clause = (
+            " Tangential angles for this interest include: "
+            + ", ".join(adjacent_terms)
+            + "."
+            if adjacent_terms
+            else ""
+        )
         system_prompt += (
-            "\n\nCRITICAL: We are in a low-yield retrieval mode. "
-            "Please be EXTREMELY permissive. Only exclude articles that are "
-            "unquestionably spam, advertising, or completely unrelated to the topic. "
-            "If an article has any reasonable connection or contains useful context/background, "
-            "choose 'include' or 'include_as_context' instead of 'exclude'. "
-            "Relax your freshness/recency checks unless they are flagrantly old (e.g. from prior years)."
+            "\n\nCRITICAL: We are in a low-yield recovery mode. Core on-topic coverage "
+            "was thin, so we are WIDENING the topic to accept tangentially-related, "
+            "aligned items in addition to direct hits." + adjacent_clause + " "
+            "Keep any article that is on-topic OR clearly adjacent to the stated "
+            "interest (e.g. accessories, gear, sub-communities, or activities that go "
+            "hand-in-hand with it). Still EXCLUDE articles that are genuinely unrelated "
+            "to the interest — an unrelated subject is not rescued by low yield. "
+            "Do NOT relax freshness or recency: stale items must still be excluded "
+            "exactly as in normal mode."
         )
     started_at = perf_counter()
     try:
@@ -566,6 +577,14 @@ def _profile_record(profile: TopicProfile | dict[str, Any]) -> dict[str, Any]:
         "search_queries": list(profile.get("search_queries") or []),
         "exclusions": list(profile.get("exclusions") or []),
     }
+
+
+def _profile_adjacent_terms(profile: TopicProfile | dict[str, Any]) -> list[str]:
+    if isinstance(profile, TopicProfile):
+        terms = profile.adjacent_terms
+    else:
+        terms = profile.get("adjacent_terms") or ()
+    return [str(term).strip() for term in terms if str(term).strip()]
 
 
 def _coverage_goal(profile: TopicProfile | dict[str, Any]) -> dict[str, Any]:

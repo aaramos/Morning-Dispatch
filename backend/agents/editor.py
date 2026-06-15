@@ -28,11 +28,32 @@ def prepare_issue_articles(digest: dict[str, Any], results: Iterable[ArticleFetc
         prepared.append(enriched)
 
     prepared.sort(key=lambda r: _sort_key(r, recency_weighting), reverse=True)
-    for index, result in enumerate(prepared):
-        if result.fetched and result.tier != "lower_confidence":
-            prepared[index] = replace(result, tier="lead", section=result.section or "Lead Story")
-            break
+    # Tangential (low-yield adjacency) items must never claim the lead when a
+    # core-topic story exists. Prefer a non-adjacency lead; fall back to an adjacency
+    # item only when nothing core is lead-eligible.
+    lead_index = _lead_index(prepared, allow_adjacency=False)
+    if lead_index is None:
+        lead_index = _lead_index(prepared, allow_adjacency=True)
+    if lead_index is not None:
+        result = prepared[lead_index]
+        prepared[lead_index] = replace(result, tier="lead", section=result.section or "Lead Story")
     return prepared
+
+
+def _lead_index(prepared: list[ArticleFetchResult], *, allow_adjacency: bool) -> int | None:
+    for index, result in enumerate(prepared):
+        if not result.fetched or result.tier == "lower_confidence":
+            continue
+        if not allow_adjacency and _is_topic_adjacent(result):
+            continue
+        return index
+    return None
+
+
+def _is_topic_adjacent(result: ArticleFetchResult) -> bool:
+    payload_metadata = result.payload.metadata if isinstance(result.payload.metadata, dict) else {}
+    result_metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return bool(payload_metadata.get("topic_adjacency") or result_metadata.get("topic_adjacency"))
 
 
 def build_issue_snapshot(
@@ -88,6 +109,10 @@ def _prepare_result(
     topic_signal = _has_ai_topic_signal(result)
     if topic_signal and result.payload.source_type == "gmail_link":
         relevance = min(1.0, relevance + 0.18)
+    # Low-yield adjacency items are kept but scored below core matches so the ranker
+    # cannot promote a tangential story above on-topic coverage.
+    if _is_topic_adjacent(result):
+        relevance *= 0.6
 
     if _is_approved_podcast_latest(result):
         tier = "main"
