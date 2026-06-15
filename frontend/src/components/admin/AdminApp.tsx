@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent } from "react";
 import { api } from "../../lib/api";
 import { loadSessionValue } from "../../lib/drafts";
+import { BrandMark } from "../BrandMark";
 import { adminTabOptions, defaultBriefControls, defaultPipelineLimits, defaultSourceSelectionForControls, sourceOptions } from "../../lib/types";
 import type { AdminStatus, AdminTab, BriefControlsDraft, BriefSettingsResponse, Digest, DigestLibraryItem, EditingDigestDraft, EditingRecencyDraft, Exploration, ExplorationIssue, ExplorationLibraryItem, GmailAllowlistResponse, LibraryResponse, ModelRouteDraft, PipelineLimitsDraft, SchedulePreset, SortMode, SourceStatusResponse, TopicProfileResponse } from "../../lib/types";
 import {
@@ -21,6 +22,7 @@ import {
   formatMetricNumber,
   formatRate,
   formatSourceSelection,
+  buildAttentionIssues,
   hasActionableBuildIssues,
   lookbackHoursForBuild,
   openPath,
@@ -108,6 +110,14 @@ export function AdminApp() {
   const [explorationsExpanded, setExplorationsExpanded] = useState(() => loadSessionValue("admin.explorationsExpanded", false));
   const [deletedExpanded, setDeletedExpanded] = useState(() => loadSessionValue("admin.deletedExpanded", false));
   const [digestsExpanded, setDigestsExpanded] = useState(() => loadSessionValue("admin.digestsExpanded", false));
+  const [expandedIssueRows, setExpandedIssueRows] = useState<Set<string>>(() => new Set());
+  const toggleIssueRow = (explorationId: string) =>
+    setExpandedIssueRows((current) => {
+      const next = new Set(current);
+      if (next.has(explorationId)) next.delete(explorationId);
+      else next.add(explorationId);
+      return next;
+    });
 
   const topicById = useMemo(
     () => new Map([...library.topics, ...library.digests].map((topic) => [topic.topic_id, topic])),
@@ -963,7 +973,7 @@ export function AdminApp() {
     <main className="admin-page">
       <header className="admin-header">
         <a className="brand-lockup" href="/">
-          <span className="brand-mark">◔</span>
+          <BrandMark />
           <span>Dispatch Admin</span>
         </a>
         <a className="secondary-action" href="/">Back to Dispatch</a>
@@ -1280,10 +1290,23 @@ export function AdminApp() {
                     </small>
                     {isModelDegraded(item.exploration) ? (
                       <p className="warning-text">Built with AI issues.</p>
-                    ) : hasActionableBuildIssues(item.exploration) && item.exploration.status === "complete" ? (
-                      <p className="warning-text">Built with source issues.</p>
                     ) : hasActionableBuildIssues(item.exploration) ? (
-                      <p className="warning-text">Source issues detected so far.</p>
+                      <div className="warning-text source-issues-disclosure">
+                        <DisclosureButton
+                          expanded={expandedIssueRows.has(item.exploration.exploration_id)}
+                          label={item.exploration.status === "complete" ? "Built with source issues." : "Source issues detected so far."}
+                          onToggle={() => toggleIssueRow(item.exploration.exploration_id)}
+                        />
+                        {expandedIssueRows.has(item.exploration.exploration_id) ? (
+                          <ul className="source-issue-list">
+                            {buildAttentionIssues(item.exploration).map((issue) => (
+                              <li key={`${issue.source_name}-${issue.reason}`}>
+                                <strong>{issue.source_name}:</strong> {issue.reason}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </div>
                     ) : null}
                     {isScheduledDigest ? (
                       <p className="muted">Scheduled digest · {formatStage(item.topic?.schedule ?? "daily")}</p>

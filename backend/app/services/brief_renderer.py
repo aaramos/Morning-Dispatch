@@ -1,4 +1,4 @@
-"""Brief HTML rendering for Morning Dispatch issues.
+"""Brief HTML rendering for Dispatch issues.
 
 Extracted verbatim from backend/app/db/database.py (M2 split). Everything here
 takes plain payload/result data and returns HTML strings; nothing touches the
@@ -850,6 +850,16 @@ def render_ingested_issue(
       border-bottom: 1px solid var(--line);
     }}
     .newsletter h3 {{ font-size: 1.05rem; line-height: 1.2; margin-top: 6px; font-weight: 700; }}
+    .newsletter .read-more {{
+      display: inline-block;
+      margin-top: 6px;
+      font-size: .85rem;
+      font-weight: 600;
+      color: #2f6df0;
+      color: var(--accent, #2f6df0);
+      text-decoration: none;
+    }}
+    .newsletter .read-more:hover {{ text-decoration: underline; }}
     .feedback-controls {{ margin-top: 14px; }}
     .feedback-controls button {{
       border: 1px solid #eaeae5;
@@ -1054,7 +1064,7 @@ def render_ingested_issue(
 <body>
   <main class="brief-shell">
     <header class="brief-masthead">
-      <div class="masthead-brand">Morning Dispatch</div>
+      <div class="masthead-brand">Dispatch</div>
       <div class="masthead-meta">{masthead_meta}</div>
     </header>
     <section class="brief-header">
@@ -1141,11 +1151,18 @@ def _render_newsletter_item(payload: NormalizedPayload) -> str:
     if _weak_newsletter_snippet(snippet):
         return ""
     published = _format_issue_date(payload.published_at)
+    read_more_html = ""
+    source_url = _safe_web_url(payload.original_url)
+    if snippet.endswith("...") and source_url and not _is_gmail_message_url(source_url):
+        read_more_html = (
+            f'\n        <a class="read-more" href="{escape(source_url, quote=True)}" '
+            'target="_blank" rel="noopener noreferrer">Read more →</a>'
+        )
     return f"""
       <article class="newsletter">
         <div class="meta">{escape(sender)} · {escape(published)}</div>
         <h3>{escape(subject)}</h3>
-        <p>{escape(snippet)}</p>
+        <p>{escape(snippet)}</p>{read_more_html}
       </article>
     """
 
@@ -3117,7 +3134,7 @@ def _format_article_date(value: str | None) -> str:
 
 
 def _render_generated_footer(generated_at: str | None) -> str:
-    return f'<footer class="issue-footer">Morning Dispatch · {escape(_format_generated_timestamp(generated_at))}</footer>'
+    return f'<footer class="issue-footer">Dispatch · {escape(_format_generated_timestamp(generated_at))}</footer>'
 
 
 def _render_masthead_meta(generated_at: str | None, lookback_hours: int, stats: dict[str, Any] | None = None) -> str:

@@ -130,7 +130,7 @@ def send_latest_digest(digest_id: str, *, recipient_email: str | None = None) ->
 
     try:
         service = _gmail_service()
-        subject = str(issue.get("title") or digest.get("name") or "Morning Dispatch")
+        subject = str(issue.get("title") or digest.get("name") or "Dispatch")
         html = _email_html(database.clean_issue_html_for_display(str(issue.get("html_content") or "")))
         plain_text = _html_to_text(html)
         raw_message = _build_raw_message(
@@ -227,7 +227,7 @@ def _build_raw_message(*, recipient: str, subject: str, html: str, plain_text: s
     message = EmailMessage()
     message["To"] = recipient
     message["Subject"] = subject
-    message.set_content(plain_text or "Morning Dispatch brief is attached below.")
+    message.set_content(plain_text or "Dispatch brief is attached below.")
     message.add_alternative(html, subtype="html")
     return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
 
@@ -528,8 +528,8 @@ def _default_recipient_email() -> str:
 def _exploration_subject(profile: dict[str, Any]) -> str:
     scope = str(profile.get("scope") or profile.get("statement") or "").strip()
     if scope:
-        return f"Morning Dispatch Explore: {scope[:100]}"
-    return "Morning Dispatch Explore"
+        return f"Dispatch Explore: {scope[:100]}"
+    return "Dispatch Explore"
 
 
 def _token_scopes(settings: Settings) -> set[str]:

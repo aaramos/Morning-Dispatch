@@ -1,6 +1,6 @@
-# Morning Dispatch 📰
+# Dispatch 📰
 
-Morning Dispatch is a local-first personal intelligence app. It aggregates Gmail newsletters, web searches, YouTube videos, local text collections, and market ticker snapshots, transforming them into an AI-curated, newspaper-style HTML digest served on localhost and delivered directly to your inbox.
+Dispatch is a local-first personal intelligence app. It aggregates Gmail newsletters, web searches, YouTube videos, local text collections, and market ticker snapshots, transforming them into an AI-curated, newspaper-style HTML digest served on localhost and delivered directly to your inbox.
 
 ---
 

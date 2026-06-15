@@ -42,6 +42,7 @@ import {
   saveActiveConversationDraft,
   saveInterestDraft,
 } from "./lib/drafts";
+import { BrandMark } from "./components/BrandMark";
 import { BuildStartingPanel } from "./components/BuildStartingPanel";
 import { ScheduledDeliveryAlert } from "./components/ScheduledDeliveryAlert";
 import { AdminApp } from "./components/admin/AdminApp";
@@ -1724,7 +1725,7 @@ function DispatchApp() {
       <section className="dispatch-frame">
         <header className="dispatch-header">
           <a className="brand-lockup" href="/" aria-label="Dispatch home">
-            <span className="brand-mark">◔</span>
+            <BrandMark />
             <span>Dispatch</span>
           </a>
           <span className="release-stamp">{releaseStamp(adminStatus)}</span>

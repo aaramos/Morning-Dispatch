@@ -717,7 +717,7 @@ def gmail_oauth_callback(request: Request) -> HTMLResponse:
           <head><meta charset="utf-8" /><title>Gmail Connected</title></head>
           <body style="font-family: system-ui; padding: 32px;">
             <h1>Gmail connected</h1>
-            <p>Morning Dispatch saved the Gmail token. You can return to the admin screen.</p>
+            <p>Dispatch saved the Gmail token. You can return to the admin screen.</p>
             <p><a href="/admin">Back to Admin</a></p>
           </body>
         </html>

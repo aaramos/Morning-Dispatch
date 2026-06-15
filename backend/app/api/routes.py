@@ -940,7 +940,7 @@ def _empty_brief_html(message: str) -> str:
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Morning Dispatch</title>
+    <title>Dispatch</title>
     <style>
       body {{
         margin: 0;
@@ -964,7 +964,7 @@ def _empty_brief_html(message: str) -> str:
   </head>
   <body>
     <main>
-      <h1>Morning Dispatch</h1>
+      <h1>Dispatch</h1>
       <p>{message}</p>
     </main>
   </body>
