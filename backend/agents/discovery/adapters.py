@@ -21,12 +21,18 @@ from backend.agents.digestor.podcast import fetch_podcast_episodes, fetch_subscr
 
 # --- Reddit rate limiting / 429 hardening ---
 # Unauthenticated www.reddit.com aggressively rate-limits and returns HTTP 429.
-# Every reddit.com GET is funneled through a process-wide min-interval limiter so
-# we never burst, and a throttled request is retried a few times with exponential
-# backoff that honors any Retry-After header. This turns transient throttling into
-# a short delay instead of zeroing out the whole Reddit lane.
-_REDDIT_MIN_INTERVAL_SECONDS = 1.0
+# Reddit only tolerates ~10 requests/min for anonymous clients (OAuth raises it to
+# 60), so every reddit.com GET is funneled through a process-wide min-interval
+# limiter that paces well under that ceiling, and a throttled request is retried a
+# few times with exponential backoff that honors any Retry-After header. This turns
+# transient throttling into a short delay instead of zeroing out the whole Reddit lane.
+_REDDIT_MIN_INTERVAL_SECONDS = 3.0
 _REDDIT_MAX_RETRIES = 3
+# Internal wall-clock budget for the Reddit lane, kept under the adapter's cost-profile
+# timeout so it returns whatever it has gathered (partial) instead of being hard-killed
+# all-or-nothing by the runner's asyncio.wait_for once the slower request pacing means
+# a run can no longer finish every fetch in time.
+_REDDIT_OVERALL_BUDGET_SECONDS = 80.0
 _reddit_rate_lock: asyncio.Lock | None = None
 _reddit_rate_lock_loop: asyncio.AbstractEventLoop | None = None
 _reddit_last_request_at = 0.0
@@ -1153,15 +1159,17 @@ def _trim_query(value: str, *, limit: int = 340) -> str:
 
 class RedditSourceAdapter:
     name = "reddit"
-    cost_profile = CostProfile(label="medium", timeout_seconds=45.0)
+    cost_profile = CostProfile(label="medium", timeout_seconds=120.0)
     good_for = ("community_discussion", "emerging_topics", "expert_opinion", "broad_discovery")
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
+        lane_started_at = time.monotonic()
         settings = get_settings()
         min_post_score = getattr(settings, "reddit_min_post_score", 10)
         limit_per_source = getattr(settings, "reddit_fetch_limit_per_source", 25)
         comments_limit = getattr(settings, "reddit_fetch_comments", 10)
-        request_timeout = getattr(settings, "reddit_request_timeout_seconds", 10.0)
+        max_comment_fetches = max(0, getattr(settings, "reddit_max_comment_fetches", 12))
+        request_timeout = getattr(settings, "reddit_request_timeout_seconds", 15.0)
         reddit_candidate_cap = min(max(1, context.candidate_limit), 100)
 
         # 1. Expand search targets
@@ -1490,15 +1498,26 @@ class RedditSourceAdapter:
             raw_candidates.sort(key=lambda x: x["prelim_score"], reverse=True)
             target_raw = raw_candidates[:reddit_candidate_cap]
 
-            # Fetch comments in parallel for selected posts. Each fetch also returns the
-            # thread's recency date so search-path posts (which arrive without one) get a
-            # usable timestamp instead of being dropped downstream as "undated".
-            comment_tasks = [fetch_comments_for_post(client, post["subreddit"], post["id"]) for post in target_raw]
-            comments_results = await asyncio.gather(*comment_tasks)
+            # Comment fetches are the dominant request-volume cost: one paced reddit.com
+            # GET each, serialized by the global rate limiter. Cap how many we attempt and
+            # stop once the lane's wall-clock budget is nearly spent, so the gentler request
+            # velocity returns partial (top-ranked) results instead of timing out to zero.
+            # Posts beyond the cap are still kept as candidates, just without comment text.
+            elapsed = time.monotonic() - lane_started_at
+            if elapsed >= _REDDIT_OVERALL_BUDGET_SECONDS:
+                commented_posts: list[dict[str, Any]] = []
+            else:
+                commented_posts = target_raw[:max_comment_fetches]
+            comment_tasks = [fetch_comments_for_post(client, post["subreddit"], post["id"]) for post in commented_posts]
+            comments_results = await asyncio.gather(*comment_tasks) if comment_tasks else []
+            comments_by_post = {
+                id(post): result for post, result in zip(commented_posts, comments_results, strict=True)
+            }
 
             # Build Candidates list
             candidates = []
-            for post, (comments_str, thread_date) in zip(target_raw, comments_results, strict=True):
+            for post in target_raw:
+                comments_str, thread_date = comments_by_post.get(id(post), ("", None))
                 if not post["published_at"] and thread_date:
                     post["published_at"] = thread_date
                 # Construct NormalizedPayload
@@ -1611,12 +1630,24 @@ class RedditSourceAdapter:
                     remaining_capacity = max(0, reddit_candidate_cap - len(candidates))
                     ref_target_raw = ref_raw_candidates[:remaining_capacity]
 
-                    # Fetch comments for refined
-                    ref_comment_tasks = [fetch_comments_for_post(client, post["subreddit"], post["id"]) for post in ref_target_raw]
-                    ref_comments_results = await asyncio.gather(*ref_comment_tasks)
+                    # Fetch comments for refined, honoring the same lane budget: only spend
+                    # the comment-fetch allowance left over from the first pass, and stop if
+                    # the wall-clock budget is already spent. Uncommented posts are still kept.
+                    ref_elapsed = time.monotonic() - lane_started_at
+                    ref_comment_budget = max(0, max_comment_fetches - len(commented_posts))
+                    if ref_elapsed >= _REDDIT_OVERALL_BUDGET_SECONDS:
+                        ref_commented_posts: list[dict[str, Any]] = []
+                    else:
+                        ref_commented_posts = ref_target_raw[:ref_comment_budget]
+                    ref_comment_tasks = [fetch_comments_for_post(client, post["subreddit"], post["id"]) for post in ref_commented_posts]
+                    ref_comments_results = await asyncio.gather(*ref_comment_tasks) if ref_comment_tasks else []
+                    ref_comments_by_post = {
+                        id(post): result for post, result in zip(ref_commented_posts, ref_comments_results, strict=True)
+                    }
 
                     # Build refined candidates
-                    for post, (comments_str, thread_date) in zip(ref_target_raw, ref_comments_results, strict=True):
+                    for post in ref_target_raw:
+                        comments_str, thread_date = ref_comments_by_post.get(id(post), ("", None))
                         original_url = post["discussion_url"] if post["is_self"] else post["url"]
                         if not post["published_at"] and thread_date:
                             post["published_at"] = thread_date
