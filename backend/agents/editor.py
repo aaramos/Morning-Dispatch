@@ -10,6 +10,28 @@ from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.librarian.date_text import parse_iso_datetime
 from backend.agents.librarian.text_utils import fallback_text, keyword_set
 
+def _topic_vocab_helpers() -> tuple[Any, Any]:
+    """Lazily import the SAME topic vocabulary + overlap logic the discovery
+    topic-relevance gate uses (and the adjacency tag the gate-loosening chip writes
+    onto candidates), so the ranker judges topical fit against one shared standard
+    rather than a fresh heuristic. Imported lazily because importing the discovery
+    package at module load creates a circular import (db -> editor).
+
+    Coordination hook: if a unified core+adjacent vocabulary module is later
+    extracted from discovery.runner, repoint these two names at it.
+    """
+    from backend.agents.discovery.runner import (
+        _overlap_passes as topic_overlap_passes,
+        filter_topic_tokens,
+    )
+
+    return filter_topic_tokens, topic_overlap_passes
+
+# Topic tiers used to order the issue and to gate the lead slot. Lower is better.
+_TOPIC_RANK_CORE = 0       # overlaps the confirmed core topic
+_TOPIC_RANK_ADJACENT = 1   # kept only via tangential/adjacent vocabulary, or unjudgeable
+_TOPIC_RANK_OFF = 2        # judgeable but off the confirmed topic
+
 
 def prepare_issue_articles(digest: dict[str, Any], results: Iterable[ArticleFetchResult]) -> list[ArticleFetchResult]:
     interest = str(digest.get("interest") or "")
@@ -17,6 +39,7 @@ def prepare_issue_articles(digest: dict[str, Any], results: Iterable[ArticleFetc
     exclusion_phrases = _exclusion_phrases(interest)
     threshold = float(digest.get("threshold") or 0.45)
     recency_weighting = str(digest.get("recency_weighting") or "recent")
+    core_tokens = core_topic_tokens(interest)
     prepared: list[ArticleFetchResult] = []
 
     for result in results:
@@ -27,27 +50,105 @@ def prepare_issue_articles(digest: dict[str, Any], results: Iterable[ArticleFetc
             continue
         prepared.append(enriched)
 
-    prepared.sort(key=lambda r: _sort_key(r, recency_weighting), reverse=True)
-    # Tangential (low-yield adjacency) items must never claim the lead when a
-    # core-topic story exists. Prefer a non-adjacency lead; fall back to an adjacency
-    # item only when nothing core is lead-eligible.
-    lead_index = _lead_index(prepared, allow_adjacency=False)
-    if lead_index is None:
-        lead_index = _lead_index(prepared, allow_adjacency=True)
+    # Last line of defense against off-topic content that slipped past the earlier
+    # gates: when ANY core-topic story made it through, genuinely off-topic items
+    # must never outrank on-topic coverage. Drop them when the topic is specific
+    # enough to trust the verdict; otherwise hard-deprioritize them.
+    has_core = any(_topic_rank(r, core_tokens) == _TOPIC_RANK_CORE for r in prepared)
+    if has_core:
+        specific = _topic_is_specific(core_tokens)
+        retained: list[ArticleFetchResult] = []
+        for result in prepared:
+            if _topic_rank(result, core_tokens) != _TOPIC_RANK_OFF:
+                retained.append(result)
+            elif specific:
+                continue  # drop: a specific topic gives us confidence it is off-topic
+            else:
+                retained.append(replace(result, tier="lower_confidence"))
+        prepared = retained
+
+    # Order by topical fit FIRST (core -> adjacent -> off-topic), newsworthiness
+    # SECOND. The lead is then chosen deterministically from the top of this order.
+    prepared.sort(
+        key=lambda r: (-_topic_rank(r, core_tokens), _sort_key(r, recency_weighting)),
+        reverse=True,
+    )
+
+    # The lead MUST be a core-topic match whenever one exists — a degraded model or
+    # a high-scoring off-topic item can never claim the lead slot.
+    lead_index = _lead_index(prepared, core_tokens, require_core=has_core)
+    if lead_index is None and not has_core:
+        # No core-topic candidate at all: prefer non-adjacency, then anything.
+        lead_index = _lead_index(prepared, core_tokens, require_core=False, allow_adjacency=False)
+        if lead_index is None:
+            lead_index = _lead_index(prepared, core_tokens, require_core=False, allow_adjacency=True)
     if lead_index is not None:
         result = prepared[lead_index]
         prepared[lead_index] = replace(result, tier="lead", section=result.section or "Lead Story")
     return prepared
 
 
-def _lead_index(prepared: list[ArticleFetchResult], *, allow_adjacency: bool) -> int | None:
+def _lead_index(
+    prepared: list[ArticleFetchResult],
+    core_tokens: set[str],
+    *,
+    require_core: bool,
+    allow_adjacency: bool = True,
+) -> int | None:
     for index, result in enumerate(prepared):
         if not result.fetched or result.tier == "lower_confidence":
             continue
-        if not allow_adjacency and _is_topic_adjacent(result):
+        rank = _topic_rank(result, core_tokens)
+        if require_core and rank != _TOPIC_RANK_CORE:
+            continue
+        if not allow_adjacency and rank != _TOPIC_RANK_CORE:
             continue
         return index
     return None
+
+
+def core_topic_tokens(interest: str) -> set[str]:
+    """Confirmed-topic vocabulary, filtered through the SAME shared stoplist the
+    discovery topic gate uses so both stages judge fit against one standard."""
+    filter_topic_tokens, _ = _topic_vocab_helpers()
+    return filter_topic_tokens(keyword_set(_positive_interest_text(interest)))
+
+
+def _topic_is_specific(core_tokens: set[str]) -> bool:
+    # Mirrors discovery.runner._topic_gate_is_specific: a topic with enough distinct
+    # tokens is specific enough to trust an "off-topic" verdict and drop the item.
+    return len(core_tokens) >= 5
+
+
+def _result_topic_text(result: ArticleFetchResult) -> str:
+    return " ".join(
+        str(value or "")
+        for value in (result.title, result.text, result.excerpt, result.editor_summary, fallback_text(result))
+    )
+
+
+def result_is_core_topic(result: ArticleFetchResult, core_tokens: set[str]) -> bool:
+    return _topic_rank(result, core_tokens) == _TOPIC_RANK_CORE
+
+
+def result_is_off_topic(result: ArticleFetchResult, core_tokens: set[str]) -> bool:
+    return _topic_rank(result, core_tokens) == _TOPIC_RANK_OFF
+
+
+def _topic_rank(result: ArticleFetchResult, core_tokens: set[str]) -> int:
+    # No usable topic vocabulary -> cannot judge; treat everything as core so the
+    # ranker falls back to pure newsworthiness ordering (prior behavior).
+    if not core_tokens:
+        return _TOPIC_RANK_CORE
+    _, topic_overlap_passes = _topic_vocab_helpers()
+    candidate_tokens = keyword_set(_result_topic_text(result))
+    if not candidate_tokens:
+        return _TOPIC_RANK_ADJACENT
+    if topic_overlap_passes(candidate_tokens & core_tokens, core_tokens):
+        return _TOPIC_RANK_CORE
+    if _is_topic_adjacent(result):
+        return _TOPIC_RANK_ADJACENT
+    return _TOPIC_RANK_OFF
 
 
 def _is_topic_adjacent(result: ArticleFetchResult) -> bool:
@@ -109,6 +210,10 @@ def _prepare_result(
     topic_signal = _has_ai_topic_signal(result)
     if topic_signal and result.payload.source_type == "gmail_link":
         relevance = min(1.0, relevance + 0.18)
+    # Low-yield adjacency items are kept but deliberately scored below core matches
+    # so the ranker cannot promote a tangential story above on-topic coverage.
+    if _is_topic_adjacent(result):
+        relevance *= 0.6
 
     if _is_approved_podcast_latest(result):
         tier = "main"
@@ -329,15 +434,11 @@ def _top_sections(results: list[ArticleFetchResult]) -> list[str]:
     return [section for section, _count in counts.most_common(4)] or ["noteworthy stories"]
 
 
-def _sort_key(result: ArticleFetchResult, recency_weighting: str = "recent") -> tuple[float, float, float, float]:
+def _sort_key(result: ArticleFetchResult, recency_weighting: str = "recent") -> tuple[float, float, float]:
     fetched = 1.0 if result.fetched else 0.0
-    # Tangential (low-yield adjacency) items rank strictly below core matches:
-    # this tier dominates the score so an adjacent story can never sort above a
-    # core one regardless of its standalone newsworthiness.
-    core_tier = 0.0 if _is_topic_adjacent(result) else 1.0
     score = result.relevance_score if result.relevance_score is not None else 0.0
     recency = _recency_score(result.payload.published_at, recency_weighting)
-    return (fetched, core_tier, score, recency)
+    return (fetched, score, recency)
 
 
 AI_SECTION_MARKERS = (

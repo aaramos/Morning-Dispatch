@@ -4,9 +4,40 @@ import os
 os.environ["MORNING_DISPATCH_LIBRARIAN_USE_MODEL"] = "false"
 
 from backend.agents.digestor.base import NormalizedPayload
-from backend.agents.editor import build_issue_snapshot, prepare_issue_articles
+from backend.agents.editor import (
+    build_issue_snapshot,
+    core_topic_tokens,
+    prepare_issue_articles,
+    result_is_core_topic,
+    result_is_off_topic,
+)
+from backend.agents.editorial_decisions import _apply_editorial_payload, _normalize_lead
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.librarian.enrichment import enrich_article, enrich_articles
+
+
+# A concrete, multi-token confirmed topic so the core-vocabulary gate is "specific"
+# (>= 5 tokens) and trusts its off-topic verdict enough to drop slipped-through items.
+RV_INTEREST = (
+    "Recreational vehicle travel, motorhome camping, campground reviews, "
+    "RV maintenance, and road trip route planning"
+)
+
+_RV_LEAD_TEXT = (
+    "A new motorhome from Winnebago targets full-time RV travel with a lighter "
+    "chassis and better campground hookups. Owners report easier maintenance on "
+    "long road trips and the recreational vehicle market is growing."
+)
+_RV_SECOND_TEXT = (
+    "Campground reservations for recreational vehicle travelers are surging this "
+    "summer. A guide to the best RV camping routes and road trip stops, plus "
+    "maintenance tips for motorhome owners."
+)
+_LUNG_CANCER_TEXT = (
+    "A dramatic new lung cancer immunotherapy trial reports a stunning survival "
+    "breakthrough. Oncologists call the tumor-shrinking results among the most "
+    "newsworthy in years for patients facing terminal diagnoses."
+)
 
 
 def result(title: str, text: str, *, link_score: float = 0.9) -> ArticleFetchResult:
@@ -64,6 +95,81 @@ def test_prepare_issue_articles_scores_summarizes_and_marks_lead():
     assert prepared[0].relevance_score and prepared[0].relevance_score >= 0.45
     assert "local AI workflows" in prepared[0].editor_summary
     assert prepared[0].section in {"Models & Labs", "Agents & Developer Tools", "AI Infrastructure"}
+
+
+def test_core_topic_helpers_classify_rv_vs_lung_cancer():
+    core_tokens = core_topic_tokens(RV_INTEREST)
+    assert len(core_tokens) >= 5  # specific enough to trust an off-topic verdict
+
+    rv = enrich_article(result("Winnebago debuts a lighter motorhome", _RV_LEAD_TEXT))
+    lung = enrich_article(result("Lung cancer immunotherapy breakthrough", _LUNG_CANCER_TEXT))
+
+    assert result_is_core_topic(rv, core_tokens) is True
+    assert result_is_off_topic(rv, core_tokens) is False
+    assert result_is_core_topic(lung, core_tokens) is False
+    assert result_is_off_topic(lung, core_tokens) is True
+
+
+def test_prepare_issue_articles_lead_is_on_topic_not_drama():
+    # Even though the lung-cancer story is the most "newsworthy"/dramatic and has
+    # the strongest link_score, it must never lead an RV brief or outrank RV items.
+    prepared = prepare_issue_articles(
+        {"interest": RV_INTEREST, "threshold": 0.45},
+        asyncio.run(
+            enrich_articles(
+                [
+                    result("Lung cancer immunotherapy breakthrough", _LUNG_CANCER_TEXT, link_score=0.99),
+                    result("Winnebago debuts a lighter motorhome", _RV_LEAD_TEXT, link_score=0.80),
+                    result("Best RV campground routes this summer", _RV_SECOND_TEXT, link_score=0.78),
+                ]
+            )
+        ),
+    )
+
+    titles = [item.title for item in prepared]
+    # The off-topic, specific-topic mismatch is dropped as the last line of defense.
+    assert "Lung cancer immunotherapy breakthrough" not in titles
+    assert prepared, "RV items must survive"
+    assert prepared[0].tier == "lead"
+    assert "RV" in prepared[0].title or "motorhome" in prepared[0].title.lower()
+    # No surviving item is off-topic, so nothing can outrank the RV coverage.
+    core_tokens = core_topic_tokens(RV_INTEREST)
+    assert all(not result_is_off_topic(item, core_tokens) for item in prepared)
+
+
+def test_apply_editorial_payload_rejects_off_topic_lead_vote():
+    # A degraded/permissive model votes the dramatic off-topic story as the lead.
+    core_tokens = core_topic_tokens(RV_INTEREST)
+    rv = enrich_article(result("Winnebago debuts a lighter motorhome", _RV_LEAD_TEXT))
+    lung = enrich_article(result("Lung cancer immunotherapy breakthrough", _LUNG_CANCER_TEXT))
+    results = [lung, rv]
+
+    payload = {
+        "decisions": [
+            {"index": 0, "decision": "lead", "confidence": 0.99, "reason": "dramatic"},
+            {"index": 1, "decision": "include", "confidence": 0.6},
+        ]
+    }
+    updated, _decisions = _apply_editorial_payload(
+        results, payload, model_name="test-model", core_tokens=core_tokens
+    )
+
+    lung_after = next(r for r in updated if r.title.startswith("Lung cancer"))
+    assert lung_after.tier != "lead"  # off-topic lead vote was ignored
+
+
+def test_normalize_lead_prefers_core_topic_over_first_item():
+    # The auto-lead fallback must skip a non-core first item when core coverage exists.
+    core_tokens = core_topic_tokens(RV_INTEREST)
+    lung = enrich_article(result("Lung cancer immunotherapy breakthrough", _LUNG_CANCER_TEXT))
+    rv = enrich_article(result("Winnebago debuts a lighter motorhome", _RV_LEAD_TEXT))
+
+    normalized = _normalize_lead([lung, rv], core_tokens)
+
+    lung_after = next(r for r in normalized if r.title.startswith("Lung cancer"))
+    rv_after = next(r for r in normalized if r.title.startswith("Winnebago"))
+    assert lung_after.tier != "lead"
+    assert rv_after.tier == "lead"
 
 
 def test_build_issue_snapshot_uses_ranked_articles():
@@ -304,69 +410,3 @@ def test_prepare_issue_articles_keeps_clear_ai_product_story():
 
     assert len(prepared) == 1
     assert prepared[0].tier == "lead"
-
-
-def _ranked(title: str, text: str, *, adjacent: bool = False, link_score: float = 0.9) -> ArticleFetchResult:
-    metadata = {"link_text": title, "parent_subject": "RV newsletter"}
-    if adjacent:
-        metadata["topic_adjacency"] = True
-    payload = NormalizedPayload(
-        source_type="gmail_link",
-        source_name="newsletter@example.com",
-        original_url=f"https://example.com/articles/{title.lower().replace(' ', '-')}",
-        published_at="2026-05-20T12:00:00+00:00",
-        metadata=metadata,
-    )
-    return ArticleFetchResult(
-        payload=payload,
-        original_url=str(payload.original_url),
-        final_url=str(payload.original_url),
-        canonical_url=str(payload.original_url),
-        title=title,
-        text=text,
-        excerpt=text[:240],
-        domain="example.com",
-        status="fetched",
-        link_score=link_score,
-    )
-
-
-def test_adjacent_item_never_outranks_or_leads_core_topic():
-    # The pipeline folds adjacent vocabulary into the ranking interest so tangential
-    # items clear the threshold; the topic_adjacency tag keeps them below core.
-    digest = {
-        "interest": (
-            "Recreational vehicle motorhome travel, ownership, and road trips "
-            "camping towing campgrounds awning accessories"
-        ),
-        "threshold": 0.45,
-    }
-    core = _ranked(
-        "New motorhome models for road trips",
-        (
-            "The recreational vehicle maker unveiled new motorhome models built for long road trips. "
-            "Owners get upgraded touring features for recreational vehicle travel and motorhome ownership."
-        ),
-    )
-    # An adjacent (tangential) item flagged topic_adjacency, with deliberately strong
-    # standalone wording so it would outrank core if the tag were ignored.
-    adjacent = _ranked(
-        "Best camping gear and towing accessories",
-        (
-            "A complete guide to camping gear, towing accessories, and campgrounds. "
-            "Camping accessories, towing setups, awning picks, and campgrounds reviewed in depth."
-        ),
-        adjacent=True,
-    )
-
-    prepared = prepare_issue_articles(digest, [adjacent, core])
-    by_url = {r.title: r for r in prepared}
-
-    # The core story leads; the adjacent item never claims the lead slot.
-    lead = next(r for r in prepared if r.tier == "lead")
-    assert lead.title == core.title
-    assert by_url[adjacent.title].tier != "lead"
-    # Adjacent ranks strictly below core in the ordered list.
-    assert prepared.index(by_url[core.title]) < prepared.index(by_url[adjacent.title])
-    # And it is scored lower by the adjacency penalty.
-    assert by_url[adjacent.title].relevance_score < by_url[core.title].relevance_score

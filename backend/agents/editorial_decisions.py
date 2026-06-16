@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from collections.abc import Callable
 
 from backend.agents.agentic import AgentDecision
+from backend.agents.editor import core_topic_tokens, result_is_core_topic
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import ModelClient, ModelClientError
 from backend.agents.model.metrics import record_model_response_metric
@@ -36,11 +37,12 @@ async def apply_editorial_decisions(
     max_candidates: int | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision]]:
     result_list = list(results)
+    core_tokens = core_topic_tokens(str(digest.get("interest") or ""))
     candidates = _candidate_indexes(result_list, max_candidates=max_candidates)
     if not candidates:
         return result_list, []
     if len(candidates) < 2:
-        return _normalize_lead(result_list), [
+        return _normalize_lead(result_list, core_tokens), [
             AgentDecision(
                 agent="editorial",
                 target="issue",
@@ -56,7 +58,7 @@ async def apply_editorial_decisions(
     client = model_client if model_client is not None else ModelClient.from_settings(settings)
     model_name = _client_model_name(client, settings.librarian_model) if client is not None else settings.librarian_model
     if client is None:
-        return _normalize_lead(result_list), [
+        return _normalize_lead(result_list, core_tokens), [
             AgentDecision(
                 agent="editorial",
                 target="issue",
@@ -94,7 +96,7 @@ async def apply_editorial_decisions(
                 on_token=reasoning_callback,
             )
     except ModelClientError as exc:
-        return _normalize_lead(result_list), [
+        return _normalize_lead(result_list, core_tokens), [
             AgentDecision(
                 agent="editorial",
                 target="issue",
@@ -106,7 +108,7 @@ async def apply_editorial_decisions(
             )
         ]
 
-    updated, decisions = _apply_editorial_payload(result_list, payload, model_name=model_name)
+    updated, decisions = _apply_editorial_payload(result_list, payload, model_name=model_name, core_tokens=core_tokens)
     decisions.append(
         AgentDecision(
             agent="editorial",
@@ -119,7 +121,7 @@ async def apply_editorial_decisions(
             metadata={"candidate_count": len(candidates), "elapsed_ms": _elapsed_ms(started_at)},
         )
     )
-    return _normalize_lead(updated), decisions
+    return _normalize_lead(updated, core_tokens), decisions
 
 
 def _candidate_indexes(results: list[ArticleFetchResult], *, max_candidates: int | None = None) -> list[int]:
@@ -142,16 +144,23 @@ def _candidate_limit(value: int | None, maximum: int) -> int:
 
 def _editorial_prompt(digest: dict[str, Any], results: list[ArticleFetchResult], indexes: list[int]) -> str:
     records = [_article_record(index, results[index]) for index in indexes]
+    confirmed_topic = str(digest.get("interest") or "").strip()
     return json.dumps(
         {
             "digest_name": digest.get("name"),
             "digest_interest": digest.get("interest"),
+            "confirmed_topic": confirmed_topic,
             "coverage_goal": _coverage_goal(digest.get("content_limits")),
             "instructions": (
+                f"The reader's confirmed topic is: {confirmed_topic!r}. "
+                "Rank and select by TOPICAL FIT FIRST, newsworthiness SECOND. "
+                "The lead story MUST be squarely on the confirmed topic — never lead with an "
+                "item that is merely dramatic, tragic, or attention-grabbing but off-topic. "
+                "Order on-topic items ahead of tangential ones, and tangential ahead of unrelated. "
                 "Choose the best Morning Dispatch issue from these already-approved sources. "
-                "Prefer concrete, timely, high-signal AI/product/infrastructure stories. "
+                "Among on-topic candidates, prefer concrete, timely, high-signal stories. "
                 "Aim for the requested visible story count when enough relevant candidates exist. "
-                "Reject ads, signup pages, thin promos, duplicates, and weakly related items. "
+                "Reject ads, signup pages, thin promos, duplicates, and off-topic items. "
                 "Return JSON only."
             ),
             "allowed_decisions": ["lead", "include", "exclude", "demote"],
@@ -208,12 +217,22 @@ def _apply_editorial_payload(
     payload: dict[str, Any],
     *,
     model_name: str,
+    core_tokens: set[str] | None = None,
 ) -> tuple[list[ArticleFetchResult], list[AgentDecision]]:
     updated = list(results)
+    core_tokens = core_tokens or set()
     decisions: list[AgentDecision] = []
     raw_decisions = payload.get("decisions", [])
     if not isinstance(raw_decisions, list):
         return updated, decisions
+
+    # Enforce the lead-is-on-topic rule in code so a degraded or permissive model
+    # cannot promote an off-topic story to the lead: when ANY core-topic candidate
+    # exists, a model "lead" vote for a non-core item is ignored.
+    has_core = any(
+        result.tier != "dropped" and result.fetched and result_is_core_topic(result, core_tokens)
+        for result in updated
+    )
 
     lead_index: int | None = None
     lead_confidence = -1.0
@@ -244,11 +263,15 @@ def _apply_editorial_payload(
             updated[index] = replace(result, tier=next_tier, section=section or result.section)
             action = "include"
         elif decision == "lead" and result.fetched and confidence > lead_confidence:
-            lead_index = index
-            lead_confidence = confidence
-            if section:
-                updated[index] = replace(result, section=section)
-            action = "candidate_lead"
+            if has_core and not result_is_core_topic(result, core_tokens):
+                # Reject an off-topic lead vote; record it as a no-op for traceability.
+                action = "lead_rejected_off_topic"
+            else:
+                lead_index = index
+                lead_confidence = confidence
+                if section:
+                    updated[index] = replace(result, section=section)
+                action = "candidate_lead"
         elif section and result.tier != "dropped":
             updated[index] = replace(result, section=section)
             action = "section_update"
@@ -276,15 +299,26 @@ def _apply_editorial_payload(
     return updated, decisions
 
 
-def _normalize_lead(results: list[ArticleFetchResult]) -> list[ArticleFetchResult]:
-    lead_seen = False
+def _normalize_lead(
+    results: list[ArticleFetchResult],
+    core_tokens: set[str] | None = None,
+) -> list[ArticleFetchResult]:
+    core_tokens = core_tokens or set()
     normalized = list(results)
+    # When core-topic coverage exists, the auto-lead must be a core-topic item; a
+    # non-core item can never claim the lead slot even as a deterministic fallback.
+    require_core = any(
+        result.tier != "dropped" and result.fetched and result_is_core_topic(result, core_tokens)
+        for result in normalized
+    )
+    lead_seen = False
     for index, result in enumerate(normalized):
         if result.tier == "dropped" or not result.fetched:
             if result.tier == "lead":
                 normalized[index] = replace(result, tier="lower_confidence")
             continue
-        if not lead_seen:
+        lead_eligible = not require_core or result_is_core_topic(result, core_tokens)
+        if not lead_seen and lead_eligible:
             normalized[index] = replace(result, tier="lead")
             lead_seen = True
         elif result.tier == "lead":
