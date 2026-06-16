@@ -7,6 +7,7 @@ import pytest
 from backend.agents.discovery.types import DiscoveryResult, Candidate, NormalizedPayload
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.app.services.reporting import (
+    _post_fetch_gate_rejection_reason,
     compile_reporting_data,
     save_reporting_log,
     get_or_build_reporting_log,
@@ -325,3 +326,46 @@ def test_reconstruct_reporting_data_fallback(tmp_path):
         
         assert "https://recency.com/1" in cand_map
         assert cand_map["https://recency.com/1"]["stages"]["recency"] == "Outside lookback window."
+
+
+def _result_with_metadata(metadata: dict) -> ArticleFetchResult:
+    payload = NormalizedPayload(
+        id="cand",
+        source_type="web_search",
+        source_name="Google",
+        original_url="https://example.com/x",
+        raw_text="",
+        metadata={},
+    )
+    return ArticleFetchResult(
+        payload=payload,
+        original_url="https://example.com/x",
+        final_url="https://example.com/x",
+        title="Title",
+        text="",
+        excerpt="",
+        domain="example.com",
+        status="fetched",
+        tier="dropped",
+        metadata=metadata,
+    )
+
+
+def test_post_fetch_gate_rejection_reason_prefers_must_have_then_topic_relevance():
+    # Must-have reason wins when both gates rejected the item.
+    both = _result_with_metadata(
+        {
+            "must_have_rejection_reason": "Missing required term: tariffs.",
+            "topic_relevance_rejection_reason": "Off topic after fetch.",
+        }
+    )
+    assert _post_fetch_gate_rejection_reason(both) == "Missing required term: tariffs."
+
+    # Falls back to the topic-relevance reason when there is no must-have reason.
+    topic_only = _result_with_metadata(
+        {"topic_relevance_rejection_reason": "Off topic after fetch."}
+    )
+    assert _post_fetch_gate_rejection_reason(topic_only) == "Off topic after fetch."
+
+    # Neither gate rejected → empty string so callers fall back to their own reason.
+    assert _post_fetch_gate_rejection_reason(_result_with_metadata({})) == ""

@@ -145,6 +145,19 @@ def _must_have_reporting_stage(result: ArticleFetchResult, *, fallback: str) -> 
     return fallback
 
 
+def _post_fetch_gate_rejection_reason(result: ArticleFetchResult) -> str:
+    """Reason for an item dropped by a post-fetch gate (must-have or topic relevance).
+
+    Prefers the must-have reason, then the post-fetch topic-relevance reason, so the
+    lifecycle log shows the real cause instead of the generic quality-audit fallback.
+    """
+    must_have = _must_have_rejection_reason(result)
+    if must_have:
+        return must_have
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return str(metadata.get("topic_relevance_rejection_reason") or "").strip()
+
+
 def _source_issue_adapter(source_name: Any) -> str:
     normalized = re.sub(r"\s+", " ", str(source_name or "").strip().lower())
     return SOURCE_ISSUE_ADAPTERS.get(normalized, normalized.replace(" ", "_"))
@@ -360,7 +373,7 @@ def compile_reporting_data(
             if any(cand["stages"].values()):
                 continue
             if result.status != "fetched":
-                reason = _must_have_rejection_reason(result) or result.error or f"Failed to fetch content ({result.status})."
+                reason = _post_fetch_gate_rejection_reason(result) or result.error or f"Failed to fetch content ({result.status})."
                 set_reason_at_stage(cand_id, _must_have_reporting_stage(result, fallback="fetch"), reason)
 
     # 6. Add pre-ranking quality audit drops
@@ -375,7 +388,7 @@ def compile_reporting_data(
         if any(cand["stages"].values()):
             continue
 
-        must_have_reason = _must_have_rejection_reason(result)
+        must_have_reason = _post_fetch_gate_rejection_reason(result)
         if must_have_reason:
             set_reason_at_stage(cand_id, _must_have_reporting_stage(result, fallback="fetch"), must_have_reason)
         elif cand_id not in enriched_ids:
