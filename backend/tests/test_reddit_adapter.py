@@ -110,6 +110,11 @@ def test_reddit_adapter_query_rss_success(monkeypatch, tmp_path) -> None:
     from backend.agents.discovery.web_search import SearchHit
     
     async def mock_search_web(query: str, limit: int, days: int | None = None) -> list[SearchHit]:
+        # Subreddit-scoped discovery search comes up empty, so the reddit.com RSS
+        # fallback is exercised for r/python; the free-form query search returns a
+        # thread hit from r/LocalLLaMA.
+        if "/r/python" in query:
+            return []
         return [
             SearchHit(
                 provider="test",
@@ -120,7 +125,7 @@ def test_reddit_adapter_query_rss_success(monkeypatch, tmp_path) -> None:
                 published_at=datetime.now(UTC).isoformat(timespec="seconds"),
             )
         ]
-        
+
     class FakeResponse:
         def __init__(self, status_code: int, text_content: str) -> None:
             self.status_code = status_code
@@ -467,8 +472,21 @@ def test_reddit_adapter_fetches_new_rss_when_bounded(monkeypatch, tmp_path) -> N
             search_queries=[]
         )
 
+    async def mock_search_web(*_args, **_kwargs) -> list:
+        # Web-search discovery yields nothing, so the reddit.com RSS fallback runs and
+        # both hot and new listings are fetched within the recency window.
+        return []
+
+    async def mock_refine_queries(*args, **kwargs) -> list[str]:
+        return []
+
     monkeypatch.setattr(adapters, "expand_reddit_targets", mock_expand)
+    monkeypatch.setattr(adapters, "search_web", mock_search_web)
     monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        "backend.agents.discovery.query_refiner.refine_queries_for_adapter",
+        mock_refine_queries,
+    )
 
     adapter = RedditSourceAdapter()
     try:
