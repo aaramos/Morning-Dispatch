@@ -89,6 +89,13 @@ from backend.agents.discovery.markets import markets_available
 logger = logging.getLogger(__name__)
 
 _EXPLORE_MODEL_REFINEMENT_LIMIT = 250
+# Hard wall-clock ceiling on the rank-stage model refinement (per-article librarian
+# enrichment + foreign translation). That stage fans out one model call per article,
+# serialized by the model server's concurrency=1; a foreign-heavy or contended run can
+# otherwise grind for an hour-plus with no timeout and no cancel checkpoint, jamming the
+# single-worker build queue behind a zombie run. On timeout we proceed with the already
+# deterministically-enriched articles so the build completes instead of hanging.
+_RANK_REFINE_BUDGET_SECONDS = 900
 _REPORTING_LOG_TIMEOUT_SECONDS = 20
 # Placeholder publishing duration rendered into the brief's stats sidebar so the
 # brief can be rendered ONCE: the real duration is only known after rendering, and
@@ -1760,17 +1767,29 @@ async def _run_digest_core(
             limit=settings.librarian_model_max_items,
         )
 
-    article_results = await refine_ranked_articles_with_model(
-        ranked_articles,
-        model_client=librarian_client,
-        model_max_items=min(
-            settings.librarian_model_max_items,
-            pipeline_limits["model_refinement_items"],
-            _EXPLORE_MODEL_REFINEMENT_LIMIT,
-        ),
-        inference_run_id=inference_run_id,
-        metrics_mode="single",
-    )
+    try:
+        article_results = await asyncio.wait_for(
+            refine_ranked_articles_with_model(
+                ranked_articles,
+                model_client=librarian_client,
+                model_max_items=min(
+                    settings.librarian_model_max_items,
+                    pipeline_limits["model_refinement_items"],
+                    _EXPLORE_MODEL_REFINEMENT_LIMIT,
+                ),
+                inference_run_id=inference_run_id,
+                metrics_mode="single",
+            ),
+            timeout=_RANK_REFINE_BUDGET_SECONDS,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.warning(
+            "Rank-stage model refinement exceeded %ss; proceeding with the "
+            "deterministically-enriched articles so the build cannot jam the queue.",
+            _RANK_REFINE_BUDGET_SECONDS,
+        )
+        article_results = list(ranked_articles)
+        progress["built_with_issues"] = True
     _set_pipeline_stage(progress, "audit", "running")
     progress["source_audit"] = {
         "status": "running",

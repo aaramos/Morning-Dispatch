@@ -201,6 +201,47 @@ def test_librarian_skips_cached_model_enrichment():
     assert enriched[0].enrichment_source == "model_cache"
 
 
+def test_refine_caps_foreign_translations_per_run():
+    """Foreign translation is the dominant per-article cost; the rank stage caps how
+    many run per build so a foreign-heavy run can't serialize into an hour-long, queue-
+    jamming stage. Over-budget foreign articles are kept (untranslated), not dropped."""
+    from backend.agents.librarian.enrichment import MAX_FOREIGN_TRANSLATIONS_PER_RUN
+
+    class CountingTranslator:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete_json(self, **_kwargs):
+            self.calls += 1
+            return {
+                "can_translate": True,
+                "confidence": "high",
+                "detected_language": "ko",
+                "title_en": "English title",
+                "body_en": "English body translation.",
+                "drop_reason": "",
+            }
+
+    client = CountingTranslator()
+    # More foreign articles than the per-run translation budget. model_max_items=0 so no
+    # non-foreign librarian enrichment confounds the count.
+    foreign = [
+        replace(
+            article_result(title=f"Foreign article {i}"),
+            payload=replace(article_result().payload, source_type="foreign_web"),
+        )
+        for i in range(MAX_FOREIGN_TRANSLATIONS_PER_RUN + 3)
+    ]
+
+    enriched = asyncio.run(
+        refine_ranked_articles_with_model(foreign, model_client=client, model_max_items=0)
+    )
+
+    # Exactly the budget is translated; the rest are returned untranslated, not dropped.
+    assert client.calls == MAX_FOREIGN_TRANSLATIONS_PER_RUN
+    assert len(enriched) == MAX_FOREIGN_TRANSLATIONS_PER_RUN + 3
+
+
 def test_librarian_records_inference_metric(monkeypatch, tmp_path):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))

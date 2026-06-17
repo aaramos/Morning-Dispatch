@@ -24,6 +24,13 @@ MAX_MODEL_TEXT_CHARS = 2500
 # so a selected article is delivered in full English rather than a partial pass.
 FOREIGN_TRANSLATION_BODY_CHARS = 16000
 FOREIGN_TRANSLATION_MAX_TOKENS = 4000
+# Cap how many foreign-language articles get a full (body-in, up to 4000-token-out)
+# translation per build. Translation is the dominant per-article model cost and is
+# serialized by the model server's concurrency=1, so an uncapped foreign-heavy run
+# can stretch the rank stage to an hour+. The cap keeps the top-ranked foreign items;
+# lower-ranked foreign articles are kept untranslated (demoted) rather than blocking
+# the build. The rank stage also has an overall wall-clock budget as a final backstop.
+MAX_FOREIGN_TRANSLATIONS_PER_RUN = 12
 logger = logging.getLogger(__name__)
 MODEL_ENRICHED_SOURCES = {"model", "model_cache", "model_fallback"}
 
@@ -278,10 +285,21 @@ async def refine_ranked_articles_with_model(
     settings = get_settings()
     client = model_client if model_client is not None else ModelClient.from_settings(settings)
     max_items = settings.librarian_model_max_items if model_max_items is None else max(0, model_max_items)
+    translations_used = 0
     tasks = []
     for index, result in enumerate(result_list):
         needs_translation = _needs_metadata_translation(result)
-        use_client = client is not None and (index < max_items or needs_translation)
+        if needs_translation:
+            # Foreign translation is the dominant per-article cost and is serialized by
+            # the model server. Cap how many we run per build (top-ranked first, since
+            # result_list is already ranked) so one foreign-heavy run can't grind the
+            # rank stage for an hour and jam the queue. Over-budget foreign items are
+            # kept untranslated rather than translated.
+            use_client = client is not None and translations_used < MAX_FOREIGN_TRANSLATIONS_PER_RUN
+            if use_client:
+                translations_used += 1
+        else:
+            use_client = client is not None and index < max_items
         tasks.append(
             enrich_article_with_model(
                 result,
