@@ -27,7 +27,17 @@ from backend.agents.digestor.podcast import fetch_podcast_episodes, fetch_subscr
 # few times with exponential backoff that honors any Retry-After header. This turns
 # transient throttling into a short delay instead of zeroing out the whole Reddit lane.
 _REDDIT_MIN_INTERVAL_SECONDS = 3.0
-_REDDIT_MAX_RETRIES = 3
+# Fail fast on 429. Reddit discovery now goes through the web-search provider first
+# (see RedditSourceAdapter.query), so the few reddit.com requests that remain — an
+# RSS-listing fallback and top-thread comment enrichment — must not burn the lane
+# budget retrying. One quick retry rides out a transient throttle; beyond that we
+# bail and let the caller fall back to web search or continue without comments.
+_REDDIT_MAX_RETRIES = 1
+# Hard ceiling on any single 429 backoff sleep. Reddit routinely returns a large
+# Retry-After (60-600s) with a 429; honoring it unbounded would park the lane until
+# the adapter's 120s wait_for hard-kills it, zeroing every result. Cap it so one
+# throttled request fails fast instead of taking the whole Reddit lane down with it.
+_REDDIT_MAX_BACKOFF_SECONDS = 8.0
 # Internal wall-clock budget for the Reddit lane, kept under the adapter's cost-profile
 # timeout so it returns whatever it has gathered (partial) instead of being hard-killed
 # all-or-nothing by the runner's asyncio.wait_for once the slower request pacing means
@@ -88,6 +98,8 @@ async def _reddit_rate_limited_get(client, url, *, headers, timeout):
                 delay = max(delay, float(retry_after))
             except ValueError:
                 pass
+        # Bound the sleep: a large Retry-After must not stall the lane past its budget.
+        delay = min(delay, _REDDIT_MAX_BACKOFF_SECONDS)
         delay += random.uniform(0.0, 0.75)  # jitter to de-sync concurrent waiters
         logger.info("Reddit 429 for %s; backing off %.1fs (attempt %d)", url, delay, attempt + 1)
         await asyncio.sleep(delay)
@@ -1327,29 +1339,36 @@ class RedditSourceAdapter:
                 logger.warning("Exception searching Reddit via web for query %s: %s", q, exc)
                 return []
 
-        async def fetch_subreddit_with_backfill(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
-            """Fetch a subreddit's listing, falling back to web search when it comes up empty.
+        async def fetch_subreddit_listing(client: httpx.AsyncClient, sub: str) -> list[dict[str, Any]]:
+            """Discover a subreddit's recent topical threads, web-search-first.
 
-            reddit.com's unauthenticated RSS is frequently 429-throttled, which zeroes a
-            subreddit's listing. When that happens we recover the subreddit's recent
-            threads through the configured web-search providers (Tavily/Brave/Serper),
-            scoping the query to that subreddit so results stay on-topic.
+            Unauthenticated reddit.com RSS is capped near ~10 req/min and aggressively
+            429-throttles, which used to zero the whole Reddit lane. So discovery now
+            runs through the configured web-search providers (Serper/Tavily/Brave),
+            scoped to the subreddit — those are not subject to reddit.com's anonymous
+            rate wall. reddit.com's own RSS listing is used only as a fallback, when web
+            search comes up empty AND the lane still has request budget, so a throttled
+            reddit.com can no longer take the Reddit lane down with it.
             """
-            posts = await fetch_subreddit_rss(client, sub)
-            if posts or not backfill_query:
+            posts: list[dict[str, Any]] = []
+            if backfill_query:
+                try:
+                    logger.info("Discovering r/%s via web search", sub)
+                    hits = await search_web(
+                        f"site:reddit.com/r/{sub} {backfill_query}", limit=10, days=days
+                    )
+                    posts = _hits_to_posts(hits, fallback_sub=sub)
+                except Exception as exc:
+                    logger.warning("Web search for r/%s failed: %s", sub, exc)
+                    posts = []
+            if posts:
                 return posts
-            try:
-                logger.info("Reddit listing for r/%s empty; backfilling via web search", sub)
-                hits = await search_web(
-                    f"site:reddit.com/r/{sub} {backfill_query}", limit=10, days=days
-                )
-                recovered = _hits_to_posts(hits, fallback_sub=sub)
-                if recovered:
-                    logger.info("Reddit web backfill recovered %d threads for r/%s", len(recovered), sub)
-                return recovered
-            except Exception as exc:
-                logger.warning("Exception backfilling r/%s via web search: %s", sub, exc)
+            # Fallback: reddit.com's rate-limited RSS listing, only while the lane still
+            # has wall-clock budget for a (possibly throttled) request.
+            if time.monotonic() - lane_started_at >= _REDDIT_OVERALL_BUDGET_SECONDS:
                 return []
+            logger.info("Web search empty for r/%s; falling back to reddit.com RSS", sub)
+            return await fetch_subreddit_rss(client, sub)
 
         async def fetch_comments_for_post(client: httpx.AsyncClient, sub: str, post_id: str) -> tuple[str, str | None]:
             """Fetch a post's comment thread and derive a recency date for it.
@@ -1436,7 +1455,7 @@ class RedditSourceAdapter:
         # individual reddit requests pass a stricter per-request timeout.
         reddit_timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
         async with httpx.AsyncClient(http2=True, follow_redirects=True, timeout=reddit_timeout) as client:
-            subreddit_tasks = [fetch_subreddit_with_backfill(client, sub) for sub in targets.subreddits]
+            subreddit_tasks = [fetch_subreddit_listing(client, sub) for sub in targets.subreddits]
             search_tasks = [fetch_search_via_web(q) for q in targets.search_queries]
 
             results = await asyncio.gather(*(subreddit_tasks + search_tasks), return_exceptions=True)
