@@ -77,10 +77,16 @@ class Settings:
     reddit_max_subreddits: int = 8
     reddit_fetch_limit_per_source: int = 25
     reddit_fetch_comments: int = 10
-    reddit_request_timeout_seconds: float = 10.0
-    # Minimum spacing between outbound reddit.com requests; throttles bursts that
-    # trigger HTTP 429. Set to 0 to disable (e.g. in tests with mocked HTTP).
-    reddit_min_request_interval_seconds: float = 1.0
+    # Max number of posts we fetch comment threads for per run. Comment fetches are
+    # the dominant request-volume cost (one paced reddit.com GET each), so capping
+    # them keeps the lane inside its time budget at the gentler request velocity.
+    reddit_max_comment_fetches: int = 12
+    reddit_request_timeout_seconds: float = 15.0
+    # Minimum spacing between outbound reddit.com requests. Unauthenticated reddit.com
+    # tolerates only ~10 requests/min before returning HTTP 429, so requests are paced
+    # well under 60/min. Lower it (or set 0 in tests with mocked HTTP) at your own risk;
+    # raise toward 6.0 for strict single-IP compliance. Set to 0 to disable.
+    reddit_min_request_interval_seconds: float = 3.0
     google_news_max_queries: int = 5
     google_news_request_delay_seconds: float = 3.0
     google_news_request_timeout_seconds: float = 10.0
@@ -383,8 +389,9 @@ def _build_settings() -> Settings:
         reddit_max_subreddits=_int_from_env("MORNING_DISPATCH_REDDIT_MAX_SUBREDDITS", 8),
         reddit_fetch_limit_per_source=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_LIMIT_PER_SOURCE", 25),
         reddit_fetch_comments=_int_from_env("MORNING_DISPATCH_REDDIT_FETCH_COMMENTS", 10),
-        reddit_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_REQUEST_TIMEOUT_SECONDS", 10.0),
-        reddit_min_request_interval_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_MIN_REQUEST_INTERVAL_SECONDS", 1.0),
+        reddit_max_comment_fetches=_int_from_env("MORNING_DISPATCH_REDDIT_MAX_COMMENT_FETCHES", 12),
+        reddit_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_REQUEST_TIMEOUT_SECONDS", 15.0),
+        reddit_min_request_interval_seconds=_float_from_env("MORNING_DISPATCH_REDDIT_MIN_REQUEST_INTERVAL_SECONDS", 3.0),
         google_news_max_queries=_int_from_env("MORNING_DISPATCH_GOOGLE_NEWS_MAX_QUERIES", 5),
         google_news_request_delay_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_DELAY_SECONDS", 3.0),
         google_news_request_timeout_seconds=_float_from_env("MORNING_DISPATCH_GOOGLE_NEWS_REQUEST_TIMEOUT_SECONDS", 10.0),
