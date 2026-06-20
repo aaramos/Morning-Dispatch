@@ -119,30 +119,85 @@ def month_from_token(token: str) -> int | None:
     return _LOCALE_MONTHS.get(_fold(token))
 
 
-_RELATIVE_RE = re.compile(
-    r"\b(\d{1,3})\s*(second|minute|hour|day|week|month|year)s?\s+ago\b",
+# Relative-date units across the locales providers actually emit (en + the
+# major foreign-media languages). Keys are accent-folded/lowercased to match
+# `_fold` output; sub-day units resolve to "today" (0 days).
+_RELATIVE_UNIT_DAYS = {
+    # second / minute / hour -> same day
+    "second": 0, "seconds": 0, "segundo": 0, "segundos": 0, "seconde": 0, "secondes": 0,
+    "sekunde": 0, "sekunden": 0, "secondo": 0, "secondi": 0,
+    "minute": 0, "minutes": 0, "minuto": 0, "minutos": 0, "minuten": 0, "minuti": 0, "minuut": 0,
+    "hour": 0, "hours": 0, "hora": 0, "horas": 0, "heure": 0, "heures": 0,
+    "stunde": 0, "stunden": 0, "ora": 0, "ore": 0, "uur": 0, "uren": 0,
+    # day
+    "day": 1, "days": 1, "dia": 1, "dias": 1, "jour": 1, "jours": 1, "tag": 1, "tage": 1,
+    "tagen": 1, "giorno": 1, "giorni": 1, "dag": 1, "dagen": 1, "gun": 1,
+    # week
+    "week": 7, "weeks": 7, "semana": 7, "semanas": 7, "semaine": 7, "semaines": 7,
+    "woche": 7, "wochen": 7, "settimana": 7, "settimane": 7, "weken": 7, "hafta": 7,
+    # month
+    "month": 30, "months": 30, "mes": 30, "meses": 30, "mois": 30, "monat": 30, "monate": 30,
+    "monaten": 30, "mese": 30, "mesi": 30, "maand": 30, "maanden": 30, "ay": 30,
+    # year
+    "year": 365, "years": 365, "ano": 365, "anos": 365, "an": 365, "ans": 365, "annee": 365,
+    "annees": 365, "jahr": 365, "jahre": 365, "jahren": 365, "anno": 365, "anni": 365,
+    "jaar": 365, "jaren": 365, "yil": 365,
+}
+# Unit captured as a generic word, then folded and looked up above (keeps the
+# regex accent-agnostic). Two marker styles: prefix ("hace/há/il y a/vor 3 días")
+# and suffix ("3 days ago", "3 giorni fa", "3 dagen geleden", "3 dias atrás").
+_REL_UNIT_WORD = r"([^\W\d_]{2,12})"
+_REL_PREFIX_RE = re.compile(
+    rf"\b(?:hace|h[aá]|il\s+y\s+a|vor)\s+(\d{{1,3}})\s+{_REL_UNIT_WORD}\b",
     re.IGNORECASE,
 )
-_RELATIVE_UNIT_DAYS = {
-    "second": 0,
-    "minute": 0,
-    "hour": 0,
-    "day": 1,
-    "week": 7,
-    "month": 30,
-    "year": 365,
+_REL_SUFFIX_RE = re.compile(
+    rf"\b(\d{{1,3}})\s+{_REL_UNIT_WORD}\s+(?:ago|fa|geleden|atr[aá]s|önce)\b",
+    re.IGNORECASE,
+)
+
+
+# CJK relative dates: NUMBER + unit char(s) + 前 (ja/zh "ago") or 전 (ko "ago"),
+# e.g. "4 日前" (ja, 4 days), "3일 전" (ko), "4天前" (zh). Multi-char units are
+# listed before their single-char prefixes so the alternation matches greedily.
+_REL_CJK_UNIT_DAYS = {
+    "時間": 0, "小时": 0, "小時": 0, "시간": 0, "時": 0, "分": 0, "분": 0, "秒": 0, "초": 0,
+    "日": 1, "天": 1, "일": 1,
+    "週間": 7, "星期": 7, "週": 7, "周": 7, "주": 7,
+    "か月": 30, "ヶ月": 30, "カ月": 30, "个月": 30, "個月": 30, "개월": 30, "月": 30,
+    "年": 365, "년": 365,
 }
+_REL_CJK_RE = re.compile(
+    r"(\d{1,3})\s*"
+    r"(時間|小时|小時|시간|週間|星期|か月|ヶ月|カ月|个月|個月|개월|日|天|일|週|周|주|月|年|년|分|분|時|秒|초)"
+    r"\s*[前전]"
+)
 
 
 def parse_relative_date(text: str, *, now: datetime | None = None) -> date | None:
-    """Resolve English relative phrasing like "10 months ago" to an absolute date."""
-    match = _RELATIVE_RE.search(str(text or ""))
+    """Resolve relative phrasing to an absolute date across supported locales.
+
+    Handles English ("10 months ago") plus the foreign-media languages providers
+    emit — e.g. "hace 3 días" (es), "há 2 dias"/"3 dias atrás" (pt), "il y a 2
+    jours" (fr), "vor 3 Tagen" (de), "3 giorni fa" (it), "3 dagen geleden" (nl),
+    and CJK forms "4 日前" (ja), "3일 전" (ko), "4天前" (zh).
+    """
+    s = str(text or "")
+    reference = (now or datetime.now(UTC)).date()
+
+    cjk = _REL_CJK_RE.search(s)
+    if cjk:
+        days_per_unit = _REL_CJK_UNIT_DAYS.get(cjk.group(2))
+        if days_per_unit is not None:
+            return reference - timedelta(days=int(cjk.group(1)) * days_per_unit)
+
+    match = _REL_SUFFIX_RE.search(s) or _REL_PREFIX_RE.search(s)
     if not match:
         return None
-    amount = int(match.group(1))
-    unit = match.group(2).lower()
-    reference = (now or datetime.now(UTC)).date()
-    return reference - timedelta(days=amount * _RELATIVE_UNIT_DAYS[unit])
+    days_per_unit = _RELATIVE_UNIT_DAYS.get(_fold(match.group(2)))
+    if days_per_unit is None:
+        return None
+    return reference - timedelta(days=int(match.group(1)) * days_per_unit)
 
 
 # Token allows Unicode letters so accented month names are captured, then folded.

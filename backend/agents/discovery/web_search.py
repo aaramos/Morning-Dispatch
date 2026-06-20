@@ -394,6 +394,10 @@ def _providers_from_config() -> list[WebSearchBackend]:
             key = str(settings.web_search_serper_api_key or _read_secret(settings, "serper", "api_key") or "").strip()
             if key:
                 add(SerperBackend(api_key=key))
+        if "tavily" not in seen:
+            key = str(settings.web_search_tavily_api_key or _read_secret(settings, "tavily", "api_key") or "").strip()
+            if key:
+                add(TavilyBackend(api_key=key))
         if "brave" not in seen:
             key = str(settings.web_search_brave_api_key or _read_secret(settings, "brave", "api_key") or "").strip()
             if key:
@@ -464,9 +468,14 @@ def _brave_search_language(language: str | None) -> str:
 
 def _serpapi_language(language: str | None) -> dict[str, str]:
     code = str(language or "").strip().lower()
-    if code not in {"ko", "ja", "zh", "de", "fr", "nl", "es"}:
+    if code not in {
+        "ko", "ja", "zh", "de", "fr", "nl", "es",
+        "pt", "it", "pl", "tr", "hi", "id", "vi", "ar", "ru", "sv", "no", "da", "fi", "cs", "el", "he", "th",
+    }:
         return {}
     params = {"hl": code}
+    # `lr=lang_xx` is Google's language restrict; zh maps to multiple lr codes
+    # (lang_zh-CN/lang_zh-TW) so we let hl drive it rather than over-restrict.
     if code != "zh":
         params["lr"] = f"lang_{code}"
     return params
@@ -491,8 +500,16 @@ async def search_web(
     language: str | None = None,
     days: int | None = None,
     vertical: str = "auto",
+    prefer_provider: str | None = None,
 ) -> list[SearchHit]:
     providers = _providers_from_config()
+    if prefer_provider:
+        # Try the preferred provider first while keeping the rest as fallbacks
+        # (stable sort preserves the configured order). Used by the foreign-media
+        # lane to lead with a language-aware index (serper/Google honors hl=xx and
+        # returns native-language results) and fall back to Tavily when it's
+        # unavailable (e.g. out of credits → it errors and the loop moves on).
+        providers = sorted(providers, key=lambda b: 0 if b.name == prefer_provider else 1)
     errors: list[str] = []
     any_success = False
     for backend in providers:

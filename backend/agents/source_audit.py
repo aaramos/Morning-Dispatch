@@ -18,6 +18,11 @@ from backend.app.core.prompt_loader import load_prompt
 
 MAX_AUDIT_CANDIDATES = 150
 RETRY_AUDIT_CANDIDATES = 4
+# Audit candidates in small batches so each model response fits within its token
+# budget. One all-candidates call overflows max_tokens on large pools, truncating
+# the decision JSON mid-array (parse_error) and forcing the whole audit into a
+# deterministic fallback.
+AUDIT_CHUNK_SIZE = 20
 URL_DATE_RE = re.compile(r"/(20\d{2})[/-](0?[1-9]|1[0-2])(?:[/-](0?[1-9]|[12]\d|3[01]))?")
 SYNDICATED_AGGREGATOR_DOMAINS = {
     "finance.yahoo.com",
@@ -94,59 +99,148 @@ async def apply_source_audit(
             )
         ], {**summary, "status": "fallback"}
 
-    try:
-        payload, elapsed_ms = await _complete_audit(
-            client,
-            profile,
-            result_list,
-            candidates,
-            lookback_hours=lookback_hours,
-            inference_run_id=inference_run_id,
-            article_id="source_audit_batch",
-            max_tokens=1600,
-            compact=False,
-            low_yield=low_yield,
-        )
-    except ModelClientError as first_error:
-        retry_candidates = _retry_candidate_indexes(result_list, candidates)
-        if retry_candidates:
-            try:
-                payload, elapsed_ms = await _complete_audit(
-                    client,
-                    profile,
-                    result_list,
-                    retry_candidates,
-                    lookback_hours=lookback_hours,
-                    inference_run_id=inference_run_id,
-                    article_id="source_audit_retry",
-                    max_tokens=900,
-                    compact=True,
-                    low_yield=low_yield,
-                )
-            except ModelClientError as retry_error:
-                return _heuristic_audit_result(
-                    profile,
-                    result_list,
-                    candidates,
-                    model_name=model_name,
-                    error=retry_error,
-                    first_error=first_error,
-                )
-        else:
-            return _heuristic_audit_result(profile, result_list, candidates, model_name=model_name, error=first_error)
-
     cutoff = None
     if lookback_hours is not None:
         cutoff = datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))
+
+    # Audit in small chunks so each model response stays within its token budget;
+    # a single failing chunk degrades on its own instead of sinking the rest.
+    profile_record = _profile_record(profile)
+    chunks = [candidates[i : i + AUDIT_CHUNK_SIZE] for i in range(0, len(candidates), AUDIT_CHUNK_SIZE)]
+    merged_decisions: list[dict[str, Any]] = []
+    summaries: list[str] = []
+    total_elapsed_ms = 0
+    model_ok_count = 0
+    fallback_indexes: list[int] = []
+    first_error: ModelClientError | None = None
+    last_error: ModelClientError | None = None
+
+    for position, chunk in enumerate(chunks):
+        try:
+            payload, elapsed_ms = await _audit_chunk_with_retry(
+                client,
+                profile,
+                result_list,
+                chunk,
+                lookback_hours=lookback_hours,
+                inference_run_id=inference_run_id,
+                low_yield=low_yield,
+                position=position,
+            )
+        except ModelClientError as error:
+            first_error = first_error or error
+            last_error = error
+            # Deterministic fallback for just this chunk, so chunks that succeeded
+            # are not discarded because one chunk's model call could not complete.
+            for index in chunk:
+                reason = _heuristic_exclusion_reason(profile_record, result_list[index])
+                if reason:
+                    merged_decisions.append(
+                        {
+                            "index": index,
+                            "decision": "exclude",
+                            "confidence": 0.72,
+                            "constraint_failures": ["source_quality"],
+                            "reason": reason,
+                            "mode": "deterministic_fallback",
+                        }
+                    )
+            fallback_indexes.extend(chunk)
+            continue
+        total_elapsed_ms += elapsed_ms
+        model_ok_count += 1
+        raw = payload.get("decisions") if isinstance(payload, dict) else None
+        if isinstance(raw, list):
+            merged_decisions.extend(raw)
+        chunk_summary = payload.get("summary") if isinstance(payload, dict) else None
+        if chunk_summary:
+            summaries.append(str(chunk_summary))
+
+    if model_ok_count == 0:
+        # Every chunk failed — fall back exactly as the old all-or-nothing path did.
+        error = last_error or ModelClientError("Source audit could not complete", status="model_error")
+        return _heuristic_audit_result(
+            profile,
+            result_list,
+            candidates,
+            model_name=model_name,
+            error=error,
+            first_error=first_error if first_error is not error else None,
+        )
+
+    merged_payload = {"decisions": merged_decisions, "summary": " ".join(summaries)[:500]}
     updated, decisions, audit_summary = _apply_audit_payload(
         result_list,
-        payload,
+        merged_payload,
         model_name=model_name,
-        elapsed_ms=elapsed_ms,
+        elapsed_ms=total_elapsed_ms,
         cutoff=cutoff,
     )
     audit_summary["candidate_count"] = len(candidates)
+    if fallback_indexes:
+        # Some chunks fell back to deterministic checks; report a partial audit
+        # instead of overclaiming a clean model pass.
+        audit_summary["status"] = "partial"
+        audit_summary["fallback_count"] = len(fallback_indexes)
+        note = (
+            f"{len(fallback_indexes)} item(s) used deterministic source-quality checks "
+            "because a model chunk could not complete."
+        )
+        existing = str(audit_summary.get("summary") or "").strip()
+        audit_summary["summary"] = f"{existing} {note}".strip()
     return updated, decisions, audit_summary
+
+
+def _audit_max_tokens(candidate_count: int) -> int:
+    """Token budget sized to the chunk so the decision JSON is not truncated."""
+    return max(900, min(4096, 256 + 130 * max(1, candidate_count)))
+
+
+async def _audit_chunk_with_retry(
+    client: ModelClient,
+    profile: TopicProfile | dict[str, Any],
+    result_list: list[ArticleFetchResult],
+    chunk: list[int],
+    *,
+    lookback_hours: int | None,
+    inference_run_id: str | None,
+    low_yield: bool,
+    position: int,
+) -> tuple[dict[str, Any], int]:
+    """Audit one chunk; on a model error retry the chunk's top items compactly.
+
+    Raises ModelClientError when both the full and retry attempts fail, so the
+    caller can apply a deterministic fallback for just this chunk.
+    """
+    try:
+        return await _complete_audit(
+            client,
+            profile,
+            result_list,
+            chunk,
+            lookback_hours=lookback_hours,
+            inference_run_id=inference_run_id,
+            article_id=f"source_audit_batch_{position}",
+            max_tokens=_audit_max_tokens(len(chunk)),
+            compact=False,
+            low_yield=low_yield,
+        )
+    except ModelClientError:
+        retry_candidates = _retry_candidate_indexes(result_list, chunk)
+        if not retry_candidates:
+            raise
+        return await _complete_audit(
+            client,
+            profile,
+            result_list,
+            retry_candidates,
+            lookback_hours=lookback_hours,
+            inference_run_id=inference_run_id,
+            article_id=f"source_audit_retry_{position}",
+            max_tokens=_audit_max_tokens(len(retry_candidates)),
+            compact=True,
+            low_yield=low_yield,
+        )
 
 
 async def _complete_audit(
@@ -519,6 +613,7 @@ def _audit_prompt(
             "user_request": profile_record["statement"],
             "refined_scope": profile_record["scope"],
             "search_strategy": profile_record["search_queries"],
+            "current_date": datetime.now(UTC).date().isoformat(),
             "source_scope": source_scope,
             "coverage_goal": _coverage_goal(profile),
             "exclusions": profile_record["exclusions"],
@@ -530,6 +625,9 @@ def _audit_prompt(
                 "Treat provider dates as weak evidence when URL paths, snippets, or article text imply an older date. "
                 "When published_at is null/empty, infer the publication date from the dateline, body text, "
                 "url_date_hint, metadata_dates, or snippet and report it in resolved_published_date as ISO YYYY-MM-DD. "
+                "When the only date evidence is relative phrasing (e.g. 'submitted 3 days ago', '5 hours ago', "
+                "'last week', 'yesterday') — common on Reddit and forum listings — compute the absolute date by "
+                "subtracting it from current_date and report that ISO date in resolved_published_date. "
                 "Also report resolved_published_date when published_at IS set but the article text, dateline, "
                 "url_date_hint, or snippet shows a credibly OLDER date that conflicts with it — in that case set "
                 "date_conflict to true and explain the evidence in date_conflict_reason. Prefer the older, "

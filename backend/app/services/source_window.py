@@ -25,6 +25,9 @@ from backend.app.services import model_routing
 
 
 _STRICT_SOURCE_WINDOW_TYPES = {"gmail_link", "foreign_web", "podcast_episode", "reddit_post"}
+# Sources whose listings state recency relatively ("submitted 3 days ago"), where
+# that age is the real publish date rather than incidental page chrome.
+_RELATIVE_DATE_SOURCE_TYPES = {"reddit_post"}
 
 
 _DATE_METADATA_KEYS = (
@@ -442,7 +445,10 @@ def _article_text_or_url_date(result: ArticleFetchResult) -> datetime | None:
         )
         if part
     )
-    return _date_from_text(text_sample[:4000])
+    # Reddit listings express recency relatively ("submitted 3 days ago"); that age
+    # IS the genuine post date, so honor relative phrasing for social posts.
+    allow_relative = str(result.payload.source_type or "") in _RELATIVE_DATE_SOURCE_TYPES
+    return _date_from_text(text_sample[:4000], allow_relative=allow_relative)
 
 
 def _parse_datetime_hint(value: Any) -> datetime | None:
@@ -509,7 +515,7 @@ def _date_from_url(value: str | None) -> datetime | None:
     return None
 
 
-def _date_from_text(value: str | None) -> datetime | None:
+def _date_from_text(value: str | None, *, allow_relative: bool = False) -> datetime | None:
     text = str(value or "")
     match = _TEXT_DATE_RE.search(text)
     if match:
@@ -539,9 +545,10 @@ def _date_from_text(value: str | None) -> datetime | None:
                     tzinfo=UTC,
                 )
     # Non-English Latin month names that the English _MONTHS map misses. Relative
-    # phrasing is disabled here because this scans free body/snippet text where
-    # "posted 2 days ago" chrome must not be read as the publish date.
-    shared = normalize_date_string(text, allow_relative=False)
+    # phrasing ("posted 2 days ago") is only honored for sources whose listings
+    # express the post age relatively (e.g. Reddit); for general web/snippet text
+    # it stays off so page chrome is not mistaken for the publish date.
+    shared = normalize_date_string(text, allow_relative=allow_relative)
     if shared:
         with suppress(ValueError):
             parsed = datetime.fromisoformat(shared)

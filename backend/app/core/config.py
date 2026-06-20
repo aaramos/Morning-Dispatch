@@ -11,7 +11,7 @@ DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 250
 DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 DEFAULT_SCHEDULER_DAILY_RUN_TIME = "05:00"
 DEFAULT_SCHEDULER_TIMEZONE = "America/Los_Angeles"
-MODEL_ROUTE_AGENTS = ("refinement", "librarian", "source_audit", "editorial", "critic")
+MODEL_ROUTE_AGENTS = ("refinement", "foreign_media", "librarian", "source_audit", "editorial", "critic")
 # Models run on a single local OpenAI-compatible server. Cloud routing was removed.
 MODEL_ROUTE_PROVIDERS = ("local",)
 DEFAULT_MODEL_ROUTES: dict[str, dict[str, object]] = {
@@ -55,7 +55,7 @@ class Settings:
     # resurrect content outside a multi-day recency window.
     article_fetch_cache_ttl_seconds: int = 0
     model_routes: dict[str, dict[str, object]] = field(default_factory=lambda: dict(DEFAULT_MODEL_ROUTES))
-    web_search_provider: str = "serper"
+    web_search_provider: str = "tavily"
     web_search_tavily_api_key: str | None = None
     web_search_brave_api_key: str | None = None
     web_search_serpapi_api_key: str | None = None
@@ -275,7 +275,7 @@ def _build_settings() -> Settings:
     fred_api_key = os.environ.get("MORNING_DISPATCH_FRED_API_KEY") or _secret_text(
         secrets_dir / "fred" / "api_key"
     )
-    web_search_provider = (os.environ.get("MORNING_DISPATCH_WEB_SEARCH_PROVIDER") or "serper").strip().lower()
+    web_search_provider = (os.environ.get("MORNING_DISPATCH_WEB_SEARCH_PROVIDER") or "tavily").strip().lower()
     shared_search_env_path = _shared_search_env_path()
     web_search_tavily_api_key = (
         os.environ.get("MORNING_DISPATCH_TAVILY_API_KEY")

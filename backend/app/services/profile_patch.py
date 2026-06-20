@@ -1480,7 +1480,8 @@ def _search_strategy_question(profile: dict[str, Any]) -> str:
 
 def _strategy_deepening_question(profile: dict[str, Any], messages: list[dict[str, str]]) -> str:
     text = _user_authored_text(profile, messages)
-    if _market_tracking_interest(text):
+    markets_selected = _source_selection_dict(profile.get("source_selection")).get("markets", False)
+    if markets_selected and _market_tracking_interest(text):
         return _first_unasked_question(
             messages,
             [
@@ -1547,9 +1548,23 @@ def _question_was_recently_asked(question: str, messages: list[dict[str, str]]) 
     for message in messages[-12:]:
         if message.get("role") != "assistant":
             continue
-        if _normalize_question_for_repeat_check(message.get("content") or "") == normalized:
+        content = message.get("content") or ""
+        # Prior assistant turns are usually multi-sentence; the repeated question is
+        # typically just the trailing sentence, so compare both the whole message and
+        # its trailing question rather than only an exact whole-message match.
+        if _normalize_question_for_repeat_check(content) == normalized:
+            return True
+        if _normalize_question_for_repeat_check(_trailing_question_text(content)) == normalized:
             return True
     return False
+
+
+def _trailing_question_text(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean.endswith("?"):
+        return ""
+    match = re.search(r"([^.!?\n][^.!?\n]*\?)\s*$", clean)
+    return match.group(1).strip() if match else clean
 
 
 def _normalize_question_for_repeat_check(question: str) -> str:
@@ -1816,7 +1831,9 @@ def _collect_hint_text(profile: dict[str, Any]) -> str:
 
 def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
     statement = str(profile.get("statement") or "")
-    gmail_selected = _source_selection_dict(profile.get("source_selection")).get("gmail", False)
+    selection = _source_selection_dict(profile.get("source_selection"))
+    gmail_selected = selection.get("gmail", False)
+    markets_interest = selection.get("markets", False) and _market_tracking_interest(statement)
     gmail_rules = _normalize_gmail_rules(profile.get("gmail_rules"))
     gmail_needs_instructions = (
         gmail_selected
@@ -1831,7 +1848,7 @@ def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
         "exclusions_already_answered": bool(profile.get("exclusions_answered")) or bool(_string_list(profile.get("exclusions"))),
         "must_have_terms": _string_list(profile.get("must_have_terms"), limit=6),
         "must_have_already_answered": bool(profile.get("must_have_answered")) or bool(_string_list(profile.get("must_have_terms"), limit=6)),
-        "market_tracking_interest": _market_tracking_interest(statement),
+        "market_tracking_interest": markets_interest,
         "gmail_rules_needed": gmail_needs_instructions,
         "recommended_question_focus": (
             "IMPORTANT: Gmail is selected but has no search instructions yet. Ask ONLY about Gmail in this turn — "
@@ -1841,7 +1858,7 @@ def _inferred_constraints(profile: dict[str, Any]) -> dict[str, Any]:
             else (
                 "Ask about investable signals, relative comparison, source quality, catalysts, or risks. "
                 "Do not ask for recency or exclusions if they are already listed here."
-                if _market_tracking_interest(statement)
+                if markets_interest
                 else "Ask for the one ambiguity that would most improve retrieval."
             )
         ),
@@ -1923,7 +1940,7 @@ def _extract_exclusion_hints(text: str) -> list[str]:
 
 def _market_tracking_interest(text: str) -> bool:
     lowered = str(text or "").lower()
-    return any(token in lowered for token in ("investor", "stock", "stocks", "company's performance", "companies performance", "performance", "ticker", "market"))
+    return any(token in lowered for token in ("investor", "stock", "stocks", "company's performance", "companies performance", "ticker", "market"))
 
 
 def _contains(text: str, tokens: tuple[str, ...]) -> bool:

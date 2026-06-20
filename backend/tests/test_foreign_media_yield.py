@@ -166,7 +166,7 @@ def test_foreign_media_fans_out_source_queries(monkeypatch, tmp_path) -> None:
     seen_queries: list[str] = []
     counter = {"n": 0}
 
-    async def fake_search_web(query, *, limit, language=None, days=None, vertical="auto"):
+    async def fake_search_web(query, *, limit, language=None, days=None, vertical="auto", prefer_provider=None):
         seen_queries.append(query)
         counter["n"] += 1
         # unique URL per query so dedupe keeps them all
@@ -199,7 +199,7 @@ def test_foreign_media_fans_out_source_queries(monkeypatch, tmp_path) -> None:
 def test_foreign_media_dedupes_and_caps_per_language(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
 
-    async def fake_search_web(query, *, limit, language=None, days=None, vertical="auto"):
+    async def fake_search_web(query, *, limit, language=None, days=None, vertical="auto", prefer_provider=None):
         # every query returns the SAME url -> must collapse to one candidate
         return [SearchHit(title="dup", url="https://medio.mx/same", snippet="x")]
 

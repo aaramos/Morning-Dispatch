@@ -25,6 +25,11 @@ _QUERIES_PER_LANGUAGE = 6
 _PER_QUERY_LIMIT = 10
 # Bounds concurrent provider calls so the fan-out stays within the 40s timeout.
 _FOREIGN_SEARCH_CONCURRENCY = 4
+# Preferred web-search provider for the foreign lane: a language-aware Google
+# index (serpapi honors hl/lr and returns native-language results with real,
+# fetchable URLs) — unlike Tavily's English-centric index. Falls back to the
+# configured chain when serpapi is unavailable (no key / out of searches).
+_FOREIGN_PREFERRED_PROVIDER = "serpapi"
 # Country code TLDs that indicate genuinely-local coverage for a language, used
 # only as a small positive score nudge (never an exclusion).
 LANGUAGE_LOCAL_TLDS: dict[str, tuple[str, ...]] = {
@@ -188,6 +193,11 @@ class ForeignMediaSourceAdapter:
                         language=language_code,
                         days=days,
                         vertical=vertical,
+                        # Lead with the language-aware index (serper/Google honors
+                        # hl=xx and returns native-language results) so foreign media
+                        # isn't filled by Tavily's English-centric index; falls back
+                        # to the configured chain when serper is unavailable.
+                        prefer_provider=_FOREIGN_PREFERRED_PROVIDER,
                     )
                 except Exception as exc:  # noqa: BLE001 - isolate one query's failure
                     # Note: Exception (not BaseException) so CancelledError still

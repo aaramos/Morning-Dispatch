@@ -217,6 +217,7 @@ def _route_model(route: dict[str, object] | None) -> str | None:
 def _agent_label(agent: str) -> str:
     labels = {
         "refinement": "Refinement",
+        "foreign_media": "Foreign Media",
         "librarian": "Librarian",
         "source_audit": "Source Audit",
         "editorial": "Editorial",
@@ -228,6 +229,7 @@ def _agent_label(agent: str) -> str:
 def _agent_description(agent: str) -> str:
     descriptions = {
         "refinement": "Turns the user's interest into a runnable search strategy.",
+        "foreign_media": "Writes native-language search queries for foreign media discovery.",
         "librarian": "Cleans and enriches fetched items.",
         "source_audit": "Checks freshness, fit, source quality, and constraints.",
         "editorial": "Ranks the complete candidate set and picks the lead.",

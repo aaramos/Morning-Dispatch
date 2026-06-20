@@ -96,8 +96,8 @@ def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path)
     _runtime(monkeypatch, tmp_path)
     calls: list[dict[str, object]] = []
 
-    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None, vertical: str = "auto"):
-        calls.append({"query": query, "limit": limit, "language": language, "vertical": vertical})
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None, vertical: str = "auto", prefer_provider: str | None = None):
+        calls.append({"query": query, "limit": limit, "language": language, "vertical": vertical, "prefer_provider": prefer_provider})
         return [
             SearchHit(
                 title="SK하이닉스 HBM 투자 확대",
@@ -133,6 +133,9 @@ def test_foreign_media_adapter_emits_translation_payloads(monkeypatch, tmp_path)
     assert calls[0]["language"] == "ko"
     assert calls[0]["limit"] == 10
     assert calls[0]["vertical"] == "organic"
+    # Foreign lane leads with the language-aware Google provider (serpapi), falling
+    # back to the configured chain when it's unavailable.
+    assert calls[0]["prefer_provider"] == "serpapi"
     assert candidates[0].adapter == "foreign_media"
     assert candidates[0].payload.source_type == "foreign_web"
     assert candidates[0].payload.metadata["needs_translation"] is True
@@ -176,7 +179,7 @@ def test_foreign_media_accepts_up_to_ten_languages(monkeypatch, tmp_path) -> Non
 def test_foreign_media_adapter_filters_english_and_low_quality_results(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
 
-    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None, vertical: str = "auto"):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None, vertical: str = "auto", prefer_provider: str | None = None):
         assert language == "ko"
         return [
             SearchHit(
@@ -229,7 +232,7 @@ def test_foreign_media_adapter_filters_english_and_low_quality_results(monkeypat
 def test_foreign_media_adapter_prefers_taiwanese_native_sources(monkeypatch, tmp_path) -> None:
     _runtime(monkeypatch, tmp_path)
 
-    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None, vertical: str = "auto"):
+    async def fake_search_web(query: str, *, limit: int, language: str | None = None, days: int | None = None, vertical: str = "auto", prefer_provider: str | None = None):
         assert language == "zh"
         return [
             SearchHit(
