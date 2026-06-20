@@ -3571,6 +3571,57 @@ def test_expired_deleted_exploration_purge_removes_stored_content(monkeypatch, t
     assert not brief_path.exists()
 
 
+def test_purge_removes_exploration_that_still_has_feedback(monkeypatch, tmp_path) -> None:
+    """An expired-deleted brief that still has a feedback rating must purge cleanly.
+
+    The exploration_feedback FK used to abort the DELETE with a FOREIGN KEY constraint
+    error, and because the purge runs inline in the library-list endpoint, that one
+    un-purgeable record 500'd the whole library and showed "0 TOTAL" briefs.
+    """
+    configure_runtime(monkeypatch, tmp_path)
+    database.init_database()
+    topic = explore.save_topic_profile(
+        {
+            "statement": "Explore purge with feedback",
+            "scope": "Purge with child rows",
+            "source_selection": {"web_search": True},
+        }
+    )
+    exploration = database.create_exploration(
+        topic_id=topic["topic_id"],
+        mode="show_now",
+        source_selection={"web_search": True},
+    )
+    eid = exploration["exploration_id"]
+    database.update_exploration_status(eid, status="complete")
+    # Attach a feedback rating — the child row that used to block the purge.
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO exploration_feedback (id, exploration_id, topic_id, url, signal, created_at)
+            VALUES (?, ?, ?, ?, 'like', ?)
+            """,
+            ("fb-purge-1", eid, topic["topic_id"], "https://example.com/x", "2026-01-01T00:00:00+00:00"),
+        )
+    database.soft_delete_exploration(eid)
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE explorations SET delete_after = '2000-01-01T00:00:00+00:00' WHERE exploration_id = ?",
+            (eid,),
+        )
+
+    purged = database.purge_expired_deleted_explorations()
+
+    assert purged == 1
+    assert database.get_exploration(eid) is None
+    with database.connect() as connection:
+        remaining = connection.execute(
+            "SELECT COUNT(*) FROM exploration_feedback WHERE exploration_id = ?",
+            (eid,),
+        ).fetchone()[0]
+    assert remaining == 0
+
+
 def test_admin_exploration_issue_details_report_source_and_reason(monkeypatch, tmp_path) -> None:
     configure_runtime(monkeypatch, tmp_path)
 

@@ -354,13 +354,32 @@ def purge_expired_deleted_explorations() -> int:
         for row in rows:
             record = _exploration_row_to_dict(row)
             topic_id = str(record.get("topic_id") or "")
-            _delete_exploration_artifacts(record)
-            connection.execute(
-                "DELETE FROM explorations WHERE exploration_id = ?",
-                (record["exploration_id"],),
-            )
-            _delete_standalone_topic_if_orphaned(connection, topic_id)
-            purged += 1
+            exploration_id = record["exploration_id"]
+            try:
+                _delete_exploration_artifacts(record)
+                # Remove child rows that reference this exploration BEFORE deleting it.
+                # `feedback` and `exploration_feedback` are the only tables that FK
+                # explorations; without this the DELETE raises a FOREIGN KEY constraint
+                # error. Historically that error propagated out of the inline purge and
+                # 500'd the whole library-list endpoint, blanking every saved brief.
+                connection.execute(
+                    "DELETE FROM exploration_feedback WHERE exploration_id = ?",
+                    (exploration_id,),
+                )
+                connection.execute(
+                    "DELETE FROM feedback WHERE exploration_id = ?",
+                    (exploration_id,),
+                )
+                connection.execute(
+                    "DELETE FROM explorations WHERE exploration_id = ?",
+                    (exploration_id,),
+                )
+                _delete_standalone_topic_if_orphaned(connection, topic_id)
+                purged += 1
+            except Exception:
+                # One un-purgeable record must never abort the batch — or the callers
+                # that run this inline (library listing, startup). Log and move on.
+                logger.exception("Failed to purge expired-deleted exploration %s", exploration_id)
     return purged
 
 def reset_exploration_for_rebuild(
