@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Literal
 
@@ -16,6 +17,21 @@ from backend.app.services.brief_title import tight_brief_title
 
 router = APIRouter(prefix="/api")
 delivery_router = APIRouter()
+
+logger = logging.getLogger(__name__)
+
+
+def _purge_expired_explorations_safely() -> None:
+    """Run the expired-deleted-exploration retention purge defensively.
+
+    The purge is invoked inline by the library/listing endpoints; a failure here must
+    never 500 the request and blank every saved brief. The purge itself is also
+    per-record fault-tolerant, but this is the belt-and-suspenders guard.
+    """
+    try:
+        database.purge_expired_deleted_explorations()
+    except Exception:
+        logger.exception("Retention purge of expired-deleted explorations failed; listing anyway")
 ScheduleValue = Literal["hourly", "daily", "weekdays", "weekly", "monthly"]
 
 
@@ -231,7 +247,7 @@ async def explore_source_status() -> dict[str, Any]:
 
 @router.get("/explore/explorations")
 def explorations(limit: int = Query(default=25, ge=1, le=200)) -> list[dict[str, Any]]:
-    database.purge_expired_deleted_explorations()
+    _purge_expired_explorations_safely()
     return database.list_explorations(limit=limit, summary_only=True)
 
 
@@ -803,7 +819,7 @@ def setup_collections() -> dict[str, Any]:
 
 @router.get("/admin/library")
 def admin_library() -> dict[str, Any]:
-    database.purge_expired_deleted_explorations()
+    _purge_expired_explorations_safely()
     return {
         "explorations": database.list_explorations(limit=200),
         "deleted_explorations": database.list_explorations(limit=200, only_deleted=True),
