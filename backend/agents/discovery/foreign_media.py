@@ -165,7 +165,7 @@ LOW_SIGNAL_TITLE_PHRASES = (
 
 class ForeignMediaSourceAdapter:
     name = "foreign_media"
-    cost_profile = CostProfile(label="medium", timeout_seconds=40.0)
+    cost_profile = CostProfile(label="medium", timeout_seconds=180.0)
     good_for = ("foreign_signal", "native_language_sources", "public_web")
 
     async def query(self, profile: TopicProfile, context: SourceAdapterContext) -> list[Candidate]:
@@ -359,15 +359,22 @@ async def foreign_language_plan_for_profile(profile: TopicProfile) -> tuple[dict
     if existing:
         return existing[:MAX_FOREIGN_LANGUAGES]
 
-    selected = _derive_language_seeds(profile)
+    selected = _derive_language_seeds(profile)[:MAX_FOREIGN_LANGUAGES]
     if not selected:
         return ()
 
     settings = get_settings()
-    client = model_routing.client_for_agent("refinement", settings=settings).client
-    tasks = [_complete_plan_entry(profile, entry, client=client) for entry in selected[:MAX_FOREIGN_LANGUAGES]]
-    entries = await asyncio.gather(*tasks)
-    return tuple(entry for entry in entries if entry.get("native_query"))
+    client = model_routing.client_for_agent("foreign_media", settings=settings).client
+    # One batched model call writes native queries for every language at once;
+    # any language the model skipped (or all of them, if the model is off or
+    # fails) falls back to the deterministic native query so each still searches.
+    model_entries = await _native_queries_with_model_batch(profile, selected, client=client)
+    plan: list[dict[str, Any]] = []
+    for entry in selected:
+        resolved = model_entries.get(str(entry["code"]).lower()) or _fallback_plan_entry(profile, entry)
+        if resolved.get("native_query"):
+            plan.append(resolved)
+    return tuple(plan)
 
 
 def _code_to_name(code: str) -> str:
@@ -445,22 +452,35 @@ def _derive_language_seeds(profile: TopicProfile) -> list[dict[str, Any]]:
     return list(selected.values())[:MAX_FOREIGN_LANGUAGES]
 
 
-async def _complete_plan_entry(profile: TopicProfile, entry: dict[str, Any], *, client: Any | None) -> dict[str, Any]:
-    model_entry = await _native_query_with_model(profile, entry, client=client)
-    if model_entry is not None:
-        return model_entry
-    return _fallback_plan_entry(profile, entry)
+async def _native_queries_with_model_batch(
+    profile: TopicProfile,
+    entries: list[dict[str, Any]],
+    *,
+    client: Any | None,
+) -> dict[str, dict[str, Any]]:
+    """Generate native queries for every selected language in a single model call.
 
-
-async def _native_query_with_model(profile: TopicProfile, entry: dict[str, Any], *, client: Any | None) -> dict[str, Any] | None:
-    if client is None:
-        return None
-    prompt = json.dumps(
+    Returns a mapping of language code -> plan entry for the languages the model
+    answered well. Callers fill any gaps with the deterministic fallback. Sending
+    one request for all languages (instead of one per language) keeps the whole
+    plan within a few seconds on the local single-GPU server and sends the shared
+    profile context only once.
+    """
+    if client is None or not entries:
+        return {}
+    languages = [
         {
-            "task": "Generate one native-language web search query for Morning Dispatch foreign media discovery.",
-            "language": {"code": entry["code"], "name": entry["name"]},
+            "code": str(entry["code"]),
+            "name": str(entry["name"]),
             "reason": entry.get("reason"),
             "native_entity_terms": entry.get("native_entity_terms", []),
+        }
+        for entry in entries
+    ]
+    prompt = json.dumps(
+        {
+            "task": "Generate one idiomatic native-language web search query per language for Morning Dispatch foreign media discovery.",
+            "languages": languages,
             "profile": {
                 "statement": profile.statement,
                 "scope": profile.scope,
@@ -471,15 +491,21 @@ async def _native_query_with_model(profile: TopicProfile, entry: dict[str, Any],
                 "exclusions": list(profile.exclusions),
             },
             "rules": [
-                "Return an idiomatic query a native business or news search user would type.",
+                "Return exactly one entry per requested language, echoing the language code given.",
+                "Write an idiomatic query a native business or news search user would type.",
                 "Prefer local company names, tickers, product names, and sector terms.",
                 "Do not return a literal word-for-word translation if a local term is more natural.",
-                "Keep the query under 180 characters.",
+                "Keep each query under 180 characters.",
             ],
             "schema": {
-                "native_query": "string",
-                "native_entity_terms": ["string"],
-                "rationale": "string",
+                "queries": [
+                    {
+                        "code": "string",
+                        "native_query": "string",
+                        "native_entity_terms": ["string"],
+                        "rationale": "string",
+                    }
+                ]
             },
         },
         ensure_ascii=False,
@@ -488,23 +514,34 @@ async def _native_query_with_model(profile: TopicProfile, entry: dict[str, Any],
         payload = await client.complete_json(
             system="You generate native-language search queries for public foreign media discovery. Return strict JSON only.",
             prompt=prompt,
-            max_tokens=360,
+            max_tokens=min(2000, 240 + 180 * len(entries)),
         )
     except Exception:
-        logger.info("Foreign media native-query generation failed for %s", entry.get("code"), exc_info=True)
-        return None
-    if not isinstance(payload, dict):
-        return None
-    native_query = " ".join(str(payload.get("native_query") or "").split()).strip()
-    if len(native_query) < 4:
-        return None
-    return {
-        "code": entry["code"],
-        "name": entry["name"],
-        "native_query": native_query[:340],
-        "native_entity_terms": _merge_strings(entry.get("native_entity_terms"), payload.get("native_entity_terms")),
-        "reason": str(payload.get("rationale") or entry.get("reason") or "").strip()[:220],
-    }
+        logger.info("Foreign media batch native-query generation failed", exc_info=True)
+        return {}
+    rows = payload.get("queries") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    entry_by_code = {str(entry["code"]).lower(): entry for entry in entries}
+    resolved: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip().lower()
+        entry = entry_by_code.get(code)
+        if entry is None or code in resolved:
+            continue
+        native_query = " ".join(str(row.get("native_query") or "").split()).strip()
+        if len(native_query) < 4:
+            continue
+        resolved[code] = {
+            "code": entry["code"],
+            "name": entry["name"],
+            "native_query": native_query[:340],
+            "native_entity_terms": _merge_strings(entry.get("native_entity_terms"), row.get("native_entity_terms")),
+            "reason": str(row.get("rationale") or entry.get("reason") or "").strip()[:220],
+        }
+    return resolved
 
 
 def _fallback_plan_entry(profile: TopicProfile, entry: dict[str, Any]) -> dict[str, Any]:
