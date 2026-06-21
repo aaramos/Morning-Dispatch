@@ -1,4 +1,4 @@
-export type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets" | "reddit" | "google_news";
+export type SourceKey = "web_search" | "foreign_media" | "gmail" | "podcasts" | "youtube" | "collections" | "markets" | "reddit" | "google_news" | "academic" | "regulatory" | "hacker_news";
 export type FlowState = "idle" | "refining" | "confirm" | "building" | "ready" | "schedule";
 export type SortMode = "recent" | "name";
 export type SchedulePreset = "daily" | "weekdays" | "weekly" | "monthly";
@@ -516,6 +516,9 @@ export const sourceOptions: Array<{ key: SourceKey; label: string; icon: string 
   { key: "markets", label: "Markets", icon: "$" },
   { key: "reddit", label: "Reddit", icon: "👽" },
   { key: "google_news", label: "Google News", icon: "📰" },
+  { key: "academic", label: "Academic", icon: "📚" },
+  { key: "regulatory", label: "Regulatory", icon: "⚖️" },
+  { key: "hacker_news", label: "Hacker News", icon: "🟧" },
 ];
 
 export interface ForeignRegionOption {
@@ -577,6 +580,9 @@ export const defaultSourceSelection: Record<SourceKey, boolean> = {
   markets: false,
   reddit: false,
   google_news: false,
+  academic: false,
+  regulatory: false,
+  hacker_news: false,
 };
 export const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   web_search: true,
@@ -588,6 +594,9 @@ export const defaultSourceSelectionForControls: Record<SourceKey, boolean> = {
   markets: true,
   reddit: true,
   google_news: true,
+  academic: true,
+  regulatory: true,
+  hacker_news: true,
 };
 
 export const defaultContentLimits: ContentLimitsDraft = {
@@ -604,6 +613,9 @@ export const defaultContentLimits: ContentLimitsDraft = {
     markets: 80,
     reddit: 60,
     google_news: 80,
+    academic: 50,
+    regulatory: 50,
+    hacker_news: 40,
   },
   quality_floor: "standard",
 };
@@ -621,6 +633,9 @@ export const defaultMediumContentLimits: ContentLimitsDraft = {
     markets: 48,
     reddit: 36,
     google_news: 48,
+    academic: 30,
+    regulatory: 30,
+    hacker_news: 24,
   },
   quality_floor: "standard",
 };

@@ -437,6 +437,9 @@ export function enabledSourceSelection(selection: Record<SourceKey, boolean>, st
     markets: Boolean(selection.markets && status?.sources.markets?.enabled),
     reddit: Boolean(selection.reddit && status?.sources.reddit?.enabled),
     google_news: Boolean(selection.google_news && status?.sources.google_news?.enabled),
+    academic: Boolean(selection.academic && status?.sources.academic?.enabled),
+    regulatory: Boolean(selection.regulatory && status?.sources.regulatory?.enabled),
+    hacker_news: Boolean(selection.hacker_news && status?.sources.hacker_news?.enabled),
   };
 }
 

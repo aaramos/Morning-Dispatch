@@ -45,6 +45,11 @@ SOURCE_ISSUE_ADAPTERS = {
     "web search": "web_search",
     "youtube": "youtube",
     "google news": "google_news",
+    "academic": "academic",
+    "research": "academic",
+    "regulatory": "regulatory",
+    "hacker news": "hacker_news",
+    "hackernews": "hacker_news",
 }
 
 

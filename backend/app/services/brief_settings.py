@@ -50,6 +50,9 @@ PER_SOURCE_MAX: dict[str, int] = {
     "podcasts": 40,
     "youtube": 40,
     "google_news": 80,
+    "academic": 50,
+    "regulatory": 50,
+    "hacker_news": 40,
 }
 # Sources not listed above fall back to this cap.
 DEFAULT_PER_SOURCE_MAX = 50

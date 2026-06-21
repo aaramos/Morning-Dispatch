@@ -329,6 +329,27 @@ async def source_status() -> dict[str, Any]:
                 "reason": None,
                 "mode": "public-rss",
             },
+            "academic": {
+                "label": "Academic",
+                "enabled": True,
+                "setup_required": False,
+                "reason": None,
+                "mode": "arxiv-openalex",
+            },
+            "regulatory": {
+                "label": "Regulatory",
+                "enabled": True,
+                "setup_required": False,
+                "reason": None,
+                "mode": "public-api",
+            },
+            "hacker_news": {
+                "label": "Hacker News",
+                "enabled": True,
+                "setup_required": False,
+                "reason": None,
+                "mode": "algolia-api",
+            },
         }
     }
 
@@ -1555,6 +1576,12 @@ def _infer_payload_adapter(payload: Any) -> str | None:
         return "collections"
     if source_type == "market_snapshot":
         return "markets"
+    if source_type == "academic_paper":
+        return "academic"
+    if source_type == "regulatory_filing":
+        return "regulatory"
+    if source_type == "hacker_news_story":
+        return "hacker_news"
     if source_type in {"gmail", "gmail_link"}:
         if metadata.get("search_query") or metadata.get("search_provider"):
             if metadata.get("search_provider") == "google_news_rss":

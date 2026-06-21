@@ -103,6 +103,9 @@ def _adapter_from_payload_type(source_type: str, metadata: dict[str, Any] | None
         "collection_chunk": "collections",
         "web_search": "web_search",
         "reddit_post": "reddit",
+        "academic_paper": "academic",
+        "regulatory_filing": "regulatory",
+        "hacker_news_story": "hacker_news",
     }.get(source_type, "")
 
 

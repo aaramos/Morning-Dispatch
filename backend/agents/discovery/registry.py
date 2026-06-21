@@ -12,7 +12,10 @@ from backend.agents.discovery.adapters import (
     RedditSourceAdapter,
     GoogleNewsSourceAdapter,
 )
+from backend.agents.discovery.academic import AcademicSourceAdapter
 from backend.agents.discovery.foreign_media import ForeignMediaSourceAdapter
+from backend.agents.discovery.hacker_news import HackerNewsSourceAdapter
+from backend.agents.discovery.regulatory import RegulatorySourceAdapter
 from backend.agents.discovery.types import SourceAdapter
 
 
@@ -51,5 +54,8 @@ def default_source_registry() -> SourceRegistry:
             MarketsSourceAdapter(),
             RedditSourceAdapter(),
             GoogleNewsSourceAdapter(),
+            AcademicSourceAdapter(),
+            RegulatorySourceAdapter(),
+            HackerNewsSourceAdapter(),
         ]
     )

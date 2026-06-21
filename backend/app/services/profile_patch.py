@@ -91,7 +91,7 @@ QUESTIONS = {
 }
 
 
-VALID_SOURCE_ADAPTERS = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news"}
+VALID_SOURCE_ADAPTERS = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news", "academic", "regulatory", "hacker_news"}
 
 
 PODCAST_STRATEGY_FIELDS = (

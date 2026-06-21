@@ -8,13 +8,13 @@ from typing import Any, Literal, Protocol
 
 from backend.agents.digestor.base import NormalizedPayload
 
-AdapterName = Literal["gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news"]
+AdapterName = Literal["gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news", "academic", "regulatory", "hacker_news"]
 AdapterStatusValue = Literal["pending", "running", "completed", "partial", "timed_out", "failed", "skipped"]
 Depth = Literal["practitioner", "informed-generalist"]
 RecencyWeighting = Literal["breaking", "recent", "last_year", "all_available"]
 ScheduleValue = Literal["hourly", "daily", "weekdays", "weekly", "monthly"]
 VALID_SCHEDULES: set[str] = {"hourly", "daily", "weekdays", "weekly", "monthly"}
-VALID_SOURCE_ADAPTERS: set[str] = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news"}
+VALID_SOURCE_ADAPTERS: set[str] = {"gmail", "podcasts", "web_search", "foreign_media", "youtube", "collections", "markets", "reddit", "google_news", "academic", "regulatory", "hacker_news"}
 
 DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
     "gmail": True,
@@ -26,6 +26,9 @@ DEFAULT_SOURCE_SELECTION: dict[str, bool] = {
     "markets": False,
     "reddit": False,
     "google_news": False,
+    "academic": False,
+    "regulatory": False,
+    "hacker_news": False,
 }
 
 DEFAULT_EXPLORE_SOURCE_SELECTION: dict[str, bool] = {
@@ -38,6 +41,9 @@ DEFAULT_EXPLORE_SOURCE_SELECTION: dict[str, bool] = {
     "markets": False,
     "reddit": False,
     "google_news": False,
+    "academic": False,
+    "regulatory": False,
+    "hacker_news": False,
 }
 
 

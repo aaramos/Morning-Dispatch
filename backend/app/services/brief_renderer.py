@@ -1698,6 +1698,9 @@ _SELECTED_SOURCE_LABELS: dict[str, str] = {
     "podcasts": "Podcast",
     "markets": "Markets",
     "collections": "Collections",
+    "academic": "Research",
+    "regulatory": "Regulatory",
+    "hacker_news": "Hacker News",
 }
 
 

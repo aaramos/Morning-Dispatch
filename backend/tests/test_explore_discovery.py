@@ -806,6 +806,9 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
                 "web_search": 5,
                 "youtube": 2,
                 "google_news": 48,
+                "academic": 30,
+                "regulatory": 30,
+                "hacker_news": 24,
             },
             "quality_floor": "strong",
             "target_items": 6,
@@ -2399,6 +2402,9 @@ def test_refinement_session_default_sources_are_web_only(monkeypatch, tmp_path) 
         "markets": False,
         "reddit": False,
         "google_news": False,
+        "academic": False,
+        "regulatory": False,
+        "hacker_news": False,
     }
 
 
