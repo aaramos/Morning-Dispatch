@@ -2176,6 +2176,44 @@ label {
   line-height: 1.35;
 }
 
+.delivery-alert-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.delivery-alert-btn {
+  padding: 4px 12px;
+  border: 1px solid #d9a441;
+  border-radius: 6px;
+  background: #fffdf6;
+  color: #4f3510;
+  font-size: 0.82rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.delivery-alert-btn:hover:not(:disabled) {
+  background: #f6e7be;
+}
+
+.delivery-alert-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.delivery-alert-btn--ghost {
+  border-color: rgba(79, 53, 16, .3);
+  background: transparent;
+}
+
+.delivery-alert-note {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #7d5a1e;
+}
+
 .library-list {
   display: grid;
   gap: 10px;
@@ -2656,6 +2694,21 @@ label {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: #77746c;
+}
+.foreign-region-hint {
+  font-size: 0.72rem;
+  color: #8a877f;
+}
+.foreign-region-group {
+  display: grid;
+  gap: 4px;
+}
+.foreign-region-continent {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #9a978e;
 }
 .foreign-region-row {
   display: flex;

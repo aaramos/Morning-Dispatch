@@ -1734,7 +1734,7 @@ function DispatchApp() {
 
         <section className="dispatch-body">
           {scheduledDeliveryFailures.length ? (
-            <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} />
+            <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} onChanged={loadStatics} />
           ) : null}
 
           {flow === "idle" || flow === "refining" || flow === "confirm" || streaming ? (

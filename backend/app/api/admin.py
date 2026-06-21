@@ -589,6 +589,22 @@ def send_latest_digest_email(digest_id: str) -> dict[str, Any]:
     return result
 
 
+@router.post("/delivery/failures/{topic_id}/retry")
+def retry_failed_delivery(topic_id: str) -> dict[str, Any]:
+    result = email_delivery.retry_failed_delivery(topic_id)
+    if result.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=result.get("error") or "No failed delivery found")
+    return result
+
+
+@router.post("/delivery/failures/{topic_id}/clear")
+def clear_failed_delivery(topic_id: str) -> dict[str, Any]:
+    result = email_delivery.clear_failed_delivery(topic_id)
+    if result.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=result.get("error") or "No failed delivery found")
+    return result
+
+
 
 
 

@@ -164,6 +164,50 @@ def send_latest_digest(digest_id: str, *, recipient_email: str | None = None) ->
         return {"status": "failed", "recipient_email": recipient, "error": _delivery_error(exc)}
 
 
+def retry_failed_delivery(topic_id: str) -> dict[str, Any]:
+    """Re-attempt a previously failed scheduled/digest email delivery.
+
+    Handles both failure shapes surfaced in the delivery alert: digest delivery
+    settings and scheduled topic-profile delivery configs.
+    """
+    if database.get_digest(topic_id) is not None:
+        # send_latest_digest records the new delivery result, clearing the
+        # failed state on success.
+        return send_latest_digest(topic_id)
+
+    if database.get_topic_profile(topic_id) is None:
+        return {"status": "not_found", "error": "No failed delivery found for this brief."}
+
+    latest = database.get_latest_exploration(topic_id=topic_id, mode="scheduled")
+    exploration_id = str(latest.get("exploration_id") or "") if latest else ""
+    if not exploration_id:
+        result: dict[str, Any] = {"status": "failed", "error": "No completed brief is available to send."}
+    else:
+        result = send_exploration_brief(exploration_id)
+    database.record_topic_delivery_result(
+        topic_id=topic_id,
+        status=str(result.get("status") or "failed"),
+        error=result.get("error"),
+        delivered_at=result.get("delivered_at"),
+    )
+    return result
+
+
+def clear_failed_delivery(topic_id: str) -> dict[str, Any]:
+    """Dismiss a failed delivery state so the alert clears and delivery re-enables."""
+    cleared = False
+    if database.get_digest(topic_id) is not None:
+        if database.get_delivery_settings(topic_id).get("last_delivery_status") == "failed":
+            database.record_delivery_result(digest_id=topic_id, status="cleared", error=None)
+            cleared = True
+    if database.get_topic_profile(topic_id) is not None:
+        database.update_topic_delivery_config(topic_id, {}, clear_failure=True)
+        cleared = True
+    if not cleared:
+        return {"status": "not_found", "error": "No failed delivery found for this brief."}
+    return {"status": "cleared", "topic_id": topic_id}
+
+
 def send_exploration_brief(
     exploration_id: str,
     *,

@@ -15,6 +15,7 @@ from backend.agents.discovery.must_have import (
     must_have_reason,
 )
 from backend.agents.librarian.text_utils import keyword_set
+from backend.agents.discovery import foreign_media
 from backend.agents.discovery.registry import SourceRegistry
 from backend.agents.discovery.types import (
     AdapterStatus,
@@ -513,7 +514,12 @@ def _dedupe_candidates(candidates: list[Candidate], *, limit: int) -> list[Candi
 
 
 def _lane_limit(profile: TopicProfile, adapter_name: str, *, default: int, system_max: int) -> int:
-    return brief_settings.source_lane_cap(adapter_name)
+    cap = brief_settings.source_lane_cap(adapter_name)
+    if adapter_name == "foreign_media":
+        # Region-focus boost: widen the foreign discovery lane by 50% (clamped to
+        # the global lane ceiling) when the brief explicitly selected regions.
+        cap = foreign_media.boost_foreign_cap(cap, profile, ceiling=brief_settings.GLOBAL_LANE_CEILING)
+    return cap
 
 
 def _source_limit(value: Any) -> int | None:

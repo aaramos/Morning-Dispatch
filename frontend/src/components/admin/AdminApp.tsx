@@ -1231,7 +1231,7 @@ export function AdminApp() {
       {tab === "library" ? (
         <section className="admin-panel">
           {scheduledDeliveryFailures.length ? (
-            <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} />
+            <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} onChanged={loadAdmin} />
           ) : null}
           {issueDetails?.built_with_issues ? (
             <div className="issue-note admin-issue-note">

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -17,6 +18,10 @@ from backend.app.services import model_routing
 logger = logging.getLogger(__name__)
 
 MAX_FOREIGN_LANGUAGES = 10
+# When a brief explicitly selects regions to focus on, widen the foreign lane by
+# 50%: more native-language lanes, more results per language, and higher
+# downstream discovery/inclusion caps (region-focus boost).
+FOREIGN_REGION_BOOST = 1.5
 DEFAULT_RESULTS_PER_LANGUAGE = 20
 # How many of the refinement-written native queries to fan out per language, on
 # top of the plan's own native_query.
@@ -71,6 +76,16 @@ REGION_LANGUAGE_SEEDS: dict[str, tuple[tuple[str, str], ...]] = {
         ("es", "Spanish-language coverage for Spain"),
         ("pl", "Polish-language coverage for Central Europe"),
     ),
+    "north_america": (
+        ("es", "Spanish-language coverage for Mexico"),
+        ("fr", "French-language coverage for Quebec and francophone Canada"),
+    ),
+    "south_america": (
+        ("es", "Spanish-language coverage for South America"),
+        ("pt", "Portuguese-language coverage for Brazil"),
+    ),
+    # Retained for backward compatibility with profiles saved before the Americas
+    # split; the picker now exposes north_america / south_america instead.
     "latin_america": (
         ("es", "Spanish-language coverage for Latin America"),
         ("pt", "Portuguese-language coverage for Brazil"),
@@ -95,14 +110,18 @@ REGION_ALIASES: dict[str, str] = {
     "east asia": "east_asia",
     "east asian": "east_asia",
     "china japan korea": "east_asia",
+    "china": "east_asia",
+    "japan": "east_asia",
+    "korea": "east_asia",
     "asia pacific": "asia",
     "apac": "asia",
     "asia": "asia",
     "europe": "europe",
     "eu": "europe",
+    "north america": "north_america",
+    "south america": "south_america",
     "latin america": "latin_america",
     "latam": "latin_america",
-    "south america": "latin_america",
     "middle east": "middle_east",
     "mena": "middle_east",
     "africa": "africa",
@@ -234,7 +253,8 @@ class ForeignMediaSourceAdapter:
 
             kept = 0
             excluded = 0
-            for rank, hit in enumerate(merged_hits[:DEFAULT_RESULTS_PER_LANGUAGE], start=1):
+            results_per_language = boost_foreign_cap(DEFAULT_RESULTS_PER_LANGUAGE, profile)
+            for rank, hit in enumerate(merged_hits[:results_per_language], start=1):
                 quality = _foreign_media_quality(hit, language_code)
                 if quality["decision"] == "exclude":
                     excluded += 1
@@ -355,11 +375,12 @@ async def foreign_language_plan_for_profile(profile: TopicProfile) -> tuple[dict
     if not profile.source_selection.get("foreign_media", False):
         return ()
 
+    max_languages = boost_foreign_cap(MAX_FOREIGN_LANGUAGES, profile)
     existing = _sanitize_plan(profile.foreign_language_plan)
     if existing:
-        return existing[:MAX_FOREIGN_LANGUAGES]
+        return existing[:max_languages]
 
-    selected = _derive_language_seeds(profile)[:MAX_FOREIGN_LANGUAGES]
+    selected = _derive_language_seeds(profile)[:max_languages]
     if not selected:
         return ()
 
@@ -449,7 +470,7 @@ def _derive_language_seeds(profile: TopicProfile) -> list[dict[str, Any]]:
         base = known_languages.get(code) or {"code": code, "name": _code_to_name(code)}
         selected.setdefault(code, {**base, "reason": reason, "native_entity_terms": []})
 
-    return list(selected.values())[:MAX_FOREIGN_LANGUAGES]
+    return list(selected.values())[:boost_foreign_cap(MAX_FOREIGN_LANGUAGES, profile)]
 
 
 async def _native_queries_with_model_batch(
@@ -587,6 +608,22 @@ def _normalized_regions(value: Any) -> list[str]:
         regions.append(normalized)
         seen.add(normalized)
     return regions
+
+
+def has_foreign_region_focus(profile: TopicProfile) -> bool:
+    """True when the brief explicitly selected at least one valid region."""
+    return bool(_normalized_regions(profile.foreign_regions))
+
+
+def foreign_region_multiplier(profile: TopicProfile) -> float:
+    """Cap/limit multiplier for the foreign lane (region-focus boost)."""
+    return FOREIGN_REGION_BOOST if has_foreign_region_focus(profile) else 1.0
+
+
+def boost_foreign_cap(value: int, profile: TopicProfile, *, ceiling: int | None = None) -> int:
+    """Scale a foreign-lane cap by the region-focus multiplier, clamped to ceiling."""
+    boosted = math.ceil(value * foreign_region_multiplier(profile))
+    return min(boosted, ceiling) if ceiling is not None else boosted
 
 
 def _explicit_language_requests(text: str) -> list[tuple[str, str]]:

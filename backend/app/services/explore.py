@@ -82,6 +82,7 @@ from backend.agents.source_audit import apply_source_audit
 from backend.app.core.config import ensure_runtime_dirs, get_settings
 from backend.app.core.prompt_loader import load_prompt
 from backend.app.db import database
+from backend.agents.discovery import foreign_media
 from backend.agents.discovery.collections_source import collections_status, setup_collections_root
 from backend.agents.discovery.markets import markets_available
 
@@ -1898,10 +1899,16 @@ def _source_inclusion_limit(profile: TopicProfile, adapter: str) -> int:
     max_allowed = brief_settings.source_inclusion_max(adapter)
     if isinstance(per_source, dict) and adapter in per_source:
         try:
-            return min(int(per_source[adapter]), max_allowed)
+            limit = min(int(per_source[adapter]), max_allowed)
         except (TypeError, ValueError):
-            return max_allowed
-    return max_allowed
+            limit = max_allowed
+    else:
+        limit = max_allowed
+    if adapter == "foreign_media":
+        # Region-focus boost: widen the foreign inclusion cap by 50% (clamped to
+        # the system ceiling) when the brief explicitly selected regions.
+        limit = foreign_media.boost_foreign_cap(limit, profile, ceiling=max_allowed)
+    return limit
 
 
 def _apply_must_have_article_gate(

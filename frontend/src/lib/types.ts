@@ -518,17 +518,54 @@ export const sourceOptions: Array<{ key: SourceKey; label: string; icon: string 
   { key: "google_news", label: "Google News", icon: "📰" },
 ];
 
-export const foreignRegionOptions: Array<{ key: string; label: string }> = [
-  { key: "asia", label: "Asia" },
-  { key: "east_asia", label: "East Asia" },
-  { key: "china", label: "China" },
-  { key: "japan", label: "Japan" },
-  { key: "korea", label: "Korea" },
-  { key: "europe", label: "Europe" },
-  { key: "latin_america", label: "Latin America" },
-  { key: "middle_east", label: "Middle East" },
-  { key: "africa", label: "Africa" },
+export interface ForeignRegionOption {
+  key: string;
+  label: string;
+}
+
+export interface ForeignRegionGroup {
+  continent: string;
+  regions: ForeignRegionOption[];
+}
+
+// Regions a brief can focus on, grouped by continent. Selecting any region feeds
+// the foreign-media lane (and boosts its caps/limits by 50% on the backend).
+export const foreignRegionGroups: ForeignRegionGroup[] = [
+  {
+    continent: "Americas",
+    regions: [
+      { key: "north_america", label: "North America" },
+      { key: "south_america", label: "South America" },
+    ],
+  },
+  {
+    continent: "Europe",
+    regions: [{ key: "europe", label: "Europe" }],
+  },
+  {
+    continent: "Asia",
+    regions: [
+      { key: "asia", label: "Asia" },
+      { key: "east_asia", label: "East Asia" },
+    ],
+  },
+  {
+    continent: "Middle East & Africa",
+    regions: [
+      { key: "middle_east", label: "Middle East" },
+      { key: "africa", label: "Africa" },
+    ],
+  },
+  {
+    continent: "Oceania",
+    regions: [{ key: "oceania", label: "Oceania" }],
+  },
 ];
+
+// Flat list of every valid region key (derived from the grouped taxonomy).
+export const foreignRegionOptions: ForeignRegionOption[] = foreignRegionGroups.flatMap(
+  (group) => group.regions,
+);
 
 export const defaultSourceSelection: Record<SourceKey, boolean> = {
   web_search: true,
