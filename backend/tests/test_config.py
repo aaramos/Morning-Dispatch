@@ -82,7 +82,7 @@ def test_web_search_saved_key_overrides_shared_search_key(monkeypatch, tmp_path)
     assert settings.web_search_brave_api_key == "saved-brave-key"
 
 
-def test_web_search_uses_serper_by_default(monkeypatch, tmp_path):
+def test_web_search_uses_tavily_by_default(monkeypatch, tmp_path):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("MORNING_DISPATCH_HOME", str(runtime))
     monkeypatch.setenv("MORNING_DISPATCH_DATA_DIR", str(runtime / "data"))
@@ -96,7 +96,8 @@ def test_web_search_uses_serper_by_default(monkeypatch, tmp_path):
 
     settings = get_settings()
 
-    assert settings.web_search_provider == "serper"
+    # Default provider order is tavily -> serper -> brave (see commit c080201).
+    assert settings.web_search_provider == "tavily"
 
 
 def test_web_search_reuses_serper_shared_search_keys(monkeypatch, tmp_path):
