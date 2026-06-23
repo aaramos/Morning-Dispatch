@@ -76,13 +76,20 @@ def test_email_html_resolves_css_variables() -> None:
       </body>
     </html>
     """
-    resolved_html = email_delivery._email_html(sample_html)
-    assert "var(--ink)" not in resolved_html
-    assert "var(--paper-deep)" not in resolved_html
-    assert "var(--accent)" not in resolved_html
-    assert "var(--line)" not in resolved_html
+    # The var() resolver still substitutes any leftover custom-property tokens.
+    resolved = email_delivery._resolve_css_variables(
+        "a{color:var(--ink);border:1px solid var(--line)}"
+    )
+    assert "var(--ink)" not in resolved
+    assert "#1a1a1a" in resolved
+    assert "#eaeae5" in resolved
 
-    assert "color: #1a1a1a" in resolved_html
-    assert "background-color: #fafaf9" in resolved_html
-    assert "color: #1e3a8a" in resolved_html
-    assert "border: 1px solid #eaeae5" in resolved_html
+    resolved_html = email_delivery._email_html(sample_html)
+    # No CSS variable tokens survive into the email.
+    for token in ("var(--ink)", "var(--paper-deep)", "var(--accent)", "var(--line)"):
+        assert token not in resolved_html
+    # The web stylesheet and inline styles are replaced by the lean, single-column
+    # email template, and the body keeps its base ink color inline.
+    assert "max-width:600px" in resolved_html
+    assert "color:#1a1a1a" in resolved_html
+    assert "Hello" in resolved_html

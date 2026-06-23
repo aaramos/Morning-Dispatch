@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import base64
 import logging
+import quopri
+import re
 from email.message import EmailMessage
+from html import escape as _html_escape
 from pathlib import Path
 from typing import Any
 
@@ -267,13 +270,34 @@ def _gmail_service() -> Any:
     return build("gmail", "v1", credentials=creds)
 
 
+GMAIL_CLIP_BYTES = 102 * 1024
+
+
 def _build_raw_message(*, recipient: str, subject: str, html: str, plain_text: str) -> str:
     message = EmailMessage()
     message["To"] = recipient
     message["Subject"] = subject
     message.set_content(plain_text or "Dispatch brief is attached below.")
     message.add_alternative(html, subtype="html")
+    _warn_if_clip_risk(message)
     return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+
+
+def _warn_if_clip_risk(message: EmailMessage) -> None:
+    """Log if the encoded HTML part risks Gmail's ~102 KB clip threshold."""
+    try:
+        for part in message.walk():
+            if part.get_content_type() == "text/html":
+                encoded = len(part.as_bytes())
+                if encoded > GMAIL_CLIP_BYTES:
+                    logger.warning(
+                        "Email HTML part is ~%d KB (> Gmail's ~102 KB clip threshold); "
+                        "the brief may be truncated in Gmail.",
+                        encoded // 1024,
+                    )
+                return
+    except Exception:  # pragma: no cover - guard logging must never break a send
+        pass
 
 
 def _html_to_text(html: str) -> str:
@@ -289,6 +313,40 @@ def _email_html(html: str) -> str:
         element.decompose()
     for element in soup.select(".feedback-controls"):
         element.decompose()
+
+    # --- Email presentation cleanup (email-only; the web view is untouched) ---
+    # Remove reader-facing internals that are debug, not content: relevance
+    # score badges, keyword chips, the story index number, and the telemetry
+    # sidebar ("About this brief": AI tokens/calls/processing time/source mix).
+    for sel in (".score", ".keywords", ".story-num", ".brief-sidebar", ".side-panel", ".provenance"):
+        for element in soup.select(sel):
+            element.decompose()
+    # Drop per-card/media thumbnails to clear Gmail's clip budget (the few hero /
+    # standings strip images are kept — glanceable and cheap on bytes).
+    for sel in (".story-thumb", ".media-thumb", ".fallback-art"):
+        for element in soup.select(sel):
+            element.decompose()
+    # Drop the heavy hidden modal bodies (full foreign translations + originals,
+    # video/podcast transcripts) — 20-33 KB each, they blow Gmail's clip limit.
+    # Each of those cards keeps its headline, summary, and a direct external
+    # source link (rewritten just below). Newsletter modals are EXCLUDED: a
+    # newsletter has no external link, so its body is the only content — those
+    # are kept and collapsed by the modal->details conversion below.
+    for sel in (
+        ".foreign-modal",
+        ".podcast-modal:not(.newsletter-modal)",
+        ".youtube-modal:not(.newsletter-modal)",
+        ".translation-original",
+    ):
+        for element in soup.select(sel):
+            element.decompose()
+    # Trim the internal "via <discovery title/query>" suffix from each meta line.
+    for meta in soup.select(".meta"):
+        text = meta.get_text(" ", strip=True)
+        trimmed = re.split(r"\s*·\s*via\b", text, maxsplit=1)[0].strip(" ·")
+        if trimmed and trimmed != text:
+            meta.clear()
+            meta.append(trimmed)
 
     # Convert YouTube modal links to direct links for email
     for a_tag in soup.find_all("a", attrs={"data-youtube-url": True}):
@@ -530,7 +588,169 @@ def _email_html(html: str) -> str:
             new_node = BeautifulSoup(details_html, "html.parser").find()
             modal.replace_with(new_node)
 
-    return _resolve_css_variables(str(soup))
+    # Replace the web stylesheet(s) and web fonts with one lean, email-safe,
+    # single-column, iPhone-first stylesheet.
+    for tag in soup.find_all(["style", "link"]):
+        tag.decompose()
+    head = soup.find("head")
+    if head is None:
+        head = soup.new_tag("head")
+        (soup.find("html") or soup).insert(0, head)
+    if not head.find("meta", attrs={"name": "viewport"}):
+        viewport = soup.new_tag("meta")
+        viewport.attrs["name"] = "viewport"
+        viewport.attrs["content"] = "width=device-width, initial-scale=1"
+        head.append(viewport)
+    style_tag = soup.new_tag("style")
+    style_tag.string = _LEAN_EMAIL_CSS
+    head.append(style_tag)
+
+    # Drop inline styles left on original content so the lean stylesheet fully
+    # controls presentation; the generated <details> blocks keep their own.
+    for element in soup.select("[style]"):
+        if element.name == "details" or element.find_parent("details"):
+            continue
+        del element["style"]
+
+    # "Back to top" anchor + a tappable section index for navigating a long,
+    # all-in-one brief on a phone.
+    shell = soup.select_one(".brief-shell") or soup.body
+    if shell is not None and not shell.get("id"):
+        shell["id"] = "brief-top"
+    _insert_section_index(soup)
+
+    # Reader footer. This brief is a personal self-send, so identity only — no
+    # bulk-mail unsubscribe machinery is required.
+    _append_email_footer(soup)
+
+    # Base colors inline so the brief survives a stripped <style> in strict clients.
+    if soup.body is not None:
+        soup.body["style"] = "margin:0;padding:0;background-color:#ffffff;color:#1a1a1a;"
+
+    # Shorten summaries ONLY as much as needed to clear Gmail's clip limit; full
+    # summaries whenever they fit. Every story, headline, and source link is kept.
+    return _fit_email_size(soup)
+
+
+# Stay safely under Gmail's ~102 KB clip threshold (encoded), leaving headroom.
+GMAIL_CLIP_SAFE_BYTES = 96 * 1024
+
+
+def _qp_len(html: str) -> int:
+    """Approximate the quoted-printable-encoded byte length Gmail clips on."""
+    return len(quopri.encodestring(html.encode("utf-8")))
+
+
+def _clip_text(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    cut = text[:cap].rsplit(" ", 1)[0].rstrip(" ,.;:—-")
+    return (cut or text[:cap]) + "…"
+
+
+def _fit_email_size(soup: BeautifulSoup) -> str:
+    """Render to HTML, progressively trimming summaries until under the clip cap."""
+    html_str = _resolve_css_variables(str(soup))
+    if _qp_len(html_str) <= GMAIL_CLIP_SAFE_BYTES:
+        return html_str
+    summaries = [(el, el.get_text(" ", strip=True)) for el in soup.select(".story-summary, .lead-summary")]
+    if not summaries:
+        return html_str
+    for cap in (400, 300, 220, 160, 120):
+        for el, original in summaries:
+            el.clear()
+            el.append(_clip_text(original, cap))
+        html_str = _resolve_css_variables(str(soup))
+        if _qp_len(html_str) <= GMAIL_CLIP_SAFE_BYTES:
+            break
+    return html_str
+
+
+_LEAN_EMAIL_CSS = """
+body{margin:0;padding:0;background-color:#ffffff;color:#1a1a1a;-webkit-text-size-adjust:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;}
+.brief-shell{max-width:600px;margin:0 auto;padding:20px 16px 36px;}
+.brief-masthead{display:block;border-bottom:2px solid #1a1a1a;padding-bottom:10px;margin-bottom:14px;}
+.masthead-brand{font-family:Georgia,'Times New Roman',serif;font-size:22px;font-weight:bold;line-height:1.1;}
+.masthead-meta,.dateline{font-size:12px;color:#6b6b66;text-align:left;margin-top:4px;}
+.brief-header{display:block;margin:0 0 16px;}
+h1{font-family:Georgia,'Times New Roman',serif;font-size:24px;line-height:1.2;margin:0 0 10px;font-weight:bold;}
+h2{font-family:Georgia,'Times New Roman',serif;font-size:19px;line-height:1.25;margin:26px 0 6px;font-weight:bold;}
+h3{font-family:Georgia,'Times New Roman',serif;font-size:17px;line-height:1.3;margin:0;font-weight:bold;}
+.section-kicker{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#6b6b66;}
+.brief-body{display:block;}
+.story-column{display:block;width:100%;}
+.brief-sidebar{display:none;}
+.source-section,.media-section{margin-bottom:6px;}
+.story-list{display:block;}
+.story-row,.media-card,.low-conf-row{display:block;border-top:1px solid #eaeae5;padding:14px 0;}
+.story-copy,.lead-content{display:block;width:100%;}
+.story-meta{font-size:12px;color:#6b6b66;margin-bottom:5px;}
+.source-type{display:inline-block;font-size:11px;font-weight:bold;color:#1e3a8a;text-transform:uppercase;letter-spacing:.04em;margin-right:6px;}
+.meta{font-size:12px;color:#6b6b66;}
+.story-title,.media-title{margin:2px 0 5px;}
+.story-title a,.media-title a,h3 a{color:#1e3a8a;text-decoration:none;font-weight:bold;display:inline-block;padding:2px 0;}
+.story-summary,.lead-summary{font-size:15px;line-height:1.5;color:#333330;margin:4px 0 0;}
+.lead-block{display:block;border-top:1px solid #eaeae5;padding:14px 0;}
+.lead-title{font-family:Georgia,'Times New Roman',serif;font-size:20px;line-height:1.25;font-weight:bold;}
+.media-cta,.media-card a.media-cta{display:inline-block;margin-top:8px;font-size:13px;font-weight:bold;color:#1e3a8a;text-decoration:none;}
+a{color:#1e3a8a;}
+img{max-width:100%;height:auto;border-radius:6px;}
+.img-strip{display:block;}
+.strip-frame{display:block;margin:0 0 10px;}
+.email-index{margin:0 0 18px;padding:14px 16px;background:#f5f5f0;border-radius:8px;}
+.email-index .section-kicker{display:block;margin-bottom:9px;}
+.email-index a{display:inline-block;font-size:13px;font-weight:bold;color:#1e3a8a;text-decoration:none;background:#ffffff;border:1px solid #e2e2dc;border-radius:999px;padding:8px 13px;margin:0 6px 8px 0;}
+.sec-top{float:right;font-size:12px;font-weight:normal;color:#1e3a8a;text-decoration:none;}
+.email-foot{margin-top:26px;padding-top:14px;border-top:1px solid #eaeae5;font-size:12px;color:#8a877f;line-height:1.6;}
+.translation-badge{display:inline-block;font-size:11px;color:#0f6e56;margin-left:4px;}
+@media (max-width:480px){.brief-shell{padding:16px 14px 32px;}h1{font-size:22px;}h2{font-size:18px;}}
+@media (prefers-color-scheme:dark){body{background-color:#111111 !important;color:#ededed !important;}.story-summary,.lead-summary{color:#d6d6d6 !important;}.brief-masthead{border-bottom-color:#ededed !important;}.story-row,.media-card,.low-conf-row,.lead-block,.email-foot{border-top-color:#333333 !important;}.email-index{background:#1c1c1c !important;}.email-index a{background:#222222 !important;color:#9bb7e8 !important;border-color:#333333 !important;}.story-title a,.media-title a,h3 a,a,.source-type,.sec-top{color:#9bb7e8 !important;}}
+""".strip()
+
+
+def _insert_section_index(soup: BeautifulSoup) -> None:
+    """Build a tappable jump-link index from the brief's section <h2> headers."""
+    headings = [h for h in soup.find_all("h2") if h.get_text(strip=True)]
+    if len(headings) < 2:
+        return
+    links: list[str] = []
+    for h2 in headings:
+        label = h2.get_text(" ", strip=True)
+        section_id = h2.get("id")
+        if not section_id:
+            section_id = "sec-" + re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:40]
+            h2["id"] = section_id
+        section = h2.find_parent(class_=re.compile(r"source-section|media-section")) or h2.parent
+        count = len(section.select(".story-row, .media-card, .low-conf-row")) if section else 0
+        suffix = f" {count}" if count else ""
+        links.append(f'<a href="#{_html_escape(section_id, quote=True)}">{_html_escape(label)}{suffix}</a>')
+        back = soup.new_tag("a", href="#brief-top")
+        back["class"] = "sec-top"
+        back.string = "↑ top"
+        h2.append(back)
+    nav_html = (
+        '<div class="email-index"><span class="section-kicker">In this brief</span>'
+        + "".join(links)
+        + "</div>"
+    )
+    nav = BeautifulSoup(nav_html, "html.parser")
+    anchor = soup.select_one(".brief-header") or soup.select_one(".brief-masthead")
+    if anchor is not None:
+        anchor.insert_after(nav)
+        return
+    target = soup.select_one(".story-column") or soup.body
+    if target is not None:
+        target.insert(0, nav)
+
+
+def _append_email_footer(soup: BeautifulSoup) -> None:
+    foot = BeautifulSoup(
+        '<div class="email-foot">Morning Dispatch · your personal intelligence brief</div>',
+        "html.parser",
+    )
+    shell = soup.select_one(".brief-shell") or soup.body
+    if shell is not None:
+        shell.append(foot)
 
 
 CSS_VARIABLES = {

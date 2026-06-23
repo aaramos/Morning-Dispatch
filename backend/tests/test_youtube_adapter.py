@@ -717,15 +717,18 @@ def test_email_html_all_modals_transformation() -> None:
 
     transformed_html = _email_html(html_input)
 
-    # Verify foreign article transformations
+    # Foreign modals are dropped for the email (byte budget): the heavy
+    # translation + original bodies are removed and the card keeps a direct
+    # external source link instead.
     assert "foreign-modal" not in transformed_html
     assert 'href="https://example.com/spanish-article"' in transformed_html
-    assert "English Translation" in transformed_html
-    assert "This is the English translation body." in transformed_html
-    assert "Original Text" in transformed_html
-    assert "Este es el cuerpo original en español." in transformed_html
+    assert "English Translation" not in transformed_html
+    assert "This is the English translation body." not in transformed_html
+    assert "Original Text" not in transformed_html
+    assert "Este es el cuerpo original en español." not in transformed_html
 
-    # Verify newsletter transformations
+    # Newsletters have no external link, so their body IS the content and is
+    # kept (collapsed into an email-safe details block).
     assert 'class="newsletter-modal"' not in transformed_html
     assert 'id="newsletter-456"' in transformed_html
     assert "Read Newsletter Content" in transformed_html
