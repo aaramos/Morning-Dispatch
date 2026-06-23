@@ -13,13 +13,16 @@ from urllib.parse import urlparse
 from backend.agents.discovery.language_support import trusted_script_language_patterns
 from backend.agents.librarian.articles import ArticleFetchResult
 from backend.agents.model import MODEL_CAPACITY_STATUS, ModelClient, ModelClientConfig, ModelClientError
-from backend.app.core.config import DEFAULT_LIBRARIAN_MODEL, get_settings
+from backend.app.core.config import get_settings
 from backend.app.core.prompt_loader import load_prompt
 from backend.app.db import database
 
 
 MAX_SUMMARY_CHARS = 620
-MAX_MODEL_TEXT_CHARS = 2500
+# Per-article enrichment input clip: how much of the article body the librarian model
+# sees when writing the title/summary/keywords. Larger windows improve summary
+# faithfulness and entity coverage; sized for 32k+ context models (Qwen3.6-35B, Gemma-4).
+MAX_MODEL_TEXT_CHARS = 12500
 # Foreign full-article translation: translate the whole body, not a clipped lead,
 # so a selected article is delivered in full English rather than a partial pass.
 FOREIGN_TRANSLATION_BODY_CHARS = 16000
@@ -256,7 +259,12 @@ def _fallback_model_client(model_client: object) -> ModelClient | None:
     settings = get_settings()
     config = getattr(model_client, "config", None)
     current_model = str(getattr(config, "model", "") or settings.librarian_model or "")
-    fallback_model = DEFAULT_LIBRARIAN_MODEL
+    # Fall back to the configured default model (settings.librarian_model, currently
+    # Qwen3.6-35B-A3B-oQ6-mtp) rather than a hard-coded id, so the retry target follows
+    # config and can't go stale. When the librarian route already runs the default,
+    # current_model == fallback_model and the guard below returns None (no point retrying
+    # the same model — capacity errors then degrade to deterministic enrichment).
+    fallback_model = settings.librarian_model
     if not fallback_model or current_model == fallback_model:
         return None
     base_url = str(getattr(config, "base_url", None) or settings.model_base_url or "")
