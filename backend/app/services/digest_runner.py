@@ -197,11 +197,20 @@ async def _fetch_articles(state: DigestGraphState) -> DigestGraphState:
 
 async def _rank_articles(state: DigestGraphState) -> DigestGraphState:
     digest = state["digest"]
-    enriched_articles = await enrich_articles(state.get("fetched_articles", []), model_max_items=0)
+    settings = get_settings()
+    translation_client = model_routing.client_for_agent(
+        "translation",
+        settings=settings,
+        items=state.get("fetched_articles", []),
+    ).client
+    enriched_articles = await enrich_articles(
+        state.get("fetched_articles", []),
+        model_max_items=0,
+        translation_client=translation_client,
+    )
     enriched_articles = database.apply_feedback_to_candidates(state["digest_id"], enriched_articles)
     ranked_articles = prepare_issue_articles(digest, enriched_articles)
 
-    settings = get_settings()
     cache_hit_count = 0
     cache_miss_count = 0
     librarian_client = model_routing.client_for_agent(
@@ -235,9 +244,15 @@ async def _refine_with_model(state: DigestGraphState) -> DigestGraphState:
         settings=settings,
         items=state.get("ranked_articles", []),
     ).client
+    translation_client = model_routing.client_for_agent(
+        "translation",
+        settings=settings,
+        items=state.get("ranked_articles", []),
+    ).client
     article_results = await refine_ranked_articles_with_model(
         state.get("ranked_articles", []),
         model_client=librarian_client,
+        translation_client=translation_client,
         model_max_items=min(settings.librarian_model_max_items, pipeline_limits["model_refinement_items"]),
         inference_run_id=state["inference_run_id"],
         metrics_mode="batch" if state.get("trigger") == "scheduled" else "single",

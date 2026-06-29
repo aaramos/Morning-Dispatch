@@ -65,9 +65,9 @@ def test_percent_presets_match_historical_tiers() -> None:
 
 
 def test_source_max_is_single_source_of_truth() -> None:
-    assert brief_settings.source_inclusion_max("reddit") == 60
-    assert brief_settings.source_inclusion_max("web_search") == 80
-    assert brief_settings.source_inclusion_max("youtube") == 40
+    assert brief_settings.source_inclusion_max("reddit") == 30
+    assert brief_settings.source_inclusion_max("web_search") == 40
+    assert brief_settings.source_inclusion_max("youtube") == 20
     # Unknown sources fall back to the default ceiling.
     assert brief_settings.source_inclusion_max("mystery") == brief_settings.DEFAULT_PER_SOURCE_MAX
 
@@ -77,7 +77,7 @@ def test_source_min_items_defaults_and_overrides() -> None:
     assert brief_settings.source_min_items("web_search", {}) == brief_settings.DEFAULT_SOURCE_FLOOR
     assert brief_settings.source_min_items("web_search", {"min_items": {"web_search": 3}}) == 3
     # Floor can never exceed the source ceiling.
-    assert brief_settings.source_min_items("youtube", {"min_items": {"youtube": 999}}) == 40
+    assert brief_settings.source_min_items("youtube", {"min_items": {"youtube": 999}}) == 20
 
 
 def test_screening_sample_randomizes_large_candidate_pools(monkeypatch) -> None:

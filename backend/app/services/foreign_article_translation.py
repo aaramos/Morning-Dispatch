@@ -12,6 +12,7 @@ from backend.agents.digestor.base import NormalizedPayload
 from backend.agents.librarian.articles import fetch_articles_for_payloads
 from backend.agents.model import ModelClient, ModelClientError
 from backend.app.core.config import get_settings
+from backend.app.services import model_routing
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ async def translate_foreign_article(payload: dict[str, Any]) -> dict[str, Any]:
     original_unavailable = result is None or not getattr(result, "fetched", False) or len(original_body) < 180
 
     settings = get_settings()
-    client = ModelClient.from_settings(settings)
+    client = model_routing.client_for_agent("translation", settings=settings).client
     if client is None:
         return {
             "status": "translation_unavailable",

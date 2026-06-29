@@ -67,7 +67,7 @@ def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
                     "target_items": 18,
                     "lead_items": 4,
                     "quality_floor": "strong",
-                    "per_source": {"web_search": 60, "youtube": 8},
+                    "per_source": {"web_search": 35, "youtube": 8},
                 },
             },
     )
@@ -76,8 +76,8 @@ def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
     assert initial.json()["defaults"]["lookback_hours"] == 168
     assert initial.json()["defaults"]["content_limits"]["total_items"] == 600
     assert initial.json()["defaults"]["content_limits"]["target_items"] == 30
-    assert initial.json()["defaults"]["content_limits"]["lead_items"] == 3
-    assert initial.json()["defaults"]["content_limits"]["per_source"]["gmail"] == 48
+    assert initial.json()["defaults"]["content_limits"]["lead_items"] == 6
+    assert initial.json()["defaults"]["content_limits"]["per_source"]["gmail"] == 24
     assert initial.json()["pipeline_limits"]["article_fetches"] == 1000
     assert any(group["group"] == "AI review caps" for group in initial.json()["system_limits"])
     assert updated.status_code == 200
@@ -87,7 +87,7 @@ def test_admin_brief_settings_defaults_round_trip(monkeypatch, tmp_path):
     assert defaults["content_limits"]["target_items"] == 18
     assert defaults["content_limits"]["lead_items"] == 4
     assert defaults["content_limits"]["quality_floor"] == "strong"
-    assert defaults["content_limits"]["per_source"]["web_search"] == 60
+    assert defaults["content_limits"]["per_source"]["web_search"] == 35
     assert defaults["content_limits"]["per_source"]["youtube"] == 8
     payload = json.loads((runtime / "data" / "brief-settings.json").read_text(encoding="utf-8"))
     assert payload["brief_defaults"]["content_limits"]["total_items"] == 80

@@ -42,6 +42,7 @@ async def enrich_articles(
     results: Iterable[ArticleFetchResult],
     *,
     model_client: ModelClient | None = None,
+    translation_client: ModelClient | None = None,
     model_max_items: int | None = None,
 ) -> list[ArticleFetchResult]:
     """Enrich fetched article results without using digest-specific interests."""
@@ -55,6 +56,7 @@ async def enrich_articles(
         enrich_article_with_model(
             result,
             model_client=client if id(result) in model_result_ids or _needs_metadata_translation(result) else None,
+            translation_client=translation_client,
         )
         for result in result_list
     ]
@@ -105,6 +107,7 @@ async def enrich_article_with_model(
     result: ArticleFetchResult,
     *,
     model_client: ModelClient | None = None,
+    translation_client: ModelClient | None = None,
     metrics_context: dict[str, object] | None = None,
 ) -> ArticleFetchResult:
     if result.enrichment_source in MODEL_ENRICHED_SOURCES:
@@ -112,7 +115,12 @@ async def enrich_article_with_model(
 
     deterministic = enrich_article(result)
     if _needs_metadata_translation(deterministic):
-        return await _assess_and_translate_foreign(deterministic, model_client=model_client)
+        # Foreign translation runs on the dedicated translation route when one is
+        # supplied, falling back to the librarian/default client otherwise.
+        return await _assess_and_translate_foreign(
+            deterministic,
+            model_client=translation_client if translation_client is not None else model_client,
+        )
 
     if model_client is None or deterministic.tier == "dropped" or not deterministic.fetched:
         return deterministic
@@ -285,6 +293,7 @@ async def refine_ranked_articles_with_model(
     results: Iterable[ArticleFetchResult],
     *,
     model_client: ModelClient | None = None,
+    translation_client: ModelClient | None = None,
     model_max_items: int | None = None,
     inference_run_id: str | None = None,
     metrics_mode: str = "single",
@@ -292,6 +301,10 @@ async def refine_ranked_articles_with_model(
     result_list = list(results)
     settings = get_settings()
     client = model_client if model_client is not None else ModelClient.from_settings(settings)
+    # Foreign translation runs on its own route so it can be pointed at a
+    # translation-tuned model independently of the librarian. Fall back to the
+    # librarian/default client when no dedicated translation client is supplied.
+    translator = translation_client if translation_client is not None else client
     max_items = settings.librarian_model_max_items if model_max_items is None else max(0, model_max_items)
     translations_used = 0
     tasks = []
@@ -303,20 +316,30 @@ async def refine_ranked_articles_with_model(
             # result_list is already ranked) so one foreign-heavy run can't grind the
             # rank stage for an hour and jam the queue. Over-budget foreign items are
             # kept untranslated rather than translated.
-            use_client = client is not None and translations_used < MAX_FOREIGN_TRANSLATIONS_PER_RUN
+            use_client = translator is not None and translations_used < MAX_FOREIGN_TRANSLATIONS_PER_RUN
             if use_client:
                 translations_used += 1
+            tasks.append(
+                enrich_article_with_model(
+                    result,
+                    model_client=client if use_client else None,
+                    translation_client=translator if use_client else None,
+                    metrics_context=_metrics_context_for_result(result, inference_run_id, metrics_mode)
+                    if use_client and inference_run_id
+                    else None,
+                )
+            )
         else:
             use_client = client is not None and index < max_items
-        tasks.append(
-            enrich_article_with_model(
-                result,
-                model_client=client if use_client else None,
-                metrics_context=_metrics_context_for_result(result, inference_run_id, metrics_mode)
-                if use_client and inference_run_id
-                else None,
+            tasks.append(
+                enrich_article_with_model(
+                    result,
+                    model_client=client if use_client else None,
+                    metrics_context=_metrics_context_for_result(result, inference_run_id, metrics_mode)
+                    if use_client and inference_run_id
+                    else None,
+                )
             )
-        )
     return list(await asyncio.gather(*tasks))
 
 

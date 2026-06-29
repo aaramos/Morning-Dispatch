@@ -797,18 +797,18 @@ def test_update_topic_profile_content_limits(monkeypatch, tmp_path) -> None:
         assert updated.json()["profile"]["content_limits"] == {
             "lead_items": 2,
             "per_source": {
-                "collections": 30,
-                "foreign_media": 48,
-                "gmail": 48,
-                "markets": 48,
-                "podcasts": 24,
-                "reddit": 36,
+                "collections": 15,
+                "foreign_media": 24,
+                "gmail": 24,
+                "markets": 24,
+                "podcasts": 12,
+                "reddit": 18,
                 "web_search": 5,
                 "youtube": 2,
-                "google_news": 48,
-                "academic": 30,
-                "regulatory": 30,
-                "hacker_news": 24,
+                "google_news": 24,
+                "academic": 15,
+                "regulatory": 15,
+                "hacker_news": 12,
             },
             "quality_floor": "strong",
             "target_items": 6,
@@ -3986,11 +3986,13 @@ def test_explore_digest_core_uses_profile_brief_model(monkeypatch, tmp_path) -> 
         results,
         *,
         model_client=None,
+        translation_client=None,
         model_max_items=None,
         inference_run_id=None,
         metrics_mode="single",
     ):
         observed["refine_model"] = getattr(getattr(model_client, "config", None), "model", None)
+        observed["translation_model"] = getattr(getattr(translation_client, "config", None), "model", None)
         observed["refine_model_max_items"] = model_max_items
         return results
 

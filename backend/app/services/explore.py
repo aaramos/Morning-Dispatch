@@ -1769,7 +1769,19 @@ async def _run_digest_core(
     _set_pipeline_stage(progress, "summarize", "running")
     await flush_progress()
 
-    enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
+    settings = get_settings()
+    brief_model = profile.models.get("brief")
+    translation_client = model_routing.client_for_agent(
+        "translation",
+        settings=settings,
+        items=fetched_articles,
+        model_override=brief_model,
+    ).client
+    enriched_articles = await enrich_articles(
+        fetched_articles,
+        model_max_items=0,
+        translation_client=translation_client,
+    )
     enriched_articles = database.apply_feedback_to_candidates(profile.topic_id, enriched_articles)
     ranked_articles = prepare_issue_articles(digest, enriched_articles)
 
@@ -1800,6 +1812,7 @@ async def _run_digest_core(
             refine_ranked_articles_with_model(
                 ranked_articles,
                 model_client=librarian_client,
+                translation_client=translation_client,
                 model_max_items=min(
                     settings.librarian_model_max_items,
                     pipeline_limits["model_refinement_items"],
@@ -2916,6 +2929,12 @@ async def re_enrich_deterministic_articles(exploration_id: str) -> dict[str, Any
         model_override=brief_model,
     )
     librarian_client = librarian_resolution.client
+    translation_client = model_routing.client_for_agent(
+        "translation",
+        settings=settings,
+        items=[temp_result],
+        model_override=brief_model,
+    ).client
     model_name = _model_client_name(librarian_client, settings.librarian_model)
 
     re_enriched_count = 0
@@ -2970,7 +2989,11 @@ async def re_enrich_deterministic_articles(exploration_id: str) -> dict[str, Any
             # Rerun model enrichment
             if not cache_row and librarian_client is not None and result.text:
                 try:
-                    enriched = await enrich_article_with_model(result, model_client=librarian_client)
+                    enriched = await enrich_article_with_model(
+                        result,
+                        model_client=librarian_client,
+                        translation_client=translation_client,
+                    )
                     if enriched.enrichment_source in {"model", "model_fallback"}:
                         # Update article summary/keywords in DB
                         connection.execute(

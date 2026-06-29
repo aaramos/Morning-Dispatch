@@ -11,7 +11,7 @@ DEFAULT_LIBRARIAN_MODEL_MAX_ITEMS = 250
 DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 DEFAULT_SCHEDULER_DAILY_RUN_TIME = "05:00"
 DEFAULT_SCHEDULER_TIMEZONE = "America/Los_Angeles"
-MODEL_ROUTE_AGENTS = ("refinement", "foreign_media", "librarian", "source_audit", "editorial", "critic")
+MODEL_ROUTE_AGENTS = ("refinement", "foreign_media", "librarian", "translation", "source_audit", "editorial", "critic")
 # Models run on a single local OpenAI-compatible server. Cloud routing was removed.
 MODEL_ROUTE_PROVIDERS = ("local",)
 DEFAULT_MODEL_ROUTES: dict[str, dict[str, object]] = {

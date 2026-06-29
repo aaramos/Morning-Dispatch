@@ -33,9 +33,9 @@ def test_default_off(name: str) -> None:
 
 
 def test_per_source_caps() -> None:
-    assert brief_settings.source_inclusion_max("academic") == 50
-    assert brief_settings.source_inclusion_max("regulatory") == 50
-    assert brief_settings.source_inclusion_max("hacker_news") == 40
+    assert brief_settings.source_inclusion_max("academic") == 25
+    assert brief_settings.source_inclusion_max("regulatory") == 25
+    assert brief_settings.source_inclusion_max("hacker_news") == 20
 
 
 @pytest.mark.parametrize(

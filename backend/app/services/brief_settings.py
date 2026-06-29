@@ -41,26 +41,26 @@ LANE_CAPS: dict[str, int] = {
 # preset scales it down. Adding a source here automatically gives it a discovery
 # lane limit, an inclusion cap, and a generated set of presets.
 PER_SOURCE_MAX: dict[str, int] = {
-    "web_search": 80,
-    "foreign_media": 80,
-    "gmail": 80,
-    "markets": 80,
-    "reddit": 60,
-    "collections": 50,
-    "podcasts": 40,
-    "youtube": 40,
-    "google_news": 80,
-    "academic": 50,
-    "regulatory": 50,
-    "hacker_news": 40,
+    "web_search": 40,
+    "foreign_media": 40,
+    "gmail": 40,
+    "markets": 40,
+    "reddit": 30,
+    "collections": 25,
+    "podcasts": 20,
+    "youtube": 20,
+    "google_news": 40,
+    "academic": 25,
+    "regulatory": 25,
+    "hacker_news": 20,
 }
 # Sources not listed above fall back to this cap.
-DEFAULT_PER_SOURCE_MAX = 50
+DEFAULT_PER_SOURCE_MAX = 25
 
 # Cross-source "Top Stories" lead section (item 5). The lead count is the number
 # of best-of items pulled from every source into the top section of the brief.
 TOP_STORIES_MAX = MAX_LEAD_ITEMS
-TOP_STORIES_DEFAULT = 5
+TOP_STORIES_DEFAULT = 10
 
 # Preset tiers expressed as a fraction of each source's max. "max" == the system
 # ceiling; the rest are percentage-scaled. Brief defaults use the "medium" (0.6)

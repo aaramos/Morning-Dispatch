@@ -16,7 +16,7 @@ from backend.agents.librarian.articles import ArticleFetchResult, fetch_articles
 from backend.agents.librarian.enrichment import enrich_articles, refine_ranked_articles_with_model
 from backend.app.core.config import get_settings
 from backend.app.db import database
-from backend.app.services import brief_settings
+from backend.app.services import brief_settings, model_routing
 
 
 async def run_controlled_verification(
@@ -196,10 +196,20 @@ async def _run_controlled_podcast_refresh(
         concurrency=pipeline_limits["article_fetch_concurrency"],
     )
     stage_started = _mark_stage(stage_seconds, "fetching", stage_started)
-    enriched_articles = await enrich_articles(fetched_articles, model_max_items=0)
+    translation_client = model_routing.client_for_agent(
+        "translation",
+        settings=get_settings(),
+        items=fetched_articles,
+    ).client
+    enriched_articles = await enrich_articles(
+        fetched_articles,
+        model_max_items=0,
+        translation_client=translation_client,
+    )
     ranked_articles = prepare_issue_articles(digest, enriched_articles)
     article_results = await refine_ranked_articles_with_model(
         ranked_articles,
+        translation_client=translation_client,
         model_max_items=pipeline_limits["model_refinement_items"],
         inference_run_id=inference_run_id,
         metrics_mode="single",
