@@ -103,6 +103,7 @@ function DispatchApp() {
   const [draft, setDraft] = useState<ConfirmationDraft>(() => restoredConversation?.draft ?? emptyDraft());
   const [flow, setFlow] = useState<FlowState>(() => restoredConversation?.flow ?? "idle");
   const [busy, setBusy] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [message, setMessage] = useState(() => (
     restoredConversation
       ? restoredConversation.flow === "confirm" ? "Conversation restored; confirm the brief setup" : "Conversation restored"
@@ -1439,6 +1440,44 @@ function DispatchApp() {
     setMessage("Ready");
   }
 
+  // Reset to the default state: stop any in-flight build (discovery/librarian
+  // pipeline) and clear the search query being built. Available from the landing
+  // page and during refinement/build.
+  async function resetSearch() {
+    if (resetting) return;
+    setResetting(true);
+    try {
+      const running =
+        backgroundBuild ??
+        (exploration && (exploration.status === "queued" || exploration.status === "running")
+          ? exploration
+          : null);
+      if (running) {
+        setMessage("Stopping the build...");
+        try {
+          await api(`/api/explore/explorations/${running.exploration_id}/cancel`, { method: "POST" });
+        } catch (error) {
+          // Best-effort: clear the UI even if the cancel call fails.
+          console.error("Failed to cancel running build during reset", error);
+        }
+      }
+      resetForNewBrief();
+      // Refresh so the cancelled run drops out of backgroundBuild and the
+      // progress panel disappears immediately.
+      await loadBuildState();
+      setMessage("Reset.");
+    } finally {
+      setResetting(false);
+    }
+  }
+
+  const showReset =
+    flow === "refining" ||
+    flow === "confirm" ||
+    flow === "building" ||
+    Boolean(backgroundBuild) ||
+    (flow === "idle" && statement.trim().length > 0);
+
   function updateSource(key: SourceKey) {
     if (sourceLocked) return;
     const status = sourceStatus?.sources[key];
@@ -1735,6 +1774,20 @@ function DispatchApp() {
         <section className="dispatch-body">
           {scheduledDeliveryFailures.length ? (
             <ScheduledDeliveryAlert failures={scheduledDeliveryFailures} onChanged={loadStatics} />
+          ) : null}
+
+          {showReset ? (
+            <div className="reset-bar">
+              <button
+                type="button"
+                className="reset-action"
+                onClick={() => void resetSearch()}
+                disabled={resetting}
+                title="Stop any running build and clear the current search to start over"
+              >
+                {resetting ? "Resetting…" : "Reset"}
+              </button>
+            </div>
           ) : null}
 
           {flow === "idle" || flow === "refining" || flow === "confirm" || streaming ? (

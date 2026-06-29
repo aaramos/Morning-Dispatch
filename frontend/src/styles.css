@@ -2699,6 +2699,30 @@ label {
   font-size: 0.72rem;
   color: #8a877f;
 }
+.reset-bar {
+  display: flex;
+  justify-content: flex-end;
+}
+.reset-action {
+  border: 1px solid #e0c4c4;
+  border-radius: 999px;
+  background: #ffffff;
+  min-height: 30px;
+  padding: 0 14px;
+  font: inherit;
+  font-weight: 700;
+  font-size: 0.78rem;
+  color: #9a3b3b;
+  cursor: pointer;
+}
+.reset-action:hover:not(:disabled) {
+  border-color: #d99a9a;
+  background: #fbf1f1;
+}
+.reset-action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
 .foreign-region-group {
   display: grid;
   gap: 4px;
